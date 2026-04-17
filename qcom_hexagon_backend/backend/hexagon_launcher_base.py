@@ -300,9 +300,9 @@ class HexagonWrapperGenerator:
                 read_from_file_string += write_call
         return read_from_file_string
 
-    def generate_lwp_call(self):
+    def generate_lwp_call(self, exec_dir):
         if self.enable_lwp:
-            return self.common_strings.call_lwp.format(path="/vendor/bin", fname="lwp")
+            return self.common_strings.call_lwp.format(path=exec_dir, fname="lwp")
         return ""
 
     def generate_tensor_write_to_file_calls(self, fname, exec_dir):
@@ -353,7 +353,7 @@ class HexagonWrapperGenerator:
             write_to_file_calls=self.generate_tensor_write_to_file_calls(
                 file_name, exec_dir
             ),
-            lwp=self.generate_lwp_call(),
+            lwp=self.generate_lwp_call(exec_dir),
         )
         return code_body
 

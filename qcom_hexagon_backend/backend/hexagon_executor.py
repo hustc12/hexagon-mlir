@@ -41,7 +41,7 @@ class HexagonExecutor:
                                  calling the `get_config` method.
         """
         self.exec_mode = get_exec_mode() if not compile_only else "compile_only"
-        self.device_path = "/vendor/bin"
+        self.device_path = "/data/local/tmp"
         self.config = self.get_config()
         self.enable_lwp = enable_lwp
         self.enable_etm = enable_etm  # When set to True, etm traces will be collected and processed with pyetm.
@@ -79,7 +79,12 @@ class HexagonExecutor:
                 {"ANDROID_HOST": "ANDROID_HOST", "ANDROID_SERIAL": "ANDROID_SERIAL"}
             )
         # Retrieve environment variables
-        env = {key: get_env_var(val) for key, val in env_vars.items()}
+        env = {}
+        for key, val in env_vars.items():
+            if key == "ANDROID_HOST":
+                env[key] = get_env_var(val, default="")
+            else:
+                env[key] = get_env_var(val)
         if "ANDROID_HOST" in env and env["ANDROID_HOST"]:
             env["ANDROID_HOST"] = "-H " + env["ANDROID_HOST"]
 
@@ -335,10 +340,9 @@ class HexagonExecutor:
             ),
         )
 
-        libcpp_path = os.path.join(
-            self.config.env_vars["HEXAGON_TOOLS"],
-            "target/hexagon/lib/v{}/G0/pic/libc++.so.1".format(self.config.Q6_VERSION),
-        )
+        # Path to libc++abi.so.1 and libc++.so.1 library needed by Hexagon sdk version
+        libcpp_path = f'{self.config.env_vars["HEXAGON_TOOLS"]}/target/hexagon/lib/v{self.config.Q6_VERSION}/G0/pic/libc++.so.1'
+        libcppabi_path = f'{self.config.env_vars["HEXAGON_TOOLS"]}/target/hexagon/lib/v{self.config.Q6_VERSION}/G0/pic/libc++abi.so.1'
 
         if not os.path.exists(libcpp_path):
             print("Path does not exist:", libcpp_path)
@@ -354,7 +358,7 @@ class HexagonExecutor:
         local_dir, principal_lib_without_ext, _ = split_path(
             path_to_principal_lib_local
         )
-        path_to_principal_lib_on_device = paths_to_shared_libs_on_device[0]
+        path_to_principal_lib_on_device = os.path.basename(paths_to_shared_libs_on_device[0])
 
         perf_device_path = f"{self.device_path}/perf.txt" if generatePerf else ""
         perf_local_path = (
@@ -448,19 +452,22 @@ class HexagonExecutor:
             ),
             # Push run_main_on_hexagon skel library
             (
-                "adb {} -s {} push {} /vendor/lib/rfsa/adsp".format(
+                "adb {} -s {} push {} {}".format(
                     self.config.env_vars["ANDROID_HOST"],
                     self.config.env_vars["ANDROID_SERIAL"],
                     librun_main_on_hexagon_skel_path,
+                    self.device_path,
                 ),
                 True,
             ),
-            # Push libc++.so.1 library specific to hexagon-tools and Q6 version
+            # Push libc++.so.1 and libc++abi.so.1 library specific to hexagon-tools and Q6 version
             (
-                "adb {} -s {} push {} /vendor/lib/rfsa/adsp".format(
+                "adb {} -s {} push {} {} {}".format(
                     self.config.env_vars["ANDROID_HOST"],
                     self.config.env_vars["ANDROID_SERIAL"],
                     libcpp_path,
+                    libcppabi_path,
+                    self.device_path,
                 ),
                 True,
             ),
@@ -471,6 +478,7 @@ class HexagonExecutor:
                         paths_to_shared_libs_local
                         + [librun_main_on_hexagon_skel_path]
                         + [libcpp_path]
+                        + [libcppabi_path]
                     ),
                     dir=etm_local_dir,
                 ),
@@ -478,9 +486,10 @@ class HexagonExecutor:
             ),
             # Run the kernel using run_main_on_hexagon
             (
-                "adb {} -s {} shell 'cd {}; touch /vendor/lib/rfsa/adsp/run_main_on_hexagon.farf; ./run_main_on_hexagon 3 {}'".format(
+                "adb {} -s {} shell 'cd {}; export ADSP_LIBRARY_PATH={}; touch run_main_on_hexagon.farf; ./run_main_on_hexagon 3 {}'".format(
                     self.config.env_vars["ANDROID_HOST"],
                     self.config.env_vars["ANDROID_SERIAL"],
+                    self.device_path,
                     self.device_path,
                     path_to_principal_lib_on_device,
                 ),
@@ -540,13 +549,15 @@ class HexagonExecutor:
                     continue
                 print(command, flush=True)
                 start_time = time.time()
-                subprocess.run(
+                result = subprocess.run(
                     command,
                     shell=True,
-                    check=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.STDOUT,
+                    capture_output=True,
+                    text=True
                 )
+                if result.returncode != 0:
+                    print(f"Command failed with output: {result.stderr}")
+                    result.check_returncode()
                 end_time = time.time()
                 elapsed_time = end_time - start_time
                 print(f"Command took {elapsed_time:.4f} seconds.", flush=True)
@@ -554,6 +565,8 @@ class HexagonExecutor:
                     hex_prof.analyze_trace()
         except subprocess.CalledProcessError as e:
             print(f"Error executing the command: {e}")
+            if e.stderr:
+                print(f"Stderr: {e.stderr}")
             sys.exit(1)
 
         # Initializing our result for the next two try blocks

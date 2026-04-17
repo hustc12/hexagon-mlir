@@ -392,10 +392,7 @@ class TritonHexagonLauncher(HexagonLauncherBase):
 
         # The directory path used for execution is given by the executor, and if it's the empty string (meaning running on device),
         # then the execution directory path will be set to the local directory path
-        exec_dir = hexec.get_Executable_Path()
-        # If no executable path specified, using local directory.
-        if not exec_dir:
-            exec_dir = local_dir_path
+        exec_dir = "." if hexec.exec_mode == "device" else local_dir_path
 
         # 2 - Generating and writing the wrapper to disk
         cpp_wrapper_path = self.generate_and_dump_wrapper(
