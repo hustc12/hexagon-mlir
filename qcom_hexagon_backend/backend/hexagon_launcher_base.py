@@ -113,6 +113,11 @@ return 0;
         # Codegen string for the entire CPP file.
         self.code_string = """
 {code_headers}
+
+extern "C" {{
+    unsigned int _QURT_MAX_HEAP_SIZE = 1073741824; // 1 GB Max Heap Size
+}}
+
 {code_define}
 {code_body}
 """

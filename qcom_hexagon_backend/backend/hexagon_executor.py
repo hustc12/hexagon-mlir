@@ -486,7 +486,7 @@ class HexagonExecutor:
             ),
             # Run the kernel using run_main_on_hexagon
             (
-                "adb {} -s {} shell 'cd {}; export ADSP_LIBRARY_PATH={}; touch run_main_on_hexagon.farf; ./run_main_on_hexagon 3 {}'".format(
+                "adb {} -s {} shell 'cd {}; export ADSP_LIBRARY_PATH={}; touch run_main_on_hexagon.farf; ./run_main_on_hexagon 3 {} stack_size=8388608'".format(
                     self.config.env_vars["ANDROID_HOST"],
                     self.config.env_vars["ANDROID_SERIAL"],
                     self.device_path,
