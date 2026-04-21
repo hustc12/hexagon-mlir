@@ -67,8 +67,11 @@ class TorchMlirHexagonWrapperGenerator(HexagonWrapperGenerator):
 
     def generate_llvm_function_signature(self):
         """Generate lowered LLVM function definition to be called from CPP launcher"""
-        # The first argument in the function signature is pointer to the return value struct
-        function_arg_string = "void *,"
+        function_arg_string = ""
+        for out in self.output_profs:
+            function_arg_string += self.common_strings.extern_llvm_func_with_return_args.format(
+                tensor_ctype=out.dtype, tensor_rank=out.rank
+            )
         function_arg_string += self.generate_llvm_function_signature_arg_string()
         return self.common_strings.extern_llvm_func_defn.format(
             kernel_name=self.func_name, function_arg_string=function_arg_string
@@ -76,8 +79,9 @@ class TorchMlirHexagonWrapperGenerator(HexagonWrapperGenerator):
 
     def generate_llvm_function_call(self):
         """Generates actual function call to lowered LLVM function call"""
-        # The function call contains the pointer to the Result as the first parameter
-        function_call_descriptor_string = "r,"
+        function_call_descriptor_string = ""
+        for i in range(len(self.output_profs)):
+            function_call_descriptor_string += f"&(r->r{i}), "
         function_call_descriptor_string += self.generate_llvm_function_call_arg_string()
         return self.common_strings.extern_llvm_func_call.format(
             func_name=self.func_name, descriptor_string=function_call_descriptor_string
