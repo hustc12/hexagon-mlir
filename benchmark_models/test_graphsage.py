@@ -124,16 +124,16 @@ def graphsage_bert(enablelwp=False):
     # # that torch-mlir lifts as extra function arguments.
     # config.max_position_embeddings = 16
 
-    config.vocab_size = 30522
-    config.hidden_size = 768
-    config.intermediate_size = 3072
-    config.num_attention_heads = 12
-    # Reduce max_position_embeddings to minimize the registered buffer sizes
-    # that torch-mlir lifts as extra function arguments.
-    config.max_position_embeddings = 512
+    # config.vocab_size = 30522
+    # config.hidden_size = 768
+    # config.intermediate_size = 3072
+    # config.num_attention_heads = 12
+    # # Reduce max_position_embeddings to minimize the registered buffer sizes
+    # # that torch-mlir lifts as extra function arguments.
+    # config.max_position_embeddings = 512
     # Use float16 to halve memory footprint, matching the GPT-2 test approach.
     # Using from_config with random weights since we changed vocab_size.
-    model = AutoModel.from_config(config, torch_dtype=torch.float16)
+    model = AutoModel.from_config(config, torch_dtype=torch.float32)
     model.eval()
 
     # Wrap BERT to return only last_hidden_state for single-output compilation.
