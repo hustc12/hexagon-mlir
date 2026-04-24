@@ -125,6 +125,46 @@ def mixtral_lite(enablelwp=False):
     config = AutoConfig.from_pretrained(model_name)
     config.num_hidden_layers = 2 # layer == 1 isn't practical for checking accuracy
 
+    import transformers.models.mixtral.modeling_mixtral as mixtral_modeling
+    import torch.nn.functional as F
+
+    def static_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        if self.training and self.jitter_noise > 0:
+            hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.jitter_noise, 1.0 + self.jitter_noise)
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        
+        router_logits = self.gate(hidden_states)
+        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        routing_weights = routing_weights.to(hidden_states.dtype)
+
+        final_hidden_states = torch.zeros(
+            (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
+        )
+
+        # Static loop over all experts to bypass dynamic data-dependent control flow (nonzero / where)
+        # This is computationally slower but produces exact same math results with zero dynamic tensor shapes,
+        # which is required for `torch.export` lowering to MLIR.
+        for expert_idx in range(self.num_experts):
+            expert_layer = self.experts[expert_idx]
+            expert_out = expert_layer(hidden_states) # [batch*seq_len, hidden_dim]
+            
+            # Create boolean mask for where this expert was selected
+            mask = (selected_experts == expert_idx) # [batch*seq_len, top_k]
+            
+            # Sum routing weights for this expert over the top_k dimension
+            expert_weight = (routing_weights * mask).sum(dim=-1) # [batch*seq_len]
+            
+            # Accumulate
+            final_hidden_states += expert_out * expert_weight.unsqueeze(-1)
+
+        return final_hidden_states.view(batch_size, sequence_length, hidden_dim), router_logits
+
+    # Apply the patch
+    mixtral_modeling.MixtralSparseMoeBlock.forward = static_moe_forward
+
     # Note: Using from_pretrained will attempt to download the full weights if not cached.
     # To initialize with random weights and bypass downloading, you can use:
     model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.float16)
