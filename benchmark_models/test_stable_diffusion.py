@@ -118,6 +118,9 @@ def test_stable_diffusion(enablelwp=False):
     if enablelwp:
         options['enableLWP'] = True
 
+    options['lowerConstantsInSeparateSharedObjects'] = True
+    options['enableVTCMTiling'] = False
+    options['enableConvertToHexagonmem'] = False
     # ---------------------------------------------------------
     # 1. Text Encoder
     # ---------------------------------------------------------
