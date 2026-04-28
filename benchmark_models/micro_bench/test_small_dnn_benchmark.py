@@ -13,6 +13,9 @@ import torch_mlir.fx as fx_mlir
 from pathlib import Path
 import time
 import json
+import io
+import re
+from contextlib import redirect_stdout, redirect_stderr
 from triton.backends.qcom_hexagon_backend.compiler import HexagonOptions
 from triton.backends.qcom_hexagon_backend.torch_mlir_hexagon_launcher import TorchMLIRHexagonLauncher
 
@@ -133,28 +136,49 @@ def benchmark_hexagon(model, inputs, filename, func_name, options, iterations=10
     Returns:
         Dictionary with benchmark results
     """
+    # End-to-end wall clock includes compile, deploy, I/O and kernel execution.
     start_time = time.time()
-    output = TorchMLIRHexagonLauncher().run_torch_mlir(
-        str(filename), 
-        inputs, 
-        func_name, 
-        base_dir_for_artifacts=None, 
-        iterations=iterations,
-        options=options
-    )
+    log_buffer = io.StringIO()
+    with redirect_stdout(log_buffer), redirect_stderr(log_buffer):
+        output = TorchMLIRHexagonLauncher().run_torch_mlir(
+            str(filename),
+            inputs,
+            func_name,
+            base_dir_for_artifacts=None,
+            iterations=iterations,
+            options=options
+        )
     end_time = time.time()
+    launcher_logs = log_buffer.getvalue()
+    if launcher_logs:
+        print(launcher_logs, end="")
+
+    perf_match = re.search(r"Perf:\s*([0-9]+(?:\.[0-9]+)?)", launcher_logs)
+    units_match = re.search(r"Units:\s*([a-zA-Z]+)", launcher_logs)
+    kernel_time_us = float(perf_match.group(1)) if perf_match else None
+    perf_units = units_match.group(1) if units_match else None
     
     # Verify correctness
     with torch.no_grad():
         reference = model(*inputs)
     is_correct = torch.allclose(output[0], reference, rtol=1e-02, atol=1e-02)
+
+    e2e_time_s = end_time - start_time
+    kernel_time_s = (kernel_time_us / 1e6) if kernel_time_us is not None else None
     
     return {
         'output': output[0],
-        'time': end_time - start_time,
+        'time': e2e_time_s,
+        'e2e_time_s': e2e_time_s,
+        'kernel_time_us': kernel_time_us,
+        'kernel_time_s': kernel_time_s,
+        'perf_units': perf_units,
         'is_correct': is_correct,
         'iterations': iterations,
-        'avg_time_per_iter': (end_time - start_time) / iterations
+        'avg_time_per_iter': (e2e_time_s / iterations),
+        'avg_kernel_time_per_iter_s': (
+            (kernel_time_s / iterations) if kernel_time_s is not None else None
+        )
     }
 
 
@@ -217,7 +241,9 @@ def run_model_benchmark(model, inputs, model_name, dtype=torch.float32):
     ).__dict__
     try:
         results['scalar'] = benchmark_hexagon(model, inputs, linalg_filename, func_name, scalar_options)
-        print(f"  Time: {results['scalar']['time']:.4f}s ({results['scalar']['avg_time_per_iter']*1000:.2f}ms/iter)")
+        print(f"  End-to-End Time: {results['scalar']['e2e_time_s']:.4f}s ({results['scalar']['avg_time_per_iter']*1000:.2f}ms/iter)")
+        if results['scalar']['kernel_time_us'] is not None:
+            print(f"  Kernel Time (Test_Info): {results['scalar']['kernel_time_us']:.2f} us")
         print(f"  Correct: {results['scalar']['is_correct']}")
     except Exception as e:
         print(f"  Scalar execution failed: {e}")
@@ -234,7 +260,9 @@ def run_model_benchmark(model, inputs, model_name, dtype=torch.float32):
     ).__dict__
     try:
         results['hvx'] = benchmark_hexagon(model, inputs, linalg_filename, func_name, hvx_options)
-        print(f"  Time: {results['hvx']['time']:.4f}s ({results['hvx']['avg_time_per_iter']*1000:.2f}ms/iter)")
+        print(f"  End-to-End Time: {results['hvx']['e2e_time_s']:.4f}s ({results['hvx']['avg_time_per_iter']*1000:.2f}ms/iter)")
+        if results['hvx']['kernel_time_us'] is not None:
+            print(f"  Kernel Time (Test_Info): {results['hvx']['kernel_time_us']:.2f} us")
         print(f"  Correct: {results['hvx']['is_correct']}")
     except Exception as e:
         print(f"  HVX execution failed: {e}")
@@ -252,7 +280,9 @@ def run_model_benchmark(model, inputs, model_name, dtype=torch.float32):
             enableMultiThreading=False
         ).__dict__
         results['hmx'] = benchmark_hexagon(model, inputs, linalg_filename, func_name, hmx_options)
-        print(f"  Time: {results['hmx']['time']:.4f}s ({results['hmx']['avg_time_per_iter']*1000:.2f}ms/iter)")
+        print(f"  End-to-End Time: {results['hmx']['e2e_time_s']:.4f}s ({results['hmx']['avg_time_per_iter']*1000:.2f}ms/iter)")
+        if results['hmx']['kernel_time_us'] is not None:
+            print(f"  Kernel Time (Test_Info): {results['hmx']['kernel_time_us']:.2f} us")
         print(f"  Correct: {results['hmx']['is_correct']}")
     except Exception as e:
         print(f"  HMX execution failed: {e}")
@@ -271,7 +301,9 @@ def run_model_benchmark(model, inputs, model_name, dtype=torch.float32):
             num_threads=4
         ).__dict__
         results['hvx_mt'] = benchmark_hexagon(model, inputs, linalg_filename, func_name, hvx_mt_options)
-        print(f"  Time: {results['hvx_mt']['time']:.4f}s ({results['hvx_mt']['avg_time_per_iter']*1000:.2f}ms/iter)")
+        print(f"  End-to-End Time: {results['hvx_mt']['e2e_time_s']:.4f}s ({results['hvx_mt']['avg_time_per_iter']*1000:.2f}ms/iter)")
+        if results['hvx_mt']['kernel_time_us'] is not None:
+            print(f"  Kernel Time (Test_Info): {results['hvx_mt']['kernel_time_us']:.2f} us")
         print(f"  Correct: {results['hvx_mt']['is_correct']}")
     except Exception as e:
         print(f"  HVX multi-threaded execution failed: {e}")
@@ -281,18 +313,25 @@ def run_model_benchmark(model, inputs, model_name, dtype=torch.float32):
     print(f"\n{'-'*80}")
     print("Performance Summary:")
     print(f"{'-'*80}")
-    print(f"{'Mode':<20} {'Time (s)':<15} {'Speedup':<15} {'ms/iter':<15} {'Correct':<10}")
+    print(f"{'Mode':<20} {'Kernel(us)':<15} {'E2E(s)':<15} {'Speedup':<15} {'ms/iter':<15} {'Correct':<10}")
     print(f"{'-'*80}")
     
-    scalar_time = results['scalar']['time'] if results['scalar'] is not None else None
+    scalar_kernel_us = (
+        results['scalar']['kernel_time_us']
+        if results['scalar'] is not None
+        else None
+    )
+    scalar_e2e_s = results['scalar']['e2e_time_s'] if results['scalar'] is not None else None
     for mode in ['scalar', 'hvx', 'hvx_mt', 'hmx']:
         if results.get(mode) is not None:
-            if scalar_time:
-                speedup = scalar_time / results[mode]['time']
+            kernel_us = results[mode]['kernel_time_us']
+            if scalar_kernel_us is not None and kernel_us is not None and kernel_us > 0:
+                speedup = scalar_kernel_us / kernel_us
             else:
-                speedup = 1.0
+                speedup = scalar_e2e_s / results[mode]['e2e_time_s'] if scalar_e2e_s else 1.0
             ms_per_iter = results[mode]['avg_time_per_iter'] * 1000
-            print(f"{mode.upper():<20} {results[mode]['time']:<15.4f} {speedup:<15.2f}x {ms_per_iter:<15.2f} {str(results[mode]['is_correct']):<10}")
+            kernel_str = f"{kernel_us:.2f}" if kernel_us is not None else "N/A"
+            print(f"{mode.upper():<20} {kernel_str:<15} {results[mode]['e2e_time_s']:<15.4f} {speedup:<15.2f}x {ms_per_iter:<15.2f} {str(results[mode]['is_correct']):<10}")
     print(f"{'-'*80}\n")
     
     return results
@@ -344,9 +383,14 @@ def main():
             if data is not None:
                 json_results[model_type][mode] = {
                     'time': data['time'],
+                    'e2e_time_s': data.get('e2e_time_s'),
+                    'kernel_time_us': data.get('kernel_time_us'),
+                    'kernel_time_s': data.get('kernel_time_s'),
+                    'perf_units': data.get('perf_units'),
                     'is_correct': data['is_correct'],
                     'iterations': data['iterations'],
-                    'avg_time_per_iter': data['avg_time_per_iter']
+                    'avg_time_per_iter': data['avg_time_per_iter'],
+                    'avg_kernel_time_per_iter_s': data.get('avg_kernel_time_per_iter_s')
                 }
     
     with open(results_file, 'w') as f:
