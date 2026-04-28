@@ -123,6 +123,11 @@ def real_esrgan(enablelwp=False):
     # Disable VTCM tiling/conversion to reduce internal DSP allocation pressure
     options['enableVTCMTiling'] = False
     options['enableConvertToHexagonmem'] = False
+    # # ROOT CAUSE FIX: HexagonTilingPass (via vectorization) generates scf.forall ops.
+    # # FormAsyncThreadsPass unconditionally lowers these to async.execute, which requires
+    # # the MLIR AsyncRuntime to `new AsyncToken()` on the DSP heap. This allocation fails
+    # # in the DSP User PD, resulting in NULL/garbage pointers → Bad VA: 0x18 (exit code 13).
+    # options['enableVectorization'] = False
     if enablelwp:
         options['enableLWP'] = True
     inputs = [input_tensor]
@@ -134,7 +139,7 @@ def real_esrgan(enablelwp=False):
     with torch.no_grad():
         x86_outputs = x86_execution(model, input_tensor)
 
-    compare(hex_outputs, x86_outputs, atol=0.5, fail_on_mismatch=True)
+    compare(hex_outputs, x86_outputs, atol=0.05, fail_on_mismatch=True)
     if enablelwp:
         process_lwp()
 
