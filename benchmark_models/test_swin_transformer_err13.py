@@ -57,16 +57,20 @@ def hex_execution(module, func_name, inputs, options: dict = None):
 def compare(hex_outputs, x86_outputs, atol=0.05, fail_on_mismatch: bool = False):
     hexagon_output = hex_outputs[0]
 
-    # SwinForImageClassification returns an ImageClassifierOutput with .logits
+    # x86_execution calls wrapped_model which returns logits tensor directly.
+    # If somehow an ImageClassifierOutput is returned, unwrap it.
     if hasattr(x86_outputs, "logits"):
         x86_tensor = x86_outputs.logits
+    elif isinstance(x86_outputs, torch.Tensor):
+        x86_tensor = x86_outputs
     else:
         x86_tensor = x86_outputs[0]
 
     # Print top-5 predicted classes for both runs
     def top5(logits, tag):
         probs = torch.softmax(logits[0].float(), dim=-1)
-        vals, idxs = torch.topk(probs, 5)
+        k = min(5, probs.shape[-1])
+        vals, idxs = torch.topk(probs, k)
         print(f"\n------- Top-5 class predictions ({tag}) -------")
         for v, i in zip(vals.tolist(), idxs.tolist()):
             print(f"  class {i:4d}: {v:.4f}")
@@ -200,6 +204,20 @@ def swin_transformer(enablelwp=False):
     # Standard 224×224 pixel_values in fp16
     pixel_values = torch.rand(1, 3, 224, 224, dtype=torch.float16)
 
+    # ------------------------------------------------------------------ #
+    # Collect relative_position_index buffers (one per stage).            #
+    # torch.export captures these as BUFFER inputs and places them        #
+    # *before* the user input (pixel_values) in the MLIR function         #
+    # signature.  We must pass them explicitly so the wrapper generates   #
+    # the correct number of input tensors and the DSP call doesn't        #
+    # receive garbage in r4/r5 → Bad VA crash (exit code 13).            #
+    # ------------------------------------------------------------------ #
+    rel_pos_indices = []
+    for layer in wrapped_model.swin.swin.encoder.layers:
+        for block in layer.blocks:
+            idx = block.attention.self.relative_position_index  # int64, (49,49)
+            rel_pos_indices.append(idx.detach())
+
     print("Compiling to linalg …")
     module = compile_to_linalg(
         wrapped_model,
@@ -231,7 +249,9 @@ def swin_transformer(enablelwp=False):
     # Bad VA: 0x18 (exit code 13 / TLB MISS).
     options["enableVectorization"] = False
 
-    inputs = [pixel_values]
+    # MLIR function signature: (rel_pos_idx_0, ..., rel_pos_idx_N, pixel_values)
+    # The buffer inputs must come first, matching the export order.
+    inputs = rel_pos_indices + [pixel_values]
 
     # ------------------------------------------------------------------ #
     # Hexagon execution                                                    #
