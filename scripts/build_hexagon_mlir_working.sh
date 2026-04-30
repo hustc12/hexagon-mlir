@@ -149,7 +149,7 @@ if [[ ! -f "${LLVM_PROJECT_BUILD_DIR}/bin/mlir-opt" ]]; then
     -DCMAKE_BUILD_TYPE="Release" \
     -DLLVM_ENABLE_ASSERTIONS=OFF \
     -DLLVM_ENABLE_RTTI=ON \
-    -DLLVM_CCACHE_BUILD:BOOL=OFF \
+    -DLLVM_CCACHE_BUILD:BOOL=ON \
     -DLLVM_ENABLE_EH=ON \
     -DLLVM_BUILD_EXAMPLES:BOOL=OFF \
     -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
@@ -159,7 +159,7 @@ if [[ ! -f "${LLVM_PROJECT_BUILD_DIR}/bin/mlir-opt" ]]; then
     # -DCMAKE_BUILD_TYPE="RelWithDebInfo" \
 
   echo "Compiling and installing LLVM..."
-  cmake --build "${LLVM_PROJECT_BUILD_DIR}" -j4
+  cmake --build "${LLVM_PROJECT_BUILD_DIR}" -j
   cmake --install "${LLVM_PROJECT_BUILD_DIR}"
 else
   echo "LLVM already built. Skipping build."
