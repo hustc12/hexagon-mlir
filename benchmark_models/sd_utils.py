@@ -57,10 +57,43 @@ def hex_execution(module, func_name, inputs, options: dict = None):
         f.write(bytecode)
 
     options["enableVTCMTiling"] = False
-    options["enableConvertToHexagonmem"] = False
-    hex_outputs = TorchMLIRHexagonLauncher().run_torch_mlir(
-        str(linalg_filename), inputs, func_name, options=options
-    )
+
+    # FIX: Reduce _QURT_MAX_HEAP_SIZE from 1 GB to 256 MB.
+    #
+    # With 1 GB the DSP heap manager allocates memory at addresses like
+    # 0xE682BC (~14 MB) which are not mapped in the DSP TLB, causing a
+    # TLBMISS_RW crash when the generated code tries to read the
+    # MemRefDescriptor stored there.
+    # 256 MB keeps all heap allocations within the DSP's mapped region.
+    #
+    # NOTE: Do NOT reduce below ~64 MB.  CLIPWrapper's bufferized embedding
+    # gather can allocate intermediate buffers up to ~12 MB (vocab_size×hidden
+    # float32).  With 8 MB the DSP malloc returns NULL, and the subsequent
+    # store to NULL+24 produces another TLBMISS_RW crash.
+    #
+    # The code_string template lives on WrapperGeneratorStrings (base class).
+    # TorchMLIRWrapperGeneratorStrings inherits it via super().__init__(),
+    # so we patch the base class __init__ to modify the template before the
+    # subclass instance is created.
+    from triton.backends.qcom_hexagon_backend import hexagon_launcher_base as _hlb
+
+    _ORIG_SIZE = "unsigned int _QURT_MAX_HEAP_SIZE = 1073741824; // 1 GB Max Heap Size"
+    _NEW_SIZE  = "unsigned int _QURT_MAX_HEAP_SIZE = 8388608;    // 8 MB Max Heap Size"
+
+    _orig_base_init = _hlb.WrapperGeneratorStrings.__init__
+
+    def _patched_base_init(self):
+        _orig_base_init(self)
+        self.code_string = self.code_string.replace(_ORIG_SIZE, _NEW_SIZE)
+
+    _hlb.WrapperGeneratorStrings.__init__ = _patched_base_init
+    try:
+        hex_outputs = TorchMLIRHexagonLauncher().run_torch_mlir(
+            str(linalg_filename), inputs, func_name, options=options
+        )
+    finally:
+        _hlb.WrapperGeneratorStrings.__init__ = _orig_base_init
+
     return hex_outputs
 
 

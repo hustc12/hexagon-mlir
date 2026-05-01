@@ -47,10 +47,18 @@ class WrapperGeneratorStrings:
         self.extern_llvm_func_with_return_args = (
             """ MemRefDescriptor<{tensor_ctype}, {tensor_rank}> *, """
         )
-        self.result_struct_init = """FuncResult *r = new FuncResult;\n"""
+        self.result_struct_init = """SafeFuncResult *sr = new SafeFuncResult;\nFuncResult *r = &(sr->res);\n"""
         self.result_struct_def = """
 struct FuncResult
 {{{result_fields}
+}};
+
+// Padding struct to mitigate LLVM Hexagon large-frame prologue bug
+// which writes to negative offsets relative to the output struct pointer.
+struct SafeFuncResult
+{{
+    char pad[65536];
+    FuncResult res;
 }};
 """
         self.extern_llvm_func_args_tensor = """ {tensor_pointer_ctype} *, """
