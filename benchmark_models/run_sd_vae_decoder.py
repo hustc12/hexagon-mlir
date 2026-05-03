@@ -56,11 +56,25 @@ def test_vae_decoder(enablelwp: bool = False):
     # Swap to AutoencoderKL.from_pretrained(...) for real-weight tests.
     config = AutoencoderKL.load_config(SD_MODEL_ID, subfolder="vae")
     vae = AutoencoderKL.from_config(config)
+
+    # FIX: Run the entire model in float16 to avoid f64 GroupNorm reductions.
+    # torch-mlir's GroupNorm lowering promotes the variance reduction to f64
+    # for numerical stability.  On Hexagon DSP there is no f64 hardware — every
+    # f64 op is software-emulated and ~100× slower than f32/f16.  At 512×512
+    # resolution each GroupNorm reduction operates on a 1×32×1048576 f64 tensor
+    # (256 MB), and there are ~12 such reductions, making execution infeasibly
+    # slow.
+    # Converting the whole model + inputs to f16 gives torch-mlir a pure f16
+    # graph so it never promotes to f64.  The Hexagon HVX unit handles f16
+    # natively and processes 2× as many elements per cycle vs f32.
+    # NOTE: f16 may lose numerical precision; widen atol in compare() if needed.
+    vae = vae.half()
+
     model = VAEDecodeWrapper(vae)
     model.eval()
 
     # Latent space: 64×64 with 4 channels (corresponds to 512×512 image).
-    latents = torch.rand(1, 4, 64, 64, dtype=torch.float32)
+    latents = torch.rand(1, 4, 64, 64, dtype=torch.float16)
     print(f"Input latents shape: {latents.shape}  dtype: {latents.dtype}")
 
     # ---- compile ----
