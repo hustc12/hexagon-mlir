@@ -91,7 +91,7 @@ class VAEDecodeWrapper(torch.nn.Module):
         return self.vae.decode(latents).sample
 
 
-def test_vae_decoder(enablelwp: bool = False):
+def test_vae_decoder(enablelwp: bool = False, disable_mid_attn: bool = False):
     print("\n=== Stable Diffusion — VAE Decoder ===")
 
     # Use from_config (random weights) for fast compilation testing.
@@ -116,6 +116,17 @@ def test_vae_decoder(enablelwp: bool = False):
                 for part in parts[0].split("."):
                     parent = getattr(parent, part)
             setattr(parent, parts[-1], GroupNormFP16(module))
+
+    # DIAGNOSTIC: Optionally disable the mid-block self-attention.
+    # The VAE mid-block contains a self-attention over the full 64×64 latent
+    # grid (sequence length = 4096), producing a 4096×4096 attention matrix
+    # (64 MB) and ~34 GFLOPs of matmul work.  This flag removes it to isolate
+    # whether attention is the remaining performance bottleneck.
+    # WARNING: this changes model structure and degrades output quality.
+    # Use only for diagnostic purposes, not for production inference.
+    if disable_mid_attn:
+        print("  [diag] mid-block self-attention DISABLED")
+        vae.decoder.mid_block.attentions = torch.nn.ModuleList()
 
     model = VAEDecodeWrapper(vae)
     model.eval()
@@ -148,5 +159,10 @@ def test_vae_decoder(enablelwp: bool = False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SD VAE Decoder Hexagon benchmark")
     parser.add_argument("--lwp", action="store_true", help="Enable lightweight profiling")
+    parser.add_argument(
+        "--no-mid-attn",
+        action="store_true",
+        help="[diagnostic] Disable mid-block self-attention to isolate its perf cost",
+    )
     args = parser.parse_args()
-    test_vae_decoder(enablelwp=args.lwp)
+    test_vae_decoder(enablelwp=args.lwp, disable_mid_attn=args.no_mid_attn)
