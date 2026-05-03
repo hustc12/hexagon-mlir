@@ -20,6 +20,7 @@
 
 import argparse
 import torch
+import torch.nn.functional as F
 from diffusers import AutoencoderKL
 
 from sd_utils import (
@@ -31,6 +32,47 @@ from sd_utils import (
     default_options,
     process_lwp,
 )
+
+
+class GroupNormFP16(torch.nn.Module):
+    """Drop-in replacement for torch.nn.GroupNorm that stays in f16.
+
+    torch-mlir's built-in GroupNorm lowering hard-codes a f16→f64 promotion
+    for the variance reduction, regardless of the model dtype.  On Hexagon DSP
+    there is no f64 hardware unit — every f64 op is software-emulated and
+    ~100× slower than f16.  At 512×512 resolution a single GroupNorm reduction
+    operates on a 1×32×1048576 f64 tensor (256 MB); with ~12 such reductions
+    the total f64 data movement exceeds 3 GB, making execution infeasibly slow.
+
+    This replacement implements the identical mathematical operation using only
+    f16 arithmetic so torch-mlir emits pure f16 linalg.generic ops instead of
+    the f64-promoting GroupNorm lowering.  The model structure (number of
+    groups, affine parameters, eps) is preserved exactly.
+    """
+
+    def __init__(self, orig: torch.nn.GroupNorm):
+        super().__init__()
+        self.num_groups = orig.num_groups
+        self.eps = orig.eps
+        self.weight = orig.weight  # shared reference — no copy
+        self.bias = orig.bias
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (N, C, *spatial)  — all f16
+        N, C = x.shape[0], x.shape[1]
+        G = self.num_groups
+        # Reshape to (N, G, -1) so the reduction is over the last dim only.
+        # This avoids the large-tensor f64 path that torch.nn.GroupNorm triggers.
+        x_grouped = x.reshape(N, G, -1)                          # (N, G, L)
+        mean = x_grouped.mean(dim=-1, keepdim=True)              # (N, G, 1)
+        var  = ((x_grouped - mean) ** 2).mean(dim=-1, keepdim=True)  # (N, G, 1)
+        x_norm = (x_grouped - mean) / (var + self.eps).sqrt()   # (N, G, L)
+        x_norm = x_norm.reshape(x.shape)                         # (N, C, *spatial)
+        if self.weight is not None:
+            # weight/bias are (C,) — broadcast over N and spatial dims
+            shape = (1, C) + (1,) * (x.dim() - 2)
+            x_norm = x_norm * self.weight.reshape(shape) + self.bias.reshape(shape)
+        return x_norm
 
 
 class VAEDecodeWrapper(torch.nn.Module):
@@ -57,18 +99,23 @@ def test_vae_decoder(enablelwp: bool = False):
     config = AutoencoderKL.load_config(SD_MODEL_ID, subfolder="vae")
     vae = AutoencoderKL.from_config(config)
 
-    # FIX: Run the entire model in float16 to avoid f64 GroupNorm reductions.
-    # torch-mlir's GroupNorm lowering promotes the variance reduction to f64
-    # for numerical stability.  On Hexagon DSP there is no f64 hardware — every
-    # f64 op is software-emulated and ~100× slower than f32/f16.  At 512×512
-    # resolution each GroupNorm reduction operates on a 1×32×1048576 f64 tensor
-    # (256 MB), and there are ~12 such reductions, making execution infeasibly
-    # slow.
-    # Converting the whole model + inputs to f16 gives torch-mlir a pure f16
-    # graph so it never promotes to f64.  The Hexagon HVX unit handles f16
-    # natively and processes 2× as many elements per cycle vs f32.
-    # NOTE: f16 may lose numerical precision; widen atol in compare() if needed.
+    # FIX: Replace all GroupNorm layers with GroupNormFP16.
+    #
+    # torch-mlir's built-in GroupNorm lowering hard-codes a promotion to f64
+    # for the variance reduction regardless of model dtype (f32 or f16).
+    # GroupNormFP16 implements the same operation with plain f16 arithmetic so
+    # torch-mlir emits pure f16 linalg.generic ops instead.
+    # The model structure (groups, affine params, eps) is unchanged.
     vae = vae.half()
+    for name, module in list(vae.named_modules()):
+        if isinstance(module, torch.nn.GroupNorm):
+            # Navigate to the parent and replace the child attribute.
+            parts = name.rsplit(".", 1)
+            parent = vae
+            if len(parts) == 2:
+                for part in parts[0].split("."):
+                    parent = getattr(parent, part)
+            setattr(parent, parts[-1], GroupNormFP16(module))
 
     model = VAEDecodeWrapper(vae)
     model.eval()
