@@ -97,7 +97,7 @@ def compile_and_run(
 
     # 3. Configure Hexagon Options
     options = HexagonOptions().__dict__
-    options["enableVectorization"] = enable_hexkl, # Seems like this option is the prerequisite for setting enableHexKL=True
+    options["enableVectorization"] = enable_hexkl # Seems like this option is the prerequisite for setting enableHexKL=True
     options["enableHexKL"] = enable_hexkl
     options["enableOmniFetchVDAE"] = enable_omnifetch
     options["enableOmniFetchLayoutAware"] = True
@@ -105,9 +105,8 @@ def compile_and_run(
     options["enableOmniFetchAdaptive"] = adaptive
     # Model is small enough to fit in a single .so — no need to split constants.
     options["lowerConstantsInSeparateSharedObjects"] = False
-    options["enableVTCMTiling"] = enable_omnifetch
     # Optional: Enable VTCM Tiling if helpful for prefetching (only with OmniFetch)
-    # options["enableVTCMTiling"] = enable_omnifetch
+    options["enableVTCMTiling"] = enable_omnifetch
 
     # 4. Execute on Hexagon NPU
     print("[Hexagon] Launching on NPU...")
