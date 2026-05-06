@@ -37,7 +37,7 @@ def export_falcon():
         model,
         dummy_input,
         "falcon_rw_1b.onnx",
-        opset_version=14,
+        opset_version=17,
         input_names=['input_ids'],
         output_names=['logits'],
         dynamic_axes={'input_ids': {1: 'sequence_length'}, 'logits': {1: 'sequence_length'}}
@@ -55,7 +55,7 @@ def export_gpt2():
         model,
         dummy_input,
         "gpt2.onnx",
-        opset_version=14,
+        opset_version=17,
         input_names=['input_ids'],
         output_names=['logits'],
         dynamic_axes={'input_ids': {1: 'sequence_length'}, 'logits': {1: 'sequence_length'}}
@@ -73,7 +73,7 @@ def export_graphsage():
         model,
         dummy_input,
         "graphsage_bert.onnx",
-        opset_version=14,
+        opset_version=17,
         input_names=['input_ids'],
         output_names=['last_hidden_state'],
         dynamic_axes={'input_ids': {1: 'sequence_length'}, 'last_hidden_state': {1: 'sequence_length'}}
@@ -91,7 +91,7 @@ def export_mamba():
         model,
         dummy_input,
         "mamba_130m.onnx",
-        opset_version=14,
+        opset_version=17,
         input_names=['input_ids'],
         output_names=['logits'],
         dynamic_axes={'input_ids': {1: 'sequence_length'}, 'logits': {1: 'sequence_length'}}
@@ -113,7 +113,7 @@ def export_qwen():
         model,
         (input_ids, attention_mask, position_ids),
         "qwen2.5_0.5b.onnx",
-        opset_version=14,
+        opset_version=17,
         input_names=['input_ids', 'attention_mask', 'position_ids'],
         output_names=['logits'],
         dynamic_axes={'input_ids': {1: 'sequence_length'}, 'attention_mask': {1: 'sequence_length'}, 'position_ids': {1: 'sequence_length'}, 'logits': {1: 'sequence_length'}}
@@ -137,7 +137,7 @@ def export_real_esrgan():
         model,
         dummy_input,
         "real_esrgan_x4.onnx",
-        opset_version=14,
+        opset_version=17,
         input_names=['input'],
         output_names=['output'],
         dynamic_axes={'input': {2: 'height', 3: 'width'}, 'output': {2: 'height', 3: 'width'}}
@@ -155,7 +155,7 @@ def export_swin():
         model,
         dummy_input,
         "swin_tiny.onnx",
-        opset_version=14,
+        opset_version=17,
         input_names=['pixel_values'],
         output_names=['logits'],
         dynamic_axes={'pixel_values': {2: 'height', 3: 'width'}}
@@ -173,7 +173,7 @@ def export_tinyllama():
         model,
         dummy_input,
         "tinyllama_1.1b.onnx",
-        opset_version=14,
+        opset_version=17,
         input_names=['input_ids'],
         output_names=['logits'],
         dynamic_axes={'input_ids': {1: 'sequence_length'}, 'logits': {1: 'sequence_length'}}
@@ -191,7 +191,7 @@ def export_vit():
         model,
         dummy_input,
         "vit_base.onnx",
-        opset_version=14,
+        opset_version=17,
         input_names=['pixel_values'],
         output_names=['logits'],
         dynamic_axes={'pixel_values': {2: 'height', 3: 'width'}}
@@ -211,7 +211,7 @@ def export_sd_components():
         text_encoder,
         dummy_input,
         "sd_text_encoder.onnx",
-        opset_version=14,
+        opset_version=17,
         input_names=['input_ids'],
         output_names=['last_hidden_state', 'pooler_output'],
         dynamic_axes={'input_ids': {1: 'sequence_length'}}
@@ -228,7 +228,7 @@ def export_sd_components():
         unet,
         (latent_model_input, timestep, encoder_hidden_states),
         "sd_unet.onnx",
-        opset_version=14,
+        opset_version=17,
         input_names=['sample', 'timestep', 'encoder_hidden_states'],
         output_names=['out_sample']
     )
@@ -250,7 +250,7 @@ def export_sd_components():
         vae_decoder,
         latents,
         "sd_vae_decoder.onnx",
-        opset_version=14,
+        opset_version=17,
         input_names=['latents'],
         output_names=['sample']
     )
