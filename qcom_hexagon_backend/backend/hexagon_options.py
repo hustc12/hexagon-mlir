@@ -57,6 +57,11 @@ class HexagonOptions:
     enableConvertToHexagonmem: bool = True  # rewrites memref.alloc/copy to hexagonmem.*
     enableHexagonmemCopyToDMA: bool = False  # rewrites hexmem.copy to memref.dma_*
     enableHexKL: bool = False  # use HexKL to lower matmul and convolutions
+    # Omni-Fetch ablation toggles
+    enableOmniFetchVDAE: bool = False  # enable V-DAE prefetch insertion pass
+    enableOmniFetchLayoutAware: bool = True  # enable in-situ layout-aware prefetch mapping
+    omniFetchLookahead: int = 2  # static prefetch look-ahead distance
+    enableOmniFetchAdaptive: bool = True  # enable PMU-based adaptive control
     enableMultiThreading: bool = False  # linalg-generic based multi-threading
     enableSCFThreading: bool = False  # scf based multi-threading
     enableSplitReduction: bool = False  # split-reduction optimization

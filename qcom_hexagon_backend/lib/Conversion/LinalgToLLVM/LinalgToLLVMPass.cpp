@@ -17,6 +17,7 @@
 #include "hexagon/Conversion/LinalgToLLVM/Common.h"
 #include "hexagon/Conversion/LinalgToLLVM/LinalgToLLVM.h"
 #include "hexagon/Conversion/LinalgToLLVM/Passes.h"
+#include "hexagon/Conversion/OmniFetchToLLVM/OmniFetchToLLVM.h"
 #include "hexagon/Dialect/HexKL/IR/HexKLDialect.h"
 #include "hexagon/Dialect/HexagonMem/IR/HexagonMemDialect.h"
 #include "hexagon/Dialect/HexagonTPtr/IR/HexagonTPtrDialect.h"
@@ -140,6 +141,12 @@ public:
     auto setLWP = [&](auto passOption) {
       passOption.disableLWPLoop = disableLWPLoop;
       passOption.LWPloopDepth = LWPloopDepth;
+      return passOption;
+    };
+    auto setOmniFetchVDAE = [&](auto passOption) {
+      passOption.lookahead = omniFetchLookahead;
+      passOption.enableAdaptive = enableOmniFetchAdaptive;
+      passOption.enableLayoutAware = enableOmniFetchLayoutAware;
       return passOption;
     };
 
@@ -343,6 +350,14 @@ public:
     if (enableHexKL)
       pm.addNestedPass<func::FuncOp>(createDecomposeHexKLMatmulPass());
 
+    // ===== Omni-Fetch V-DAE prefetch insertion =====
+    // Runs after HMX decomposition so that `hexkl` micro-ops are visible
+    // for pattern matching.  Inserts layout-aware prefetch + semaphore sync.
+    if (enableHexKL && enableOmniFetchVDAE)
+      pm.addNestedPass<func::FuncOp>(
+          hexagon::createOmniFetchVDAEInsertPass(
+              setOmniFetchVDAE(OmniFetchVDAEInsertOptions{})));
+
     // Lower linalg ops with library_call attribute set to custom fns.
     pm.addPass(createHexagonReplaceWithLibraryCallsPass());
     if (enableHexagonmemCopyToDMA)
@@ -382,6 +397,9 @@ public:
     pm.addPass(hexagon::createDMAToLLVMPass());
     pm.addPass(hexagonmem::createHexagonMemToLLVMPass());
     pm.addPass(hexkl::createHexKLToLLVMPass());
+    // Lower omni_fetch dialect ops to extern-C runtime calls
+    if (enableOmniFetchVDAE)
+      pm.addPass(omni_fetch::createOmniFetchToLLVMPass());
 
     if (enableCollapseAddressSpace) {
       pm.addPass(createCollapseAddressSpacePass());

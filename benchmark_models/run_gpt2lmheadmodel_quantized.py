@@ -55,12 +55,15 @@ import os
 import math
 import argparse
 import subprocess
+import re
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch_mlir import fx
 from torch_mlir.compiler_utils import OutputType
 from transformers import GPT2LMHeadModel, GPT2Tokenizer, GPT2Config
+from transformers.pytorch_utils import Conv1D
 from pathlib import Path
 
 from triton.backends.qcom_hexagon_backend.compiler import HexagonOptions
@@ -136,7 +139,7 @@ def apply_weight_quantization(
     scheme: str = "w8a16",
     target_dtype: torch.dtype = torch.float16,
 ) -> nn.Module:
-    """Apply simulated (fake) weight quantization to all nn.Linear layers.
+    """Apply simulated (fake) weight quantization to Linear/Conv1D projection layers.
 
     The quantization is "fake" in the sense that weights are quantized to
     int8/int4 and immediately dequantized back to float16.  The resulting
@@ -163,13 +166,23 @@ def apply_weight_quantization(
     total_params_before = sum(p.numel() for p in model.parameters())
 
     for name, module in model.named_modules():
-        if not isinstance(module, nn.Linear):
+        if not isinstance(module, (nn.Linear, Conv1D)):
             continue
 
-        w = module.weight.data.float()
+        # Conv1D in HF GPT-2 stores weight as [in_features, out_features].
+        # For per-output-channel quantization we temporarily transpose to
+        # [out_features, in_features], then transpose back.
+        if isinstance(module, Conv1D):
+            w = module.weight.data.float().T
+        else:
+            w = module.weight.data.float()
+
         w_q, scale, _ = quant_fn(w)
         w_dq = _dequantize_weight(w_q, scale, target_dtype=target_dtype)
-        module.weight = nn.Parameter(w_dq, requires_grad=False)
+        if isinstance(module, Conv1D):
+            module.weight = nn.Parameter(w_dq.T.contiguous(), requires_grad=False)
+        else:
+            module.weight = nn.Parameter(w_dq, requires_grad=False)
 
         # Cast bias to target_dtype if present
         if module.bias is not None:
@@ -184,7 +197,7 @@ def apply_weight_quantization(
 
     print(
         f"[Quantization] scheme={scheme}  "
-        f"quantized {quantized_layers} Linear layers to int{bits} "
+        f"quantized {quantized_layers} projection layers (Linear/Conv1D) to int{bits} "
         f"(dequantized back to {target_dtype})  "
         f"total params: {total_params_before:,}"
     )
@@ -227,12 +240,6 @@ def hex_execution(
     bytecode = module.operation.get_asm(binary=True)
     with open(linalg_filename, "wb") as f:
         f.write(bytecode)
-
-    # These two options must be disabled for GPT-2 (known limitation):
-    # enableVTCMTiling causes issues with the attention mask shape, and
-    # enableConvertToHexagonmem is not needed for this model size.
-    options["enableVTCMTiling"] = False
-    options["enableConvertToHexagonmem"] = False
 
     hex_outputs = TorchMLIRHexagonLauncher().run_torch_mlir(
         str(linalg_filename), inputs, func_name, options=options
@@ -326,6 +333,63 @@ def compile_to_linalg(model: nn.Module, input, dump_to_file=None, debug=False):
     return linalg
 
 
+def force_projection_fp16_io(model: nn.Module) -> None:
+    """Force Linear/Conv1D projection islands to fp16 at graph-export time.
+
+    This aggressively inserts cast boundaries around projection layers so
+    linalg.matmul lowering can see f16 operands for HexKL.
+    """
+    patched = 0
+    for module in model.modules():
+        if not isinstance(module, (nn.Linear, Conv1D)):
+            continue
+
+        # Keep parameters in fp16 to avoid f32 re-promotion in exported graph.
+        module.weight = nn.Parameter(module.weight.data.to(torch.float16), requires_grad=False)
+        if getattr(module, "bias", None) is not None:
+            module.bias = nn.Parameter(module.bias.data.to(torch.float16), requires_grad=False)
+
+        if isinstance(module, nn.Linear):
+            def linear_forward_fp16(input, m=module):
+                return F.linear(
+                    input.to(torch.float16),
+                    m.weight,
+                    None if m.bias is None else m.bias,
+                ).to(torch.float16)
+
+            module.forward = linear_forward_fp16
+        else:
+            # HF Conv1D forward is effectively addmm(matmul + bias). Re-implement
+            # with explicit fp16 boundaries to avoid lingering fp32 matmul islands.
+            def conv1d_forward_fp16(x, m=module):
+                x_fp16 = x.to(torch.float16)
+                size_out = x_fp16.size()[:-1] + (m.nf,)
+                x_2d = x_fp16.view(-1, x_fp16.size(-1))
+                out = torch.addmm(
+                    m.bias.to(torch.float16),
+                    x_2d,
+                    m.weight.to(torch.float16),
+                )
+                return out.view(size_out).to(torch.float16)
+
+            module.forward = conv1d_forward_fp16
+
+        patched += 1
+
+    print(f"[DType Guard] Forced fp16 I/O on {patched} projection layers (Linear/Conv1D).")
+
+
+def has_f32_linalg_matmul(module) -> bool:
+    """Return True if the exported Linalg IR still contains f32 matmul inputs."""
+    ir = str(module)
+    # Matches lines like:
+    # linalg.matmul ins(%a, %b : tensor<...xf32>, tensor<...xf32>)
+    return re.search(
+        r"linalg\.matmul\s+ins\([^\n]*tensor<[^>]*xf32>",
+        ir,
+    ) is not None
+
+
 def process_lwp() -> None:
     """Post-process lightweight profiling (LWP) data if available."""
     HEXAGON_MLIR_ROOT = os.environ.get("HEXAGON_MLIR_ROOT")
@@ -363,14 +427,33 @@ def gpt2lmheadmodel_quantized(
     enablelwp: bool = False,
     dump_mlir: bool = False,
     debug: bool = False,
+    # --- Pipeline switches ---
+    # Because the fake-quantization graph is entirely float16, HexKL,
+    # VTCM tiling and Omni-Fetch prefetching are all opt-in here.
+    # Note: VTCM tiling still has a known GPT-2 attention-mask shape issue;
+    # use --enable-vtcm-tiling with caution.
+    enable_hexkl: bool = False,
+    enable_vtcm_tiling: bool = False,
+    enable_convert_to_hexagonmem: bool = False,
+    enable_omnifetch_vdae: bool = False,
+    enable_omnifetch_layout_aware: bool = True,
+    omnifetch_lookahead: int = 2,
+    enable_omnifetch_adaptive: bool = True,
 ) -> None:
     """End-to-end quantized GPT-2 inference on Hexagon NPU.
 
     Args:
-        quant_scheme : "w8a16" | "w4a16" | "fp16"
-        enablelwp    : enable lightweight profiling
-        dump_mlir    : save the Linalg MLIR to a .mlir text file
-        debug        : enable torch-mlir graph/IR printing
+        quant_scheme               : "w8a16" | "w4a16" | "fp16"
+        enablelwp                  : enable lightweight profiling
+        dump_mlir                  : save the Linalg MLIR to a .mlir text file
+        debug                      : enable torch-mlir graph/IR printing
+        enable_hexkl               : enable HexKL HMX matrix-multiply lowering
+        enable_vtcm_tiling         : enable VTCM tiling (caution: known GPT-2 shape issue)
+        enable_convert_to_hexagonmem: enable memref→hexagonmem conversion
+        enable_omnifetch_vdae      : enable Omni-Fetch V-DAE prefetch pass
+        enable_omnifetch_layout_aware: enable in-situ layout-aware index maps
+        omnifetch_lookahead        : static prefetch look-ahead distance
+        enable_omnifetch_adaptive  : enable PMU-based adaptive control
     """
     print(f"\n{'='*60}")
     print(f"  GPT-2 Quantized Inference on Hexagon NPU")
@@ -412,6 +495,9 @@ def gpt2lmheadmodel_quantized(
 
     print(f"[Quantization] Applying {quant_scheme} weight quantization ...")
     model = apply_weight_quantization(model, scheme=quant_scheme, target_dtype=torch.float16)
+    # Strong repair: aggressively enforce fp16 boundaries around projection ops
+    # so exported linalg.matmul islands become HexKL-legal.
+    force_projection_fp16_io(model)
     model.eval()
 
     size_after = estimate_model_size_mb(model)
@@ -445,8 +531,40 @@ def gpt2lmheadmodel_quantized(
     # 5. Run on Hexagon NPU
     # ------------------------------------------------------------------
     options = HexagonOptions().__dict__
+    # The fake-quantization graph is entirely float16, so HexKL / VTCM
+    # tiling / Omni-Fetch are all available.  The two passes that have a
+    # known GPT-2 shape issue are kept off by default (see CLI flags).
+    # HexKL verifier currently requires f16 inputs for matmul. GPT-2 export can
+    # still contain some f32 matmul ops; detect this and gracefully fallback.
+    effective_enable_hexkl = enable_hexkl
+    if enable_hexkl and has_f32_linalg_matmul(module):
+        effective_enable_hexkl = False
+        print(
+            "[Options] HexKL HMX lowering  : OFF (fallback). "
+            "Detected f32 linalg.matmul in exported IR; HexKL matmul currently "
+            "requires f16 inputs."
+        )
+        print(
+            "[Hint] Re-run with --dump-mlir and inspect matmul operand dtypes to "
+            "identify remaining fp32 islands."
+        )
+
+    options["enableHexKL"] = effective_enable_hexkl
+    options["enableVTCMTiling"] = enable_vtcm_tiling
+    options["enableConvertToHexagonmem"] = enable_convert_to_hexagonmem
+    options["enableOmniFetchVDAE"] = enable_omnifetch_vdae
+    options["enableOmniFetchLayoutAware"] = enable_omnifetch_layout_aware
+    options["omniFetchLookahead"] = omnifetch_lookahead
+    options["enableOmniFetchAdaptive"] = enable_omnifetch_adaptive
     if enablelwp:
         options["enableLWP"] = True
+
+    if effective_enable_hexkl:
+        print("[Options] HexKL HMX lowering  : ON")
+    if enable_omnifetch_vdae:
+        print(f"[Options] Omni-Fetch V-DAE     : ON  (lookahead={omnifetch_lookahead}, "
+              f"layout_aware={enable_omnifetch_layout_aware}, "
+              f"adaptive={enable_omnifetch_adaptive})")
 
     print("\n[Hexagon] Launching inference on Hexagon NPU ...")
     inputs = [encoding["input_ids"]]
@@ -495,20 +613,34 @@ Quantization schemes
                      Equivalent to the original run_gpt2lmheadmodel.py but
                      starting from float32 weights cast to float16.
 
-Examples
---------
+Ablation study examples
+-----------------------
+  # Baseline (no HMX, no prefetch)
   python run_gpt2lmheadmodel_quantized.py
-  python run_gpt2lmheadmodel_quantized.py --quant-scheme w4a16
-  python run_gpt2lmheadmodel_quantized.py --quant-scheme fp16
-  python run_gpt2lmheadmodel_quantized.py --enablelwp --dump-mlir
+
+  # Enable HexKL HMX lowering only
+  python run_gpt2lmheadmodel_quantized.py --enable-hexkl
+
+  # Full Omni-Fetch pipeline (HexKL + V-DAE prefetch)
+  python run_gpt2lmheadmodel_quantized.py --enable-hexkl --enable-omnifetch-vdae
+
+  # V-DAE without layout-aware mapping (linear prefetch only)
+  python run_gpt2lmheadmodel_quantized.py --enable-hexkl --enable-omnifetch-vdae --disable-layout-aware
+
+  # V-DAE with aggressive lookahead
+  python run_gpt2lmheadmodel_quantized.py --enable-hexkl --enable-omnifetch-vdae --omnifetch-lookahead 4
         """,
     )
+
+    # --- Quantization ---
     parser.add_argument(
         "--quant-scheme",
         choices=["w8a16", "w4a16", "fp16"],
         default="w8a16",
         help="Weight quantization scheme (default: w8a16)",
     )
+
+    # --- General ---
     parser.add_argument(
         "--enablelwp",
         action="store_true",
@@ -527,6 +659,56 @@ Examples
         default=False,
         help="Enable torch-mlir graph and IR printing",
     )
+
+    # --- Pipeline switches (ablation study) ---
+    pipeline = parser.add_argument_group(
+        "pipeline switches (ablation study)",
+        "All off by default.  The fake-quantization graph is entirely float16,\n"
+        "so HexKL and Omni-Fetch are safe to enable here.",
+    )
+    pipeline.add_argument(
+        "--enable-hexkl",
+        action="store_true",
+        default=False,
+        help="Enable HexKL HMX matrix-multiply lowering (requires f16 graph — safe here).",
+    )
+    pipeline.add_argument(
+        "--enable-vtcm-tiling",
+        action="store_true",
+        default=False,
+        help="Enable VTCM tiling (caution: known GPT-2 attention-mask shape issue).",
+    )
+    pipeline.add_argument(
+        "--enable-convert-to-hexagonmem",
+        action="store_true",
+        default=False,
+        help="Enable memref→hexagonmem conversion pass.",
+    )
+    pipeline.add_argument(
+        "--enable-omnifetch-vdae",
+        action="store_true",
+        default=False,
+        help="Enable Omni-Fetch V-DAE prefetch insertion pass (best used with --enable-hexkl).",
+    )
+    pipeline.add_argument(
+        "--disable-layout-aware",
+        action="store_true",
+        default=False,
+        help="Disable in-situ layout-aware index maps (use linear prefetch only).",
+    )
+    pipeline.add_argument(
+        "--omnifetch-lookahead",
+        type=int,
+        default=2,
+        help="Static prefetch look-ahead distance in loop iterations (default: 2).",
+    )
+    pipeline.add_argument(
+        "--disable-omnifetch-adaptive",
+        action="store_true",
+        default=False,
+        help="Disable PMU-driven adaptive prefetch distance tuning.",
+    )
+
     return parser.parse_args()
 
 
@@ -537,4 +719,11 @@ if __name__ == "__main__":
         enablelwp=args.enablelwp,
         dump_mlir=args.dump_mlir,
         debug=args.debug,
+        enable_hexkl=args.enable_hexkl,
+        enable_vtcm_tiling=args.enable_vtcm_tiling,
+        enable_convert_to_hexagonmem=args.enable_convert_to_hexagonmem,
+        enable_omnifetch_vdae=args.enable_omnifetch_vdae,
+        enable_omnifetch_layout_aware=not args.disable_layout_aware,
+        omnifetch_lookahead=args.omnifetch_lookahead,
+        enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
     )

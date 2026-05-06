@@ -33,6 +33,7 @@ add_triton_plugin(TritonHexagon
     DMAToLLVM
     HexKLToLLVM
     HexagonMemToLLVM
+    OmniFetchToLLVM
     HexagonMLIRLLVMToLLVMIR
     Transforms
 

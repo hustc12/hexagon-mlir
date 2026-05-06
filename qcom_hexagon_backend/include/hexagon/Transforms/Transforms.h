@@ -102,6 +102,11 @@ std::unique_ptr<Pass> createHoistScalarOpsPass();
 
 std::unique_ptr<Pass> createFoldMulFByZeroPass();
 
+/// V-DAE: inserts layout-aware prefetch structure into HMX compute loops.
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createOmniFetchVDAEInsertPass(
+    const OmniFetchVDAEInsertOptions &options = OmniFetchVDAEInsertOptions());
+
 } // namespace hexagon
 } // namespace mlir
 

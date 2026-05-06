@@ -333,4 +333,62 @@ def SmallExponentToMultiply :
     ];
 }
 
+//===----------------------------------------------------------------------===//
+// Omni-Fetch: V-DAE prefetching pass
+//===----------------------------------------------------------------------===//
+
+def OmniFetchVDAEInsert :
+    InterfacePass<"omni-fetch-vdae-insert", "mlir::FunctionOpInterface"> {
+  let summary = "Insert V-DAE layout-aware prefetch structure into compute loops";
+  let description = [{
+    Implements the Virtual Decoupled Access-Execute (V-DAE) transformation
+    for DNN inference loops on Hexagon NPU.
+
+    The pass walks `scf.for` loops whose bodies contain `hexkl` HMX compute
+    operations (or `memref.dma_start` transfers from a prior double-buffer
+    pass) and rewrites them into a prefetch-ahead + semaphore-synchronised
+    structure:
+
+      Prologue: prefetch the first `lookahead` tiles.
+
+      Loop body (per iteration i):
+        1. `omni_fetch.wait %sem`          -- ensure tile [i] is in VTCM
+        2. existing HMX compute on tile [i]
+        3. `omni_fetch.prefetch_in_situ`   -- start fetching tile [i + lookahead]
+        4. `omni_fetch.signal %sem`        -- notify tile [i + lookahead] ready
+        5. `omni_fetch.adaptive_control`   -- tune look-ahead from PMU feedback
+
+    The `layout_transform` attribute on each `prefetch_in_situ` op is set
+    to `HMXWeight` or `HMXActivation` depending on the tensor role detected
+    from the surrounding computation, so the runtime performs the layout
+    reshape during the fetch rather than in a separate pass.
+
+    Options
+    -------
+    - `lookahead`       : static prefetch look-ahead distance (default: 2)
+    - `enable-adaptive` : emit adaptive_control ops to tune at runtime
+  }];
+
+  let options = [
+    Option<"lookahead", "lookahead", "int",
+           /*default=*/"2",
+           "Static prefetch look-ahead distance (number of iterations).">,
+    Option<"enableAdaptive", "enable-adaptive", "bool",
+           /*default=*/"true",
+           "Emit omni_fetch.adaptive_control ops for runtime PMU tuning.">,
+    Option<"enableLayoutAware", "enable-layout-aware", "bool",
+           /*default=*/"true",
+           "Enable in-situ layout-aware prefetch index maps; when false, emit linear prefetches only.">,
+  ];
+
+  let constructor = "hexagon::createOmniFetchVDAEInsertPass()";
+
+  let dependentDialects = [
+    "mlir::omni_fetch::OmniFetchDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::memref::MemRefDialect",
+  ];
+}
+
 #endif

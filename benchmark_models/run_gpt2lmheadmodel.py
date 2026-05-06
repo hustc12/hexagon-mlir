@@ -26,8 +26,6 @@ def hex_execution(module, func_name, inputs, options: dict=None):
     with open(linalg_filename, "wb") as f:
         f.write(bytecode)
 
-    options["enableVTCMTiling"] = False
-    options["enableConvertToHexagonmem"] = False 
     hex_outputs = TorchMLIRHexagonLauncher().run_torch_mlir(str(linalg_filename), inputs, func_name, options=options)
     return hex_outputs
 
@@ -113,7 +111,18 @@ def process_lwp():
         print(f"Command output: {e.stdout}")
         print(f"Error output: {e.stderr}")
 
-def gpt2lmheadmodel(enablelwp=False): 
+def gpt2lmheadmodel(
+    enablelwp: bool = False,
+    # Mirror HexagonOptions defaults: HexKL off, VTCM tiling and hexagonmem
+    # conversion also off for GPT2 (mixed f32/f16 pipeline).
+    enable_hexkl: bool = False,
+    enable_vtcm_tiling: bool = False,
+    enable_convert_to_hexagonmem: bool = False,
+    enable_omnifetch_vdae: bool = False,
+    enable_omnifetch_layout_aware: bool = True,
+    omnifetch_lookahead: int = 2,
+    enable_omnifetch_adaptive: bool = True,
+): 
 
     model_name = "openai-community/gpt2"
     prompt = "What is nature of our existence?"
@@ -129,6 +138,13 @@ def gpt2lmheadmodel(enablelwp=False):
     module = compile_to_linalg(model, encoding["input_ids"])
 
     options = HexagonOptions().__dict__
+    options["enableHexKL"] = enable_hexkl
+    options["enableVTCMTiling"] = enable_vtcm_tiling
+    options["enableConvertToHexagonmem"] = enable_convert_to_hexagonmem
+    options["enableOmniFetchVDAE"] = enable_omnifetch_vdae
+    options["enableOmniFetchLayoutAware"] = enable_omnifetch_layout_aware
+    options["omniFetchLookahead"] = omnifetch_lookahead
+    options["enableOmniFetchAdaptive"] = enable_omnifetch_adaptive
     if enablelwp:
         options['enableLWP'] = True
     inputs = [encoding["input_ids"]]
@@ -140,6 +156,36 @@ def gpt2lmheadmodel(enablelwp=False):
         process_lwp()
 
 if __name__ == "__main__":
-    gpt2lmheadmodel()
+    parser = argparse.ArgumentParser(description="Run GPT2 LMHead on Hexagon with optional Omni-Fetch ablation toggles.")
+    parser.add_argument("--enable-lwp", action="store_true", help="Enable lightweight profiling instrumentation.")
+
+    parser.add_argument("--enable-hexkl", action="store_true",
+                        help="Enable HexKL lowering (requires a fully-f16 pipeline; off by default for GPT2).")
+    parser.add_argument("--enable-vtcm-tiling", action="store_true",
+                        help="Enable VTCM tiling (requires a fully-f16 pipeline; off by default for GPT2).")
+    parser.add_argument("--enable-convert-to-hexagonmem", action="store_true",
+                        help="Enable memref->hexagonmem conversion (off by default for GPT2).")
+
+    parser.add_argument("--enable-omnifetch-vdae", action="store_true",
+                        help="Enable Omni-Fetch V-DAE prefetch pass.")
+    parser.add_argument("--disable-layout-aware", action="store_true",
+                        help="Disable layout-aware in-situ mapping (linear prefetch only).")
+    parser.add_argument("--omnifetch-lookahead", type=int, default=2,
+                        help="Static prefetch look-ahead distance.")
+    parser.add_argument("--disable-omnifetch-adaptive", action="store_true",
+                        help="Disable PMU-driven adaptive prefetch distance.")
+
+    args = parser.parse_args()
+
+    gpt2lmheadmodel(
+        enablelwp=args.enable_lwp,
+        enable_hexkl=args.enable_hexkl,
+        enable_vtcm_tiling=args.enable_vtcm_tiling,
+        enable_convert_to_hexagonmem=args.enable_convert_to_hexagonmem,
+        enable_omnifetch_vdae=args.enable_omnifetch_vdae,
+        enable_omnifetch_layout_aware=not args.disable_layout_aware,
+        omnifetch_lookahead=args.omnifetch_lookahead,
+        enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
+    )
 
 

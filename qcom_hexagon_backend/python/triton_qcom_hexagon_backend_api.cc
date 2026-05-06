@@ -13,6 +13,7 @@
 #include "hexagon/Dialect/HexKL/Transforms/BufferizableOpInterfaceImpl.h"
 #include "hexagon/Dialect/HexagonMem/IR/HexagonMemDialect.h"
 #include "hexagon/Dialect/HexagonTPtr/IR/HexagonTPtrDialect.h"
+#include "hexagon/Dialect/OmniFetch/IR/OmniFetchDialect.h"
 #include "hexagon/Dialect/TTX/IR/TTXDialect.h"
 #include "hexagon/Dialect/TmTensor/IR/TmTensorDialect.h"
 #include "hexagon/Target/HEX_LLVMIR/LLVMIRTranslation.h"
@@ -148,6 +149,7 @@ void loadDialects(mlir::MLIRContext &context) {
 
   registry.insert<mlir::hexagonmem::HexagonMemDialect>();
   registry.insert<mlir::hexkl::HexKLDialect>();
+  registry.insert<mlir::omni_fetch::OmniFetchDialect>();
   registry.insert<mlir::tm_tensor::TmTensorDialect>();
   registry.insert<mlir::ttx::TTXDialect>();
   registry.insert<mlir::tptr::HexagonTPtrDialect>();

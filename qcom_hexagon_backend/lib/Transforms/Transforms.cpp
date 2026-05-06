@@ -14,6 +14,7 @@
 
 #include "hexagon/Transforms/Transforms.h"
 
+#include "hexagon/Dialect/OmniFetch/IR/OmniFetchDialect.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
