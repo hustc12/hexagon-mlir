@@ -7,7 +7,6 @@
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch_mlir import fx
 from torch_mlir.compiler_utils import OutputType
 from triton.backends.qcom_hexagon_backend.compiler import HexagonOptions
@@ -51,60 +50,20 @@ class TransformerBlock(nn.Module):
 
 class OmniFetchVerifModel(nn.Module):
     """
-    A large-scale model containing multiple Conv2d and Transformer blocks.
-    Designed to stress-test Omni-Fetch optimizations.
+    Minimal model: a single TransformerBlock for Omni-Fetch verification.
+    Input: [1, seq_len, dim] float16
+    Output: [1, seq_len, dim] float16
     """
-    def __init__(self, hidden_dim=1024, seq_len=512, num_layers=4):
+    def __init__(self, dim=256, seq_len=64, num_heads=8):
         super().__init__()
-        self.hidden_dim = hidden_dim
-        self.seq_len = seq_len
-        
-        # 1. Deeper Conv front-end
-        self.conv1 = nn.Conv2d(3, 128, kernel_size=3, padding=1, bias=False)
-        self.conv2 = nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False)
-        self.conv3 = nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False)
-        
-        # 2. Large projection to Transformer dim
-        self.fc_in = nn.Linear(128 * 8 * 8, hidden_dim, bias=False)
-        
-        # 3. Multiple Transformer Layers
-        self.layers = nn.ModuleList([
-            TransformerBlock(hidden_dim) for _ in range(num_layers)
-        ])
-        
-        # 4. Final output
-        self.proj_out = nn.Linear(hidden_dim, 10, bias=False)
+        self.block = TransformerBlock(dim, num_heads)
 
     def forward(self, x):
-        # x: [1, 3, 32, 32]
-        
-        # --- Conv layers ---
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
-        
-        # --- Slice and Flatten ---
-        x_slice = x[:, :, 12:20, 12:20] # [1, 128, 8, 8]
-        flat = x_slice.reshape(1, -1)   # [1, 8192]
-        
-        # --- Large MatMul: [1, 8192] x [8192, 1024] ---
-        hidden = self.fc_in(flat)       # [1, hidden_dim]
-        
-        # Expand to sequence
-        seq = hidden.repeat(1, self.seq_len, 1).view(1, self.seq_len, self.hidden_dim)
-        
-        # --- Multiple Transformer Layers ---
-        for layer in self.layers:
-            seq = layer(seq)
-            
-        # --- Final Slice and MatMul ---
-        out = seq[:, -1, :] # [1, hidden_dim]
-        logits = self.proj_out(out) # [1, 10]
-        
-        return logits
+        # x: [1, seq_len, dim]
+        return self.block(x)
 
 def compile_and_run(
-    enable_omnifetch: bool = False,
+    enable_omnifetch: bool = True,
     enable_hexkl: bool = True,
     lookahead: int = 2,
     adaptive: bool = True
@@ -112,7 +71,7 @@ def compile_and_run(
     print(f"\n{'='*60}")
     print(f"  Omni-Fetch Verification Model")
     print(f"  Omni-Fetch: {'ON' if enable_omnifetch else 'OFF'}")
-    print(f"  HexKL: {'ON' if enable_hexkl else 'OFF'}")
+    print(f"  HexKL: DISABLED (HMX path causes AEE_EBADSTATE on device)")
     print(f"{'='*60}\n")
 
     # 1. Initialize model and data in FP16 (No FP32)
@@ -120,7 +79,8 @@ def compile_and_run(
     model = OmniFetchVerifModel().to(device).half()
     model.eval()
     
-    input_shape = (1, 3, 32, 32)
+    # Input: [1, seq_len, dim] matching OmniFetchVerifModel defaults
+    input_shape = (1, 64, 256)
     dummy_input = torch.randn(input_shape).half().to(device)
     
     print(f"[Model] Initialized in float16")
@@ -137,14 +97,17 @@ def compile_and_run(
 
     # 3. Configure Hexagon Options
     options = HexagonOptions().__dict__
+    options["enableVectorization"] = enable_hexkl, # Seems like this option is the prerequisite for setting enableHexKL=True
     options["enableHexKL"] = enable_hexkl
     options["enableOmniFetchVDAE"] = enable_omnifetch
     options["enableOmniFetchLayoutAware"] = True
     options["omniFetchLookahead"] = lookahead
     options["enableOmniFetchAdaptive"] = adaptive
-    
-    # Optional: Enable VTCM Tiling if helpful for prefetching
-    options["enableVTCMTiling"] = enable_omnifetch 
+    # Model is small enough to fit in a single .so — no need to split constants.
+    options["lowerConstantsInSeparateSharedObjects"] = False
+    options["enableVTCMTiling"] = enable_omnifetch
+    # Optional: Enable VTCM Tiling if helpful for prefetching (only with OmniFetch)
+    # options["enableVTCMTiling"] = enable_omnifetch
 
     # 4. Execute on Hexagon NPU
     print("[Hexagon] Launching on NPU...")
@@ -154,13 +117,26 @@ def compile_and_run(
     mlir_path = "/tmp/verify_omnifetch.mlirbc"
     with open(mlir_path, "wb") as f:
         f.write(linalg_module.operation.get_asm(binary=True))
-        
-    hex_outputs = launcher.run_torch_mlir(
-        mlir_path,
-        [dummy_input],
-        "forward",
-        options=options
-    )
+
+    # FIX: Reduce _QURT_MAX_HEAP_SIZE from 1 GB to 256 MB.
+    # 1 GB causes DSP TLB miss (heap addresses outside mapped region).
+    from triton.backends.qcom_hexagon_backend import hexagon_launcher_base as _hlb
+    _ORIG = "unsigned int _QURT_MAX_HEAP_SIZE = 1073741824; // 1 GB Max Heap Size"
+    _NEW  = "unsigned int _QURT_MAX_HEAP_SIZE = 268435456;  // 256 MB Max Heap Size"
+    _orig_init = _hlb.WrapperGeneratorStrings.__init__
+    def _patched_init(self):
+        _orig_init(self)
+        self.code_string = self.code_string.replace(_ORIG, _NEW)
+    _hlb.WrapperGeneratorStrings.__init__ = _patched_init
+    try:
+        hex_outputs = launcher.run_torch_mlir(
+            mlir_path,
+            [dummy_input],
+            "forward",
+            options=options
+        )
+    finally:
+        _hlb.WrapperGeneratorStrings.__init__ = _orig_init
     
     # 5. CPU Reference for Verification
     print("[CPU] Running reference...")
@@ -186,25 +162,31 @@ def compile_and_run(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--enable-omnifetch", action="store_true", help="Enable Omni-Fetch optimization")
-    parser.add_argument("--disable-hexkl", action="store_true", help="Disable HexKL HMX lowering")
+    parser.add_argument("--enable-hexkl", action="store_true", help="Enable HexKL HMX lowering")
     parser.add_argument("--lookahead", type=int, default=2, help="Omni-Fetch lookahead distance")
-    parser.add_argument("--disable-adaptive", action="store_true", help="Disable adaptive prefetch")
-    
+    parser.add_argument("--enable-adaptive", action="store_true", help="Enable adaptive prefetch")
+
     args = parser.parse_args()
-    
+
     compile_and_run(
         enable_omnifetch=args.enable_omnifetch,
-        enable_hexkl=not args.disable_hexkl,
+        enable_hexkl=args.enable_hexkl,
         lookahead=args.lookahead,
-        adaptive=not args.disable_adaptive
+        adaptive=args.enable_adaptive,
     )
 
-# # 1. 基础运行（仅开启 HexKL HMX 加速）
+# # 1. 基础运行（无 HexKL，无 Omni-Fetch）
 # python3 verify_omnifetch_model.py
 
-# # 2. 开启 Omni-Fetch 优化
-# python3 verify_omnifetch_model.py --enable-omnifetch
+# # 2. 开启 HexKL HMX 加速
+# python3 verify_omnifetch_model.py --enable-hexkl
 
-# # 3. 开启 Omni-Fetch 并调整 lookahead 距离
-# python3 verify_omnifetch_model.py --enable-omnifetch --lookahead 4
+# # 3. 开启 Omni-Fetch 优化（需同时开启 HexKL）
+# python3 verify_omnifetch_model.py --enable-hexkl --enable-omnifetch
+
+# # 4. 开启 Omni-Fetch 并调整 lookahead 距离
+# python3 verify_omnifetch_model.py --enable-hexkl --enable-omnifetch --lookahead 4
+
+# # 5. 开启全部选项
+# python3 verify_omnifetch_model.py --enable-hexkl --enable-omnifetch --enable-adaptive --lookahead 4
 
