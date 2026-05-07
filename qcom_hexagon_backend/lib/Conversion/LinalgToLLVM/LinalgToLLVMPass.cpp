@@ -254,10 +254,16 @@ public:
 
     pm.addNestedPass<func::FuncOp>(createDecomposeTensorConcatPass());
 
-    if (enableVTCMTiling) {
+    // VTCMTiling conflicts with OmniFetch: VTCMTiling moves data to VTCM early,
+    // so V-DAE pass can't find DDR inputs and won't insert prefetch.
+    // When OmniFetch is enabled, skip VTCMTiling and let OmniFetch handle data movement.
+    if (enableVTCMTiling && !enableOmniFetchVDAE) {
       pm.addNestedPass<func::FuncOp>(
           createVTCMTilingPass(setVTCMTiling(VTCMTilingOptions{})));
       pm.addPass(createCanonicalizerPass());
+    } else if (enableOmniFetchVDAE) {
+      // OmniFetch enabled: VTCMTiling is disabled to allow V-DAE to see DDR inputs
+      LLVM_DEBUG(llvm::dbgs() << "[LinalgToLLVM] OmniFetch enabled, skipping VTCMTiling\n");
     }
 
     if (enableMultiThreading) {

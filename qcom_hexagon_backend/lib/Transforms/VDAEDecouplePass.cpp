@@ -137,6 +137,30 @@ static SmallVector<Value> collectDDRInputs(scf::ForOp loop) {
   return inputs;
 }
 
+/// Collect all memref inputs regardless of address space.
+/// This is used as a fallback when no DDR inputs are found (e.g., when
+/// bufferization allocated everything to VTCM).
+static SmallVector<Value> collectAllMemrefInputs(scf::ForOp loop) {
+  SmallVector<Value> inputs;
+  llvm::SmallPtrSet<Value, 8> seen;
+
+  loop.getBody()->walk([&](Operation *op) {
+    for (Value operand : op->getOperands()) {
+      if (!seen.insert(operand).second)
+        continue;
+      auto memTy = dyn_cast<MemRefType>(operand.getType());
+      if (!memTy)
+        continue;
+      // Accept memrefs in any address space (DDR, VTCM, etc.)
+      // Must be defined outside the loop
+      if (loop->isAncestor(operand.getParentBlock()->getParentOp()))
+        continue;
+      inputs.push_back(operand);
+    }
+  });
+  return inputs;
+}
+
 /// Guess whether `memref` is a weight or activation based on its use inside
 /// the loop body.  Heuristic: if it feeds into the `lhs` of a hexkl.matmul
 /// (or micro-setup op), it is treated as a weight; otherwise, activation.
@@ -230,13 +254,35 @@ static void transformLoop(scf::ForOp loop, int lookahead, bool enableAdaptive,
 
   // ----- Collect DDR inputs -----------------------------------------------
   SmallVector<Value> ddrInputs = collectDDRInputs(loop);
+  
+  DBG("Checking loop at " << loc);
+  DBG("  Found " << ddrInputs.size() << " DDR inputs");
+  
+  // RELAXED CONDITION: If no DDR inputs, try all memref inputs.
+  // This handles cases where bufferization allocated everything to VTCM.
   if (ddrInputs.empty()) {
-    DBG("no DDR inputs found, skipping loop");
+    DBG("  No DDR inputs found, trying all memref inputs...");
+    ddrInputs = collectAllMemrefInputs(loop);
+    DBG("  Found " << ddrInputs.size() << " total memref inputs");
+    
+    if (!ddrInputs.empty()) {
+      // Print their address spaces for debugging
+      for (Value input : ddrInputs) {
+        auto memTy = cast<MemRefType>(input.getType());
+        int memSpace = memTy.getMemorySpaceAsInt();
+        DBG("    Using memref with address space " << memSpace 
+            << " (0=DDR, 1=VTCM, 2=Other)");
+      }
+    }
+  }
+  
+  if (ddrInputs.empty()) {
+    DBG("  → No memref inputs found at all, skipping loop");
     return;
   }
 
   DBG("transforming loop at " << loc << " with " << ddrInputs.size()
-                               << " DDR inputs");
+                               << " inputs");
 
   // ----- Create semaphore -------------------------------------------------
   Value sem = builder.create<CreateSemOp>(loc,
