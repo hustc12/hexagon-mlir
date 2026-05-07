@@ -357,9 +357,10 @@ public:
       pm.addNestedPass<func::FuncOp>(createDecomposeHexKLMatmulPass());
 
     // ===== Omni-Fetch V-DAE prefetch insertion =====
-    // Runs after HMX decomposition so that `hexkl` micro-ops are visible
-    // for pattern matching.  Inserts layout-aware prefetch + semaphore sync.
-    if (enableHexKL && enableOmniFetchVDAE)
+    // Runs after HMX decomposition (if enabled) so that `hexkl` micro-ops are visible
+    // for pattern matching. Also works with HVX-only code (without HexKL).
+    // Inserts layout-aware prefetch + semaphore sync.
+    if (enableOmniFetchVDAE)
       pm.addNestedPass<func::FuncOp>(
           hexagon::createOmniFetchVDAEInsertPass(
               setOmniFetchVDAE(OmniFetchVDAEInsertOptions{})));
