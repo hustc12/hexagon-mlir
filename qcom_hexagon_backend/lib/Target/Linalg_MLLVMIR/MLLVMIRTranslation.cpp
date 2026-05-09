@@ -55,12 +55,12 @@ void setLinalgToLLVMOptions(
     mlir::hexagon::LinalgToLLVMOptions &options,
     const std::unordered_map<std::string, std::string> &arch_kwargs) {
 
-  // Debug: print all options from Python
-  llvm::errs() << "\n[setLinalgToLLVMOptions] Received options from Python:\n";
-  for (const auto &kv : arch_kwargs) {
-    llvm::errs() << "  " << kv.first << " = " << kv.second << "\n";
-  }
-  llvm::errs() << "\n";
+  // DEBUG (disabled): print all options received from Python
+  // llvm::errs() << "\n[setLinalgToLLVMOptions] Received options from Python:\n";
+  // for (const auto &kv : arch_kwargs) {
+  //   llvm::errs() << "  " << kv.first << " = " << kv.second << "\n";
+  // }
+  // llvm::errs() << "\n";
 
   // Note: seems very counter-intuitive due to the fact that compare() returns 0
   // when the strings are actually equal, which is why we negate it to convert

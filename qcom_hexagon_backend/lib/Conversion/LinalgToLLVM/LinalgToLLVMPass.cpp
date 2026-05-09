@@ -79,13 +79,14 @@ public:
   }
 
   void runOnOperation() override {
-    llvm::errs() << "\n[LinalgToLLVM] ========== Pass Starting ==========\n";
-    llvm::errs() << "[LinalgToLLVM] enableOmniFetchVDAE = " << enableOmniFetchVDAE << "\n";
-    llvm::errs() << "[LinalgToLLVM] enableHexKL = " << enableHexKL << "\n";
-    llvm::errs() << "[LinalgToLLVM] omniFetchLookahead = " << omniFetchLookahead << "\n";
-    llvm::errs() << "[LinalgToLLVM] enableOmniFetchAdaptive = " << enableOmniFetchAdaptive << "\n";
-    llvm::errs() << "[LinalgToLLVM] enableOmniFetchLayoutAware = " << enableOmniFetchLayoutAware << "\n";
-    llvm::errs() << "[LinalgToLLVM] ==========================================\n\n";
+    // DEBUG (disabled): pass entry banner and option dump
+    // llvm::errs() << "\n[LinalgToLLVM] ========== Pass Starting ==========\n";
+    // llvm::errs() << "[LinalgToLLVM] enableOmniFetchVDAE = " << enableOmniFetchVDAE << "\n";
+    // llvm::errs() << "[LinalgToLLVM] enableHexKL = " << enableHexKL << "\n";
+    // llvm::errs() << "[LinalgToLLVM] omniFetchLookahead = " << omniFetchLookahead << "\n";
+    // llvm::errs() << "[LinalgToLLVM] enableOmniFetchAdaptive = " << enableOmniFetchAdaptive << "\n";
+    // llvm::errs() << "[LinalgToLLVM] enableOmniFetchLayoutAware = " << enableOmniFetchLayoutAware << "\n";
+    // llvm::errs() << "[LinalgToLLVM] ==========================================\n\n";
     
     auto moduleOp = getOperation();
     MLIRContext *context = moduleOp.getContext();
