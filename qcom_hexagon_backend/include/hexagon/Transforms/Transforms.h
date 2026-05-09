@@ -102,10 +102,20 @@ std::unique_ptr<Pass> createHoistScalarOpsPass();
 
 std::unique_ptr<Pass> createFoldMulFByZeroPass();
 
-/// V-DAE: inserts layout-aware prefetch structure into HMX compute loops.
+/// Prefetch: inserts prefetch operations to preload data from DDR to VTCM.
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createPrefetchInsertPass(
+    const PrefetchInsertOptions &options = PrefetchInsertOptions());
+
+/// V-DAE: decouples Memory Access and Compute Execution using semaphores.
 std::unique_ptr<InterfacePass<FunctionOpInterface>>
 createOmniFetchVDAEInsertPass(
     const OmniFetchVDAEInsertOptions &options = OmniFetchVDAEInsertOptions());
+
+/// Layout Ops Elimination: eliminates redundant layout ops when in-situ
+/// reshape is enabled.
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createLayoutOpsEliminationPass();
 
 } // namespace hexagon
 } // namespace mlir

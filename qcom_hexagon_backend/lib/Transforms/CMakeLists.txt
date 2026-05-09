@@ -37,7 +37,9 @@ add_mlir_library(Transforms
   ReduceContractionRankPass.cpp
   HoistScalarOps.cpp
   FoldMulFByZeroPass.cpp
+  PrefetchInsertPass.cpp
   VDAEDecouplePass.cpp
+  LayoutOpsEliminationPass.cpp
 
   DEPENDS
   TransformsPassIncGen

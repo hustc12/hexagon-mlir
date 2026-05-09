@@ -153,9 +153,7 @@ public:
       return passOption;
     };
     auto setOmniFetchVDAE = [&](auto passOption) {
-      passOption.lookahead = omniFetchLookahead;
       passOption.enableAdaptive = enableOmniFetchAdaptive;
-      passOption.enableLayoutAware = enableOmniFetchLayoutAware;
       return passOption;
     };
 
@@ -365,10 +363,37 @@ public:
     if (enableHexKL)
       pm.addNestedPass<func::FuncOp>(createDecomposeHexKLMatmulPass());
 
-    // ===== Omni-Fetch V-DAE prefetch insertion =====
-    // Runs after HMX decomposition (if enabled) so that `hexkl` micro-ops are visible
-    // for pattern matching. Also works with HVX-only code (without HexKL).
-    // Inserts layout-aware prefetch + semaphore sync.
+    // ===== Omni-Fetch: 3-component architecture =====
+    // Component 1: Prefetch (independent)
+    // Component 2: In-Situ Reshape + Layout Ops Elimination (bound together)
+    // Component 3: V-DAE (independent)
+    
+    // Component 1: Prefetch insertion
+    // Inserts prefetch operations to preload data from DDR to VTCM.
+    // Can optionally perform in-situ layout transformation during prefetch.
+    if (enableOmniFetchVDAE) {
+      // Note: Currently prefetch is controlled by enableOmniFetchVDAE
+      // TODO: Add separate enablePrefetch option
+      auto prefetchOptions = PrefetchInsertOptions{};
+      prefetchOptions.lookahead = omniFetchLookahead;
+      prefetchOptions.enableLayoutAware = enableOmniFetchLayoutAware;
+      
+      pm.addNestedPass<func::FuncOp>(
+          hexagon::createPrefetchInsertPass(prefetchOptions));
+    }
+
+    // Component 2: Layout Ops Elimination (bound to In-Situ Reshape)
+    // Eliminates redundant layout ops when in-situ reshape is enabled.
+    // This pass detects prefetch_in_situ operations and removes redundant
+    // transpose/permute/slice ops that are now performed by hardware.
+    if (enableOmniFetchLayoutAware) {
+      pm.addNestedPass<func::FuncOp>(
+          hexagon::createLayoutOpsEliminationPass());
+    }
+
+    // Component 3: V-DAE (Virtual Decoupled Access-Execute)
+    // Decouples Memory Access and Compute Execution using semaphores.
+    // Adds wait/signal synchronization around existing prefetch operations.
     if (enableOmniFetchVDAE) {
       pm.addNestedPass<func::FuncOp>(
           hexagon::createOmniFetchVDAEInsertPass(
