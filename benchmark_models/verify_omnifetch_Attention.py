@@ -72,6 +72,8 @@ def compile_and_run(
         print(f"  Layout Aware: {'ON' if enable_layout_aware else 'OFF'}")
         print(f"{'='*60}\n")
 
+    # --- DEBUG prints below are intentionally kept under verbose=True only ---
+
     # 1. Initialize model and data in FP16
     device = "cpu"
     
@@ -89,13 +91,15 @@ def compile_and_run(
     q = torch.randn(1, num_heads, seq_len, head_dim).half().to(device)
     k = torch.randn(1, num_heads, seq_len, head_dim).half().to(device)
     
-    if verbose:
-        print(f"[Model] PureAttentionModel (no Linear layers)")
-        print(f"[Input] Q shape: {q.shape}, K shape: {k.shape}, Dtype: {q.dtype}")
+    # DEBUG: model/input info (disabled)
+    # if verbose:
+    #     print(f"[Model] PureAttentionModel (no Linear layers)")
+    #     print(f"[Input] Q shape: {q.shape}, K shape: {k.shape}, Dtype: {q.dtype}")
 
     # 2. Export to Linalg-on-Tensors MLIR
-    if verbose:
-        print("[Compile] Exporting to Linalg MLIR...")
+    # DEBUG: compile step info (disabled)
+    # if verbose:
+    #     print("[Compile] Exporting to Linalg MLIR...")
     linalg_module = fx.export_and_import(
         model,
         q, k,
@@ -118,8 +122,9 @@ def compile_and_run(
     ).__dict__
 
     # 4. Execute on Hexagon NPU
-    if verbose:
-        print("[Hexagon] Launching on NPU...")
+    # DEBUG: launcher info (disabled)
+    # if verbose:
+    #     print("[Hexagon] Launching on NPU...")
     launcher = TorchMLIRHexagonLauncher()
     
     # Save MLIR for inspection if needed
@@ -173,8 +178,9 @@ def compile_and_run(
         perf_match = re.search(r'Perf:\s*([0-9]+(?:\.[0-9]+)?)', launcher_output)
         if perf_match:
             npu_time_us = float(perf_match.group(1))
-            if verbose:
-                print(f"\n[NPU Performance] Kernel execution time: {npu_time_us:.2f} us ({npu_time_us/1000:.2f} ms)")
+            # DEBUG: per-run NPU time print (disabled)
+            # if verbose:
+            #     print(f"\n[NPU Performance] Kernel execution time: {npu_time_us:.2f} us ({npu_time_us/1000:.2f} ms)")
         
     except Exception as e:
         sys.stdout = original_stdout
@@ -183,8 +189,9 @@ def compile_and_run(
         _hlb.WrapperGeneratorStrings.__init__ = _orig_init
     
     # 5. CPU Reference for Verification
-    if verbose:
-        print("[CPU] Running reference...")
+    # DEBUG: CPU reference info (disabled)
+    # if verbose:
+    #     print("[CPU] Running reference...")
     with torch.no_grad():
         expected_output = model(q, k)
     
@@ -195,8 +202,9 @@ def compile_and_run(
     if not isinstance(actual_output, torch.Tensor):
         actual_output = torch.from_numpy(actual_output)
         
-    if verbose:
-        print("\n[Compare] Hexagon vs CPU Reference:")
+    # DEBUG: comparison header (disabled)
+    # if verbose:
+    #     print("\n[Compare] Hexagon vs CPU Reference:")
     allclose = torch.allclose(actual_output.float(), expected_output.float(), atol=1e-2)
     if verbose:
         if allclose:
@@ -211,197 +219,200 @@ def compile_and_run(
 def run_ablation_study():
     """
     Run comprehensive ablation studies to isolate performance factors.
-    
+
+    Experiment 0: Baseline (all optimizations OFF)
     Experiment 1: OmniFetch lookahead sweep with adaptive on/off (HexKL=ON)
     Experiment 2: HexKL + OmniFetch + VTCMTiling 2x2 ablation
     Experiment 3: Layout-aware on/off comparison
-    
+    Experiment 4: Full stack vs. individual passes (single-pass contribution)
+
     Performance is measured using NPU kernel execution time from Test_Info (in microseconds).
+    Speedup is computed relative to the Baseline (Exp0) NPU time.
     """
     import time
-    
+
     print("\n" + "="*80)
     print("ABLATION STUDY: Omni-Fetch Performance Analysis")
+    print("Model: PureAttentionModel  Q/K=[1,8,64,32] fp16  -> attn_weights=[1,8,64,64]")
     print("="*80 + "\n")
-    
+
     results = []
-    
-    # Experiment 1: Lookahead sweep with adaptive on/off (HexKL=ON, OmniFetch=ON)
-    print("\n" + "-"*80)
-    print("Experiment 1: OmniFetch Lookahead Sweep (HexKL=ON)")
-    print("-"*80)
-    
-    for lookahead in [0, 1, 2, 4]:
-        for adaptive in [False, True]:
-            config_name = f"Lookahead={lookahead}, Adaptive={'ON' if adaptive else 'OFF'}"
-            print(f"\n[Config] {config_name}")
-            
-            start_time = time.time()
-            try:
-                success, npu_time_us = compile_and_run(
-                    enable_omnifetch=True,
-                    enable_hexkl=True,
-                    lookahead=lookahead,
-                    adaptive=adaptive,
-                    enable_vtcm_tiling=True,
-                    enable_layout_aware=True,
-                    verbose=False
-                )
-                e2e_time = time.time() - start_time
-                results.append({
-                    'experiment': 'Exp1: Lookahead Sweep',
-                    'config': config_name,
-                    'hexkl': True,
-                    'omnifetch': True,
-                    'lookahead': lookahead,
-                    'adaptive': adaptive,
-                    'vtcm_tiling': True,
-                    'layout_aware': True,
-                    'npu_time_us': npu_time_us,
-                    'npu_time_ms': npu_time_us / 1000 if npu_time_us else None,
-                    'e2e_time_s': e2e_time,
-                    'success': success
-                })
-                if npu_time_us:
-                    print(f"  NPU Time: {npu_time_us/1000:.2f} ms, E2E Time: {e2e_time:.2f}s, Success: {success}")
-                else:
-                    print(f"  E2E Time: {e2e_time:.2f}s, Success: {success}")
-            except Exception as e:
-                print(f"  FAILED: {e}")
-                results.append({
-                    'experiment': 'Exp1: Lookahead Sweep',
-                    'config': config_name,
-                    'error': str(e)
-                })
-    
-    # Experiment 2: HexKL + OmniFetch + VTCMTiling 2x2 ablation
-    print("\n" + "-"*80)
-    print("Experiment 2: OmniFetch × VTCMTiling Ablation (HexKL=ON)")
-    print("-"*80)
-    
-    for omnifetch in [False, True]:
-        for vtcm_tiling in [False, True]:
-            config_name = f"OmniFetch={'ON' if omnifetch else 'OFF'}, VTCMTiling={'ON' if vtcm_tiling else 'OFF'}"
-            print(f"\n[Config] {config_name}")
-            
-            start_time = time.time()
-            try:
-                success, npu_time_us = compile_and_run(
-                    enable_omnifetch=omnifetch,
-                    enable_hexkl=True,
-                    lookahead=2,
-                    adaptive=True,
-                    enable_vtcm_tiling=vtcm_tiling,
-                    enable_layout_aware=True,
-                    verbose=False
-                )
-                e2e_time = time.time() - start_time
-                results.append({
-                    'experiment': 'Exp2: OmniFetch×VTCMTiling',
-                    'config': config_name,
-                    'hexkl': True,
-                    'omnifetch': omnifetch,
-                    'lookahead': 2,
-                    'adaptive': True,
-                    'vtcm_tiling': vtcm_tiling,
-                    'layout_aware': True,
-                    'npu_time_us': npu_time_us,
-                    'npu_time_ms': npu_time_us / 1000 if npu_time_us else None,
-                    'e2e_time_s': e2e_time,
-                    'success': success
-                })
-                if npu_time_us:
-                    print(f"  NPU Time: {npu_time_us/1000:.2f} ms, E2E Time: {e2e_time:.2f}s, Success: {success}")
-                else:
-                    print(f"  E2E Time: {e2e_time:.2f}s, Success: {success}")
-            except Exception as e:
-                print(f"  FAILED: {e}")
-                results.append({
-                    'experiment': 'Exp2: OmniFetch×VTCMTiling',
-                    'config': config_name,
-                    'error': str(e)
-                })
-    
-    # Experiment 3: Layout-aware on/off (HexKL=ON, OmniFetch=ON)
-    print("\n" + "-"*80)
-    print("Experiment 3: Layout-Aware Comparison (HexKL=ON, OmniFetch=ON)")
-    print("-"*80)
-    
-    for layout_aware in [False, True]:
-        config_name = f"Layout-Aware={'ON' if layout_aware else 'OFF'}"
-        print(f"\n[Config] {config_name}")
-        
-        start_time = time.time()
+
+    def _run(exp_name, config_name, **kwargs):
+        """Helper: run one config, record result, print one-liner."""
+        print(f"  {config_name:<55}", end="", flush=True)
+        start = time.time()
         try:
-            success, npu_time_us = compile_and_run(
-                enable_omnifetch=True,
-                enable_hexkl=True,
-                lookahead=2,
-                adaptive=True,
-                enable_vtcm_tiling=True,
-                enable_layout_aware=layout_aware,
-                verbose=False
-            )
-            e2e_time = time.time() - start_time
-            results.append({
-                'experiment': 'Exp3: Layout-Aware',
+            success, npu_time_us = compile_and_run(**kwargs, verbose=False)
+            e2e = time.time() - start
+            rec = {
+                'experiment': exp_name,
                 'config': config_name,
-                'hexkl': True,
-                'omnifetch': True,
-                'lookahead': 2,
-                'adaptive': True,
-                'vtcm_tiling': True,
-                'layout_aware': layout_aware,
                 'npu_time_us': npu_time_us,
                 'npu_time_ms': npu_time_us / 1000 if npu_time_us else None,
-                'e2e_time_s': e2e_time,
-                'success': success
-            })
-            if npu_time_us:
-                print(f"  NPU Time: {npu_time_us/1000:.2f} ms, E2E Time: {e2e_time:.2f}s, Success: {success}")
-            else:
-                print(f"  E2E Time: {e2e_time:.2f}s, Success: {success}")
-        except Exception as e:
-            print(f"  FAILED: {e}")
-            results.append({
-                'experiment': 'Exp3: Layout-Aware',
-                'config': config_name,
-                'error': str(e)
-            })
-    
-    # Print summary table
+                'e2e_time_s': e2e,
+                'success': success,
+                **kwargs,
+            }
+            npu_str = f"{npu_time_us/1000:.2f} ms" if npu_time_us else "N/A"
+            print(f"  NPU={npu_str}  E2E={e2e:.1f}s  {'OK' if success else 'MISMATCH'}")
+        except Exception as exc:
+            e2e = time.time() - start
+            rec = {'experiment': exp_name, 'config': config_name, 'error': str(exc), 'e2e_time_s': e2e}
+            print(f"  FAILED ({exc})")
+        results.append(rec)
+        return rec
+
+    # ------------------------------------------------------------------
+    # Experiment 0: Baseline – everything OFF
+    # ------------------------------------------------------------------
+    print("-"*80)
+    print("Experiment 0: Baseline (all optimizations OFF)")
+    print("-"*80)
+    baseline_rec = _run(
+        'Exp0: Baseline', 'HexKL=OFF, OmniFetch=OFF, VTCM=OFF, Layout=OFF',
+        enable_omnifetch=False, enable_hexkl=False,
+        lookahead=0, adaptive=False,
+        enable_vtcm_tiling=False, enable_layout_aware=False,
+    )
+    baseline_npu = baseline_rec.get('npu_time_us')
+
+    # ------------------------------------------------------------------
+    # Experiment 1: Lookahead sweep (HexKL=ON, OmniFetch=ON, VTCM=ON, Layout=ON)
+    # ------------------------------------------------------------------
+    print("\n" + "-"*80)
+    print("Experiment 1: OmniFetch Lookahead Sweep  (HexKL=ON, VTCM=ON, Layout=ON)")
+    print("-"*80)
+    for lookahead in [0, 1, 2, 4]:
+        for adaptive in [False, True]:
+            _run(
+                'Exp1: Lookahead Sweep',
+                f"Lookahead={lookahead}, Adaptive={'ON' if adaptive else 'OFF'}",
+                enable_omnifetch=True, enable_hexkl=True,
+                lookahead=lookahead, adaptive=adaptive,
+                enable_vtcm_tiling=True, enable_layout_aware=True,
+            )
+
+    # ------------------------------------------------------------------
+    # Experiment 2: OmniFetch × VTCMTiling 2×2 ablation (HexKL=ON)
+    # ------------------------------------------------------------------
+    print("\n" + "-"*80)
+    print("Experiment 2: OmniFetch × VTCMTiling Ablation  (HexKL=ON, Lookahead=2, Adaptive=ON)")
+    print("-"*80)
+    for omnifetch in [False, True]:
+        for vtcm_tiling in [False, True]:
+            _run(
+                'Exp2: OmniFetch×VTCMTiling',
+                f"OmniFetch={'ON' if omnifetch else 'OFF'}, VTCMTiling={'ON' if vtcm_tiling else 'OFF'}",
+                enable_omnifetch=omnifetch, enable_hexkl=True,
+                lookahead=2, adaptive=True,
+                enable_vtcm_tiling=vtcm_tiling, enable_layout_aware=True,
+            )
+
+    # ------------------------------------------------------------------
+    # Experiment 3: Layout-aware on/off (HexKL=ON, OmniFetch=ON, VTCM=ON)
+    # ------------------------------------------------------------------
+    print("\n" + "-"*80)
+    print("Experiment 3: Layout-Aware Comparison  (HexKL=ON, OmniFetch=ON, VTCM=ON)")
+    print("-"*80)
+    for layout_aware in [False, True]:
+        _run(
+            'Exp3: Layout-Aware',
+            f"Layout-Aware={'ON' if layout_aware else 'OFF'}",
+            enable_omnifetch=True, enable_hexkl=True,
+            lookahead=2, adaptive=True,
+            enable_vtcm_tiling=True, enable_layout_aware=layout_aware,
+        )
+
+    # ------------------------------------------------------------------
+    # Experiment 4: Single-pass contribution (add one pass at a time)
+    # ------------------------------------------------------------------
+    print("\n" + "-"*80)
+    print("Experiment 4: Single-Pass Contribution  (incremental stack over Baseline)")
+    print("-"*80)
+    single_pass_configs = [
+        ("HexKL only",
+         dict(enable_omnifetch=False, enable_hexkl=True,  lookahead=0, adaptive=False, enable_vtcm_tiling=False, enable_layout_aware=False)),
+        ("HexKL + VTCM",
+         dict(enable_omnifetch=False, enable_hexkl=True,  lookahead=0, adaptive=False, enable_vtcm_tiling=True,  enable_layout_aware=False)),
+        ("HexKL + OmniFetch (no adaptive)",
+         dict(enable_omnifetch=True,  enable_hexkl=True,  lookahead=2, adaptive=False, enable_vtcm_tiling=False, enable_layout_aware=False)),
+        ("HexKL + OmniFetch + Adaptive",
+         dict(enable_omnifetch=True,  enable_hexkl=True,  lookahead=2, adaptive=True,  enable_vtcm_tiling=False, enable_layout_aware=False)),
+        ("HexKL + OmniFetch + Adaptive + VTCM",
+         dict(enable_omnifetch=True,  enable_hexkl=True,  lookahead=2, adaptive=True,  enable_vtcm_tiling=True,  enable_layout_aware=False)),
+        ("Full Stack (all ON)",
+         dict(enable_omnifetch=True,  enable_hexkl=True,  lookahead=2, adaptive=True,  enable_vtcm_tiling=True,  enable_layout_aware=True)),
+    ]
+    for label, kwargs in single_pass_configs:
+        _run('Exp4: Single-Pass', label, **kwargs)
+
+    # ------------------------------------------------------------------
+    # Summary table with speedup
+    # ------------------------------------------------------------------
     print("\n" + "="*80)
-    print("ABLATION STUDY SUMMARY")
-    print("="*80 + "\n")
-    
-    # Group by experiment
-    for exp_name in ['Exp1: Lookahead Sweep', 'Exp2: OmniFetch×VTCMTiling', 'Exp3: Layout-Aware']:
+    print("ABLATION STUDY SUMMARY  (Speedup = Baseline NPU time / Config NPU time)")
+    print("="*80)
+
+    exp_order = [
+        'Exp0: Baseline',
+        'Exp1: Lookahead Sweep',
+        'Exp2: OmniFetch×VTCMTiling',
+        'Exp3: Layout-Aware',
+        'Exp4: Single-Pass',
+    ]
+
+    for exp_name in exp_order:
         exp_results = [r for r in results if r.get('experiment') == exp_name]
         if not exp_results:
             continue
-            
+
         print(f"\n{exp_name}")
-        print("-" * 80)
-        
-        # Print header
-        print(f"{'Configuration':<50} {'NPU Time (ms)':<15} {'E2E Time (s)':<15} {'Success':<10}")
-        print("-" * 80)
-        
-        # Print rows
+        print("-" * 90)
+        hdr = f"{'Configuration':<55} {'NPU (ms)':<12} {'Speedup':<10} {'E2E (s)':<10} {'OK?'}"
+        print(hdr)
+        print("-" * 90)
+
         for r in exp_results:
             if 'error' in r:
-                print(f"{r['config']:<50} {'ERROR':<15} {'N/A':<15} {'False':<10}")
+                print(f"  {r['config']:<53} {'ERROR':<12} {'N/A':<10} {r.get('e2e_time_s', 0):<10.1f} False")
+                continue
+            npu_ms  = r.get('npu_time_ms')
+            npu_str = f"{npu_ms:.2f}" if npu_ms is not None else "N/A"
+            if baseline_npu and npu_ms is not None:
+                speedup = baseline_npu / (npu_ms * 1000)
+                spd_str = f"{speedup:.2f}x"
             else:
-                npu_time_str = f"{r['npu_time_ms']:.2f}" if r.get('npu_time_ms') else "N/A"
-                e2e_time_str = f"{r['e2e_time_s']:.2f}" if r.get('e2e_time_s') else "N/A"
-                print(f"{r['config']:<50} {npu_time_str:<15} {e2e_time_str:<15} {str(r['success']):<10}")
-    
+                spd_str = "N/A"
+            e2e_str = f"{r['e2e_time_s']:.1f}" if r.get('e2e_time_s') is not None else "N/A"
+            ok_str  = "✓" if r.get('success') else "✗"
+            print(f"  {r['config']:<53} {npu_str:<12} {spd_str:<10} {e2e_str:<10} {ok_str}")
+
+    # Best config per experiment
     print("\n" + "="*80)
-    print("Ablation study complete!")
-    print("\nNote: NPU Time is the actual kernel execution time on Hexagon DSP (from Test_Info).")
-    print("      E2E Time includes compilation, data transfer, and NPU execution.")
+    print("BEST CONFIGURATION PER EXPERIMENT")
+    print("="*80)
+    for exp_name in exp_order[1:]:   # skip baseline itself
+        exp_results = [r for r in results
+                       if r.get('experiment') == exp_name
+                       and r.get('npu_time_us') is not None
+                       and r.get('success')]
+        if not exp_results:
+            continue
+        best = min(exp_results, key=lambda r: r['npu_time_us'])
+        speedup_str = ""
+        if baseline_npu:
+            spd = baseline_npu / best['npu_time_us']
+            speedup_str = f"  →  {spd:.2f}x speedup over baseline"
+        print(f"  {exp_name}: {best['config']}  ({best['npu_time_ms']:.2f} ms){speedup_str}")
+
+    print("\n" + "="*80)
+    print("Notes:")
+    print("  • NPU Time  = actual kernel execution time on Hexagon DSP (from Test_Info Perf field)")
+    print("  • Speedup   = Baseline NPU time / Config NPU time  (>1 means faster than baseline)")
+    print("  • E2E Time  = wall-clock time including compile, data transfer, and NPU execution")
     print("="*80 + "\n")
-    
+
     return results
 
 if __name__ == "__main__":
