@@ -122,10 +122,18 @@ static void addSynchronizationToLoop(scf::ForOp loop, bool enableAdaptive) {
   SmallVector<PrefetchInSituOp> prologuePrefetches = collectProloguePrefetches(loop);
   SmallVector<PrefetchInSituOp> loopBodyPrefetches = collectLoopBodyPrefetches(loop);
 
+  llvm::dbgs() << "[VDAEDecouple]   Found " << prologuePrefetches.size() 
+               << " prologue prefetches\n";
+  llvm::dbgs() << "[VDAEDecouple]   Found " << loopBodyPrefetches.size() 
+               << " loop body prefetches\n";
+
   if (prologuePrefetches.empty() && loopBodyPrefetches.empty()) {
     // No prefetch operations, nothing to synchronize
+    llvm::dbgs() << "[VDAEDecouple]   No prefetch operations, skipping synchronization\n";
     return;
   }
+
+  llvm::dbgs() << "[VDAEDecouple]   Adding synchronization (semaphore + wait/signal)\n";
 
   // Create semaphore before the loop
   builder.setInsertionPoint(loop);
@@ -183,10 +191,19 @@ struct OmniFetchVDAEInsertPass
   void runOnOperation() override {
     auto func = cast<func::FuncOp>(getOperation());
 
+    llvm::dbgs() << "\n[VDAEDecouple] ========== PASS STARTING ==========\n";
+    llvm::dbgs() << "[VDAEDecouple] Function: " << func.getName() << "\n";
+    llvm::dbgs() << "[VDAEDecouple] Options: enableAdaptive=" << enableAdaptive << "\n";
+
+    int loopIdx = 0;
     // Find all loops and add synchronization if they have prefetch operations
     func.walk([&](scf::ForOp loop) {
+      llvm::dbgs() << "\n[VDAEDecouple] --- Processing loop " << loopIdx++ 
+                   << " at " << loop.getLoc() << " ---\n";
       addSynchronizationToLoop(loop, enableAdaptive);
     });
+    
+    llvm::dbgs() << "[VDAEDecouple] ========== PASS COMPLETE ==========\n\n";
   }
 };
 

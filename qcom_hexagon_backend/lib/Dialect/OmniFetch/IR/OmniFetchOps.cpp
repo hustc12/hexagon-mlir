@@ -44,9 +44,12 @@ LogicalResult PrefetchInSituOp::verify() {
   auto srcType = cast<MemRefType>(getSrc().getType());
   auto dstType = cast<MemRefType>(getDest().getType());
 
-  // dest must reside in address space 1 (VTCM)
-  if (dstType.getMemorySpaceAsInt() != 1)
-    return emitOpError("dest memref must be in VTCM (address space 1)");
+  // dest must reside in address space 0 (DDR/heap via malloc) or 1 (VTCM).
+  // Address space 0 is used when true VTCM allocation is not yet available;
+  // the prefetch still performs a useful DDR→DDR copy for software pipelining.
+  int destAS = dstType.getMemorySpaceAsInt();
+  if (destAS != 0 && destAS != 1)
+    return emitOpError("dest memref must be in DDR (address space 0) or VTCM (address space 1)");
 
   // Element types must match
   if (srcType.getElementType() != dstType.getElementType())
