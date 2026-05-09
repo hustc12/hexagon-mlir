@@ -195,10 +195,9 @@ static Value buildTileSubview(OpBuilder &builder, Location loc, Value base,
   SmallVector<OpFoldResult> strides(rank, builder.getIndexAttr(1));
 
   // Outer dim: offset = iter * tileSize, size = tileSize
-  offsets[0] = builder.create<arith::MulIOp>(
-      loc, iterVal,
-      builder.create<arith::ConstantIndexOp>(loc, tileSize).getResult())
-      .getResult();
+  Value tileSizeVal = builder.create<arith::ConstantIndexOp>(loc, tileSize);
+  Value offsetVal = builder.create<arith::MulIOp>(loc, iterVal, tileSizeVal);
+  offsets[0] = offsetVal;
   sizes[0] = builder.getIndexAttr(tileSize);
 
   // Inner dims: full extent
@@ -252,37 +251,39 @@ static void transformLoop(scf::ForOp loop, int lookahead, bool enableAdaptive,
   Location loc = loop.getLoc();
   MLIRContext *ctx = loop.getContext();
 
+  llvm::errs() << "\n[VDAEInsert] transformLoop: lookahead=" << lookahead 
+               << " adaptive=" << enableAdaptive 
+               << " layoutAware=" << enableLayoutAware << "\n";
+
   // ----- Collect DDR inputs -----------------------------------------------
   SmallVector<Value> ddrInputs = collectDDRInputs(loop);
   
-  DBG("Checking loop at " << loc);
-  DBG("  Found " << ddrInputs.size() << " DDR inputs");
+  llvm::errs() << "[VDAEInsert]   Found " << ddrInputs.size() << " DDR inputs\n";
   
   // RELAXED CONDITION: If no DDR inputs, try all memref inputs.
   // This handles cases where bufferization allocated everything to VTCM.
   if (ddrInputs.empty()) {
-    DBG("  No DDR inputs found, trying all memref inputs...");
+    llvm::errs() << "[VDAEInsert]   No DDR inputs, trying all memref inputs...\n";
     ddrInputs = collectAllMemrefInputs(loop);
-    DBG("  Found " << ddrInputs.size() << " total memref inputs");
+    llvm::errs() << "[VDAEInsert]   Found " << ddrInputs.size() << " total memref inputs\n";
     
     if (!ddrInputs.empty()) {
       // Print their address spaces for debugging
       for (Value input : ddrInputs) {
         auto memTy = cast<MemRefType>(input.getType());
         int memSpace = memTy.getMemorySpaceAsInt();
-        DBG("    Using memref with address space " << memSpace 
-            << " (0=DDR, 1=VTCM, 2=Other)");
+        llvm::errs() << "[VDAEInsert]     Using memref with address space " << memSpace 
+                     << " (0=DDR, 1=VTCM, 2=Other)\n";
       }
     }
   }
   
   if (ddrInputs.empty()) {
-    DBG("  → No memref inputs found at all, skipping loop");
+    llvm::errs() << "[VDAEInsert]   → No memref inputs found, skipping loop\n";
     return;
   }
 
-  DBG("transforming loop at " << loc << " with " << ddrInputs.size()
-                               << " inputs");
+  llvm::errs() << "[VDAEInsert]   Transforming loop with " << ddrInputs.size() << " inputs\n";
 
   // ----- Create semaphore -------------------------------------------------
   Value sem = builder.create<CreateSemOp>(loc,
@@ -299,9 +300,11 @@ static void transformLoop(scf::ForOp loop, int lookahead, bool enableAdaptive,
   for (Value src : ddrInputs) {
     auto srcType = cast<MemRefType>(src.getType());
     if (srcType.getRank() < 1 || srcType.getShape()[0] < kTileSize) {
-      DBG("skipping small/scalar DDR input");
+      llvm::errs() << "[VDAEInsert]     Skipping small/scalar input\n";
       continue;
     }
+
+    llvm::errs() << "[VDAEInsert]     Processing input with shape rank=" << srcType.getRank() << "\n";
 
     // Allocate VTCM shadow tile (2x for double-buffering)
     Value vtcmTile = allocateVTCMTile(builder, loc, src, kTileSize * 2);
@@ -309,10 +312,14 @@ static void transformLoop(scf::ForOp loop, int lookahead, bool enableAdaptive,
 
     LayoutTransform lt = enableLayoutAware ? inferLayoutTransform(src, loop)
                                            : LayoutTransform::None;
+    llvm::errs() << "[VDAEInsert]     Layout transform: " << (int)lt << "\n";
+    
     // Compute static index map for this layout transform
     auto vtcmTileType = cast<MemRefType>(vtcmTile.getType());
     SmallVector<int32_t> idxMapVec =
         computeHMXIndexMap(ctx, srcType, vtcmTileType, lt);
+
+    llvm::errs() << "[VDAEInsert]     Index map size: " << idxMapVec.size() << "\n";
 
     // Prologue: prefetch tile 0
     Value iterZero = loop.getLowerBound();
@@ -324,10 +331,12 @@ static void transformLoop(scf::ForOp loop, int lookahead, bool enableAdaptive,
         idxMapVec.empty() ? DenseI32ArrayAttr{}
                           : DenseI32ArrayAttr::get(ctx, idxMapVec));
     (void)prefetchOp;
+    llvm::errs() << "[VDAEInsert]     Created prologue prefetch\n";
   }
 
   // Signal after prologue prefetches
   builder.create<SignalOp>(loc, sem);
+  llvm::errs() << "[VDAEInsert]   Prologue complete, inserted signal\n";
 
   // ----- Rewrite loop body ------------------------------------------------
   // We insert:
@@ -341,6 +350,7 @@ static void transformLoop(scf::ForOp loop, int lookahead, bool enableAdaptive,
     OpBuilder::InsertionGuard g(builder);
     builder.setInsertionPointToStart(body);
     builder.create<WaitOp>(loc, sem);
+    llvm::errs() << "[VDAEInsert]   Inserted wait at loop body start\n";
   }
 
   // Insert prefetch + signal + adaptive at the bottom (before yield).
@@ -352,9 +362,10 @@ static void transformLoop(scf::ForOp loop, int lookahead, bool enableAdaptive,
     // next iteration index: iv + step * lookahead
     Value step = loop.getStep();
     Value kVal = builder.create<arith::ConstantIndexOp>(loc, lookahead);
-    Value nextIter = builder.create<arith::AddIOp>(
-        loc, iv,
-        builder.create<arith::MulIOp>(loc, step, kVal).getResult());
+    Value stepTimesK = builder.create<arith::MulIOp>(loc, step, kVal);
+    Value nextIter = builder.create<arith::AddIOp>(loc, iv, stepTimesK);
+    
+    llvm::errs() << "[VDAEInsert]   Computing next iteration index (iv + step * " << lookahead << ")\n";
 
     for (size_t i = 0; i < vtcmTiles.size(); ++i) {
       Value src = ddrInputs[i];
@@ -393,10 +404,11 @@ static void transformLoop(scf::ForOp loop, int lookahead, bool enableAdaptive,
       Value initDist =
           builder.create<arith::ConstantIntOp>(loc, (int64_t)lookahead, 32u);
       builder.create<AdaptiveControlOp>(loc, builder.getI32Type(), initDist);
+      llvm::errs() << "[VDAEInsert]   Inserted adaptive control\n";
     }
   }
 
-  DBG("V-DAE transformation complete for loop");
+  llvm::errs() << "[VDAEInsert] V-DAE transformation complete for loop\n";
 }
 
 //===----------------------------------------------------------------------===//
@@ -413,16 +425,43 @@ struct OmniFetchVDAEInsertPass
     auto func = cast<func::FuncOp>(getOperation());
     SmallVector<scf::ForOp> candidates;
 
+    llvm::errs() << "\n[VDAEInsert] === Pass Running ===\n";
+    llvm::errs() << "[VDAEInsert] Function: " << func.getName() << "\n";
+    llvm::errs() << "[VDAEInsert] lookahead=" << lookahead 
+                 << " enableAdaptive=" << enableAdaptive
+                 << " enableLayoutAware=" << enableLayoutAware << "\n";
+    
+    int totalLoops = 0;
+    int innermostLoops = 0;
+    int loopsWithHMX = 0;
+
     func.walk([&](scf::ForOp loop) {
+      totalLoops++;
       // Only transform inner-most loops (no nested for ops) with HMX compute.
       bool hasNestedFor = false;
       loop.getBody()->walk([&](scf::ForOp) { hasNestedFor = true; });
-      if (!hasNestedFor && containsHMXCompute(loop))
-        candidates.push_back(loop);
+      
+      if (!hasNestedFor) {
+        innermostLoops++;
+        bool hasHMX = containsHMXCompute(loop);
+        llvm::errs() << "[VDAEInsert]   Innermost loop: hasHMX=" << hasHMX << "\n";
+        
+        if (hasHMX) {
+          loopsWithHMX++;
+          candidates.push_back(loop);
+        }
+      }
     });
+
+    llvm::errs() << "[VDAEInsert] Found " << totalLoops << " total loops, " 
+                 << innermostLoops << " innermost, " 
+                 << loopsWithHMX << " with HMX compute\n";
+    llvm::errs() << "[VDAEInsert] Transforming " << candidates.size() << " candidate loops\n";
 
     for (auto loop : candidates)
       transformLoop(loop, lookahead, enableAdaptive, enableLayoutAware);
+    
+    llvm::errs() << "[VDAEInsert] === Pass Complete ===\n\n";
   }
 };
 

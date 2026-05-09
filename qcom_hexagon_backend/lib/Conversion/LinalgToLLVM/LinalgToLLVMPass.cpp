@@ -79,6 +79,14 @@ public:
   }
 
   void runOnOperation() override {
+    llvm::errs() << "\n[LinalgToLLVM] ========== Pass Starting ==========\n";
+    llvm::errs() << "[LinalgToLLVM] enableOmniFetchVDAE = " << enableOmniFetchVDAE << "\n";
+    llvm::errs() << "[LinalgToLLVM] enableHexKL = " << enableHexKL << "\n";
+    llvm::errs() << "[LinalgToLLVM] omniFetchLookahead = " << omniFetchLookahead << "\n";
+    llvm::errs() << "[LinalgToLLVM] enableOmniFetchAdaptive = " << enableOmniFetchAdaptive << "\n";
+    llvm::errs() << "[LinalgToLLVM] enableOmniFetchLayoutAware = " << enableOmniFetchLayoutAware << "\n";
+    llvm::errs() << "[LinalgToLLVM] ==========================================\n\n";
+    
     auto moduleOp = getOperation();
     MLIRContext *context = moduleOp.getContext();
 
@@ -360,10 +368,17 @@ public:
     // Runs after HMX decomposition (if enabled) so that `hexkl` micro-ops are visible
     // for pattern matching. Also works with HVX-only code (without HexKL).
     // Inserts layout-aware prefetch + semaphore sync.
-    if (enableOmniFetchVDAE)
+    if (enableOmniFetchVDAE) {
       pm.addNestedPass<func::FuncOp>(
           hexagon::createOmniFetchVDAEInsertPass(
               setOmniFetchVDAE(OmniFetchVDAEInsertOptions{})));
+      
+      // Dump IR after V-DAE pass for debugging
+      if (mlir::hexagon::isEnvTrue("DUMP_AFTER_VDAE")) {
+        pm.addPass(createCanonicalizerPass());
+        // The IR will be printed by the pass manager's IR printing callback
+      }
+    }
 
     // Lower linalg ops with library_call attribute set to custom fns.
     pm.addPass(createHexagonReplaceWithLibraryCallsPass());

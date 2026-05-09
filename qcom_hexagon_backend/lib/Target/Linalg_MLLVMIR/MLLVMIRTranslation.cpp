@@ -55,6 +55,13 @@ void setLinalgToLLVMOptions(
     mlir::hexagon::LinalgToLLVMOptions &options,
     const std::unordered_map<std::string, std::string> &arch_kwargs) {
 
+  // Debug: print all options from Python
+  llvm::errs() << "\n[setLinalgToLLVMOptions] Received options from Python:\n";
+  for (const auto &kv : arch_kwargs) {
+    llvm::errs() << "  " << kv.first << " = " << kv.second << "\n";
+  }
+  llvm::errs() << "\n";
+
   // Note: seems very counter-intuitive due to the fact that compare() returns 0
   // when the strings are actually equal, which is why we negate it to convert
   // it to a boolean.
@@ -95,6 +102,15 @@ void setLinalgToLLVMOptions(
       !arch_kwargs.at("enableVectorization").compare(TRUE);
   options.enableHVXInlining =
       !arch_kwargs.at("enableHVXInlining").compare(TRUE);
+  
+  // OmniFetch V-DAE options
+  options.enableOmniFetchVDAE =
+      !arch_kwargs.at("enableOmniFetchVDAE").compare(TRUE);
+  options.omniFetchLookahead = std::stoi(arch_kwargs.at("omniFetchLookahead"));
+  options.enableOmniFetchAdaptive =
+      !arch_kwargs.at("enableOmniFetchAdaptive").compare(TRUE);
+  options.enableOmniFetchLayoutAware =
+      !arch_kwargs.at("enableOmniFetchLayoutAware").compare(TRUE);
 }
 
 namespace mlir {

@@ -179,24 +179,34 @@ SmallVector<int32_t>
 mlir::omni_fetch::computeHMXIndexMap(MLIRContext * /*ctx*/,
                                      MemRefType srcType, MemRefType dstType,
                                      LayoutTransform transform) {
-  ArrayRef<int64_t> srcShape = srcType.getShape();
+  // CRITICAL FIX: Use dstType (VTCM tile) shape for index_map size,
+  // not srcType (full DDR tensor) shape!
+  // The index_map must have one entry per element in the destination tile.
+  ArrayRef<int64_t> dstShape = dstType.getShape();
+  
+  DBG("computeHMXIndexMap: transform=" << (int)transform);
+  DBG("  srcShape: rank=" << srcType.getRank());
+  DBG("  dstShape: rank=" << dstType.getRank());
 
   switch (transform) {
   case LayoutTransform::None: {
     // Identity map: dest[i] = src[i]
     int64_t n = 1;
-    for (auto d : dstType.getShape())
+    for (auto d : dstShape)
       n *= d;
     SmallVector<int32_t> id;
     id.reserve(n);
     for (int32_t i = 0; i < (int32_t)n; ++i)
       id.push_back(i);
+    DBG("  Identity map size: " << id.size());
     return id;
   }
   case LayoutTransform::HMXWeight:
-    return computeHMXWeightMap(srcShape);
+    // Use destination tile shape for map computation
+    return computeHMXWeightMap(dstShape);
   case LayoutTransform::HMXActivation:
-    return computeHMXActivationMap(srcShape);
+    // Use destination tile shape for map computation
+    return computeHMXActivationMap(dstShape);
   case LayoutTransform::Custom:
     // For Custom, the caller supplies the index_map directly.
     return {};
