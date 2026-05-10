@@ -552,9 +552,13 @@ def gpt2lmheadmodel_quantized(
     options["enableHexKL"] = effective_enable_hexkl
     options["enableVTCMTiling"] = enable_vtcm_tiling
     options["enableConvertToHexagonmem"] = enable_convert_to_hexagonmem
-    options["enableOmniFetchVDAE"] = enable_omnifetch_vdae
+    # Omni-Fetch Plan-A: three independent components.
+    # enablePrefetch is the base; enableOmniFetchVDAE is Component 3.
+    # Enabling V-DAE automatically implies Prefetch is needed.
+    options["enablePrefetch"] = enable_omnifetch_vdae  # V-DAE requires Prefetch
     options["enableOmniFetchLayoutAware"] = enable_omnifetch_layout_aware
     options["omniFetchLookahead"] = omnifetch_lookahead
+    options["enableOmniFetchVDAE"] = enable_omnifetch_vdae
     options["enableOmniFetchAdaptive"] = enable_omnifetch_adaptive
     if enablelwp:
         options["enableLWP"] = True

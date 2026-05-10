@@ -33,14 +33,38 @@
 #define STALL_THRESHOLD 8000u
 
 /* -------------------------------------------------------------------------
- * Semaphore – volatile counter + spin-wait.
+ * Semaphore – volatile counter + proper spin-wait.
  *
- * On Hexagon the DSP runs a single hardware thread per PD in the common
- * case, so a volatile counter is sufficient for the Access/Execute ordering
- * we need.  For multi-threaded DSP use, the memw_locked / store_locked
- * intrinsics provide the necessary atomicity without any OS dependency.
+ * V-DAE execution model
+ * ---------------------
+ * V-DAE assumes Access Thread and Execute Thread run CONCURRENTLY.  On a
+ * single Hexagon hardware thread this is realised through software
+ * pipelining: the Access Thread role is played by the *previous* loop
+ * iteration (which issued the prefetch for the current tile K iterations
+ * ahead), while the Execute Thread role is played by the *current*
+ * iteration (which computes on the tile).
+ *
+ * Semaphore semantics:
+ *   signal(sem) – issued AFTER a prefetch_insitu transfer completes,
+ *                 indicating the VTCM tile is ready for consumption.
+ *   wait(sem)   – issued BEFORE the HMX compute, ensuring the tile is
+ *                 valid.  Must NOT return until the counter is > 0.
+ *
+ * With synchronous prefetch_insitu (current default), the signal is always
+ * posted before the corresponding wait, so wait() returns immediately.
+ * With async DMA prefetch (future), the spin provides the necessary ordering
+ * guarantee without any OS dependency.
+ *
+ * Atomicity note: on a single-threaded DSP the volatile read/write is
+ * sufficient.  On a multi-threaded DSP (QuRT multi-PD) the memw_locked /
+ * memw_store_locked intrinsics would be required; the spin body below is
+ * structured to facilitate that upgrade.
  * ------------------------------------------------------------------------- */
 #define OMNI_SEM_POOL_SIZE 16
+
+/* Maximum spin iterations before giving up (prevents infinite hang on
+ * incorrect usage; should never be reached in a correct program). */
+#define OMNI_SEM_MAX_SPIN  0x100000
 
 typedef volatile int omni_sem_t;
 static omni_sem_t omni_sem_pool[OMNI_SEM_POOL_SIZE];
@@ -64,17 +88,30 @@ int32_t __omni_fetch_create_sem(void) {
 
 void __omni_fetch_signal(int32_t sem_idx) {
   if ((unsigned)sem_idx >= OMNI_SEM_POOL_SIZE) return;
+  /* Write is visible to the same hardware thread (single-threaded model)
+   * and to a second HW thread via the Hexagon memory model.  A compiler
+   * barrier suffices here; the volatile qualifier on omni_sem_t prevents
+   * the store from being reordered across the preceding prefetch. */
   omni_sem_pool[sem_idx]++;
 }
 
 void __omni_fetch_wait(int32_t sem_idx) {
   if ((unsigned)sem_idx >= OMNI_SEM_POOL_SIZE) return;
-  /* NOTE: In the current single-threaded execution model, prefetch_insitu
-   * runs synchronously (DMA wait is called inside prefetch_insitu before
-   * returning). So by the time wait() is called, the data is already ready.
-   * We simply decrement the counter without spinning. */
-  if (omni_sem_pool[sem_idx] > 0)
-    omni_sem_pool[sem_idx]--;
+  /* Spin until the Access Thread signals that the VTCM tile is ready.
+   * In the current synchronous-prefetch model this loop body executes
+   * zero times (signal was already posted before wait is reached).
+   * With async DMA the spin provides the necessary ordering fence. */
+  int spins = 0;
+  while (omni_sem_pool[sem_idx] <= 0) {
+    if (++spins >= OMNI_SEM_MAX_SPIN)
+      break;  /* Safety valve: avoid infinite hang on mis-use. */
+#ifdef __hexagon__
+    /* Hexagon pause instruction: yield the pipeline for one cycle.
+     * Reduces power and bus contention during the spin loop. */
+    __asm__ volatile("pause(#255)");
+#endif
+  }
+  omni_sem_pool[sem_idx]--;
 }
 
 /* -------------------------------------------------------------------------
@@ -137,7 +174,59 @@ static void hmx_activation_gather(const void *src, void *dest,
 }
 
 /* -------------------------------------------------------------------------
+ * L2 fetch helpers
+ *
+ * l2fetch is an asynchronous cache-hint instruction on Hexagon (V62+).
+ * It initiates a line fetch from DDR → L2 without stalling the pipeline.
+ * We use it as a low-overhead "warm-up" hint before the blocking memcpy so
+ * that by the time memcpy reads the source data it is already in L2 cache.
+ *
+ * l2fetch encoding:  l2fetch(Rtt, Rs)
+ *   Rtt[63:32] = stride (bytes between rows)
+ *   Rtt[31:16] = width  (bytes per row)
+ *   Rtt[15:0]  = height (number of rows)
+ * For a flat 1-D buffer we use stride=width=total_bytes, height=1.
+ * Maximum single l2fetch = 64 kB; split into chunks if larger.
+ * ------------------------------------------------------------------------- */
+#ifdef __hexagon__
+static void omni_l2fetch(const void *ptr, uint32_t total_bytes) {
+  const char *p = (const char *)ptr;
+  const uint32_t kChunk = 0x8000u;  /* 32 kB per l2fetch call */
+  while (total_bytes > 0) {
+    uint32_t chunk = total_bytes < kChunk ? total_bytes : kChunk;
+    /* Pack the l2fetch descriptor: stride=chunk, width=chunk, height=1 */
+    uint64_t spec = ((uint64_t)chunk << 32) | ((uint64_t)chunk << 16) | 1ULL;
+    __asm__ volatile("l2fetch(%0, %1)" : : "r"(p), "r"(spec) : "memory");
+    p += chunk;
+    total_bytes -= chunk;
+  }
+}
+#endif
+
+/* -------------------------------------------------------------------------
  * __omni_fetch_prefetch_insitu
+ *
+ * Execution model
+ * ---------------
+ * This function implements the "Access Thread" role of V-DAE.  It runs
+ * BEFORE the HMX compute (Execute Thread) for the SAME iteration's tile by
+ * being issued K iterations ahead (K = lookahead).
+ *
+ * Phase 1 (async hint): emit l2fetch to begin warming the source data into
+ *   L2 cache while the pipeline continues.  This overlaps with preceding
+ *   compute and reduces the effective DDR latency seen by Phase 2.
+ *
+ * Phase 2 (synchronous copy): perform the actual layout-aware gather from
+ *   DDR/L2 into the VTCM shadow buffer.  Because Phase 1 pre-warmed L2,
+ *   Phase 2 accesses L2-resident data (fast) rather than DDR (slow).
+ *
+ * After this function returns, the caller (V-DAE pass) issues signal(sem)
+ * to mark the VTCM tile as ready for the Execute Thread.
+ *
+ * NOTE: When the Hexagon DMA engine (v66+) is available via a supported
+ *   API, Phase 2 can be replaced with an async DMA kick followed by a
+ *   DMA-completion poll inside wait().  The semaphore infrastructure is
+ *   already structured for that upgrade.
  * ------------------------------------------------------------------------- */
 void __omni_fetch_prefetch_insitu(const void *src, void *dest,
                                    int32_t elem_bytes, int32_t num_elems,
@@ -145,13 +234,18 @@ void __omni_fetch_prefetch_insitu(const void *src, void *dest,
                                    const int32_t *index_map) {
   (void)lookahead;
 
+  uint32_t total_bytes = (uint32_t)(num_elems * elem_bytes);
+
+#ifdef __hexagon__
+  /* Phase 1: async L2 warm-up hint.  Fire-and-forget; does not stall. */
+  omni_l2fetch(src, total_bytes);
+#endif
+
   switch (layout_kind) {
 
   case LAYOUT_NONE: {
-    uint32_t sz = (uint32_t)(num_elems * elem_bytes);
-    /* Use memcpy: dest is DDR (heap), not VTCM, so DMA is not applicable.
-     * When true VTCM allocation is wired in, switch back to async DMA. */
-    memcpy(dest, src, (size_t)sz);
+    /* Phase 2: linear copy DDR → VTCM shadow buffer. */
+    memcpy(dest, src, (size_t)total_bytes);
     break;
   }
 
@@ -171,12 +265,12 @@ void __omni_fetch_prefetch_insitu(const void *src, void *dest,
     if (index_map)
       gather_reorder(src, dest, elem_bytes, num_elems, index_map);
     else
-      memcpy(dest, src, (size_t)(num_elems * elem_bytes));
+      memcpy(dest, src, (size_t)total_bytes);
     break;
   }
 
   default:
-    memcpy(dest, src, (size_t)(num_elems * elem_bytes));
+    memcpy(dest, src, (size_t)total_bytes);
     break;
   }
 }

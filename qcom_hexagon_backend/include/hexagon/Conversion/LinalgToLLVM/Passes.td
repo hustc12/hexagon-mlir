@@ -88,15 +88,22 @@ def LinalgToLLVM : Pass<"linalg-to-llvm", "mlir::ModuleOp"> {
     Option<"enableHexKL", "enable-hexkl", "bool",
           /*default=*/"false",
           "Enable linalg matmul to hexkl dialect lowering">,
-    Option<"enableOmniFetchVDAE", "enable-omnifetch-vdae", "bool",
+    // Omni-Fetch: Plan-A three independent components -----------------------
+    // Component 1: Prefetch insertion (base component; required by 2 & 3)
+    Option<"enablePrefetch", "enable-prefetch", "bool",
           /*default=*/"false",
-          "Enable Omni-Fetch V-DAE prefetch insertion pass">,
+          "Insert omni_fetch.prefetch_in_situ ops (base Omni-Fetch component)">,
+    // Component 2: In-Situ Reshape (requires enablePrefetch)
     Option<"enableOmniFetchLayoutAware", "enable-omnifetch-layout-aware", "bool",
           /*default=*/"true",
-          "Enable layout-aware in-situ prefetch mapping (for ablation, disable to use linear prefetch)">,
+          "Enable layout-aware in-situ prefetch mapping; requires enablePrefetch">,
     Option<"omniFetchLookahead", "omnifetch-lookahead", "int",
           /*default=*/"2",
-          "Static look-ahead distance for Omni-Fetch V-DAE prefetching">,
+          "Static look-ahead distance for Omni-Fetch prefetching">,
+    // Component 3: V-DAE (requires enablePrefetch)
+    Option<"enableOmniFetchVDAE", "enable-omnifetch-vdae", "bool",
+          /*default=*/"false",
+          "Decouple Access/Execute with semaphores (V-DAE); requires enablePrefetch">,
     Option<"enableOmniFetchAdaptive", "enable-omnifetch-adaptive", "bool",
           /*default=*/"true",
           "Enable adaptive PMU-driven prefetch distance updates">,

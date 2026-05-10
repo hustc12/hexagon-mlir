@@ -253,12 +253,18 @@ static Value buildTileSubview(OpBuilder &builder, Location loc, Value base,
       loc, cast<MemRefType>(subviewType), base, offsets, sizes, strides);
 }
 
-/// Allocate a one-tile buffer for prefetching.
-/// Uses address space 0 (DDR/heap) because memref::AllocOp does not map
-/// to VTCM – true VTCM allocation requires the VTCMPool runtime API which
-/// is not yet wired into the compiler-generated alloc path.
-/// The prefetch will perform a DDR→DDR copy (still useful for hiding latency
-/// via software pipelining, and correct for layout transformation).
+/// Allocate a one-tile buffer for prefetching in VTCM (address space 1).
+///
+/// Using address space 1 (VTCM) is the correct choice because:
+///  - The downstream `hexagonmem::createConvertToHexagonmemPass()` converts
+///    `memref.alloc(addrspace=1)` → `hexagonmem.alloc`, which at runtime is
+///    served by the existing VTCMPool (HAP_compute_res_acquire).  This is
+///    preferable to a separate VTCMPool instantiation: it prevents VTCM
+///    fragmentation and respects the single system-wide VTCM budget.
+///  - Data in true VTCM is accessible to HMX/HVX without any L2 cache miss.
+///  - When `enableConvertToHexagonmem=false` the alloc still compiles safely
+///    (it will fall back to malloc on the DSP heap, which is a correct but
+///    slower execution path).
 static Value allocateVTCMTile(OpBuilder &builder, Location loc, Value src,
                               int64_t tileSize) {
   auto srcType = cast<MemRefType>(src.getType());
@@ -269,13 +275,13 @@ static Value allocateVTCMTile(OpBuilder &builder, Location loc, Value src,
   for (int64_t i = 1; i < srcType.getRank(); ++i)
     tileShape.push_back(srcType.getShape()[i]);
 
-  // Address space 0 = DDR (heap). AllocOp lowers to malloc which is safe.
-  // TODO: switch to VTCM once VTCMPool alloc is exposed to the compiler.
+  // Address space 1 = VTCM.  The hexagonmem pipeline converts this alloc to
+  // a VTCMPool allocation at runtime (via hexagonmem::createConvertToHexagonmemPass).
   auto tileMemref = MemRefType::get(
       tileShape, srcType.getElementType(),
       /*layout=*/MemRefLayoutAttrInterface{},
       /*memorySpace=*/IntegerAttr::get(
-          IntegerType::get(builder.getContext(), 64), 0));
+          IntegerType::get(builder.getContext(), 64), 1));
 
   return builder.create<memref::AllocOp>(loc, tileMemref);
 }
@@ -323,10 +329,11 @@ static void insertPrefetchForLoop(scf::ForOp loop, int lookahead,
   const int64_t kMaxTileSize = 32;  // Maximum tile size (one HMX tile)
   const int64_t kMinTileSize = 8;   // Minimum tile size (increased from 4 to avoid too small tiles)
   
-  // VTCM budget management: limit total allocation to avoid OOM on DSP heap.
-  // DSP heap is limited; keep total prefetch buffers small.
-  // Each tile is allocated 2x (double-buffering), so budget = max single alloc.
-  const int64_t kMaxVTCMBytes = 64 * 1024;  // 64 KB total across all loops
+  // VTCM budget management: limit total allocation to avoid exhausting VTCM.
+  // Hexagon V73/V75 provides ~8 MB of VTCM, but the existing tensor pipeline
+  // already occupies most of it.  Reserve at most 256 KB for prefetch shadow
+  // tiles; the remainder stays available for the main tensor buffers.
+  const int64_t kMaxVTCMBytes = 256 * 1024;  // 256 KB budget for prefetch tiles
   int64_t vtcmUsed = 0;
 
   // For each DDR input, insert prefetch operations

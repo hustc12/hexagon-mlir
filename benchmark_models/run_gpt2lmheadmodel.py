@@ -141,9 +141,11 @@ def gpt2lmheadmodel(
     options["enableHexKL"] = enable_hexkl
     options["enableVTCMTiling"] = enable_vtcm_tiling
     options["enableConvertToHexagonmem"] = enable_convert_to_hexagonmem
-    options["enableOmniFetchVDAE"] = enable_omnifetch_vdae
+    # Omni-Fetch Plan-A: V-DAE (Component 3) implies Prefetch (Component 1).
+    options["enablePrefetch"] = enable_omnifetch_vdae
     options["enableOmniFetchLayoutAware"] = enable_omnifetch_layout_aware
     options["omniFetchLookahead"] = omnifetch_lookahead
+    options["enableOmniFetchVDAE"] = enable_omnifetch_vdae
     options["enableOmniFetchAdaptive"] = enable_omnifetch_adaptive
     if enablelwp:
         options['enableLWP'] = True

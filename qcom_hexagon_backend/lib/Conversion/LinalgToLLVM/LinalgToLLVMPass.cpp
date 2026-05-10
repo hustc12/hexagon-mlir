@@ -261,16 +261,50 @@ public:
 
     pm.addNestedPass<func::FuncOp>(createDecomposeTensorConcatPass());
 
-    // VTCMTiling conflicts with OmniFetch: VTCMTiling moves data to VTCM early,
-    // so V-DAE pass can't find DDR inputs and won't insert prefetch.
-    // When OmniFetch is enabled, skip VTCMTiling and let OmniFetch handle data movement.
-    if (enableVTCMTiling && !enableOmniFetchVDAE) {
+    // -----------------------------------------------------------------------
+    // Plan-A Omni-Fetch dependency / safety checks
+    // -----------------------------------------------------------------------
+    // Verify legal combinations and emit diagnostics.  We use mlir::emitWarning
+    // on the module location so the message reaches the user regardless of
+    // whether DEBUG builds are enabled.
+    {
+      bool anyOmniFetch = enablePrefetch || enableOmniFetchVDAE ||
+                          (enableOmniFetchLayoutAware && enablePrefetch);
+      (void)anyOmniFetch;
+
+      // In-Situ Reshape (Layout-Aware) depends on Prefetch.
+      if (enableOmniFetchLayoutAware && !enablePrefetch) {
+        moduleOp->emitWarning(
+            "[OmniFetch] enableOmniFetchLayoutAware=true but enablePrefetch=false: "
+            "In-Situ Reshape requires Prefetch; LayoutOpsElimination will find "
+            "no prefetch_in_situ ops and will be a no-op.");
+      }
+      // V-DAE depends on Prefetch.
+      if (enableOmniFetchVDAE && !enablePrefetch) {
+        moduleOp->emitWarning(
+            "[OmniFetch] enableOmniFetchVDAE=true but enablePrefetch=false: "
+            "V-DAE requires Prefetch ops to synchronize; pass will be a no-op.");
+      }
+      // Prefetch without V-DAE is unsafe (no synchronization).
+      if (enablePrefetch && !enableOmniFetchVDAE) {
+        moduleOp->emitWarning(
+            "[OmniFetch] enablePrefetch=true but enableOmniFetchVDAE=false: "
+            "Prefetch without V-DAE semaphore synchronization is unsafe "
+            "(Execute Thread may observe partially-loaded VTCM tiles).");
+      }
+    }
+
+    // VTCMTiling conflicts with Omni-Fetch: VTCMTiling moves data to VTCM
+    // early, so PrefetchInsertPass can't find DDR inputs in address space 0.
+    // Disable VTCMTiling whenever any Omni-Fetch component is active.
+    const bool anyOmniFetchActive = enablePrefetch || enableOmniFetchVDAE;
+    if (enableVTCMTiling && !anyOmniFetchActive) {
       pm.addNestedPass<func::FuncOp>(
           createVTCMTilingPass(setVTCMTiling(VTCMTilingOptions{})));
       pm.addPass(createCanonicalizerPass());
-    } else if (enableOmniFetchVDAE) {
-      // OmniFetch enabled: VTCMTiling is disabled to allow V-DAE to see DDR inputs
-      LLVM_DEBUG(llvm::dbgs() << "[LinalgToLLVM] OmniFetch enabled, skipping VTCMTiling\n");
+    } else if (anyOmniFetchActive) {
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[LinalgToLLVM] OmniFetch active, skipping VTCMTiling\n");
     }
 
     if (enableMultiThreading) {
@@ -363,47 +397,43 @@ public:
     if (enableHexKL)
       pm.addNestedPass<func::FuncOp>(createDecomposeHexKLMatmulPass());
 
-    // ===== Omni-Fetch: 3-component architecture =====
-    // Component 1: Prefetch (independent)
-    // Component 2: In-Situ Reshape + Layout Ops Elimination (bound together)
-    // Component 3: V-DAE (independent)
-    
-    // Component 1: Prefetch insertion
-    // Inserts prefetch operations to preload data from DDR to VTCM.
-    // Can optionally perform in-situ layout transformation during prefetch.
-    if (enableOmniFetchVDAE) {
-      // Note: Currently prefetch is controlled by enableOmniFetchVDAE
-      // TODO: Add separate enablePrefetch option
+    // ===== Omni-Fetch: Plan-A 3-component architecture =====
+    //
+    //  Component 1 – Prefetch Insertion   (gate: enablePrefetch)
+    //  Component 2 – In-Situ Reshape      (gate: enablePrefetch && enableOmniFetchLayoutAware)
+    //                Layout Ops Elim      (gate: enablePrefetch && enableOmniFetchLayoutAware)
+    //  Component 3 – V-DAE Decouple       (gate: enableOmniFetchVDAE)
+    //
+    // OmniFetchToLLVM lowers all omni_fetch dialect ops.  It must run whenever
+    // any component has emitted such ops (i.e. whenever enablePrefetch is true).
+
+    // --- Component 1: Prefetch Insertion ---
+    if (enablePrefetch) {
       auto prefetchOptions = PrefetchInsertOptions{};
       prefetchOptions.lookahead = omniFetchLookahead;
+      // Layout-aware flag controls in-situ reshape during prefetch.
       prefetchOptions.enableLayoutAware = enableOmniFetchLayoutAware;
-      
       pm.addNestedPass<func::FuncOp>(
           hexagon::createPrefetchInsertPass(prefetchOptions));
+      pm.addPass(createCanonicalizerPass());
     }
 
-    // Component 2: Layout Ops Elimination (bound to In-Situ Reshape)
-    // Eliminates redundant layout ops when in-situ reshape is enabled.
-    // This pass detects prefetch_in_situ operations and removes redundant
-    // transpose/permute/slice ops that are now performed by hardware.
-    if (enableOmniFetchLayoutAware) {
+    // --- Component 2: Layout Ops Elimination (In-Situ Reshape partner) ---
+    // Only meaningful when both Prefetch and Layout-Aware are active.
+    if (enablePrefetch && enableOmniFetchLayoutAware) {
       pm.addNestedPass<func::FuncOp>(
           hexagon::createLayoutOpsEliminationPass());
     }
 
-    // Component 3: V-DAE (Virtual Decoupled Access-Execute)
-    // Decouples Memory Access and Compute Execution using semaphores.
-    // Adds wait/signal synchronization around existing prefetch operations.
+    // --- Component 3: V-DAE (Virtual Decoupled Access-Execute) ---
+    // Adds wait/signal semaphore synchronization around prefetch operations.
+    // Requires Component 1 to have already inserted prefetch ops.
     if (enableOmniFetchVDAE) {
       pm.addNestedPass<func::FuncOp>(
           hexagon::createOmniFetchVDAEInsertPass(
               setOmniFetchVDAE(OmniFetchVDAEInsertOptions{})));
-      
-      // Dump IR after V-DAE pass for debugging
-      if (mlir::hexagon::isEnvTrue("DUMP_AFTER_VDAE")) {
+      if (mlir::hexagon::isEnvTrue("DUMP_AFTER_VDAE"))
         pm.addPass(createCanonicalizerPass());
-        // The IR will be printed by the pass manager's IR printing callback
-      }
     }
 
     // Lower linalg ops with library_call attribute set to custom fns.
@@ -445,8 +475,10 @@ public:
     pm.addPass(hexagon::createDMAToLLVMPass());
     pm.addPass(hexagonmem::createHexagonMemToLLVMPass());
     pm.addPass(hexkl::createHexKLToLLVMPass());
-    // Lower omni_fetch dialect ops to extern-C runtime calls
-    if (enableOmniFetchVDAE)
+    // Lower omni_fetch dialect ops to extern-C runtime calls.
+    // Required whenever Prefetch (Component 1) has emitted prefetch_in_situ ops,
+    // regardless of whether V-DAE (Component 3) is also active.
+    if (enablePrefetch)
       pm.addPass(omni_fetch::createOmniFetchToLLVMPass());
 
     if (enableCollapseAddressSpace) {

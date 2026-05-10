@@ -103,14 +103,16 @@ void setLinalgToLLVMOptions(
   options.enableHVXInlining =
       !arch_kwargs.at("enableHVXInlining").compare(TRUE);
   
-  // OmniFetch V-DAE options
-  options.enableOmniFetchVDAE =
-      !arch_kwargs.at("enableOmniFetchVDAE").compare(TRUE);
-  options.omniFetchLookahead = std::stoi(arch_kwargs.at("omniFetchLookahead"));
-  options.enableOmniFetchAdaptive =
-      !arch_kwargs.at("enableOmniFetchAdaptive").compare(TRUE);
+  // OmniFetch options (Plan-A: three independent components)
+  options.enablePrefetch =
+      !arch_kwargs.at("enablePrefetch").compare(TRUE);
   options.enableOmniFetchLayoutAware =
       !arch_kwargs.at("enableOmniFetchLayoutAware").compare(TRUE);
+  options.omniFetchLookahead = std::stoi(arch_kwargs.at("omniFetchLookahead"));
+  options.enableOmniFetchVDAE =
+      !arch_kwargs.at("enableOmniFetchVDAE").compare(TRUE);
+  options.enableOmniFetchAdaptive =
+      !arch_kwargs.at("enableOmniFetchAdaptive").compare(TRUE);
 }
 
 namespace mlir {
