@@ -23,14 +23,14 @@ compute = [data['Compute_Base'][0], data['Compute_ALPS'][0], data['Layout_Base']
 l2_stall = [data['Compute_Base'][1], data['Compute_ALPS'][1], data['Layout_Base'][1], data['Layout_ALPS'][1]]
 vtcm_stall = [data['Compute_Base'][2], data['Compute_ALPS'][2], data['Layout_Base'][2], data['Layout_ALPS'][2]]
 
-fig, ax = plt.subplots(figsize=(12, 8), dpi=300)
-bar_width = 0.55
+fig, ax = plt.subplots(figsize=(18, 11), dpi=500)
+bar_width = 0.45
 x = np.arange(len(labels))
 
 # 学术配色
-c_comp = '#27ae60'  # 绿色: 有效计算
-c_l2 = '#c0392b'    # 红色: L2 Miss 停顿
-c_vtcm = '#f39c12'  # 橙色: VTCM 布局停顿
+c_comp = '#2F5597'  # 深蓝: 有效计算
+c_l2 = '#7FACD6'    # 浅蓝: L2 Miss 停顿
+c_vtcm = '#E67E22'  # 橙色: VTCM 布局停顿
 
 # 绘制堆叠柱状图
 ax.bar(x, compute, bar_width, label='Effective Compute (HMX Active)', color=c_comp, edgecolor='black', linewidth=0.7)
@@ -39,36 +39,38 @@ ax.bar(x, vtcm_stall, bar_width, bottom=np.array(compute)+np.array(l2_stall),
        label='VTCM Stall (Layout/Bank Conflict)', color=c_vtcm, edgecolor='black', linewidth=0.7)
 
 # 装饰细节
-ax.set_ylabel('Clock Cycles (Per 1M Cycles)', fontsize=12, fontweight='bold')
-ax.set_title('Micro-architectural Analysis across Typical Transformer Configurations', fontsize=14, fontweight='bold', pad=30)
+# 装饰细节
+ax.set_ylabel('Clock Cycles (Per 1M Cycles)', fontsize=28, fontweight='bold')
+ax.tick_params(axis='y', labelsize=24)
+ax.set_title('Micro-architectural Analysis across Typical Transformer Configurations', fontsize=32, fontweight='bold', pad=30)
 
 # X轴设置，将 Baseline 和 ALPS 分组显示
 ax.set_xticks(x)
-ax.set_xticklabels(labels, fontsize=10, fontweight='bold')
-ax.set_ylim(0, 1250000)
+ax.set_xticklabels(labels, fontsize=20, fontweight='bold')
+ax.set_ylim(0, 1350000)
 
 # 移除边框
 ax.spines['right'].set_visible(False)
 ax.spines['top'].set_visible(False)
-ax.yaxis.grid(True, linestyle='--', alpha=0.3)
+ax.yaxis.grid(True, linestyle='--', alpha=0.4)
 
 # 添加带背景颜色的标注框，解释参数含义
-ax.text(0.5, 1100000, "Compute-Bound: Large weights lead to DRAM latency", 
-        bbox=dict(facecolor='white', alpha=0.5, edgecolor='#BDC3C7'), ha='center', fontsize=9, style='italic')
-ax.text(2.5, 1100000, "Layout-Bound: Long sequence & GQA lead to VTCM swizzling", 
-        bbox=dict(facecolor='white', alpha=0.5, edgecolor='#BDC3C7'), ha='center', fontsize=9, style='italic')
+ax.text(0.5, 1220000, "Compute-Bound:\nLarge weights lead to DRAM latency", 
+        bbox=dict(facecolor='white', alpha=0.9, edgecolor='#BDC3C7'), ha='center', va='center', fontsize=18, style='italic', fontweight='bold')
+ax.text(2.5, 1220000, "Layout-Bound:\nLong seq & GQA lead to VTCM swizzling", 
+        bbox=dict(facecolor='white', alpha=0.9, edgecolor='#BDC3C7'), ha='center', va='center', fontsize=18, style='italic', fontweight='bold')
 
 # 标注加速效应
-ax.annotate('1.8x Gain', xy=(1, 810000), xytext=(1, 950000),
-            arrowprops=dict(facecolor='black', shrink=0.05, width=1, headwidth=6),
-            ha='center', fontsize=10, fontweight='bold', color='#1e8449')
+ax.annotate('1.8x Gain', xy=(1, 810000), xytext=(1, 1050000),
+            arrowprops=dict(facecolor='black', shrink=0.05, width=2.5, headwidth=10),
+            ha='center', fontsize=24, fontweight='bold', color='#2F5597')
 
-ax.annotate('2.4x Gain', xy=(3, 720000), xytext=(3, 950000),
-            arrowprops=dict(facecolor='black', shrink=0.05, width=1, headwidth=6),
-            ha='center', fontsize=10, fontweight='bold', color='#1e8449')
+ax.annotate('2.4x Gain', xy=(3, 720000), xytext=(3, 1050000),
+            arrowprops=dict(facecolor='black', shrink=0.05, width=2.5, headwidth=10),
+            ha='center', fontsize=24, fontweight='bold', color='#2F5597')
 
-ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=3, frameon=False, fontsize=10)
+ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.22), ncol=3, frameon=True, shadow=True, fontsize=24)
 
 plt.tight_layout()
-plt.savefig('transformer_block_detailed_config.png')
-plt.show()
+plt.savefig('transformer_block_detailed_config.pdf', format='pdf', bbox_inches='tight')
+# plt.show()
