@@ -1,5 +1,6 @@
 add_subdirectory(HexagonMem)
 add_subdirectory(HexagonTPtr)
 add_subdirectory(HexKL)
+add_subdirectory(OmniFetch)
 add_subdirectory(TmTensor)
 add_subdirectory(TTX)

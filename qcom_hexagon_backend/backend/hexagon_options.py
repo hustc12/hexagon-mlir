@@ -57,6 +57,15 @@ class HexagonOptions:
     enableConvertToHexagonmem: bool = True  # rewrites memref.alloc/copy to hexagonmem.*
     enableHexagonmemCopyToDMA: bool = False  # rewrites hexmem.copy to memref.dma_*
     enableHexKL: bool = False  # use HexKL to lower matmul and convolutions
+    # Omni-Fetch ablation toggles (Plan-A: three independent components)
+    # Component 1 – Prefetch insertion (base; required by the other two)
+    enablePrefetch: bool = False  # insert prefetch_in_situ ops in loop prologue/body
+    # Component 2 – In-Situ Reshape (depends on enablePrefetch)
+    enableOmniFetchLayoutAware: bool = True  # enable in-situ layout-aware prefetch mapping
+    omniFetchLookahead: int = 2  # static prefetch look-ahead distance
+    # Component 3 – V-DAE (depends on enablePrefetch)
+    enableOmniFetchVDAE: bool = False  # decouple Access/Execute via hardware semaphores
+    enableOmniFetchAdaptive: bool = True  # enable PMU-based adaptive control
     enableMultiThreading: bool = False  # linalg-generic based multi-threading
     enableSCFThreading: bool = False  # scf based multi-threading
     enableSplitReduction: bool = False  # split-reduction optimization

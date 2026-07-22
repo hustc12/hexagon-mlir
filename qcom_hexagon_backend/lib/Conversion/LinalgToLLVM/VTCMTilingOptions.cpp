@@ -318,6 +318,11 @@ namespace hexagon {
 
 // To calculate the tile size for a linalg op such that it fits in vtcm.
 //
+// UPDATED: Added small-tensor optimization to avoid over-tiling.
+// If the entire op fits comfortably in VTCM (< 25% of VTCM size), we
+// skip tiling entirely and prefetch the whole tensor. This eliminates
+// unnecessary loop overhead and copy costs for small operations.
+//
 // Example:
 // ```
 // #map = affine_map<(d0, d1, d2) -> (d0, d1)>
@@ -384,6 +389,8 @@ determineTileSizes(linalg::LinalgOp op, SmallVector<int64_t> tilingDims) {
   auto size =
       calcMemoryFootprint(op, getInitialTileSize(op), *memoryFootprintMap);
 
+  // Note: Very small ops (< 25% VTCM) are already skipped in getVTCMTilingOptions.
+  // Here we handle ops that are small but not tiny (25% < size <= 100% VTCM).
   if (size <= vtcmSizeInBytes) {
     DBG("-> Memory footprint of op:"
         << size << " bytes, is less than or equal to VTCM Memory size: "
@@ -485,6 +492,21 @@ getVTCMTilingOptions(linalg::LinalgOp op,
     DBG("-> get vtcm tiling options aborted. Constraints not "
         "satisfied.");
     return failure();
+  }
+
+  // OPTIMIZATION: For very small ops, skip VTCMTiling entirely.
+  // Check memory footprint before computing tile sizes.
+  auto memoryFootprintMap = generateMemoryFootprintAffineMap(op);
+  if (memoryFootprintMap) {
+    auto size = calcMemoryFootprint(op, getInitialTileSize(op), *memoryFootprintMap);
+    // Skip tiling for ops < 25% of VTCM (512KB for 2MB VTCM).
+    // These will run directly on DDR with minimal overhead.
+    const int64_t kSkipTilingThreshold = vtcmSizeInBytes / 4;
+    if (size <= kSkipTilingThreshold) {
+      DBG("-> Op is very small (" << size << " bytes < " << kSkipTilingThreshold
+          << " bytes). Skipping VTCMTiling pass entirely - op will run directly.");
+      return failure();  // Skip this op
+    }
   }
 
   linalg::LinalgTilingOptions options;

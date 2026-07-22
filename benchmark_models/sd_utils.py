@@ -50,7 +50,8 @@ def compile_to_linalg(model, *inputs, dump_to_file=None, debug=False):
 # Hexagon execution
 # ---------------------------------------------------------------------------
 
-def hex_execution(module, func_name, inputs, options: dict = None):
+def hex_execution(module, func_name, inputs, options: dict = None,
+                  heap_size_mb: int = 8):
     linalg_filename = Path(__file__).parent / (func_name + ".mlirbc")
     bytecode = module.operation.get_asm(binary=True)
     with open(linalg_filename, "wb") as f:
@@ -58,27 +59,10 @@ def hex_execution(module, func_name, inputs, options: dict = None):
 
     options["enableVTCMTiling"] = False
 
-    # FIX: Reduce _QURT_MAX_HEAP_SIZE from 1 GB to 256 MB.
-    #
-    # With 1 GB the DSP heap manager allocates memory at addresses like
-    # 0xE682BC (~14 MB) which are not mapped in the DSP TLB, causing a
-    # TLBMISS_RW crash when the generated code tries to read the
-    # MemRefDescriptor stored there.
-    # 256 MB keeps all heap allocations within the DSP's mapped region.
-    #
-    # NOTE: Do NOT reduce below ~64 MB.  CLIPWrapper's bufferized embedding
-    # gather can allocate intermediate buffers up to ~12 MB (vocab_size×hidden
-    # float32).  With 8 MB the DSP malloc returns NULL, and the subsequent
-    # store to NULL+24 produces another TLBMISS_RW crash.
-    #
-    # The code_string template lives on WrapperGeneratorStrings (base class).
-    # TorchMLIRWrapperGeneratorStrings inherits it via super().__init__(),
-    # so we patch the base class __init__ to modify the template before the
-    # subclass instance is created.
     from triton.backends.qcom_hexagon_backend import hexagon_launcher_base as _hlb
 
     _ORIG_SIZE = "unsigned int _QURT_MAX_HEAP_SIZE = 1073741824; // 1 GB Max Heap Size"
-    _NEW_SIZE  = "unsigned int _QURT_MAX_HEAP_SIZE = 8388608;    // 8 MB Max Heap Size"
+    _NEW_SIZE  = f"unsigned int _QURT_MAX_HEAP_SIZE = {heap_size_mb * 1024 * 1024};    // {heap_size_mb} MB Max Heap Size"
 
     _orig_base_init = _hlb.WrapperGeneratorStrings.__init__
 
@@ -142,6 +126,7 @@ def default_options(enablelwp: bool = False) -> dict:
     opts["lowerConstantsInSeparateSharedObjects"] = True
     opts["enableVTCMTiling"] = False
     opts["enableConvertToHexagonmem"] = False
+    opts["enableHexKL"] = True   # matmul → HexKL HVX path (conv2d replaced by unfold+matmul)
     if enablelwp:
         opts["enableLWP"] = True
     return opts

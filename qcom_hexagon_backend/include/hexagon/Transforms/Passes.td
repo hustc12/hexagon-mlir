@@ -333,4 +333,153 @@ def SmallExponentToMultiply :
     ];
 }
 
+//===----------------------------------------------------------------------===//
+// Omni-Fetch: Prefetch insertion pass
+//===----------------------------------------------------------------------===//
+
+def PrefetchInsert :
+    InterfacePass<"prefetch-insert", "mlir::FunctionOpInterface"> {
+  let summary = "Insert prefetch operations to preload data from DDR to VTCM";
+  let description = [{
+    This pass inserts prefetch operations to preload data from DDR to VTCM,
+    reducing memory latency during compute operations.
+
+    The pass:
+    1. Detects loops with HMX compute operations
+    2. Identifies DDR inputs that need to be prefetched
+    3. Allocates VTCM shadow buffers
+    4. Inserts prefetch operations in prologue and loop body
+
+    The prefetch can optionally perform in-situ layout transformation during
+    the DDR→VTCM transfer (controlled by enableLayoutAware option).
+
+    This pass is independent of V-DAE. It only inserts prefetch operations
+    without any synchronization mechanism. The V-DAE pass (if enabled) will
+    later add semaphore synchronization around these prefetch operations.
+
+    Options
+    -------
+    - `lookahead`       : static prefetch look-ahead distance (default: 2)
+    - `enable-layout-aware` : enable in-situ layout transformation during prefetch
+  }];
+
+  let options = [
+    Option<"lookahead", "lookahead", "int",
+           /*default=*/"2",
+           "Static prefetch look-ahead distance (number of iterations).">,
+    Option<"enableLayoutAware", "enable-layout-aware", "bool",
+           /*default=*/"true",
+           "Enable in-situ layout-aware prefetch; when false, emit linear prefetches only.">,
+  ];
+
+  let constructor = "hexagon::createPrefetchInsertPass()";
+
+  let dependentDialects = [
+    "mlir::omni_fetch::OmniFetchDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::memref::MemRefDialect",
+  ];
+}
+
+//===----------------------------------------------------------------------===//
+// Omni-Fetch: V-DAE (Virtual Decoupled Access-Execute) pass
+//===----------------------------------------------------------------------===//
+
+def OmniFetchVDAEInsert :
+    InterfacePass<"omni-fetch-vdae-insert", "mlir::FunctionOpInterface"> {
+  let summary = "Decouple Memory Access and Compute Execution using semaphores";
+  let description = [{
+    Implements the Virtual Decoupled Access-Execute (V-DAE) transformation
+    for DNN inference loops on Hexagon NPU.
+
+    **Problem**: VLIW (Very Long Instruction Word) architecture means a single
+    memory load stall can halt an entire instruction packet, freezing all
+    compute units in the same cycle.
+
+    **Solution**: Decouple Memory Access and Compute Execution using hardware
+    semaphores, allowing Access Thread and Execute Thread to run in parallel.
+
+    The pass walks loops that already have `omni_fetch.prefetch_in_situ`
+    operations (inserted by PrefetchInsertPass) and adds synchronization:
+
+      Prologue:
+        %sem = omni_fetch.create_sem
+        <existing prefetch operations>
+        omni_fetch.signal %sem
+
+      Loop body (per iteration i):
+        omni_fetch.wait %sem           -- ensure tile [i] is ready
+        <existing HMX compute on tile[i]>
+        <existing prefetch for tile[i + lookahead]>
+        omni_fetch.signal %sem         -- notify tile [i + lookahead] ready
+        %dist = omni_fetch.adaptive_control(%dist)  -- optional
+
+    **Key design**: This pass does NOT insert prefetch operations. It only
+    adds synchronization around existing prefetch operations. The prefetch
+    operations should be inserted by PrefetchInsertPass first.
+
+    Options
+    -------
+    - `enable-adaptive` : emit adaptive_control ops to tune at runtime
+  }];
+
+  let options = [
+    Option<"enableAdaptive", "enable-adaptive", "bool",
+           /*default=*/"true",
+           "Emit omni_fetch.adaptive_control ops for runtime PMU tuning.">,
+  ];
+
+  let constructor = "hexagon::createOmniFetchVDAEInsertPass()";
+
+  let dependentDialects = [
+    "mlir::omni_fetch::OmniFetchDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::arith::ArithDialect",
+  ];
+}
+
+//===----------------------------------------------------------------------===//
+// Omni-Fetch: Layout Ops Elimination pass
+//===----------------------------------------------------------------------===//
+
+def LayoutOpsElimination :
+    InterfacePass<"layout-ops-elimination", "mlir::FunctionOpInterface"> {
+  let summary = "Eliminate redundant layout ops when in-situ reshape is enabled";
+  let description = [{
+    This pass eliminates redundant layout transformation operations
+    (transpose, permute, slice) when in-situ reshape is enabled during
+    prefetch operations.
+
+    The pass works by:
+    1. Finding all `omni_fetch.prefetch_in_situ` operations with
+       `layout_transform != None`
+    2. Walking backward from each prefetch's `src` operand to find
+       layout ops that match the in-situ transform
+    3. Marking those ops as redundant (since the hardware performs
+       the transform during prefetch)
+    4. Deleting the marked ops
+
+    This pass should run AFTER any pass that inserts prefetch_in_situ
+    operations (e.g., V-DAE pass) and BEFORE lowering to LLVM.
+
+    Key insight: This pass detects `prefetch_in_situ` operations, NOT
+    loops. It works at function level and is independent of V-DAE.
+    Even without V-DAE, if other passes insert prefetch_in_situ operations,
+    this pass will eliminate redundant layout ops.
+
+    Design: This pass is bound to in-situ reshape. Whenever layout-aware
+    prefetch is enabled, this pass should run to eliminate redundant ops.
+  }];
+
+  let constructor = "hexagon::createLayoutOpsEliminationPass()";
+
+  let dependentDialects = [
+    "mlir::omni_fetch::OmniFetchDialect",
+    "mlir::linalg::LinalgDialect",
+    "mlir::memref::MemRefDialect",
+    "mlir::tensor::TensorDialect",
+  ];
+}
+
 #endif

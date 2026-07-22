@@ -37,6 +37,9 @@ add_mlir_library(Transforms
   ReduceContractionRankPass.cpp
   HoistScalarOps.cpp
   FoldMulFByZeroPass.cpp
+  PrefetchInsertPass.cpp
+  VDAEDecouplePass.cpp
+  LayoutOpsEliminationPass.cpp
 
   DEPENDS
   TransformsPassIncGen
@@ -50,8 +53,10 @@ add_mlir_library(Transforms
   MLIRIR
   MLIRMathDialect
   MLIRPass
+  MLIRSCFDialect
   MLIRTensorDialect
   MLIRTransforms
   MLIRMathTransforms
   MLIRSupport
+  OmniFetch
 )

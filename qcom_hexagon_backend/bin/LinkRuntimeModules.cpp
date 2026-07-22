@@ -71,6 +71,7 @@ INIT_MODULE(HexagonCAPI);
 INIT_MODULE(HexKLAPI);
 INIT_MODULE(RuntimeDMA);
 INIT_MODULE(UserDMA);
+INIT_MODULE(OmniFetchRuntime);
 
 // collectFuncsInMod collects the functions in the passed module. We distinguish
 // between functions that are declarations and the ones that are definitions
@@ -183,6 +184,7 @@ void mlir::Hexagon::Translate::linkRuntimeModules(
   ADD_MODULE_CAND(HexKLAPI, ctx, otherModule, moduleCandidates);
   ADD_MODULE_CAND(RuntimeDMA, ctx, otherModule, moduleCandidates);
   ADD_MODULE_CAND(UserDMA, ctx, otherModule, moduleCandidates);
+  ADD_MODULE_CAND(OmniFetchRuntime, ctx, otherModule, moduleCandidates);
 
   llvm::Linker linker(*module);
   llvm::Module *mainModule = module.get();
