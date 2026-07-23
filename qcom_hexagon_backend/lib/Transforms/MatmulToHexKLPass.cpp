@@ -43,6 +43,27 @@ struct MatmulToHexKL final : public OpRewritePattern<linalg::MatmulOp> {
 
   LogicalResult matchAndRewrite(linalg::MatmulOp op,
                                 PatternRewriter &rewriter) const override {
+    // HMX micro-kernels tile in 32x32 blocks (see DecomposeHexKLMatmulPass).
+    // Converting unaligned shapes (e.g. GPT-2 lm_head N=50257) faults on
+    // device (adb exit 13).  Keep those on the HVX path instead.
+    auto lhsTy = dyn_cast<ShapedType>(op.getDpsInputOperand(0)->get().getType());
+    auto rhsTy = dyn_cast<ShapedType>(op.getDpsInputOperand(1)->get().getType());
+    if (!lhsTy || !rhsTy || !lhsTy.hasStaticShape() || !rhsTy.hasStaticShape())
+      return rewriter.notifyMatchFailure(op, "dynamic matmul shape");
+    if (lhsTy.getRank() != 2 || rhsTy.getRank() != 2)
+      return rewriter.notifyMatchFailure(op, "expected rank-2 matmul");
+    int64_t M = lhsTy.getDimSize(0);
+    int64_t K = lhsTy.getDimSize(1);
+    int64_t N = rhsTy.getDimSize(1);
+    if (K != rhsTy.getDimSize(0))
+      return rewriter.notifyMatchFailure(op, "K mismatch");
+    constexpr int64_t kHmxTile = 32;
+    if ((M % kHmxTile) != 0 || (K % kHmxTile) != 0 || (N % kHmxTile) != 0) {
+      DBG("skip HexKL: unaligned MxKxN=" << M << "x" << K << "x" << N);
+      return rewriter.notifyMatchFailure(
+          op, "M/K/N not divisible by HMX tile size 32");
+    }
+
     Value A = op.getDpsInputOperand(0)->get();
     Value B = op.getDpsInputOperand(1)->get();
     Value C = op.getOutputs()[0];

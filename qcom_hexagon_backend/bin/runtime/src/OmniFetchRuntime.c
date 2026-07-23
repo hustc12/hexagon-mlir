@@ -24,6 +24,7 @@
 #define LAYOUT_HMX_WEIGHT      1
 #define LAYOUT_HMX_ACTIVATION  2
 #define LAYOUT_CUSTOM          3
+#define LAYOUT_L2_HINT         4
 
 /* -------------------------------------------------------------------------
  * Adaptive prefetch parameters
@@ -234,23 +235,32 @@ void __omni_fetch_prefetch_insitu(const void *src, void *dest,
                                    const int32_t *index_map) {
   (void)lookahead;
 
-  if (elem_bytes <= 0 || num_elems <= 0 || !src || !dest)
+  if (elem_bytes <= 0 || num_elems <= 0 || !src)
+    return;
+  /* L2 hints may pass dest==src; real copies require a distinct dest. */
+  if (layout_kind != LAYOUT_L2_HINT && !dest)
     return;
 
   uint32_t total_bytes = (uint32_t)(num_elems * elem_bytes);
 
-#ifdef __hexagon__
-  /* l2fetch disabled for now: bad pointers fault the DSP (exit 13).
-   * Re-enable once pointer/offset lowering is fully validated.
-   * omni_l2fetch(src, total_bytes);
-   */
-  (void)total_bytes;
-#endif
-
   switch (layout_kind) {
 
+  case LAYOUT_L2_HINT: {
+    /* Cache-warmup only: no memcpy, no compute rewire.  Used for tiny HVX
+     * vector tiles where a synchronous DDR→shadow copy is pure overhead. */
+#ifdef __hexagon__
+    omni_l2fetch(src, total_bytes);
+#else
+    (void)total_bytes;
+#endif
+    break;
+  }
+
   case LAYOUT_NONE: {
-    /* Phase 2: linear copy DDR → VTCM shadow buffer. */
+#ifdef __hexagon__
+    /* Warm L2 before the blocking copy when destination is real VTCM/DDR. */
+    omni_l2fetch(src, total_bytes);
+#endif
     memcpy(dest, src, (size_t)total_bytes);
     break;
   }

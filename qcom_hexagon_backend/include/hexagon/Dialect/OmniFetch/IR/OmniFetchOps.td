@@ -27,11 +27,14 @@ def OmniFetch_LayoutHMXWeight   : I32EnumAttrCase<"HMXWeight",   1,
 def OmniFetch_LayoutHMXActivation : I32EnumAttrCase<"HMXActivation", 2,
     "hmx_activation">;
 def OmniFetch_LayoutCustom      : I32EnumAttrCase<"Custom",      3>;
+def OmniFetch_LayoutL2Hint      : I32EnumAttrCase<"L2Hint",      4,
+    "l2_hint">;
 
 def OmniFetch_LayoutTransformAttr : I32EnumAttr<"LayoutTransform",
     "Describes the in-situ layout reshaping required during prefetch",
     [OmniFetch_LayoutNone, OmniFetch_LayoutHMXWeight,
-     OmniFetch_LayoutHMXActivation, OmniFetch_LayoutCustom]> {
+     OmniFetch_LayoutHMXActivation, OmniFetch_LayoutCustom,
+     OmniFetch_LayoutL2Hint]> {
   let cppNamespace = "::mlir::omni_fetch";
   let genSpecializedAttr = 1;
 }

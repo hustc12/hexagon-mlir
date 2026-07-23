@@ -232,8 +232,10 @@ static bool canSafelyRemove(Operation *op) {
 /// Walk the def-use chain from `memref` and mark all redundant layout ops.
 static void markRedundantLayoutOps(Value memref, LayoutTransform lt,
                                    FunctionOpInterface func) {
-  if (lt == LayoutTransform::None) {
-    llvm::dbgs() << "[LayoutOpsElimination]   Layout transform is None, nothing to mark\n";
+  // L2Hint only warms cache; it does not replace expand/collapse/transpose.
+  if (lt == LayoutTransform::None || lt == LayoutTransform::L2Hint) {
+    llvm::dbgs() << "[LayoutOpsElimination]   Layout transform is None/L2Hint, "
+                    "nothing to mark\n";
     return;
   }
 
@@ -330,11 +332,12 @@ struct LayoutOpsEliminationPass
                    << static_cast<int>(op.getLayoutTransform()) 
                    << " (0=None, 1=HMXWeight, 2=HMXActivation)\n";
       
-      if (op.getLayoutTransform() != LayoutTransform::None) {
+      auto lt = op.getLayoutTransform();
+      if (lt != LayoutTransform::None && lt != LayoutTransform::L2Hint) {
         prefetches.push_back(op);
         llvm::dbgs() << "[LayoutOpsElimination]   ✓ Has layout transform, will process\n";
       } else {
-        llvm::dbgs() << "[LayoutOpsElimination]   ✗ No layout transform, skipping\n";
+        llvm::dbgs() << "[LayoutOpsElimination]   ✗ No layout transform (or L2Hint), skipping\n";
       }
     });
 

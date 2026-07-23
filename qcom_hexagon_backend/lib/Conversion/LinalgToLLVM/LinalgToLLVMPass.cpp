@@ -416,6 +416,10 @@ public:
       pm.addNestedPass<func::FuncOp>(
           hexagon::createPrefetchInsertPass(prefetchOptions));
       pm.addPass(createCanonicalizerPass());
+      // PrefetchInsert may emit AS1 memref.alloc for large VTCM tiles after
+      // the earlier ConvertToHexagonmem pass; convert those now.
+      if (enableConvertToHexagonmem)
+        pm.addNestedPass<func::FuncOp>(createConvertToHexagonmemPass());
     }
 
     // --- Component 2: Layout Ops Elimination (In-Situ Reshape partner) ---

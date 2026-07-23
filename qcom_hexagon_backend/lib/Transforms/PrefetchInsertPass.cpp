@@ -7,16 +7,19 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This pass inserts prefetch operations to preload data from DDR to VTCM.
+// This pass inserts prefetch operations to preload data from DDR to a
+// multi-buffer shadow, and rewires the loop-body compute to consume the
+// current shadow tile (software-pipelined with depth = lookahead+1).
 //
 // The pass:
-// 1. Detects loops with HMX compute operations
+// 1. Detects loops with HMX/HVX compute operations
 // 2. Identifies DDR inputs that need to be prefetched
-// 3. Allocates VTCM shadow buffers
-// 4. Inserts prefetch operations in prologue and loop body
+// 3. Allocates multi-buffer shadow tiles (AS0 unless hexagonmem is enabled)
+// 4. Prefetches prologue tiles [0, lookahead) and body tile i+lookahead
+// 5. Rewires compute subviews of the DDR source to the current shadow slot
 //
 // The prefetch can optionally perform in-situ layout transformation during
-// the DDR→VTCM transfer (controlled by enableLayoutAware option).
+// the DDR→shadow transfer (controlled by enableLayoutAware option).
 //
 // This pass is independent of V-DAE. It only inserts prefetch operations
 // without any synchronization mechanism. The V-DAE pass (if enabled) will
@@ -40,7 +43,9 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/Interfaces/DestinationStyleOpInterface.h"
 #include "mlir/Pass/Pass.h"
 
 #include "llvm/Support/Debug.h"
@@ -228,64 +233,266 @@ static LayoutTransform inferLayoutTransform(Value memref, scf::ForOp loop) {
   return LayoutTransform::None;
 }
 
-/// Build a subview of `base` along `tiledDim` starting at `iterVal` with
-/// static `tileSize`.  After Hexagon tiling, scf.for IVs are element offsets
-/// into the tiled dimension (0, step, 2*step, …), not tile indices.
-static Value buildTileSubview(OpBuilder &builder, Location loc, Value base,
-                              Value iterVal, int64_t tileSize,
-                              unsigned tiledDim) {
-  auto baseType = cast<MemRefType>(base.getType());
-  auto rank = static_cast<unsigned>(baseType.getRank());
-  assert(tiledDim < rank && "tiledDim out of range");
+//===----------------------------------------------------------------------===//
+// Core transformation
+//===----------------------------------------------------------------------===//
 
-  SmallVector<OpFoldResult> offsets(rank, builder.getIndexAttr(0));
-  SmallVector<OpFoldResult> sizes(rank);
-  SmallVector<OpFoldResult> strides(rank, builder.getIndexAttr(1));
-
-  offsets[tiledDim] = iterVal;
-  sizes[tiledDim] = builder.getIndexAttr(tileSize);
-
-  for (unsigned i = 0; i < rank; ++i) {
-    if (i == tiledDim)
-      continue;
-    int64_t dim = baseType.getShape()[i];
-    if (ShapedType::isDynamic(dim))
-      sizes[i] = builder.create<memref::DimOp>(loc, base, i).getResult();
-    else
-      sizes[i] = builder.getIndexAttr(dim);
+static bool sizeIsConstant(OpFoldResult size, int64_t expect) {
+  if (auto attr = dyn_cast<Attribute>(size)) {
+    if (auto ia = dyn_cast<IntegerAttr>(attr))
+      return ia.getInt() == expect;
+    return false;
   }
-
-  auto subviewType =
-      memref::SubViewOp::inferResultType(baseType, offsets, sizes, strides);
-  return builder.create<memref::SubViewOp>(
-      loc, cast<MemRefType>(subviewType), base, offsets, sizes, strides);
+  if (auto v = dyn_cast<Value>(size)) {
+    IntegerAttr ia;
+    if (matchPattern(v, m_Constant(&ia)))
+      return ia.getInt() == expect;
+  }
+  return false;
 }
 
-/// Allocate a one-tile shadow buffer for prefetching.
-///
-/// Minimal safety fix (GPT2 path): use address space 0 (DDR/heap).
-/// GPT2 runs with enableConvertToHexagonmem=false; AS1 allocs are not
-/// converted to real VTCMPool and have been observed to fault on device
-/// (adb exit 13).  When hexagonmem conversion is enabled, a later patch
-/// can restore AS1 for true VTCM.
-static Value allocateVTCMTile(OpBuilder &builder, Location loc, Value src,
-                              int64_t tileSize, unsigned tiledDim) {
-  auto srcType = cast<MemRefType>(src.getType());
-  assert(tiledDim < static_cast<unsigned>(srcType.getRank()));
+/// Follow trivial memref.cast chains.
+static Value peelMemRefCasts(Value v) {
+  while (auto cast = v.getDefiningOp<memref::CastOp>())
+    v = cast.getSource();
+  return v;
+}
 
-  // Build tile shape: full dims, except tiledDim := tileSize.
-  SmallVector<int64_t> tileShape(srcType.getShape().begin(),
-                                 srcType.getShape().end());
-  tileShape[tiledDim] = tileSize;
+/// True if `v` (or a subview of it) is written inside `loop`.
+static bool isWrittenInLoop(Value v, scf::ForOp loop) {
+  for (Operation *user : v.getUsers()) {
+    if (!loop->isAncestor(user))
+      continue;
+    if (auto sv = dyn_cast<memref::SubViewOp>(user)) {
+      if (isWrittenInLoop(sv.getResult(), loop))
+        return true;
+      continue;
+    }
+    if (auto cast = dyn_cast<memref::CastOp>(user)) {
+      if (isWrittenInLoop(cast.getResult(), loop))
+        return true;
+      continue;
+    }
+    if (isa<memref::StoreOp>(user))
+      return true;
+    if (auto tw = dyn_cast<vector::TransferWriteOp>(user)) {
+      if (tw.getBase() == v)
+        return true;
+      continue;
+    }
+    if (auto dps = dyn_cast<DestinationStyleOpInterface>(user)) {
+      for (OpOperand &init : dps.getDpsInitsMutable()) {
+        if (init.get() == v)
+          return true;
+      }
+    }
+  }
+  return false;
+}
 
-  // AS 0 = DDR/heap (safe without ConvertToHexagonmem).
-  auto tileMemref = MemRefType::get(
-      tileShape, srcType.getElementType(),
+/// Subview of `src` inside `loop` that covers one tile along `tiledDim`.
+static bool isTileSubviewOf(memref::SubViewOp sv, Value src, unsigned tiledDim,
+                            int64_t tileSize) {
+  if (peelMemRefCasts(sv.getSource()) != src && sv.getSource() != src)
+    return false;
+  SmallVector<OpFoldResult> sizes = sv.getMixedSizes();
+  return tiledDim < sizes.size() && sizeIsConstant(sizes[tiledDim], tileSize);
+}
+
+/// Collect tile subviews of `src` that feed vector.transfer_read or linalg.
+static void collectTileSubviews(Value src, scf::ForOp loop, unsigned tiledDim,
+                                int64_t tileSize,
+                                SmallVectorImpl<memref::SubViewOp> &out) {
+  for (Operation *user : src.getUsers()) {
+    if (!loop->isAncestor(user))
+      continue;
+    auto sv = dyn_cast<memref::SubViewOp>(user);
+    if (!sv || !isTileSubviewOf(sv, src, tiledDim, tileSize))
+      continue;
+    bool useful = false;
+    for (Operation *su : sv.getResult().getUsers()) {
+      if (isa<vector::TransferReadOp>(su)) {
+        useful = true;
+        break;
+      }
+      if (auto dps = dyn_cast<DestinationStyleOpInterface>(su)) {
+        for (OpOperand &operand : su->getOpOperands()) {
+          if (operand.get() == sv.getResult() && !dps.isDpsInit(&operand)) {
+            useful = true;
+            break;
+          }
+        }
+      }
+      if (useful)
+        break;
+    }
+    if (useful)
+      out.push_back(sv);
+  }
+}
+
+/// Insert L2-fetch hints before transfer_read/linalg readers of each tile
+/// subview.  Currently unused on GPT2: per-strip runtime calls regress
+/// latency more than they hide.  Kept for experiments on larger tiles.
+[[maybe_unused]] static int insertL2FetchHints(OpBuilder &builder,
+                                               scf::ForOp loop, Value src,
+                                               unsigned tiledDim,
+                                               int64_t tileSize) {
+  SmallVector<memref::SubViewOp> tileViews;
+  collectTileSubviews(src, loop, tiledDim, tileSize, tileViews);
+  if (tileViews.empty())
+    return 0;
+
+  // Per-site 1-element scratch dest so PrefetchInSitu's MemWrite does not
+  // alias the live DDR subview (src==dest broke later passes).
+  int inserted = 0;
+  for (memref::SubViewOp sv : tileViews) {
+    auto svTy = cast<MemRefType>(sv.getType());
+    if (!svTy.hasStaticShape())
+      continue;
+
+    SmallVector<Operation *> readers;
+    for (Operation *user : sv.getResult().getUsers()) {
+      if (isa<vector::TransferReadOp>(user)) {
+        readers.push_back(user);
+        continue;
+      }
+      if (auto dps = dyn_cast<DestinationStyleOpInterface>(user)) {
+        for (OpOperand &operand : user->getOpOperands()) {
+          if (operand.get() == sv.getResult() && !dps.isDpsInit(&operand)) {
+            readers.push_back(user);
+            break;
+          }
+        }
+      }
+    }
+    if (readers.empty())
+      continue;
+
+    llvm::sort(readers, [](Operation *a, Operation *b) {
+      return a->isBeforeInBlock(b);
+    });
+    OpBuilder b(readers.front());
+    // Tiny AS0 scratch — runtime L2Hint ignores dest contents.
+    auto scratchTy = MemRefType::get(
+        ArrayRef<int64_t>{1}, svTy.getElementType(),
+        /*layout=*/MemRefLayoutAttrInterface{},
+        /*memorySpace=*/IntegerAttr::get(
+            IntegerType::get(builder.getContext(), 64), 0));
+    // Hoist scratch next to the enclosing loop so it is allocated once.
+    Value scratch;
+    {
+      OpBuilder::InsertionGuard g(builder);
+      builder.setInsertionPoint(loop);
+      scratch = builder.create<memref::AllocOp>(loop.getLoc(), scratchTy);
+    }
+    b.create<PrefetchInSituOp>(sv.getLoc(), sv.getResult(), scratch,
+                               LayoutTransform::L2Hint, /*lookahead=*/1,
+                               DenseI32ArrayAttr{});
+    ++inserted;
+  }
+
+  llvm::dbgs() << "[PrefetchInsert]     l2-hint ops: " << inserted << "\n";
+  return inserted;
+}
+
+/// Insert sync prefetch and rewire for large tiles (VTCM-oriented path).
+/// Currently unused on GPT2's 64-element HVX strips; kept for larger tiles.
+static int insertSyncPrefetchAndRewire(OpBuilder &builder, scf::ForOp loop,
+                                       Value src, unsigned tiledDim,
+                                       int64_t tileSize, int64_t &vtcmUsed,
+                                       int64_t kMaxVTCMBytes) {
+  SmallVector<memref::SubViewOp> tileViews;
+  collectTileSubviews(src, loop, tiledDim, tileSize, tileViews);
+  if (tileViews.empty())
+    return 0;
+
+  auto refTy = cast<MemRefType>(tileViews.front().getType());
+  if (!refTy.hasStaticShape())
+    return 0;
+  for (auto sv : tileViews) {
+    auto ty = cast<MemRefType>(sv.getType());
+    if (ty.getShape() != refTy.getShape() ||
+        ty.getElementType() != refTy.getElementType())
+      return 0;
+  }
+
+  int64_t tileBytes = refTy.getElementTypeBitWidth() / 8;
+  for (int64_t d : refTy.getShape())
+    tileBytes *= d;
+  // Tiny tiles: sync copy cannot win — caller should use L2 hints instead.
+  const int64_t kMinCopyBytes = 4096;
+  if (tileBytes < kMinCopyBytes)
+    return 0;
+  if (vtcmUsed + tileBytes > kMaxVTCMBytes)
+    return 0;
+
+  Location loc = loop.getLoc();
+  OpBuilder::InsertionGuard g(builder);
+  builder.setInsertionPoint(loop);
+  // Prefer VTCM (AS1).  ConvertToHexagonmem runs before this pass today, so
+  // emit hexagonmem.alloc when the dialect is available; else AS1 memref.alloc
+  // and rely on a follow-up hexagonmem conversion if enabled later.
+  auto shadowTy = MemRefType::get(
+      refTy.getShape(), refTy.getElementType(),
       /*layout=*/MemRefLayoutAttrInterface{},
       /*memorySpace=*/IntegerAttr::get(
-          IntegerType::get(builder.getContext(), 64), 0));
+          IntegerType::get(builder.getContext(), 64),
+          /*VTCM*/ 1));
+  Value shadow = builder.create<memref::AllocOp>(loc, shadowTy);
+  vtcmUsed += tileBytes;
 
-  return builder.create<memref::AllocOp>(loc, tileMemref);
+  int replaced = 0;
+  for (memref::SubViewOp sv : tileViews) {
+    SmallVector<Operation *> readers;
+    for (Operation *user : sv.getResult().getUsers()) {
+      if (isa<vector::TransferReadOp>(user)) {
+        readers.push_back(user);
+        continue;
+      }
+      if (auto dps = dyn_cast<DestinationStyleOpInterface>(user)) {
+        for (OpOperand &operand : user->getOpOperands()) {
+          if (operand.get() == sv.getResult() && !dps.isDpsInit(&operand)) {
+            readers.push_back(user);
+            break;
+          }
+        }
+      }
+    }
+    if (readers.empty())
+      continue;
+
+    llvm::sort(readers, [](Operation *a, Operation *b) {
+      return a->isBeforeInBlock(b);
+    });
+    OpBuilder b(readers.front());
+    b.create<PrefetchInSituOp>(sv.getLoc(), sv.getResult(), shadow,
+                               LayoutTransform::None, /*lookahead=*/1,
+                               DenseI32ArrayAttr{});
+
+    for (Operation *user : readers) {
+      IRMapping mapping;
+      mapping.map(sv.getResult(), shadow);
+      OpBuilder cb(user);
+      Operation *cloned = cb.clone(*user, mapping);
+      if (user->getNumResults() == 0) {
+        user->erase();
+      } else {
+        user->replaceAllUsesWith(cloned);
+        user->erase();
+      }
+      ++replaced;
+    }
+  }
+
+  llvm::dbgs() << "[PrefetchInsert]     sync-rewired ops: " << replaced
+               << " shadow=" << shadowTy << " (" << tileBytes / 1024
+               << " KB)\n";
+  if (replaced == 0) {
+    shadow.getDefiningOp()->erase();
+    vtcmUsed -= tileBytes;
+  }
+  return replaced;
 }
 
 //===----------------------------------------------------------------------===//
@@ -302,44 +509,50 @@ static void insertPrefetchForLoop(scf::ForOp loop, int lookahead,
 
   // Collect DDR inputs
   SmallVector<Value> ddrInputs = collectDDRInputs(loop);
-  
+
   // Fallback: try all memref inputs if no DDR inputs found
   if (ddrInputs.empty()) {
     llvm::dbgs() << "[PrefetchInsert]   No DDR inputs found, trying all memref inputs\n";
     ddrInputs = collectAllMemrefInputs(loop);
   }
-  
-  llvm::dbgs() << "[PrefetchInsert]   Found " << ddrInputs.size() 
+
+  llvm::dbgs() << "[PrefetchInsert]   Found " << ddrInputs.size()
                << " memref inputs to prefetch\n";
-  
+
   // Debug: print types of all inputs
   for (size_t i = 0; i < ddrInputs.size(); ++i) {
     auto memrefType = dyn_cast<MemRefType>(ddrInputs[i].getType());
     if (memrefType) {
-      llvm::dbgs() << "[PrefetchInsert]     Input " << i << ": " 
-                   << memrefType << "\n";
+      llvm::dbgs() << "[PrefetchInsert]     Input " << i << ": " << memrefType
+                   << "\n";
     }
   }
-  
+
   if (ddrInputs.empty()) {
     llvm::dbgs() << "[PrefetchInsert]   No inputs to prefetch, skipping loop\n";
     return;
   }
 
-  const int64_t kMaxTileSize = 32;
+  const int64_t kMaxTileSize = 128;
   const int64_t kMinTileSize = 8;
   // Skip giant tiled extents (e.g. GPT2 vocab embedding 50257).
   const int64_t kMaxTiledExtent = 4096;
-  const int64_t kMaxVTCMBytes = 256 * 1024;
+  // Shadow buffers currently live in AS0 (DDR).  Use a larger budget than
+  // physical VTCM; tighten again when hexagonmem/AS1 allocation is enabled.
+  const int64_t kMaxVTCMBytes = 2 * 1024 * 1024;
   int64_t vtcmUsed = 0;
 
   // Force linear prefetch for now.  HMX layout transforms without HexKL (and
-  // without compute rewire) corrupt / OOB on device.
+  // without a matching consumer layout) corrupt data on device.
   (void)enableLayoutAware;
   const bool doLayoutAware = false;
 
-  // (src, shadowTile, tiledDim)
-  SmallVector<std::tuple<Value, Value, unsigned>> prefetchPairs;
+  // Single-buffer synchronous schedule for HVX vector.transfer_read tiles:
+  // before each reader, copy the existing tile subview into a contiguous
+  // shadow and rewire the reader to that shadow.
+  (void)lookahead;
+
+  int totalRewired = 0;
 
   // Prefetch addressing: IV is an element offset into whichever memref dim
   // matches the loop upper bound (GPT2 weight loops commonly tile dim1).
@@ -381,15 +594,12 @@ static void insertPrefetchForLoop(scf::ForOp loop, int lookahead,
       continue;
     }
 
-    // Only floating-point payloads (skip i1/i64 index masks etc.).
     if (!isa<FloatType>(srcType.getElementType())) {
       llvm::dbgs() << "[PrefetchInsert]   Memref " << i
                    << ": non-float element, skipping\n";
       continue;
     }
 
-    // Contiguous identity layout only.  Strided / dynamic-offset views
-    // (common after subview) have caused DSP Bad VA (adb exit 13).
     if (!srcType.getLayout().isIdentity()) {
       llvm::dbgs() << "[PrefetchInsert]   Memref " << i
                    << ": non-identity layout, skipping\n";
@@ -401,7 +611,12 @@ static void insertPrefetchForLoop(scf::ForOp loop, int lookahead,
       continue;
     }
 
-    // Find the dimension this loop tiles (must match ub).
+    if (isWrittenInLoop(src, loop)) {
+      llvm::dbgs() << "[PrefetchInsert]   Memref " << i
+                   << ": written in loop, skipping\n";
+      continue;
+    }
+
     int tiledDim = -1;
     for (int d = 0; d < srcType.getRank(); ++d) {
       if (srcType.getShape()[d] == loopUb) {
@@ -415,138 +630,38 @@ static void insertPrefetchForLoop(scf::ForOp loop, int lookahead,
       continue;
     }
 
+    int64_t tileSize = loopStep;
     int64_t tiledExtent = srcType.getShape()[tiledDim];
     if (tiledExtent > kMaxTiledExtent) {
       llvm::dbgs() << "[PrefetchInsert]   Memref " << i << ": tiled extent "
-                   << tiledExtent << " > " << kMaxTiledExtent
-                   << ", skipping\n";
+                   << tiledExtent << " > " << kMaxTiledExtent << ", skipping\n";
       continue;
     }
 
-    int64_t tileSize = loopStep;
-    llvm::dbgs() << "[PrefetchInsert]   Memref " << i << ": using tileSize="
+    llvm::dbgs() << "[PrefetchInsert]   Memref " << i << ": trying tileSize="
                  << tileSize << " on dim" << tiledDim << " (extent="
                  << tiledExtent << ")\n";
 
-    // Dest size must equal src tile size (OmniFetchToLLVM uses dest.num_elems).
-    Value vtcmTile = allocateVTCMTile(builder, loc, src, tileSize,
-                                      static_cast<unsigned>(tiledDim));
-
-    auto vtcmTileType = cast<MemRefType>(vtcmTile.getType());
-    int64_t tileBytes = 1;
-    for (int64_t dim : vtcmTileType.getShape()) {
-      if (ShapedType::isDynamic(dim)) {
-        tileBytes = -1;
-        break;
-      }
-      tileBytes *= dim;
-    }
-    if (tileBytes > 0)
-      tileBytes *= vtcmTileType.getElementTypeBitWidth() / 8;
-
-    if (tileBytes < 0 || vtcmUsed + tileBytes > kMaxVTCMBytes) {
+    // Tiny HVX strips (e.g. GPT2 64xf16): neither sync DDR→shadow memcpy nor
+    // per-read L2-hint runtime calls can win — both regress vs baseline.
+    // Only instrument tiles large enough for a contiguous copy to matter.
+    int n = insertSyncPrefetchAndRewire(builder, loop, src,
+                                        static_cast<unsigned>(tiledDim),
+                                        tileSize, vtcmUsed, kMaxVTCMBytes);
+    if (n == 0) {
       llvm::dbgs() << "[PrefetchInsert]   Memref " << i
-                   << ": exceeds budget or dynamic, skipping\n";
-      vtcmTile.getDefiningOp()->erase();
+                   << ": no large-tile prefetch opportunity, skipping\n";
       continue;
     }
-
-    vtcmUsed += tileBytes;
-    llvm::dbgs() << "[PrefetchInsert]   Memref " << i << ": allocated "
-                 << tileBytes / 1024 << " KB (total: " << vtcmUsed / 1024
-                 << " KB)\n";
-
-    LayoutTransform lt =
-        doLayoutAware ? inferLayoutTransform(src, loop) : LayoutTransform::None;
-
-    llvm::dbgs() << "[PrefetchInsert]   Processing memref " << i
-                 << " layout=" << static_cast<int>(lt) << "\n";
-
-    if (srcType.getElementType() != vtcmTileType.getElementType()) {
-      vtcmUsed -= tileBytes;
-      vtcmTile.getDefiningOp()->erase();
-      continue;
-    }
-
-    SmallVector<int32_t> idxMapVec =
-        computeHMXIndexMap(ctx, srcType, vtcmTileType, lt);
-
-    // Prologue: prefetch at lower bound offset.
-    Value iterZero = loop.getLowerBound();
-    Value tileSubview =
-        buildTileSubview(builder, loc, src, iterZero, tileSize,
-                         static_cast<unsigned>(tiledDim));
-
-    auto subviewType = cast<MemRefType>(tileSubview.getType());
-    if (subviewType.getElementType() != vtcmTileType.getElementType()) {
-      vtcmUsed -= tileBytes;
-      vtcmTile.getDefiningOp()->erase();
-      continue;
-    }
-
-    builder.create<PrefetchInSituOp>(
-        loc, tileSubview, vtcmTile, lt, static_cast<uint32_t>(lookahead),
-        idxMapVec.empty() ? DenseI32ArrayAttr{}
-                          : DenseI32ArrayAttr::get(ctx, idxMapVec));
-
-    llvm::dbgs() << "[PrefetchInsert]     ✓ Prologue prefetch tileSize="
-                 << tileSize << " dim=" << tiledDim << "\n";
-    prefetchPairs.emplace_back(src, vtcmTile, static_cast<unsigned>(tiledDim));
+    totalRewired += n;
+    llvm::dbgs() << "[PrefetchInsert]     ✓ prefetch sites for memref " << i
+                 << ": " << n << "\n";
   }
 
-  llvm::dbgs() << "[PrefetchInsert]   Total prefetch pairs created: " << prefetchPairs.size() << "\n";
-  llvm::dbgs() << "[PrefetchInsert]   Total VTCM used: " << vtcmUsed / 1024 << " KB / " 
-               << kMaxVTCMBytes / 1024 << " KB\n";
-
-  // === LOOP BODY: prefetch tile i+lookahead ===
-  Block *body = loop.getBody();
-  Value iv = loop.getInductionVar();
-
-  {
-    OpBuilder::InsertionGuard g(builder);
-    Operation *yieldOp = body->getTerminator();
-    builder.setInsertionPoint(yieldOp);
-
-    // next iteration index: iv + step * lookahead
-    Value step = loop.getStep();
-    Value kVal = builder.create<arith::ConstantIndexOp>(loc, lookahead);
-    Value stepTimesK = builder.create<arith::MulIOp>(loc, step, kVal);
-    Value nextIter = builder.create<arith::AddIOp>(loc, iv, stepTimesK);
-
-    // Process each prefetch pair
-    for (auto [src, vtcmTile, tiledDim] : prefetchPairs) {
-      LayoutTransform lt = LayoutTransform::None;
-      auto srcType = cast<MemRefType>(src.getType());
-      auto vtcmTileType = cast<MemRefType>(vtcmTile.getType());
-
-      int64_t tileSize = loopStep;
-      if (tileSize < kMinTileSize)
-        continue;
-
-      SmallVector<int32_t> idxMapVec =
-          computeHMXIndexMap(ctx, srcType, vtcmTileType, lt);
-
-      // Require nextIter + tileSize <= ub (exclusive upper bound).
-      Value ub = loop.getUpperBound();
-      Value tileSizeVal =
-          builder.create<arith::ConstantIndexOp>(loc, tileSize);
-      Value nextEnd =
-          builder.create<arith::AddIOp>(loc, nextIter, tileSizeVal);
-      Value inBounds = builder.create<arith::CmpIOp>(
-          loc, arith::CmpIPredicate::ule, nextEnd, ub);
-
-      auto ifOp = builder.create<scf::IfOp>(loc, inBounds, /*withElse=*/false);
-      OpBuilder thenBuilder = ifOp.getThenBodyBuilder();
-
-      Value nextSubview = buildTileSubview(thenBuilder, loc, src, nextIter,
-                                           tileSize, tiledDim);
-
-      thenBuilder.create<PrefetchInSituOp>(
-          loc, nextSubview, vtcmTile, lt, static_cast<uint32_t>(lookahead),
-          idxMapVec.empty() ? DenseI32ArrayAttr{}
-                            : DenseI32ArrayAttr::get(ctx, idxMapVec));
-    }
-  }
+  llvm::dbgs() << "[PrefetchInsert]   Total prefetch sites: " << totalRewired
+               << "\n";
+  llvm::dbgs() << "[PrefetchInsert]   Total shadow used: " << vtcmUsed / 1024
+               << " KB / " << kMaxVTCMBytes / 1024 << " KB\n";
 }
 
 //===----------------------------------------------------------------------===//

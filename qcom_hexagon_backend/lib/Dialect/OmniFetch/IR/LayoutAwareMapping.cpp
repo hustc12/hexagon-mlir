@@ -210,6 +210,9 @@ mlir::omni_fetch::computeHMXIndexMap(MLIRContext * /*ctx*/,
   case LayoutTransform::Custom:
     // For Custom, the caller supplies the index_map directly.
     return {};
+  case LayoutTransform::L2Hint:
+    // Cache hint only — no gather map.
+    return {};
   }
   llvm_unreachable("unhandled LayoutTransform");
 }

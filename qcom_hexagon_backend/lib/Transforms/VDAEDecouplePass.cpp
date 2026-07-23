@@ -122,6 +122,22 @@ static void addSynchronizationToLoop(scf::ForOp loop, bool enableAdaptive) {
   SmallVector<PrefetchInSituOp> prologuePrefetches = collectProloguePrefetches(loop);
   SmallVector<PrefetchInSituOp> loopBodyPrefetches = collectLoopBodyPrefetches(loop);
 
+  // L2-hint prefetches are fire-and-forget cache warmups; wait/signal around
+  // them only adds overhead and must not gate compute.
+  auto isRealPrefetch = [](PrefetchInSituOp op) {
+    return op.getLayoutTransform() != LayoutTransform::L2Hint;
+  };
+  prologuePrefetches.erase(
+      llvm::remove_if(prologuePrefetches, [&](PrefetchInSituOp op) {
+        return !isRealPrefetch(op);
+      }),
+      prologuePrefetches.end());
+  loopBodyPrefetches.erase(
+      llvm::remove_if(loopBodyPrefetches, [&](PrefetchInSituOp op) {
+        return !isRealPrefetch(op);
+      }),
+      loopBodyPrefetches.end());
+
   llvm::dbgs() << "[VDAEDecouple]   Found " << prologuePrefetches.size() 
                << " prologue prefetches\n";
   llvm::dbgs() << "[VDAEDecouple]   Found " << loopBodyPrefetches.size() 
