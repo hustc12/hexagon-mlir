@@ -393,7 +393,8 @@ public:
     if (enableConvertToHexagonmem)
       pm.addNestedPass<func::FuncOp>(createConvertToHexagonmemPass());
 
-    // Decompose hexkl.matmul to micro ops
+    // Decompose hexkl.matmul to micro ops first so PrefetchInsert can see
+    // MicroHMX DDR→VTCM copies (tile_row/tile_col) in innermost loops.
     if (enableHexKL)
       pm.addNestedPass<func::FuncOp>(createDecomposeHexKLMatmulPass());
 

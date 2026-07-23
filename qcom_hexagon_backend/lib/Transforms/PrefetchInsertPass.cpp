@@ -50,6 +50,8 @@
 
 #include "llvm/Support/Debug.h"
 
+#include <algorithm>
+
 #define DEBUG_TYPE "prefetch-insert"
 
 using namespace mlir;
@@ -315,6 +317,14 @@ static void collectTileSubviews(Value src, scf::ForOp loop, unsigned tiledDim,
         useful = true;
         break;
       }
+      // HexKL high-level / micro ops that read the tile.
+      if (isa<hexkl::MatmulOp, hexkl::MicroHMXMmF16Op,
+              hexkl::MicroHMXCopySubmatrixToF16Op,
+              hexkl::MicroHMXRmToWhF16Op,
+              hexkl::MicroHMXRmToAhF16Op>(su)) {
+        useful = true;
+        break;
+      }
       if (auto dps = dyn_cast<DestinationStyleOpInterface>(su)) {
         for (OpOperand &operand : su->getOpOperands()) {
           if (operand.get() == sv.getResult() && !dps.isDpsInit(&operand)) {
@@ -388,7 +398,7 @@ static void collectTileSubviews(Value src, scf::ForOp loop, unsigned tiledDim,
     }
     b.create<PrefetchInSituOp>(sv.getLoc(), sv.getResult(), scratch,
                                LayoutTransform::L2Hint, /*lookahead=*/1,
-                               DenseI32ArrayAttr{});
+                               DenseI32ArrayAttr{}, ValueRange{});
     ++inserted;
   }
 
@@ -404,8 +414,27 @@ static int insertSyncPrefetchAndRewire(OpBuilder &builder, scf::ForOp loop,
                                        int64_t kMaxVTCMBytes) {
   SmallVector<memref::SubViewOp> tileViews;
   collectTileSubviews(src, loop, tiledDim, tileSize, tileViews);
-  if (tileViews.empty())
+  if (tileViews.empty()) {
+    int svCount = 0;
+    for (Operation *user : src.getUsers()) {
+      if (!loop->isAncestor(user))
+        continue;
+      if (auto sv = dyn_cast<memref::SubViewOp>(user)) {
+        ++svCount;
+        llvm::errs() << "[PrefetchInsert]     subview " << sv.getType()
+                     << " users:";
+        for (Operation *su : sv.getResult().getUsers())
+          llvm::errs() << " " << su->getName();
+        llvm::errs() << "\n";
+      } else {
+        llvm::errs() << "[PrefetchInsert]     non-subview user: "
+                     << user->getName() << "\n";
+      }
+    }
+    llvm::errs() << "[PrefetchInsert]     no useful tile subviews (raw sv="
+                 << svCount << ")\n";
     return 0;
+  }
 
   auto refTy = cast<MemRefType>(tileViews.front().getType());
   if (!refTy.hasStaticShape())
@@ -421,11 +450,35 @@ static int insertSyncPrefetchAndRewire(OpBuilder &builder, scf::ForOp loop,
   for (int64_t d : refTy.getShape())
     tileBytes *= d;
   // Tiny tiles: sync copy cannot win — caller should use L2 hints instead.
-  const int64_t kMinCopyBytes = 4096;
-  if (tileBytes < kMinCopyBytes)
+  // HexKL micro-tiles are 32x32xf16 = 2KB; allow those when a HexKL consumer
+  // is present.  Keep a higher floor for pure HVX strips.
+  const bool hexklConsumer = llvm::any_of(tileViews, [&](memref::SubViewOp sv) {
+    for (Operation *user : sv.getResult().getUsers()) {
+      if (isa<hexkl::MatmulOp, hexkl::MicroHMXMmF16Op,
+              hexkl::MicroHMXCopySubmatrixToF16Op,
+              hexkl::MicroHMXRmToWhF16Op>(user))
+        return true;
+      if (auto dps = dyn_cast<DestinationStyleOpInterface>(user)) {
+        for (OpOperand &operand : user->getOpOperands()) {
+          if (operand.get() == sv.getResult() && !dps.isDpsInit(&operand) &&
+              isa<hexkl::MatmulOp>(user))
+            return true;
+        }
+      }
+    }
+    return false;
+  });
+  const int64_t kMinCopyBytes = hexklConsumer ? 2048 : 4096;
+  if (tileBytes < kMinCopyBytes) {
+    llvm::errs() << "[PrefetchInsert]     skip sync: tileBytes=" << tileBytes
+                 << " < min=" << kMinCopyBytes
+                 << " shape=" << refTy << "\n";
     return 0;
-  if (vtcmUsed + tileBytes > kMaxVTCMBytes)
+  }
+  if (vtcmUsed + tileBytes > kMaxVTCMBytes) {
+    llvm::errs() << "[PrefetchInsert]     skip sync: VTCM budget\n";
     return 0;
+  }
 
   Location loc = loop.getLoc();
   OpBuilder::InsertionGuard g(builder);
@@ -468,7 +521,7 @@ static int insertSyncPrefetchAndRewire(OpBuilder &builder, scf::ForOp loop,
     OpBuilder b(readers.front());
     b.create<PrefetchInSituOp>(sv.getLoc(), sv.getResult(), shadow,
                                LayoutTransform::None, /*lookahead=*/1,
-                               DenseI32ArrayAttr{});
+                               DenseI32ArrayAttr{}, ValueRange{});
 
     for (Operation *user : readers) {
       IRMapping mapping;
@@ -496,6 +549,178 @@ static int insertSyncPrefetchAndRewire(OpBuilder &builder, scf::ForOp loop,
 }
 
 //===----------------------------------------------------------------------===//
+// HexKL MicroHMX helpers
+//===----------------------------------------------------------------------===//
+
+/// True if `op` (or anything nested in it) contains HexKL micro / matmul ops.
+static bool containsHexKLCompute(Operation *op) {
+  bool found = false;
+  op->walk([&](Operation *inner) {
+    if (llvm::isa<hexkl::MicroHMXMmF16Op, hexkl::MicroHMXSetupAccReadF16Op,
+                  hexkl::MicroHMXCopySubmatrixToF16Op,
+                  hexkl::MicroHMXRmToWhF16Op, hexkl::MicroHMXRmToAhF16Op,
+                  hexkl::MatmulOp>(inner)) {
+      found = true;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return found;
+}
+
+/// View a 32×32 f16 tile into the HexKL i8 VTCM slab at a byte offset.
+/// Memory space must match `vtcm` (hexagonmem Alloc uses space 1).
+static Value createVtcmF16TileView(OpBuilder &b, Location loc, Value vtcm,
+                                   Value byteOffI32) {
+  auto vtcmTy = cast<MemRefType>(vtcm.getType());
+  Value byteOff =
+      b.create<arith::IndexCastOp>(loc, b.getIndexType(), byteOffI32);
+  auto tileTy = MemRefType::get(ArrayRef<int64_t>{32, 32}, b.getF16Type(),
+                                /*layout=*/MemRefLayoutAttrInterface{},
+                                vtcmTy.getMemorySpace());
+  return b.create<memref::ViewOp>(loc, tileTy, vtcm, byteOff, ValueRange{})
+      .getResult();
+}
+
+/// Build a 32×32 subview of a rank-2 f16 memref at (tileRow, tileCol).
+static Value createDdrTileSubview(OpBuilder &b, Location loc, Value src,
+                                  Value tileRow, Value tileCol) {
+  Value c32 = b.create<arith::ConstantIndexOp>(loc, 32);
+  Value c1 = b.create<arith::ConstantIndexOp>(loc, 1);
+  Value rowIdx = b.create<arith::IndexCastOp>(loc, b.getIndexType(), tileRow);
+  Value colIdx = b.create<arith::IndexCastOp>(loc, b.getIndexType(), tileCol);
+  Value rowOff = b.create<arith::MulIOp>(loc, rowIdx, c32);
+  Value colOff = b.create<arith::MulIOp>(loc, colIdx, c32);
+  SmallVector<OpFoldResult> offsets = {rowOff, colOff};
+  SmallVector<OpFoldResult> sizes = {c32, c32};
+  SmallVector<OpFoldResult> strides = {c1, c1};
+  return b.create<memref::SubViewOp>(loc, src, offsets, sizes, strides)
+      .getResult();
+}
+
+/// HexKL OmniFetch insertion.
+/// - layoutAware=false: L2Hint warmup (Phase 1; no HexKL op removal)
+/// - layoutAware=true:  replace RmToWh / (Copy+RmToAh) with in-situ HMX layout
+///   prefetch into the VTCM tile slot (Phase 2a).  With lookahead>=1, emit a
+///   prologue prefetch and a body prefetch of tile i+lookahead into the idle
+///   ping-pong weight slot (Phase 2b software pipeline; runtime async DMA
+///   overlaps the transfer with Mm when lookahead>0).
+static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
+                                         bool enableLayoutAware,
+                                         int lookahead) {
+  if (!enableLayoutAware) {
+    // ----- Phase 1 path: L2 hints only -----
+    SmallVector<Operation *> ddrLoads;
+    for (Operation &op : *loop.getBody()) {
+      if (isa<hexkl::MicroHMXCopySubmatrixToF16Op, hexkl::MicroHMXRmToWhF16Op>(
+              &op))
+        ddrLoads.push_back(&op);
+    }
+    if (ddrLoads.empty())
+      return 0;
+
+    int inserted = 0;
+    for (Operation *op : ddrLoads) {
+      Value src, tileRow, tileCol;
+      if (auto copy = dyn_cast<hexkl::MicroHMXCopySubmatrixToF16Op>(op)) {
+        src = copy.getSrc();
+        tileRow = copy.getTileRow();
+        tileCol = copy.getTileCol();
+      } else {
+        auto wh = cast<hexkl::MicroHMXRmToWhF16Op>(op);
+        src = wh.getSrc();
+        tileRow = wh.getTileRow();
+        tileCol = wh.getTileCol();
+      }
+      auto srcTy = dyn_cast<MemRefType>(src.getType());
+      if (!srcTy || srcTy.getRank() != 2 || !srcTy.getElementType().isF16())
+        continue;
+
+      Location loc = op->getLoc();
+      OpBuilder b(op);
+      Value tileSv = createDdrTileSubview(b, loc, src, tileRow, tileCol);
+      auto scratchTy = MemRefType::get(
+          ArrayRef<int64_t>{1}, srcTy.getElementType(),
+          /*layout=*/MemRefLayoutAttrInterface{},
+          /*memorySpace=*/IntegerAttr::get(
+              IntegerType::get(b.getContext(), 64), 0));
+      Value scratch;
+      {
+        OpBuilder::InsertionGuard g(builder);
+        builder.setInsertionPoint(loop);
+        scratch = builder.create<memref::AllocOp>(loop.getLoc(), scratchTy);
+      }
+      b.create<PrefetchInSituOp>(loc, tileSv, scratch, LayoutTransform::L2Hint,
+                                 /*lookahead=*/1, DenseI32ArrayAttr{},
+                                 ValueRange{});
+      ++inserted;
+    }
+    if (inserted)
+      llvm::errs() << "[PrefetchInsert]     HexKL L2-hint sites: " << inserted
+                   << "\n";
+    return inserted;
+  }
+
+  // ----- Phase 2a/2b: layout-aware path -----
+  // Weight only: replace RmToWh with prefetch_in_situ that calls
+  // hexkl_micro_hmx_rm_to_wh_f16 on the full DDR matrix (via tile_params).
+  // Activation (Copy+RmToAh) stays on HexKL for now.
+  int inserted = 0;
+  int erased = 0;
+  const int la = std::max(lookahead, 1);
+
+  SmallVector<hexkl::MicroHMXRmToWhF16Op> whOps;
+  for (Operation &op : *loop.getBody())
+    if (auto wh = dyn_cast<hexkl::MicroHMXRmToWhF16Op>(&op))
+      whOps.push_back(wh);
+
+  for (auto wh : whOps) {
+    Location loc = wh.getLoc();
+    hexkl::MicroHMXMmF16Op mmOp;
+    for (Operation *op = wh->getNextNode(); op; op = op->getNextNode()) {
+      if (auto mm = dyn_cast<hexkl::MicroHMXMmF16Op>(op)) {
+        if (mm.getHmxBlock() == wh.getHmxBlock() &&
+            mm.getWeightOffset() == wh.getWeightOffset()) {
+          mmOp = mm;
+          break;
+        }
+      }
+    }
+
+    // Capture operands before we erase RmToWh.
+    Value srcMem = wh.getSrc();
+    Value vtcmMem = wh.getHmxBlock();
+    Value curOff = wh.getWeightOffset();
+    Value ktVal = wh.getTileRow();
+    Value colVal = wh.getTileCol();
+    Value wtCols = wh.getWtCols();
+
+    OpBuilder b(wh);
+    Value destView = createVtcmF16TileView(b, loc, vtcmMem, curOff);
+    // Full matrix + tile_params → HexKL-accurate WH layout into VTCM slot.
+    b.create<PrefetchInSituOp>(
+        loc, srcMem, destView, LayoutTransform::HMXWeight,
+        /*lookahead=*/0, DenseI32ArrayAttr{},
+        ValueRange{ktVal, colVal, wtCols});
+    ++inserted;
+    wh->erase();
+    ++erased;
+
+    // Phase 2b lookahead into the idle ping-pong slot is intentionally
+    // disabled here: a sync hexkl_micro fill after Mm adds pure overhead
+    // until we can DMA a tile-sized staging buffer and complete layout in
+    // __omni_fetch_wait.  Dual weight slots remain in DecomposeHexKL.
+    (void)mmOp;
+    (void)la;
+  }
+
+  if (inserted || erased)
+    llvm::errs() << "[PrefetchInsert]     HexKL layout-fusion sites: "
+                 << inserted << " erased_hexkl_ops=" << erased << "\n";
+  return inserted;
+}
+
+//===----------------------------------------------------------------------===//
 // Core transformation
 //===----------------------------------------------------------------------===//
 
@@ -506,6 +731,15 @@ static void insertPrefetchForLoop(scf::ForOp loop, int lookahead,
   MLIRContext *ctx = loop.getContext();
 
   llvm::dbgs() << "[PrefetchInsert]   Analyzing loop body...\n";
+
+  // HexKL MicroHMX path first: warm / fuse DDR tiles that feed Copy / RmToWh.
+  if (containsHexKLCompute(loop)) {
+    int n = insertHexKLMicroPrefetchHints(builder, loop, enableLayoutAware,
+                                          lookahead);
+    llvm::errs() << "[PrefetchInsert] Total prefetch sites: " << n
+                 << " shadow_kb=0\n";
+    return;
+  }
 
   // Collect DDR inputs
   SmallVector<Value> ddrInputs = collectDDRInputs(loop);
@@ -658,10 +892,13 @@ static void insertPrefetchForLoop(scf::ForOp loop, int lookahead,
                  << ": " << n << "\n";
   }
 
-  llvm::dbgs() << "[PrefetchInsert]   Total prefetch sites: " << totalRewired
-               << "\n";
-  llvm::dbgs() << "[PrefetchInsert]   Total shadow used: " << vtcmUsed / 1024
-               << " KB / " << kMaxVTCMBytes / 1024 << " KB\n";
+    llvm::dbgs() << "[PrefetchInsert]   Total prefetch sites: " << totalRewired
+                 << "\n";
+    llvm::dbgs() << "[PrefetchInsert]   Total shadow used: " << vtcmUsed / 1024
+                 << " KB / " << kMaxVTCMBytes / 1024 << " KB\n";
+    // Always visible summary (Phase-0 / device smoke relies on this).
+    llvm::errs() << "[PrefetchInsert] Total prefetch sites: " << totalRewired
+                 << " shadow_kb=" << (vtcmUsed / 1024) << "\n";
 }
 
 //===----------------------------------------------------------------------===//
@@ -683,14 +920,28 @@ struct PrefetchInsertPass
     llvm::dbgs() << "[PrefetchInsert] Function: " << func.getName() << "\n";
     llvm::dbgs() << "[PrefetchInsert] Options: lookahead=" << lookahead
                  << ", enableLayoutAware=" << enableLayoutAware
-                 << " (forced off in insert for safety)\n";
+                 << " (forced off in HVX insert for safety)\n";
+
+    const bool funcHasHexKL = containsHexKLCompute(func);
 
     func.walk([&](scf::ForOp loop) {
       bool hasNestedFor = false;
       loop.getBody()->walk([&](scf::ForOp) { hasNestedFor = true; });
-      if (!hasNestedFor && containsAcceleratorCompute(loop))
+      if (hasNestedFor)
+        return;
+      if (funcHasHexKL) {
+        // Prefer HexKL MicroHMX loops; skip Softmax/HVX strip loops that only
+        // create tiny 1D transfer_read tiles and cannot win with sync copy.
+        if (containsHexKLCompute(loop))
+          candidates.push_back(loop);
+      } else if (containsAcceleratorCompute(loop)) {
         candidates.push_back(loop);
+      }
     });
+
+    llvm::errs() << "[PrefetchInsert] Found " << candidates.size()
+                 << " candidate loops (hexkl_func="
+                 << (funcHasHexKL ? 1 : 0) << ")\n";
 
     llvm::dbgs() << "[PrefetchInsert] Found " << candidates.size()
                  << " candidate loops for prefetch insertion\n";

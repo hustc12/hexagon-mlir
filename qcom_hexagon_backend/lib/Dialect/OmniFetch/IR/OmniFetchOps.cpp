@@ -57,17 +57,24 @@ LogicalResult PrefetchInSituOp::verify() {
         "src and dest element types must match; got ")
         << srcType.getElementType() << " vs " << dstType.getElementType();
 
-  // If a custom index_map is provided, verify its size
+  // Custom index_map must cover every dest element.
   if (auto idxMap = getIndexMap()) {
-    int64_t numElems = 1;
-    for (auto d : dstType.getShape())
-      numElems *= d;
-    if ((int64_t)idxMap->size() != numElems)
-      return emitOpError(
-          "custom index_map size (")
-          << idxMap->size()
-          << ") must equal total dest element count (" << numElems << ")";
+    if (getLayoutTransform() == LayoutTransform::Custom) {
+      int64_t numElems = 1;
+      for (auto d : dstType.getShape())
+        numElems *= d;
+      if ((int64_t)idxMap->size() != numElems)
+        return emitOpError("custom index_map size (")
+               << idxMap->size()
+               << ") must equal total dest element count (" << numElems << ")";
+    }
   }
+
+  // HexKL tile_params must be empty or exactly {row, col, src_cols}.
+  auto tileParams = getTileParams();
+  if (!tileParams.empty() && tileParams.size() != 3)
+    return emitOpError("tile_params must be empty or 3 i32 values "
+                       "(tile_row, tile_col, src_cols)");
 
   return success();
 }

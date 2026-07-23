@@ -17,6 +17,13 @@
 #include <stdint.h>
 #include <string.h>
 
+#ifdef __hexagon__
+/* HexKL micro API — linked via -lhexkl_micro on the final device .so. */
+int hexkl_micro_hmx_rm_to_wh_f16(uint8_t *vtcm_base, uint32_t weight_offset,
+                                 const _Float16 *wt_old, uint32_t row_tile,
+                                 uint32_t col_tile, uint32_t wt_cols);
+#endif
+
 /* -------------------------------------------------------------------------
  * Layout kind constants – must match OmniFetchOps.td enum ordinals
  * ------------------------------------------------------------------------- */
@@ -96,19 +103,123 @@ void __omni_fetch_signal(int32_t sem_idx) {
   omni_sem_pool[sem_idx]++;
 }
 
+/* -------------------------------------------------------------------------
+ * Async DMA support (Phase 2b)
+ *
+ * When lookahead > 0, LAYOUT_NONE / HMX* kick a UserDMA transfer of the raw
+ * DDR tile into a staging buffer and return immediately.  __omni_fetch_wait
+ * completes the DMA and (for HMX*) finishes the in-situ gather into dest.
+ * That lets Mm overlap with the DDR→staging transfer on a single HW thread.
+ * ------------------------------------------------------------------------- */
+enum { OMNI_DDR = 0, OMNI_VTCM = 1 };
+enum { OMNI_DMA_OK = 0 };
+
+extern uint32_t hexagon_runtime_dma_start(void *src, int srcAS, void *dst,
+                                          int dstAS, uint32_t length,
+                                          int bypassCacheSrc,
+                                          int bypassCacheDst, int *status);
+extern void hexagon_runtime_dma_wait(uint32_t token);
+
+#define OMNI_STAGE_ELEMS (32 * 32)
+#define OMNI_STAGE_SLOTS 4
+
+static uint16_t omni_stage[OMNI_STAGE_SLOTS][OMNI_STAGE_ELEMS];
+static int omni_stage_slot = 0;
+
+typedef struct {
+  int active;
+  uint32_t token;
+  void *dest;
+  int32_t elem_bytes;
+  int32_t num_elems;
+  int32_t layout_kind;
+  int stage_slot;
+} OmniAsyncJob;
+
+static OmniAsyncJob omni_async_job;
+
+/* Forward decls – defined below. */
+static void hmx_weight_gather(const void *src, void *dest, int32_t elem_bytes,
+                              int32_t M, int32_t K);
+static void hmx_activation_gather(const void *src, void *dest,
+                                  int32_t elem_bytes, int32_t N, int32_t C,
+                                  int32_t H, int32_t W);
+
+static void omni_async_complete(void) {
+  if (!omni_async_job.active)
+    return;
+#ifdef __hexagon__
+  if (omni_async_job.token != 0)
+    hexagon_runtime_dma_wait(omni_async_job.token);
+#endif
+  const void *staged = omni_stage[omni_async_job.stage_slot];
+  void *dest = omni_async_job.dest;
+  int32_t eb = omni_async_job.elem_bytes;
+  int32_t ne = omni_async_job.num_elems;
+  switch (omni_async_job.layout_kind) {
+  case LAYOUT_NONE:
+    memcpy(dest, staged, (size_t)ne * (size_t)eb);
+    break;
+  case LAYOUT_HMX_WEIGHT: {
+    int32_t K = 32;
+    int32_t M = (ne > 0) ? ne / K : 1;
+    hmx_weight_gather(staged, dest, eb, M, K);
+    break;
+  }
+  case LAYOUT_HMX_ACTIVATION:
+    hmx_activation_gather(staged, dest, eb, 1, ne, 1, 1);
+    break;
+  default:
+    memcpy(dest, staged, (size_t)ne * (size_t)eb);
+    break;
+  }
+  omni_async_job.active = 0;
+}
+
+static int omni_async_kick(const void *src, void *dest, int32_t elem_bytes,
+                           int32_t num_elems, int32_t layout_kind) {
+  uint32_t bytes = (uint32_t)elem_bytes * (uint32_t)num_elems;
+  if (bytes == 0 || bytes > sizeof(omni_stage[0]) || !src || !dest)
+    return 0;
+  /* Complete any prior job before reusing the staging ring. */
+  omni_async_complete();
+
+  int slot = omni_stage_slot;
+  omni_stage_slot = (omni_stage_slot + 1) % OMNI_STAGE_SLOTS;
+#ifdef __hexagon__
+  int status = OMNI_DMA_OK;
+  /* Staging lives in DDR (.bss); both ends are DDR address space. */
+  uint32_t tok = hexagon_runtime_dma_start(
+      (void *)src, OMNI_DDR, omni_stage[slot], OMNI_DDR, bytes,
+      /*bypassSrc=*/0, /*bypassDst=*/0, &status);
+  if (status != OMNI_DMA_OK) {
+    memcpy(omni_stage[slot], src, bytes);
+    tok = 0;
+  }
+  omni_async_job.token = tok;
+#else
+  memcpy(omni_stage[slot], src, bytes);
+  omni_async_job.token = 0;
+#endif
+  omni_async_job.active = 1;
+  omni_async_job.dest = dest;
+  omni_async_job.elem_bytes = elem_bytes;
+  omni_async_job.num_elems = num_elems;
+  omni_async_job.layout_kind = layout_kind;
+  omni_async_job.stage_slot = slot;
+  return 1;
+}
+
 void __omni_fetch_wait(int32_t sem_idx) {
+  /* Drain async DMA + finish in-situ gather before Execute consumes the tile. */
+  omni_async_complete();
+
   if ((unsigned)sem_idx >= OMNI_SEM_POOL_SIZE) return;
-  /* Spin until the Access Thread signals that the VTCM tile is ready.
-   * In the current synchronous-prefetch model this loop body executes
-   * zero times (signal was already posted before wait is reached).
-   * With async DMA the spin provides the necessary ordering fence. */
   int spins = 0;
   while (omni_sem_pool[sem_idx] <= 0) {
     if (++spins >= OMNI_SEM_MAX_SPIN)
-      break;  /* Safety valve: avoid infinite hang on mis-use. */
+      break;
 #ifdef __hexagon__
-    /* Hexagon pause instruction: yield the pipeline for one cycle.
-     * Reduces power and bus contention during the spin loop. */
     __asm__ volatile("pause(#255)");
 #endif
   }
@@ -232,16 +343,55 @@ static void omni_l2fetch(const void *ptr, uint32_t total_bytes) {
 void __omni_fetch_prefetch_insitu(const void *src, void *dest,
                                    int32_t elem_bytes, int32_t num_elems,
                                    int32_t layout_kind, int32_t lookahead,
-                                   const int32_t *index_map) {
-  (void)lookahead;
-
+                                   const int32_t *index_map,
+                                   int32_t tile_row, int32_t tile_col,
+                                   int32_t src_cols) {
   if (elem_bytes <= 0 || num_elems <= 0 || !src)
     return;
   /* L2 hints may pass dest==src; real copies require a distinct dest. */
   if (layout_kind != LAYOUT_L2_HINT && !dest)
     return;
 
+  /* HexKL-accurate weight path: same transform as MicroHMXRmToWhF16.
+   * src is the full DDR matrix; dest is the VTCM weight slot (offset 0).
+   * Do not use the generic HMXWeight gather — it assumes a contiguous
+   * 32-wide tile and corrupts strided subviews. */
+  if (layout_kind == LAYOUT_HMX_WEIGHT && src_cols > 0 && tile_row >= 0 &&
+      tile_col >= 0) {
+#ifdef __hexagon__
+    (void)elem_bytes;
+    (void)num_elems;
+    (void)lookahead;
+    (void)index_map;
+    hexkl_micro_hmx_rm_to_wh_f16((uint8_t *)dest, /*weight_offset=*/0,
+                                 (const _Float16 *)src, (uint32_t)tile_row,
+                                 (uint32_t)tile_col, (uint32_t)src_cols);
+#else
+    (void)tile_row;
+    (void)tile_col;
+    (void)src_cols;
+    (void)lookahead;
+    (void)index_map;
+    /* Host stub: keep old gather for unit tests without HexKL. */
+    {
+      int32_t K = 32;
+      int32_t M = (num_elems > 0) ? num_elems / K : 1;
+      hmx_weight_gather(src, dest, elem_bytes, M, K);
+    }
+#endif
+    return;
+  }
+
   uint32_t total_bytes = (uint32_t)(num_elems * elem_bytes);
+
+  /* Phase 2b: async DMA kick when lookahead requests overlap. */
+  if (lookahead > 0 &&
+      (layout_kind == LAYOUT_NONE || layout_kind == LAYOUT_HMX_WEIGHT ||
+       layout_kind == LAYOUT_HMX_ACTIVATION)) {
+    if (omni_async_kick(src, dest, elem_bytes, num_elems, layout_kind))
+      return;
+    /* Fall through to synchronous path if kick refused. */
+  }
 
   switch (layout_kind) {
 

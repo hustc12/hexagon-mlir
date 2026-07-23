@@ -162,14 +162,15 @@ static bool isRedundantLayoutOp(Operation *op, LayoutTransform lt) {
   if (opName.contains("contiguous"))
     return true;
 
-  // Check for reshape/expand/collapse ops
+  // reshape/expand/collapse can be redundant when in-situ layout absorbs them
   if (opName.contains("reshape") || opName.contains("expand_shape") ||
       opName.contains("collapse_shape"))
     return true;
 
-  // Check for slice/extract ops
-  if (isa<tensor::ExtractSliceOp>(op) || isa<memref::SubViewOp>(op))
-    return lt == LayoutTransform::HMXWeight;
+  // Do NOT treat memref.subview / tensor.extract_slice as redundant layout
+  // ops.  PrefetchInsert builds 32×32 tile subviews as the *source* of
+  // prefetch_in_situ; deleting them leaves dangling SSA and crashes.
+  // True layout redundancy is transpose/permute/reshape above.
 
   return false;
 }
@@ -207,6 +208,10 @@ static bool canSafelyRemove(Operation *op) {
   // Original logic for other operations
   for (OpOperand &use : op->getUses()) {
     Operation *user = use.getOwner();
+
+    // Never delete a value still consumed by OmniFetch prefetch.
+    if (isa<PrefetchInSituOp>(user))
+      return false;
 
     // If user is also marked redundant, it's safe
     if (user->hasAttr("omni_fetch.redundant"))

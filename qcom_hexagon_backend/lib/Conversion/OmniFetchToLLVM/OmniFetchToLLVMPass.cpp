@@ -107,9 +107,9 @@ getOrInsertPrefetchInSitu(ModuleOp module,
   auto i32Ty  = IntegerType::get(ctx, 32);
   auto voidTy = LLVM::LLVMVoidType::get(ctx);
   // (src_ptr, dest_ptr, elem_bytes, num_elems, layout_kind, lookahead,
-  //  index_map_ptr)
-  SmallVector<Type, 7> argTys = {ptrTy, ptrTy, i32Ty, i32Ty,
-                                 i32Ty, i32Ty, ptrTy};
+  //  index_map_ptr, tile_row, tile_col, src_cols)
+  SmallVector<Type, 10> argTys = {ptrTy, ptrTy, i32Ty, i32Ty, i32Ty, i32Ty,
+                                  ptrTy, i32Ty, i32Ty, i32Ty};
   return LLVM::lookupOrCreateFn(rewriter, module, getPrefetchInSituFnName(),
                                 argTys, voidTy);
 }
@@ -231,7 +231,8 @@ struct LowerWait : public ConvertOpToLLVMPattern<WaitOp> {
 //       const void *src, void *dest,
 //       int32_t elem_bytes, int32_t num_elems,
 //       int32_t layout_kind, int32_t lookahead,
-//       const int32_t *index_map);  // NULL for non-Custom
+//       const int32_t *index_map,  // NULL for non-Custom
+//       int32_t tile_row, int32_t tile_col, int32_t src_cols);
 //===----------------------------------------------------------------------===//
 struct LowerPrefetchInSitu
     : public ConvertOpToLLVMPattern<PrefetchInSituOp> {
@@ -270,6 +271,11 @@ struct LowerPrefetchInSitu
         rewriter.create<LLVM::ConstantOp>(loc, i32Ty,
             rewriter.getI32IntegerAttr(static_cast<int32_t>(elemBytes)));
 
+    auto cI32 = [&](int32_t v) {
+      return rewriter.create<LLVM::ConstantOp>(
+          loc, i32Ty, rewriter.getI32IntegerAttr(v));
+    };
+
     // Rank-2 LAYOUT_NONE: use stride-aware copy2d.  Inner-dim tiles produce
     // strided src subviews; a flat num_elems memcpy would OOB / Bad VA.
     if (op.getLayoutTransform() == LayoutTransform::None &&
@@ -301,14 +307,11 @@ struct LowerPrefetchInSitu
       if (failed(fnOrErr))
         return failure();
 
-      auto c = [&](int64_t v) {
-        return rewriter.create<LLVM::ConstantOp>(
-            loc, i32Ty, rewriter.getI32IntegerAttr(static_cast<int32_t>(v)));
-      };
       rewriter.replaceOpWithNewOp<LLVM::CallOp>(
           op, *fnOrErr,
-          ValueRange{srcPtr, destPtr, elemBytesVal, c(rows), c(cols),
-                     c(*srcStride), c(*dstStride)});
+          ValueRange{srcPtr, destPtr, elemBytesVal, cI32((int32_t)rows),
+                     cI32((int32_t)cols), cI32((int32_t)*srcStride),
+                     cI32((int32_t)*dstStride)});
       return success();
     }
 
@@ -332,31 +335,39 @@ struct LowerPrefetchInSitu
       numElems = srcElems;
     if (numElems < 0)
       numElems = 0;
-    Value numElemsVal =
-        rewriter.create<LLVM::ConstantOp>(loc, i32Ty,
-            rewriter.getI32IntegerAttr(static_cast<int32_t>(numElems)));
+    // HexKL HMXWeight with tile_params uses the full matrix as src; volume is
+    // the dest tile (32×32), not the whole matrix.
+    if (op.getLayoutTransform() == LayoutTransform::HMXWeight &&
+        op.getTileParams().size() == 3)
+      numElems = dstElems > 0 ? dstElems : 1024;
+    Value numElemsVal = cI32(static_cast<int32_t>(numElems));
 
     // --- layout kind ---
     Value layoutKindVal =
-        rewriter.create<LLVM::ConstantOp>(
-            loc, i32Ty,
-            rewriter.getI32IntegerAttr(
-                static_cast<int32_t>(op.getLayoutTransform())));
+        cI32(static_cast<int32_t>(op.getLayoutTransform()));
 
     // --- lookahead ---
-    Value lookaheadVal =
-        rewriter.create<LLVM::ConstantOp>(
-            loc, i32Ty,
-            rewriter.getI32IntegerAttr(op.getLookahead()));
+    Value lookaheadVal = cI32(op.getLookahead());
 
     // --- index_map pointer (null unless Custom) ---
     Value indexMapPtr = rewriter.create<LLVM::ZeroOp>(loc, ptrTy);
     (void)op.getIndexMap();
 
+    // --- HexKL tile params (default -1 = unused) ---
+    Value tileRow = cI32(-1);
+    Value tileCol = cI32(-1);
+    Value srcCols = cI32(-1);
+    auto tileParams = adaptor.getTileParams();
+    if (tileParams.size() == 3) {
+      tileRow = tileParams[0];
+      tileCol = tileParams[1];
+      srcCols = tileParams[2];
+    }
+
     rewriter.replaceOpWithNewOp<LLVM::CallOp>(
         op, *fnOrErr,
-        ValueRange{srcPtr, destPtr, elemBytesVal, numElemsVal,
-                   layoutKindVal, lookaheadVal, indexMapPtr});
+        ValueRange{srcPtr, destPtr, elemBytesVal, numElemsVal, layoutKindVal,
+                   lookaheadVal, indexMapPtr, tileRow, tileCol, srcCols});
     return success();
   }
 };

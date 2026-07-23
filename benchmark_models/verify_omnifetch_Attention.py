@@ -37,11 +37,11 @@ class PureAttentionModel(nn.Module):
     def forward(self, q, k):
         # q, k: [1, num_heads, seq_len, head_dim]
         # Attention: Q @ K^T -> [1, num_heads, seq_len, seq_len]
+        # NOTE: this is linalg.batch_matmul after export. MatmulToHexKL only
+        # matches 2D linalg.matmul — use verify_omnifetch_Gemm.py for HexKL
+        # MicroHMX + OmniFetch experiments.
         attn_weights = torch.matmul(q, k.transpose(-2, -1))
-        
-        # Apply softmax (optional, but makes it more realistic)
         attn_weights = torch.softmax(attn_weights, dim=-1)
-        
         return attn_weights
 
 def compile_and_run(
@@ -51,11 +51,17 @@ def compile_and_run(
     adaptive: bool = True,
     enable_vtcm_tiling: bool = True,
     enable_layout_aware: bool = True,
-    verbose: bool = True
+    verbose: bool = True,
+    num_heads: int = 8,
+    seq_len: int = 128,
+    head_dim: int = 64,
 ):
     """
     Compile and run the model on Hexagon NPU.
-    
+
+    Default Q/K shapes are sized so HexKL tiles are more likely ≥4KB
+    (PrefetchInsert sync-copy gate), unlike the old 64×32 microbench.
+
     Returns:
         tuple: (success: bool, npu_time_us: float or None)
                - success: Whether the execution succeeded and results match
@@ -64,6 +70,7 @@ def compile_and_run(
     if verbose:
         print(f"\n{'='*60}")
         print(f"  Pure Attention Model (HexKL Compatible)")
+        print(f"  Shape: Q/K=[1,{num_heads},{seq_len},{head_dim}] f16")
         print(f"  Omni-Fetch: {'ON' if enable_omnifetch else 'OFF'}")
         print(f"  HexKL: {'ON' if enable_hexkl else 'OFF'}")
         print(f"  Lookahead: {lookahead}")
@@ -76,16 +83,16 @@ def compile_and_run(
 
     # 1. Initialize model and data in FP16
     device = "cpu"
-    
+
     # Use PureAttentionModel - compatible with HexKL
     # No Linear layers, only attention batch_matmul
-    num_heads = 8
-    seq_len = 64
-    head_dim = 32
-    
+    assert seq_len % 32 == 0 and head_dim % 32 == 0, (
+        f"HexKL alignment: seq_len={seq_len} and head_dim={head_dim} must be multiples of 32"
+    )
+
     model = PureAttentionModel(num_heads=num_heads, seq_len=seq_len, head_dim=head_dim).to(device).half()
     model.eval()
-    
+
     # Prepare inputs: Q and K tensors in multi-head format
     # Shape: [1, num_heads, seq_len, head_dim]
     q = torch.randn(1, num_heads, seq_len, head_dim).half().to(device)
@@ -110,15 +117,21 @@ def compile_and_run(
     # 3. Configure Hexagon Options
     # IMPORTANT: Pass options to HexagonOptions constructor for proper validation
     # Do NOT manually assign to __dict__ as it bypasses type checking
+    # PrefetchInsert is gated by enablePrefetch.  enableOmniFetchVDAE alone is
+    # a no-op for insertion (pipeline warns and skips).  Mirror GPT2 runner:
+    # when OmniFetch is requested, enable both Prefetch and V-DAE together.
+    # Note: LinalgToLLVM skips VTCMTiling whenever OmniFetch is active.
     options = HexagonOptions(
         enableVectorization=enable_hexkl,  # Required prerequisite for enableHexKL
         enableHexKL=enable_hexkl,
+        enablePrefetch=enable_omnifetch,
         enableOmniFetchVDAE=enable_omnifetch,
-        enableOmniFetchLayoutAware=enable_layout_aware,
+        enableOmniFetchLayoutAware=enable_layout_aware and enable_omnifetch,
         omniFetchLookahead=lookahead,
-        enableOmniFetchAdaptive=adaptive,
+        enableOmniFetchAdaptive=adaptive and enable_omnifetch,
         lowerConstantsInSeparateSharedObjects=False,
-        enableVTCMTiling=enable_vtcm_tiling
+        enableVTCMTiling=enable_vtcm_tiling,
+        enableConvertToHexagonmem=True,
     ).__dict__
 
     # 4. Execute on Hexagon NPU
@@ -233,17 +246,21 @@ def run_ablation_study():
 
     print("\n" + "="*80)
     print("ABLATION STUDY: Omni-Fetch Performance Analysis")
-    print("Model: PureAttentionModel  Q/K=[1,8,64,32] fp16  -> attn_weights=[1,8,64,64]")
+    print("Model: PureAttentionModel  Q/K=[1,8,128,64] fp16  -> attn_weights=[1,8,128,128]")
     print("="*80 + "\n")
 
     results = []
+    # Shared geometry for Phase-0/ablation (tiles large enough for ≥4KB gate).
+    shape_kwargs = dict(num_heads=8, seq_len=128, head_dim=64)
 
     def _run(exp_name, config_name, **kwargs):
         """Helper: run one config, record result, print one-liner."""
         print(f"  {config_name:<55}", end="", flush=True)
         start = time.time()
         try:
-            success, npu_time_us = compile_and_run(**kwargs, verbose=False)
+            success, npu_time_us = compile_and_run(
+                **shape_kwargs, **kwargs, verbose=False
+            )
             e2e = time.time() - start
             rec = {
                 'experiment': exp_name,
@@ -424,12 +441,46 @@ if __name__ == "__main__":
     parser.add_argument("--enable-vtcm-tiling", action="store_true", help="Enable VTCM tiling")
     parser.add_argument("--enable-layout-aware", action="store_true", help="Enable layout-aware optimization")
     parser.add_argument("--ablation", action="store_true", help="Run full ablation study")
+    parser.add_argument("--seq-len", type=int, default=128, help="Attention sequence length (multiple of 32)")
+    parser.add_argument("--head-dim", type=int, default=64, help="Head dimension (multiple of 32)")
+    parser.add_argument("--num-heads", type=int, default=8, help="Number of attention heads")
+    parser.add_argument("--phase0", action="store_true",
+                        help="Run Phase-0 smoke: HexKL / HexKL+VTCM / HexKL+OmniFetch(layout OFF)")
 
     args = parser.parse_args()
 
     if args.ablation:
         # Run comprehensive ablation study
         run_ablation_study()
+    elif args.phase0:
+        import time
+        configs = [
+            ("HexKL only",
+             dict(enable_omnifetch=False, enable_hexkl=True, lookahead=0, adaptive=False,
+                  enable_vtcm_tiling=False, enable_layout_aware=False)),
+            ("HexKL + VTCM",
+             dict(enable_omnifetch=False, enable_hexkl=True, lookahead=0, adaptive=False,
+                  enable_vtcm_tiling=True, enable_layout_aware=False)),
+            ("HexKL + OmniFetch (sync, layout OFF)",
+             dict(enable_omnifetch=True, enable_hexkl=True, lookahead=2, adaptive=True,
+                  enable_vtcm_tiling=False, enable_layout_aware=False)),
+        ]
+        print("\nPhase 0 smoke (Attention)")
+        print(f"  Q/K=[1,{args.num_heads},{args.seq_len},{args.head_dim}] f16")
+        print("  Note: pipeline skips VTCMTiling when OmniFetch is active.\n")
+        for name, kw in configs:
+            print(f"=== {name} ===", flush=True)
+            t0 = time.time()
+            ok, npu = compile_and_run(
+                verbose=True,
+                num_heads=args.num_heads,
+                seq_len=args.seq_len,
+                head_dim=args.head_dim,
+                **kw,
+            )
+            npu_str = f"{npu/1000:.2f} ms" if npu is not None else "N/A"
+            print(f">>> RESULT {name}: Pass={ok} NPU={npu_str} E2E={time.time()-t0:.1f}s\n",
+                  flush=True)
     else:
         # Run single configuration
         compile_and_run(
@@ -439,6 +490,9 @@ if __name__ == "__main__":
             adaptive=args.enable_adaptive,
             enable_vtcm_tiling=args.enable_vtcm_tiling,
             enable_layout_aware=args.enable_layout_aware,
+            num_heads=args.num_heads,
+            seq_len=args.seq_len,
+            head_dim=args.head_dim,
             verbose=True
         )
 

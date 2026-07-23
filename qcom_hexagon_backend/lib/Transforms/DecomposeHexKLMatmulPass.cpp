@@ -91,6 +91,7 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
 
     Value i32_0 = rewriter.create<arith::ConstantIntOp>(loc, i32Ty, 0);
     Value i32_1 = rewriter.create<arith::ConstantIntOp>(loc, i32Ty, 1);
+    Value i32_2 = rewriter.create<arith::ConstantIntOp>(loc, i32Ty, 2);
     Value i32_32 = rewriter.create<arith::ConstantIntOp>(loc, i32Ty, 32);
     Value i32_4096 = rewriter.create<arith::ConstantIntOp>(loc, i32Ty, 4096);
     Value idx4096 = rewriter.create<arith::ConstantIndexOp>(loc, 4096);
@@ -109,12 +110,13 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
     Value kTiles = rewriter.create<arith::DivUIOp>(loc, kPlus31, idx32);
     Value kTilesI32 = rewriter.create<arith::IndexCastOp>(loc, i32Ty, kTiles);
 
-    // Calculate VTCM size: (numKTiles*2 + 2 + 3) * 4096
-    // Layout: [act_tiles | scratch_tiles | flat_out | acc_read | extra]
+    // Calculate VTCM size: (numKTiles*2 + 4 + 3) * 4096
+    // Layout: [act_tiles | scratch_tiles | w0 | w1 | flat_out | acc_read | extra]
+    // Dual weight slots enable OmniFetch lookahead (prefetch next while Mm runs).
     Value twoKTiles = rewriter.create<arith::MulIOp>(
         loc, kTiles, rewriter.create<arith::ConstantIndexOp>(loc, 2));
     Value dataTiles = rewriter.create<arith::AddIOp>(
-        loc, twoKTiles, rewriter.create<arith::ConstantIndexOp>(loc, 2));
+        loc, twoKTiles, rewriter.create<arith::ConstantIndexOp>(loc, 4));
     Value vtcmTiles = rewriter.create<arith::AddIOp>(
         loc, dataTiles, rewriter.create<arith::ConstantIndexOp>(loc, 3));
     Value vtcmBytes = rewriter.create<arith::MulIOp>(loc, vtcmTiles, idx4096);
@@ -134,16 +136,19 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
     rewriter.create<hexkl::MicroHMXSetupAccReadF16Op>(loc, vtcm);
 
     // Hoist loop-invariant offset calculations
-    // weightOffset = numKTiles * 4096 (weight buffer starts after activation
-    // tiles)
-    Value wOff = rewriter.create<arith::MulIOp>(loc, kTilesI32, i32_4096);
+    // weight ping/pong after activation+scratch: w0 at kTiles, w1 at kTiles+1
+    Value wOff0 = rewriter.create<arith::MulIOp>(loc, kTilesI32, i32_4096);
+    Value wOff1 = rewriter.create<arith::AddIOp>(loc, wOff0, i32_4096);
 
-    // flatOffset = numKTiles * 4096 (flat output buffer location)
-    Value flatOff = wOff;
-
-    // accReadOffset = (numKTiles + 1) * 4096 (accumulator readback location)
-    Value kTilesPlus1 = rewriter.create<arith::AddIOp>(loc, kTilesI32, i32_1);
-    Value accOff = rewriter.create<arith::MulIOp>(loc, kTilesPlus1, i32_4096);
+    // flatOffset / accRead after the dual weight slots
+    Value kTilesPlus2 = rewriter.create<arith::AddIOp>(
+        loc, kTilesI32, rewriter.create<arith::ConstantIntOp>(loc, i32Ty, 2));
+    Value flatOff =
+        rewriter.create<arith::MulIOp>(loc, kTilesPlus2, i32_4096);
+    Value kTilesPlus3 = rewriter.create<arith::AddIOp>(
+        loc, kTilesI32, rewriter.create<arith::ConstantIntOp>(loc, i32Ty, 3));
+    Value accOff =
+        rewriter.create<arith::MulIOp>(loc, kTilesPlus3, i32_4096);
 
     // Outer loop: iterate over rows (M dimension) in 32-row tiles
     auto outerFor = rewriter.create<scf::ForOp>(
@@ -184,22 +189,30 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
                 // Clear accumulator
                 bb.create<hexkl::MicroHMXAccClearF16Op>(loc);
 
-                // Innermost loop: iterate over K tiles for accumulation
+                // Innermost loop: iterate over K tiles for accumulation.
+                // Ping-pong weight slots so OmniFetch can prefetch kt+1 into
+                // the idle buffer while Mm consumes the current buffer.
                 bb.create<scf::ForOp>(
                     loc, idx0, kTiles, idx1, ValueRange{},
                     [&](OpBuilder &bbb, Location loc, Value ktIdx, ValueRange) {
                       Value kt =
                           bbb.create<arith::IndexCastOp>(loc, i32Ty, ktIdx);
 
-                      // Load weight tile
+                      Value phase = bbb.create<arith::RemUIOp>(loc, kt, i32_2);
+                      Value isOdd = bbb.create<arith::CmpIOp>(
+                          loc, arith::CmpIPredicate::ne, phase, i32_0);
+                      Value curW = bbb.create<arith::SelectOp>(loc, isOdd, wOff1,
+                                                               wOff0);
+
+                      // Load weight tile into the current ping-pong slot
                       bbb.create<hexkl::MicroHMXRmToWhF16Op>(
-                          loc, vtcm, wOff, rhs, kt, colTile, N);
+                          loc, vtcm, curW, rhs, kt, colTile, N);
 
                       // Perform matrix multiplication (accumulates)
                       Value actOff2 =
                           bbb.create<arith::MulIOp>(loc, kt, i32_4096);
                       bbb.create<hexkl::MicroHMXMmF16Op>(loc, vtcm, actOff2,
-                                                         wOff);
+                                                         curW);
 
                       bbb.create<scf::YieldOp>(loc);
                     });

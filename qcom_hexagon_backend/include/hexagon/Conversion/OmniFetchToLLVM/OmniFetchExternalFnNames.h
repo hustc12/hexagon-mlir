@@ -33,7 +33,10 @@ inline llvm::StringRef getWaitFnName() { return "__omni_fetch_wait"; }
 ///       const void *src, void *dest,
 ///       int32_t elem_bytes, int32_t num_elems,
 ///       int32_t layout_kind, int32_t lookahead,
-///       const int32_t *index_map);   // NULL for non-Custom layouts
+///       const int32_t *index_map,   // NULL for non-Custom layouts
+///       int32_t tile_row, int32_t tile_col, int32_t src_cols);
+/// tile_row/col/src_cols are -1 when unused; for HMXWeight+HexKL they select
+/// a tile in the full src matrix (src_cols = matrix width).
 inline llvm::StringRef getPrefetchInSituFnName() {
   return "__omni_fetch_prefetch_insitu";
 }

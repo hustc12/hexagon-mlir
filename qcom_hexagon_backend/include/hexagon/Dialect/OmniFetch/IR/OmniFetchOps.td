@@ -151,11 +151,16 @@ def OmniFetch_PrefetchInSituOp : OmniFetch_Op<"prefetch_in_situ",
     AnyMemRef:$dest,
     OmniFetch_LayoutTransformAttr:$layout_transform,
     DefaultValuedAttr<I32Attr, "2">:$lookahead,
-    OptionalAttr<DenseI32ArrayAttr>:$index_map
+    OptionalAttr<DenseI32ArrayAttr>:$index_map,
+    // Optional HexKL tile metadata: [tile_row, tile_col, src_cols].
+    // When present with HMXWeight, runtime calls hexkl_micro_hmx_rm_to_wh_f16
+    // on the full src matrix (handles strided DDR tiles correctly).
+    Variadic<I32>:$tile_params
   );
 
   let assemblyFormat = [{
     $src `,` $dest
+    (`tile_params` `(` $tile_params^ `:` type($tile_params) `)`)?
     attr-dict
     `:` qualified(type($src)) `,` qualified(type($dest))
   }];
