@@ -234,11 +234,17 @@ void __omni_fetch_prefetch_insitu(const void *src, void *dest,
                                    const int32_t *index_map) {
   (void)lookahead;
 
+  if (elem_bytes <= 0 || num_elems <= 0 || !src || !dest)
+    return;
+
   uint32_t total_bytes = (uint32_t)(num_elems * elem_bytes);
 
 #ifdef __hexagon__
-  /* Phase 1: async L2 warm-up hint.  Fire-and-forget; does not stall. */
-  omni_l2fetch(src, total_bytes);
+  /* l2fetch disabled for now: bad pointers fault the DSP (exit 13).
+   * Re-enable once pointer/offset lowering is fully validated.
+   * omni_l2fetch(src, total_bytes);
+   */
+  (void)total_bytes;
 #endif
 
   switch (layout_kind) {
@@ -273,6 +279,34 @@ void __omni_fetch_prefetch_insitu(const void *src, void *dest,
     memcpy(dest, src, (size_t)total_bytes);
     break;
   }
+}
+
+/* Rank-2 tile copy that respects row strides.  Required when PrefetchInsert
+ * tiles an inner dimension: the src subview is strided, so a flat memcpy of
+ * rows*cols elements would read the wrong (contiguous) bytes. */
+void __omni_fetch_copy2d(const void *src, void *dest, int32_t elem_bytes,
+                         int32_t rows, int32_t cols,
+                         int32_t src_row_stride_elems,
+                         int32_t dst_row_stride_elems) {
+  if (elem_bytes <= 0 || rows <= 0 || cols <= 0 || !src || !dest)
+    return;
+  if (src_row_stride_elems < cols || dst_row_stride_elems < cols)
+    return;
+
+  const char *s = (const char *)src;
+  char *d = (char *)dest;
+  const size_t row_bytes = (size_t)cols * (size_t)elem_bytes;
+  const size_t src_pitch = (size_t)src_row_stride_elems * (size_t)elem_bytes;
+  const size_t dst_pitch = (size_t)dst_row_stride_elems * (size_t)elem_bytes;
+
+  /* Fast path: both sides contiguous. */
+  if (src_row_stride_elems == cols && dst_row_stride_elems == cols) {
+    memcpy(d, s, row_bytes * (size_t)rows);
+    return;
+  }
+
+  for (int32_t r = 0; r < rows; ++r)
+    memcpy(d + (size_t)r * dst_pitch, s + (size_t)r * src_pitch, row_bytes);
 }
 
 /* -------------------------------------------------------------------------

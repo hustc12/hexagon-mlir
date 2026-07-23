@@ -38,6 +38,14 @@ inline llvm::StringRef getPrefetchInSituFnName() {
   return "__omni_fetch_prefetch_insitu";
 }
 
+/// Rank-2 (possibly strided) tile copy used for LAYOUT_NONE prefetches.
+/// Signature (C):
+///   void __omni_fetch_copy2d(
+///       const void *src, void *dest,
+///       int32_t elem_bytes, int32_t rows, int32_t cols,
+///       int32_t src_row_stride_elems, int32_t dst_row_stride_elems);
+inline llvm::StringRef getCopy2DFnName() { return "__omni_fetch_copy2d"; }
+
 /// Reads PMU AXI-stall counter and returns adjusted prefetch distance.
 inline llvm::StringRef getUpdateDistanceFnName() {
   return "__omni_fetch_update_distance";

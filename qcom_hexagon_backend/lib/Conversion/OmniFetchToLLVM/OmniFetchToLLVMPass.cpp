@@ -51,7 +51,21 @@ namespace {
 // Shared helpers
 //===----------------------------------------------------------------------===//
 
-/// Extract the aligned data pointer from a lowered MemRef descriptor.
+/// Extract the aligned data pointer from a lowered MemRef descriptor,
+/// advanced by the descriptor's offset (in elements).  Subviews produced by
+/// PrefetchInsert are offset into a parent buffer; ignoring the offset made
+/// the runtime read/write the wrong address (DSP Bad VA / exit 13).
+static Value alignedPtrWithOffset(ConversionPatternRewriter &rewriter,
+                                  Location loc, Value memrefDesc,
+                                  Type elementType) {
+  MemRefDescriptor desc(memrefDesc);
+  Value ptr = desc.alignedPtr(rewriter, loc);
+  Value offset = desc.offset(rewriter, loc);
+  // GEP by element offset.
+  return rewriter.create<LLVM::GEPOp>(
+      loc, ptr.getType(), elementType, ptr, ValueRange{offset});
+}
+
 static Value alignedPtr(ConversionPatternRewriter &rewriter, Location loc,
                         Value memrefDesc) {
   MemRefDescriptor desc(memrefDesc);
@@ -98,6 +112,20 @@ getOrInsertPrefetchInSitu(ModuleOp module,
                                  i32Ty, i32Ty, ptrTy};
   return LLVM::lookupOrCreateFn(rewriter, module, getPrefetchInSituFnName(),
                                 argTys, voidTy);
+}
+
+/// Get or insert `void __omni_fetch_copy2d(...)`.
+static FailureOr<LLVM::LLVMFuncOp>
+getOrInsertCopy2D(ModuleOp module, ConversionPatternRewriter &rewriter) {
+  MLIRContext *ctx = module.getContext();
+  auto ptrTy  = LLVM::LLVMPointerType::get(ctx);
+  auto i32Ty  = IntegerType::get(ctx, 32);
+  auto voidTy = LLVM::LLVMVoidType::get(ctx);
+  // (src, dest, elem_bytes, rows, cols, src_row_stride, dst_row_stride)
+  SmallVector<Type, 7> argTys = {ptrTy, ptrTy, i32Ty, i32Ty,
+                                 i32Ty, i32Ty, i32Ty};
+  return LLVM::lookupOrCreateFn(rewriter, module, getCopy2DFnName(), argTys,
+                                voidTy);
 }
 
 /// Get or insert `i32 __omni_fetch_update_distance(i32)`.
@@ -196,6 +224,7 @@ struct LowerWait : public ConvertOpToLLVMPattern<WaitOp> {
 
 //===----------------------------------------------------------------------===//
 // PrefetchInSituOp  →  void __omni_fetch_prefetch_insitu(…)
+//                 or   void __omni_fetch_copy2d(…) for rank-2 LAYOUT_NONE
 //
 // The runtime signature:
 //   void __omni_fetch_prefetch_insitu(
@@ -214,19 +243,18 @@ struct LowerPrefetchInSitu
     Location loc = op.getLoc();
     ModuleOp module = op->getParentOfType<ModuleOp>();
 
-    auto fnOrErr = getOrInsertPrefetchInSitu(module, rewriter);
-    if (failed(fnOrErr))
-      return failure();
-
     MLIRContext *ctx = rewriter.getContext();
     auto i32Ty  = IntegerType::get(ctx, 32);
     auto ptrTy  = LLVM::LLVMPointerType::get(ctx);
 
-    // --- src / dest aligned pointers ---
-    // Extract raw pointers
-    Value srcPtr  = alignedPtr(rewriter, loc, adaptor.getSrc());
-    Value destPtr = alignedPtr(rewriter, loc, adaptor.getDest());
-    
+    // --- src / dest pointers (aligned + memref offset) ---
+    auto srcMemrefTy = cast<MemRefType>(op.getSrc().getType());
+    auto destMemref = cast<MemRefType>(op.getDest().getType());
+    Value srcPtr = alignedPtrWithOffset(rewriter, loc, adaptor.getSrc(),
+                                        srcMemrefTy.getElementType());
+    Value destPtr = alignedPtrWithOffset(rewriter, loc, adaptor.getDest(),
+                                         destMemref.getElementType());
+
     // Cast to generic address space (0) if needed using proper LLVM addrspacecast
     if (srcPtr.getType() != ptrTy) {
       srcPtr = LLVM::AddrSpaceCastOp::create(rewriter, loc, ptrTy, srcPtr);
@@ -236,17 +264,74 @@ struct LowerPrefetchInSitu
     }
 
     // --- element byte-size (from dest element type) ---
-    auto destMemref = cast<MemRefType>(op.getDest().getType());
     int64_t elemBytes =
         destMemref.getElementType().getIntOrFloatBitWidth() / 8;
     Value elemBytesVal =
         rewriter.create<LLVM::ConstantOp>(loc, i32Ty,
             rewriter.getI32IntegerAttr(static_cast<int32_t>(elemBytes)));
 
-    // --- total element count ---
-    int64_t numElems = 1;
-    for (auto d : destMemref.getShape())
-      numElems *= d;
+    // Rank-2 LAYOUT_NONE: use stride-aware copy2d.  Inner-dim tiles produce
+    // strided src subviews; a flat num_elems memcpy would OOB / Bad VA.
+    if (op.getLayoutTransform() == LayoutTransform::None &&
+        srcMemrefTy.getRank() == 2 && destMemref.getRank() == 2 &&
+        srcMemrefTy.hasStaticShape() && destMemref.hasStaticShape()) {
+      int64_t rows = srcMemrefTy.getShape()[0];
+      int64_t cols = srcMemrefTy.getShape()[1];
+      if (destMemref.getShape()[0] != rows ||
+          destMemref.getShape()[1] != cols) {
+        return rewriter.notifyMatchFailure(op, "src/dest tile shape mismatch");
+      }
+
+      auto rowStrideOr = [](MemRefType t) -> std::optional<int64_t> {
+        int64_t offset;
+        SmallVector<int64_t> strides;
+        if (failed(t.getStridesAndOffset(strides, offset)))
+          return std::nullopt;
+        if (strides.size() != 2 || strides[1] != 1)
+          return std::nullopt;
+        return strides[0];
+      };
+      auto srcStride = rowStrideOr(srcMemrefTy);
+      auto dstStride = rowStrideOr(destMemref);
+      if (!srcStride || !dstStride)
+        return rewriter.notifyMatchFailure(
+            op, "expected row-major rank-2 memrefs with unit inner stride");
+
+      auto fnOrErr = getOrInsertCopy2D(module, rewriter);
+      if (failed(fnOrErr))
+        return failure();
+
+      auto c = [&](int64_t v) {
+        return rewriter.create<LLVM::ConstantOp>(
+            loc, i32Ty, rewriter.getI32IntegerAttr(static_cast<int32_t>(v)));
+      };
+      rewriter.replaceOpWithNewOp<LLVM::CallOp>(
+          op, *fnOrErr,
+          ValueRange{srcPtr, destPtr, elemBytesVal, c(rows), c(cols),
+                     c(*srcStride), c(*dstStride)});
+      return success();
+    }
+
+    auto fnOrErr = getOrInsertPrefetchInSitu(module, rewriter);
+    if (failed(fnOrErr))
+      return failure();
+
+    // --- total element count: min(src, dest) static volumes ---
+    auto staticVolume = [](MemRefType t) -> int64_t {
+      if (!t.hasStaticShape())
+        return -1;
+      int64_t n = 1;
+      for (auto d : t.getShape())
+        n *= d;
+      return n;
+    };
+    int64_t srcElems = staticVolume(srcMemrefTy);
+    int64_t dstElems = staticVolume(destMemref);
+    int64_t numElems = dstElems;
+    if (srcElems > 0 && (numElems < 0 || srcElems < numElems))
+      numElems = srcElems;
+    if (numElems < 0)
+      numElems = 0;
     Value numElemsVal =
         rewriter.create<LLVM::ConstantOp>(loc, i32Ty,
             rewriter.getI32IntegerAttr(static_cast<int32_t>(numElems)));
@@ -265,17 +350,8 @@ struct LowerPrefetchInSitu
             rewriter.getI32IntegerAttr(op.getLookahead()));
 
     // --- index_map pointer (null unless Custom) ---
-    Value indexMapPtr;
-    if (auto idxMap = op.getIndexMap()) {
-      // For now, pass NULL and let the runtime use default mapping
-      // TODO: Implement proper index map passing via global constant
-      // The issue is that LLVM::GlobalOp requires specific attribute format
-      // that's not compatible with DenseI32ArrayAttr
-      indexMapPtr = rewriter.create<LLVM::ZeroOp>(loc, ptrTy);
-    } else {
-      // Pass NULL for non-custom layouts.
-      indexMapPtr = rewriter.create<LLVM::ZeroOp>(loc, ptrTy);
-    }
+    Value indexMapPtr = rewriter.create<LLVM::ZeroOp>(loc, ptrTy);
+    (void)op.getIndexMap();
 
     rewriter.replaceOpWithNewOp<LLVM::CallOp>(
         op, *fnOrErr,
