@@ -21,7 +21,7 @@ if not hasattr(huggingface_hub, "hf_hub_url"):
 from RealESRGAN import RealESRGAN
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from hexkl_phase4_utils import (  # noqa: E402
+from hexkl_utils import (  # noqa: E402
     patch_dsp_heap_256mb,
     compile_to_linalg,
     hex_execution,
@@ -43,8 +43,12 @@ def compare(hex_outputs, x86_outputs, atol=0.05, fail_on_mismatch: bool = False)
         assert not fail_on_mismatch, "Correctness issue: Hexagon vs x86"
 
 
-def customize_input_size(default: int = 16) -> int:
-    """Identity hook for main; debug may shrink further."""
+def customize_input_size(default: int = 64) -> int:
+    """Spatial input size (RRDBNet topology is always full). Debug may shrink.
+
+    Default 64×64 is a practical full-harness smoke size; published demo images
+    are often larger. Pass --input-size to override.
+    """
     return default
 
 
@@ -67,7 +71,7 @@ def real_esrgan(
     model = model_wrapper.model.eval()
     func_name = model.__class__.__name__
 
-    size = input_size if input_size is not None else customize_input_size(16)
+    size = input_size if input_size is not None else customize_input_size(64)
     # Full RRDBNet topology; spatial size is the DSP-capacity knob (not layer count).
     input_tensor = torch.rand(1, 3, size, size)
     print(f"[Config] RealESRGAN x4 RRDBNet input={size}x{size} HexKL={enable_hexkl}")

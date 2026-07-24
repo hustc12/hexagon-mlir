@@ -1,7 +1,7 @@
 # ===- run_sd_text_encoder.py -----------------------------------------------===
 #
 # Stable Diffusion — Text Encoder (CLIP) Phase-4 harness.
-# Main = published CLIP structure; debug shrinks via run_sd_text_encoder_debug.py
+# Main = published CLIP structure; debug shrinks via debug_running/run_sd_text_encoder_debug.py
 #
 # ===------------------------------------------------------------------------===
 
@@ -53,8 +53,8 @@ def customize_clip_config(config):
     return config
 
 
-def customize_seq_len(default: int = 16) -> int:
-    """DSP-safe default 16 (full CLIP max=77 can blow stack frames)."""
+def customize_seq_len(default: int = 77) -> int:
+    """Published CLIP context length (77). Debug may shrink for DSP stack."""
     return default
 
 
@@ -99,7 +99,7 @@ def test_text_encoder(
 
     model = CLIPWrapper(_clip).eval()
 
-    seq_len = customize_seq_len(16)
+    seq_len = customize_seq_len(77)
     input_ids = get_text_inputs(
         tokenizer, "A beautiful picture of a Hexagon NPU", max_length=seq_len
     )

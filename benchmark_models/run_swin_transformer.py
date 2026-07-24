@@ -11,7 +11,7 @@ from transformers import SwinConfig
 from transformers.models.swin.modeling_swin import SwinForImageClassification
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from hexkl_phase4_utils import (  # noqa: E402
+from hexkl_utils import (  # noqa: E402
     patch_dsp_heap_256mb,
     compile_to_linalg,
     hex_execution,

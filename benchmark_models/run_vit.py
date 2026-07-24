@@ -10,7 +10,7 @@ import torch
 from transformers import AutoModelForImageClassification, AutoConfig
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from hexkl_phase4_utils import (  # noqa: E402
+from hexkl_utils import (  # noqa: E402
     patch_dsp_heap_256mb,
     compile_to_linalg,
     hex_execution,
