@@ -64,6 +64,16 @@ struct MatmulToHexKL final : public OpRewritePattern<linalg::MatmulOp> {
           op, "M/K/N not divisible by HMX tile size 32");
     }
 
+    // Attention score / context matmuls (after ReduceContractionRank collapses
+    // batch=1 batch_matmul) are tile-aligned at seq=32 but HMX on those shapes
+    // faults on device (Bad VA / exit 13), e.g. QK^T 32x64x32 (N==M) and
+    // AV 32x32x64 (K==M). Keep projections / FFN / lm_head on HexKL only.
+    if (K == M || N == M) {
+      DBG("skip HexKL: attention-like MxKxN=" << M << "x" << K << "x" << N);
+      return rewriter.notifyMatchFailure(
+          op, "attention-like matmul (K==M or N==M); keep HVX");
+    }
+
     Value A = op.getDpsInputOperand(0)->get();
     Value B = op.getDpsInputOperand(1)->get();
     Value C = op.getOutputs()[0];

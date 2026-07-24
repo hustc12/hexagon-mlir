@@ -7,8 +7,11 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This file implements a pattern to rewrite ub.poison operations to zero
-// constants for vector types.
+// Rewrite ub.poison to zero constants.  The Hexagon LLVM translation path has
+// no LLVMTranslationDialectInterface for ub.poison; leaving any residual poison
+// (from vectorization padding, unreachable cf.assert paths, etc.) fails
+// translation.  Zero is a safe stand-in for padding / dead values on this
+// backend.
 //
 //===----------------------------------------------------------------------===//
 
@@ -30,6 +33,52 @@ using namespace hexagon;
 #include "hexagon/Conversion/LinalgToLLVM/Passes.h.inc"
 
 namespace {
+
+/// Build a typed zero attribute for scalar / vector / ranked-tensor element
+/// types that arith.constant can materialize.
+static FailureOr<TypedAttr> getZeroAttr(Type ty, Builder &b) {
+  if (auto intTy = dyn_cast<IntegerType>(ty)) {
+    TypedAttr attr = b.getIntegerAttr(intTy, 0);
+    return attr;
+  }
+  if (auto floatTy = dyn_cast<FloatType>(ty)) {
+    TypedAttr attr = b.getFloatAttr(floatTy, 0.0);
+    return attr;
+  }
+  if (auto vecTy = dyn_cast<VectorType>(ty)) {
+    auto elemZero = getZeroAttr(vecTy.getElementType(), b);
+    if (failed(elemZero))
+      return failure();
+    TypedAttr attr = DenseElementsAttr::get(vecTy, *elemZero);
+    return attr;
+  }
+  if (auto ranked = dyn_cast<RankedTensorType>(ty)) {
+    if (!ranked.hasStaticShape())
+      return failure();
+    auto elemZero = getZeroAttr(ranked.getElementType(), b);
+    if (failed(elemZero))
+      return failure();
+    TypedAttr attr = DenseElementsAttr::get(ranked, *elemZero);
+    return attr;
+  }
+  return failure();
+}
+
+/// Replace every ub.poison with a zero constant of the same type.
+struct UBPoisonToZeroPattern : public OpRewritePattern<ub::PoisonOp> {
+  using OpRewritePattern<ub::PoisonOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(ub::PoisonOp op,
+                                PatternRewriter &rewriter) const override {
+    auto zeroAttr = getZeroAttr(op.getType(), rewriter);
+    if (failed(zeroAttr))
+      return rewriter.notifyMatchFailure(op, "unsupported poison type");
+    rewriter.replaceOpWithNewOp<arith::ConstantOp>(op, op.getType(), *zeroAttr);
+    return success();
+  }
+};
+
+/// Legacy targeted rewrite: transfer_read padding that is ub.poison → zero.
 struct UBPoisonPaddingToZeroPattern
     : public OpRewritePattern<vector::TransferReadOp> {
   using OpRewritePattern<vector::TransferReadOp>::OpRewritePattern;
@@ -40,27 +89,20 @@ struct UBPoisonPaddingToZeroPattern
     if (!padding)
       return failure();
 
-    if (auto poison = padding.getDefiningOp<ub::PoisonOp>()) {
-      Type padTy = padding.getType();
+    auto poison = padding.getDefiningOp<ub::PoisonOp>();
+    if (!poison)
+      return failure();
 
-      TypedAttr zeroAttr;
-      if (auto intTy = dyn_cast<IntegerType>(padTy))
-        zeroAttr = rewriter.getIntegerAttr(intTy, 0);
-      else if (auto floatTy = dyn_cast<FloatType>(padTy))
-        zeroAttr = rewriter.getFloatAttr(floatTy, 0.0);
-      else
-        return rewriter.notifyMatchFailure(op, "Unsupported padding type");
+    auto zeroAttr = getZeroAttr(padding.getType(), rewriter);
+    if (failed(zeroAttr))
+      return rewriter.notifyMatchFailure(op, "unsupported padding type");
 
-      // Create a constant zero of the same type as padding
-      auto zeroConst =
-          rewriter.create<arith::ConstantOp>(op.getLoc(), padTy, zeroAttr);
-
-      // Replace the padding with the zero constant.
-      rewriter.modifyOpInPlace(
-          op, [&]() { op.getPaddingMutable().assign(zeroConst); });
-      return success();
-    }
-    return failure();
+    auto zeroConst =
+        rewriter.create<arith::ConstantOp>(op.getLoc(), padding.getType(),
+                                           *zeroAttr);
+    rewriter.modifyOpInPlace(
+        op, [&]() { op.getPaddingMutable().assign(zeroConst); });
+    return success();
   }
 };
 
@@ -76,15 +118,15 @@ struct RewriteUBPoisonToZeroPass
     return "hexagon-rewrite-ub-poison-to-zero";
   }
   StringRef getDescription() const final {
-    return "Rewrite ub.poison operations used as padding in "
-           "vector.transfer_read to zero constants";
+    return "Rewrite ub.poison operations to zero constants "
+           "(all uses, plus vector.transfer_read padding)";
   }
 
   void runOnOperation() override {
     MLIRContext *context = &getContext();
 
     RewritePatternSet patterns(context);
-    patterns.add<UBPoisonPaddingToZeroPattern>(context);
+    patterns.add<UBPoisonToZeroPattern, UBPoisonPaddingToZeroPattern>(context);
 
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       signalPassFailure();

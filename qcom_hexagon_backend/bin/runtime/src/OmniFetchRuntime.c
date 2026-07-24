@@ -130,10 +130,16 @@ typedef struct {
   int active;
   uint32_t token;
   void *dest;
+  const void *src; /* full DDR matrix when hexkl_deferred */
   int32_t elem_bytes;
   int32_t num_elems;
   int32_t layout_kind;
   int stage_slot;
+  /* HexKL weight tile metadata (valid when hexkl_deferred != 0). */
+  int hexkl_deferred;
+  int32_t tile_row;
+  int32_t tile_col;
+  int32_t src_cols;
 } OmniAsyncJob;
 
 static OmniAsyncJob omni_async_job;
@@ -144,6 +150,9 @@ static void hmx_weight_gather(const void *src, void *dest, int32_t elem_bytes,
 static void hmx_activation_gather(const void *src, void *dest,
                                   int32_t elem_bytes, int32_t N, int32_t C,
                                   int32_t H, int32_t W);
+#ifdef __hexagon__
+static void omni_l2fetch(const void *ptr, uint32_t total_bytes);
+#endif
 
 static void omni_async_complete(void) {
   if (!omni_async_job.active)
@@ -152,10 +161,32 @@ static void omni_async_complete(void) {
   if (omni_async_job.token != 0)
     hexagon_runtime_dma_wait(omni_async_job.token);
 #endif
-  const void *staged = omni_stage[omni_async_job.stage_slot];
   void *dest = omni_async_job.dest;
   int32_t eb = omni_async_job.elem_bytes;
   int32_t ne = omni_async_job.num_elems;
+
+  if (omni_async_job.hexkl_deferred) {
+#ifdef __hexagon__
+    if (omni_async_job.stage_slot >= 0) {
+      const _Float16 *staged =
+          (const _Float16 *)omni_stage[omni_async_job.stage_slot];
+      hexkl_micro_hmx_rm_to_wh_f16((uint8_t *)dest, 0, staged, 0, 0, 32);
+    } else {
+      hexkl_micro_hmx_rm_to_wh_f16(
+          (uint8_t *)dest, 0, (const _Float16 *)omni_async_job.src,
+          (uint32_t)omni_async_job.tile_row, (uint32_t)omni_async_job.tile_col,
+          (uint32_t)omni_async_job.src_cols);
+    }
+#else
+    (void)dest;
+    (void)eb;
+    (void)ne;
+#endif
+    omni_async_job.active = 0;
+    return;
+  }
+
+  const void *staged = omni_stage[omni_async_job.stage_slot];
   switch (omni_async_job.layout_kind) {
   case LAYOUT_NONE:
     memcpy(dest, staged, (size_t)ne * (size_t)eb);
@@ -174,6 +205,39 @@ static void omni_async_complete(void) {
     break;
   }
   omni_async_job.active = 0;
+}
+
+#ifdef __hexagon__
+static void omni_l2fetch_weight_tile(const _Float16 *src, int32_t tile_row,
+                                     int32_t tile_col, int32_t src_cols) {
+  const _Float16 *row0 =
+      src + (size_t)tile_row * 32 * (size_t)src_cols + (size_t)tile_col * 32;
+  for (int32_t r = 0; r < 32; ++r)
+    omni_l2fetch(row0 + (size_t)r * (size_t)src_cols, 32u * 2u);
+}
+#endif
+
+/* Phase 2b HexKL kick: L2-hint the next weight tile so Mm can overlap DDR
+ * warmup.  WH layout itself stays on the synchronous Prefetch (Phase 2a) —
+ * deferring hexkl_micro into wait() corrupted VTCM on device (bad dest /
+ * HMX state across the wait boundary).  Contiguous-tile DMA can be layered
+ * on later once dest provenance is hardened. */
+static int omni_async_kick_hexkl_weight(const void *src, void *dest,
+                                        int32_t tile_row, int32_t tile_col,
+                                        int32_t src_cols) {
+  if (!src || src_cols <= 0 || tile_row < 0 || tile_col < 0)
+    return 0;
+  (void)dest;
+#ifdef __hexagon__
+  omni_l2fetch_weight_tile((const _Float16 *)src, tile_row, tile_col, src_cols);
+#else
+  (void)src;
+  (void)tile_row;
+  (void)tile_col;
+  (void)src_cols;
+#endif
+  /* No deferred job: __omni_fetch_wait is a no-op for this kick. */
+  return 1;
 }
 
 static int omni_async_kick(const void *src, void *dest, int32_t elem_bytes,
@@ -203,10 +267,12 @@ static int omni_async_kick(const void *src, void *dest, int32_t elem_bytes,
 #endif
   omni_async_job.active = 1;
   omni_async_job.dest = dest;
+  omni_async_job.src = src;
   omni_async_job.elem_bytes = elem_bytes;
   omni_async_job.num_elems = num_elems;
   omni_async_job.layout_kind = layout_kind;
   omni_async_job.stage_slot = slot;
+  omni_async_job.hexkl_deferred = 0;
   return 1;
 }
 
@@ -354,14 +420,17 @@ void __omni_fetch_prefetch_insitu(const void *src, void *dest,
 
   /* HexKL-accurate weight path: same transform as MicroHMXRmToWhF16.
    * src is the full DDR matrix; dest is the VTCM weight slot (offset 0).
-   * Do not use the generic HMXWeight gather — it assumes a contiguous
-   * 32-wide tile and corrupts strided subviews. */
+   * lookahead>0 → Phase 2b async (l2fetch/DMA + layout in wait). */
   if (layout_kind == LAYOUT_HMX_WEIGHT && src_cols > 0 && tile_row >= 0 &&
       tile_col >= 0) {
+    /* Phase 2b: kick records a deferred HexKL layout into dest; wait()
+     * performs hexkl_micro.  Always safe to fall back to sync. */
+    if (lookahead > 0 &&
+        omni_async_kick_hexkl_weight(src, dest, tile_row, tile_col, src_cols))
+      return;
 #ifdef __hexagon__
     (void)elem_bytes;
     (void)num_elems;
-    (void)lookahead;
     (void)index_map;
     hexkl_micro_hmx_rm_to_wh_f16((uint8_t *)dest, /*weight_offset=*/0,
                                  (const _Float16 *)src, (uint32_t)tile_row,
@@ -370,9 +439,7 @@ void __omni_fetch_prefetch_insitu(const void *src, void *dest,
     (void)tile_row;
     (void)tile_col;
     (void)src_cols;
-    (void)lookahead;
     (void)index_map;
-    /* Host stub: keep old gather for unit tests without HexKL. */
     {
       int32_t K = 32;
       int32_t M = (num_elems > 0) ? num_elems / K : 1;

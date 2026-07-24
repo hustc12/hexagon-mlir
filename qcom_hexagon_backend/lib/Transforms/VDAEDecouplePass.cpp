@@ -101,11 +101,14 @@ static SmallVector<PrefetchInSituOp> collectProloguePrefetches(scf::ForOp loop) 
   return prefetches;
 }
 
-/// Collect all prefetch operations inside the loop body.
+/// Collect prefetch ops whose nearest enclosing scf.for is `loop`.
+/// Walking nested loops would otherwise attach wait/signal to parents and
+/// complete async DMA too early (Phase 2b corruption).
 static SmallVector<PrefetchInSituOp> collectLoopBodyPrefetches(scf::ForOp loop) {
   SmallVector<PrefetchInSituOp> prefetches;
   loop.getBody()->walk([&](PrefetchInSituOp op) {
-    prefetches.push_back(op);
+    if (op->getParentOfType<scf::ForOp>() == loop)
+      prefetches.push_back(op);
   });
   return prefetches;
 }

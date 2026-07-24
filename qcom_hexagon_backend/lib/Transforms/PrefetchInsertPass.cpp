@@ -662,12 +662,15 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
   }
 
   // ----- Phase 2a/2b: layout-aware path -----
-  // Weight only: replace RmToWh with prefetch_in_situ that calls
-  // hexkl_micro_hmx_rm_to_wh_f16 on the full DDR matrix (via tile_params).
-  // Activation (Copy+RmToAh) stays on HexKL for now.
+  // Weight only: replace RmToWh with prefetch_in_situ → hexkl_micro WH layout.
+  // Phase 2b software pipeline (lookahead>=1, dual weight slots):
+  //   kt==0: sync fill current slot
+  //   after Mm: async kick of tile kt+1 into the idle slot (l2fetch/DMA;
+  //             WH layout completes in __omni_fetch_wait at next iter)
+  //   kt>0:  skip sync fill — wait already populated the current slot
   int inserted = 0;
   int erased = 0;
-  const int la = std::max(lookahead, 1);
+  const bool doAsync = lookahead >= 1;
 
   SmallVector<hexkl::MicroHMXRmToWhF16Op> whOps;
   for (Operation &op : *loop.getBody())
@@ -687,7 +690,6 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
       }
     }
 
-    // Capture operands before we erase RmToWh.
     Value srcMem = wh.getSrc();
     Value vtcmMem = wh.getHmxBlock();
     Value curOff = wh.getWeightOffset();
@@ -696,27 +698,59 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
     Value wtCols = wh.getWtCols();
 
     OpBuilder b(wh);
-    Value destView = createVtcmF16TileView(b, loc, vtcmMem, curOff);
-    // Full matrix + tile_params → HexKL-accurate WH layout into VTCM slot.
-    b.create<PrefetchInSituOp>(
-        loc, srcMem, destView, LayoutTransform::HMXWeight,
-        /*lookahead=*/0, DenseI32ArrayAttr{},
-        ValueRange{ktVal, colVal, wtCols});
-    ++inserted;
+
+    if (doAsync && mmOp) {
+      auto i32Ty = b.getI32Type();
+      Value c0 = b.create<arith::ConstantIntOp>(loc, i32Ty, 0);
+      Value c1 = b.create<arith::ConstantIntOp>(loc, i32Ty, 1);
+      Value c2 = b.create<arith::ConstantIntOp>(loc, i32Ty, 2);
+      Value c4096 = b.create<arith::ConstantIntOp>(loc, i32Ty, 4096);
+      Value neg4096 = b.create<arith::ConstantIntOp>(loc, i32Ty, -4096);
+
+      // Always sync-fill current (correctness). Async kick of next overlaps Mm.
+      Value destView = createVtcmF16TileView(b, loc, vtcmMem, curOff);
+      b.create<PrefetchInSituOp>(
+          loc, srcMem, destView, LayoutTransform::HMXWeight,
+          /*lookahead=*/0, DenseI32ArrayAttr{},
+          ValueRange{ktVal, colVal, wtCols});
+      ++inserted;
+
+      Value ub = loop.getUpperBound();
+      Value ubI32 = b.create<arith::IndexCastOp>(loc, i32Ty, ub);
+      Value lastKt = b.create<arith::SubIOp>(loc, ubI32, c1);
+      Value nextKtRaw = b.create<arith::AddIOp>(loc, ktVal, c1);
+      Value nextGt = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt,
+                                             nextKtRaw, lastKt);
+      Value nextKt =
+          b.create<arith::SelectOp>(loc, nextGt, lastKt, nextKtRaw);
+      Value phase = b.create<arith::RemUIOp>(loc, ktVal, c2);
+      Value isEven = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
+                                             phase, c0);
+      Value delta = b.create<arith::SelectOp>(loc, isEven, c4096, neg4096);
+      Value nextOff = b.create<arith::AddIOp>(loc, curOff, delta);
+      Value nextView = createVtcmF16TileView(b, loc, vtcmMem, nextOff);
+      // Kick before Mm so DMA/l2fetch overlaps compute; wait finishes layout.
+      b.create<PrefetchInSituOp>(
+          loc, srcMem, nextView, LayoutTransform::HMXWeight,
+          /*lookahead=*/1, DenseI32ArrayAttr{},
+          ValueRange{nextKt, colVal, wtCols});
+      ++inserted;
+    } else {
+      Value destView = createVtcmF16TileView(b, loc, vtcmMem, curOff);
+      b.create<PrefetchInSituOp>(
+          loc, srcMem, destView, LayoutTransform::HMXWeight,
+          /*lookahead=*/0, DenseI32ArrayAttr{},
+          ValueRange{ktVal, colVal, wtCols});
+      ++inserted;
+    }
     wh->erase();
     ++erased;
-
-    // Phase 2b lookahead into the idle ping-pong slot is intentionally
-    // disabled here: a sync hexkl_micro fill after Mm adds pure overhead
-    // until we can DMA a tile-sized staging buffer and complete layout in
-    // __omni_fetch_wait.  Dual weight slots remain in DecomposeHexKL.
-    (void)mmOp;
-    (void)la;
   }
 
   if (inserted || erased)
     llvm::errs() << "[PrefetchInsert]     HexKL layout-fusion sites: "
-                 << inserted << " erased_hexkl_ops=" << erased << "\n";
+                 << inserted << " erased_hexkl_ops=" << erased
+                 << (doAsync ? " async_pipeline=1\n" : "\n");
   return inserted;
 }
 
