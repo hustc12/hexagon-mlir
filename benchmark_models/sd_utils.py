@@ -121,15 +121,50 @@ def compare(hex_outputs, x86_outputs, atol=0.05, fail_on_mismatch: bool = False)
 # Default HexagonOptions
 # ---------------------------------------------------------------------------
 
-def default_options(enablelwp: bool = False) -> dict:
+def default_options(
+    enablelwp: bool = False,
+    enable_hexkl: bool = False,
+    enable_omnifetch_vdae: bool = False,
+    enable_omnifetch_layout_aware: bool = True,
+    omnifetch_lookahead: int = 2,
+    enable_omnifetch_adaptive: bool = True,
+) -> dict:
+    """Phase-4 options. HexKL off by default for fair HVX baseline."""
     opts = HexagonOptions().__dict__
     opts["lowerConstantsInSeparateSharedObjects"] = True
     opts["enableVTCMTiling"] = False
-    opts["enableConvertToHexagonmem"] = False
-    opts["enableHexKL"] = True   # matmul → HexKL HVX path (conv2d replaced by unfold+matmul)
+    opts["enableVectorization"] = False
+    opts["enableHexKL"] = bool(enable_hexkl)
+    opts["enableConvertToHexagonmem"] = bool(enable_hexkl)
+    opts["enablePrefetch"] = bool(enable_omnifetch_vdae)
+    opts["enableOmniFetchLayoutAware"] = bool(enable_omnifetch_layout_aware)
+    opts["omniFetchLookahead"] = int(omnifetch_lookahead)
+    opts["enableOmniFetchVDAE"] = bool(enable_omnifetch_vdae)
+    opts["enableOmniFetchAdaptive"] = bool(enable_omnifetch_adaptive)
     if enablelwp:
         opts["enableLWP"] = True
     return opts
+
+
+def add_phase4_cli(parser):
+    parser.add_argument("--lwp", action="store_true")
+    parser.add_argument("--enable-hexkl", action="store_true")
+    parser.add_argument("--enable-omnifetch-vdae", action="store_true")
+    parser.add_argument("--disable-layout-aware", action="store_true")
+    parser.add_argument("--omnifetch-lookahead", type=int, default=2)
+    parser.add_argument("--disable-omnifetch-adaptive", action="store_true")
+    return parser
+
+
+def options_from_args(args, enablelwp: bool = None):
+    return default_options(
+        enablelwp=args.lwp if enablelwp is None else enablelwp,
+        enable_hexkl=getattr(args, "enable_hexkl", False),
+        enable_omnifetch_vdae=getattr(args, "enable_omnifetch_vdae", False),
+        enable_omnifetch_layout_aware=not getattr(args, "disable_layout_aware", False),
+        omnifetch_lookahead=getattr(args, "omnifetch_lookahead", 2),
+        enable_omnifetch_adaptive=not getattr(args, "disable_omnifetch_adaptive", False),
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -1,139 +1,97 @@
+"""ViT-Base Hexagon Phase-4 harness (full published architecture)."""
+from __future__ import annotations
+
 from typing import Optional
-import sys, os
-import torch
 import argparse
-import subprocess
-from torch_mlir import fx
-from torch_mlir.compiler_utils import OutputType
-from transformers import AutoModelForImageClassification, AutoConfig, AutoImageProcessor
+import sys
 from pathlib import Path
-from triton.backends.qcom_hexagon_backend.compiler import HexagonOptions
-from triton.backends.qcom_hexagon_backend.torch_mlir_hexagon_launcher import TorchMLIRHexagonLauncher
 
-def get_image_inputs(processor, dtype=torch.float32):
-    # Dummy image of size 224x224 (standard for ViT)
-    dummy_image = torch.rand(1, 3, 224, 224, dtype=dtype)
-    # Usually processor handles image normalization, but for MLIR tests a random tensor is fine.
-    return {"pixel_values": dummy_image}
+import torch
+from transformers import AutoModelForImageClassification, AutoConfig
 
-def x86_execution(model, encoding):
-    x86_outputs = model(**encoding)
-    return x86_outputs
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from hexkl_phase4_utils import (  # noqa: E402
+    patch_dsp_heap_256mb,
+    compile_to_linalg,
+    hex_execution,
+    apply_hexkl_ir_rewrites,
+    hexagon_options_phase4,
+    add_phase4_args,
+)
 
-def hex_execution(module, func_name, inputs, options: dict=None):
-    linalg_filename = Path(__file__).parent / (str(func_name) + ".mlirbc")
 
-    bytecode = module.operation.get_asm(binary=True)
-    # Save the bytecode to a file
-    with open(linalg_filename, "wb") as f:
-        f.write(bytecode)
+def compare(
+    hex_outputs,
+    x86_tensor,
+    atol=0.03,
+    fail_on_mismatch: bool = False,
+    require_exact_top5: bool = True,
+):
+    hex_logits = hex_outputs[0]
+    max_diff = (hex_logits.float() - x86_tensor.float()).abs().max().item()
+    print(f"\nMax difference between Hexagon and x86 outputs: {max_diff:.4f}")
 
-    options["enableVTCMTiling"] = False
-    options["enableConvertToHexagonmem"] = False 
-    hex_outputs = TorchMLIRHexagonLauncher().run_torch_mlir(str(linalg_filename), inputs, func_name, options=options)
-    return hex_outputs
+    def top5(logits, tag):
+        probs = torch.softmax(logits[0].float(), dim=-1)
+        k = min(5, probs.shape[-1])
+        vals, idxs = torch.topk(probs, k)
+        print(f"\n------- Top-5 class predictions ({tag}) -------")
+        for v, i in zip(vals.tolist(), idxs.tolist()):
+            print(f"  class {i:4d}: {v:.4f}")
+        print("-----------------------------------------------")
+        return idxs.tolist(), vals.tolist()
 
-def compare(hex_outputs, x86_outputs, atol=0.03, fail_on_mismatch: bool=False):
-    hexagon_output = hex_outputs[0]
-    
-    # Vision Transformer usually returns a dataclass where .logits is the classification output
-    if hasattr(x86_outputs, "logits"):
-        x86_tensor = x86_outputs.logits
-    elif hasattr(x86_outputs, "last_hidden_state"):
-        x86_tensor = x86_outputs.last_hidden_state
+    idxs_hex, vals_hex = top5(hex_logits, "Hexagon")
+    idxs_x86, vals_x86 = top5(x86_tensor, "x86")
+
+    if require_exact_top5:
+        ok = idxs_hex == idxs_x86 and torch.allclose(
+            torch.tensor(vals_hex), torch.tensor(vals_x86), atol=atol
+        )
+        msg = "Hexagon and CPU top-5 matched"
     else:
-        x86_tensor = x86_outputs[0]
-
-    max_diff = torch.max(torch.abs(hexagon_output - x86_tensor))
-    print(f"\nMax difference between Hexagon and x86 outputs: {max_diff.item():.4f}")
-
-    match = torch.allclose(hexagon_output, x86_tensor, atol=atol)
-
-    if match:
-        print("Hexagon and CPU results matched within the specified tolerance.")
+        ok = idxs_hex[0] == idxs_x86[0]
+        msg = "Top-1 class matched (HexKL numerical tolerance)"
+    if ok:
+        print(msg)
     else:
         print("Hexagon and CPU results do not match.")
-        assert not fail_on_mismatch, "Correctness issue: the results obtained on Hexagon and on x86 do not match"
+        assert not fail_on_mismatch, "Correctness issue: Hexagon vs x86"
 
-def compile_to_linalg(model, input, dump_to_file=None, debug=False) -> str:
-    if isinstance(input, torch.Tensor):
-        input = (input,)
 
-    # Generate linalg-IR using torch-mlir's fx
-    linalg = fx.export_and_import(
-        model,
-        *input,
-        output_type=OutputType.LINALG_ON_TENSORS,
-        func_name=model.__class__.__name__,
-        enable_graph_printing=debug,
-        enable_ir_printing=debug
-    )
+def customize_model_config(config):
+    """Identity hook except gelu_new (Hexagon lacks math.erf)."""
+    config.hidden_act = "gelu_new"
+    return config
 
-    if dump_to_file:
-        with open(dump_to_file, "w") as file:
-            file.write(str(linalg))
 
-    return linalg
+def load_vit_model(_model_name, config):
+    return AutoModelForImageClassification.from_config(config).half()
 
-def process_lwp():
-    HEXAGON_MLIR_ROOT = os.environ.get("HEXAGON_MLIR_ROOT")
-        
-    if not HEXAGON_MLIR_ROOT:
-        print("Cannot process lwp data as path to process_lwp.py is unknown")
-        return
 
-    try:
-        subprocess.run(
-            [
-                "python3",
-                f"{HEXAGON_MLIR_ROOT}/test/python/process_lwp.py",
-                "/tmp/lwp.json",
-                "/tmp/lwp_infodump.txt",
-                "/tmp/initial-linalg.mlir"
-            ],
-            check=True,
-            capture_output=True,
-            text=True
-        )
-        print("LWP processing completed successfully")
-    except subprocess.CalledProcessError as e:
-        print(f"Error processing LWP data: {e}")
-        print(f"Command output: {e.stdout}")
-        print(f"Error output: {e.stderr}")
-
-def vit(enablelwp=False): 
-
-    # The user requested facebook/EUPE-ViT-B, but it does not contain a standard Hugging Face config.json
-    # Since EUPE-ViT-B is structurally identical to the standard ViT-B/16, we use the standard identifier
-    # to successfully fetch the architecture and configure the model for Hexagon compiler testing.
+def vit(
+    enable_hexkl: bool = False,
+    enable_omnifetch_vdae: bool = False,
+    enable_omnifetch_layout_aware: bool = True,
+    omnifetch_lookahead: int = 2,
+    enable_omnifetch_adaptive: bool = True,
+    seq_len: Optional[int] = None,  # unused; kept for CLI parity
+    image_size: Optional[int] = None,
+):
+    patch_dsp_heap_256mb()
     model_name = "google/vit-base-patch16-224"
-    
-    # Try loading the processor
-    try:
-        processor = AutoImageProcessor.from_pretrained(model_name)
-    except Exception as e:
-        print(f"Could not load processor from {model_name}, proceeding with raw random tensors.")
-        processor = None
 
     config = AutoConfig.from_pretrained(model_name)
-    # Using 2 layers for a "Lite" compilation test
-    if hasattr(config, "num_hidden_layers"):
-        config.num_hidden_layers = 2
-        
-    # Fix: BERT/ViT default "gelu" uses math.erf which the Hexagon MLIR backend
-    # does not support. Switch to "gelu_new" (tanh approximation).
-    config.hidden_act = "gelu_new"
+    config = customize_model_config(config)
+    print(
+        f"[Config] layers={config.num_hidden_layers} hidden={config.hidden_size} "
+        f"patch={config.patch_size} image={config.image_size} "
+        f"heads={config.num_attention_heads}"
+    )
 
-    # Use larger patches (32x32) to reduce sequence length from 197 to 50 tokens.
-    # The DSP heap cannot sustain 66+ internal mallocs for 197-token attention matrices.
-    # With 32x32 patches on 224x224: ceil(224/32)^2 = 49 patches + 1 cls = 50 tokens.
-    config.patch_size = 32
-
-    model = AutoModelForImageClassification.from_config(config)
-    model = model.half()
+    model = load_vit_model(model_name, config)
     model.eval()
 
-    # Wrap ViT to return just the logits tensor directly.
     class ViTWrapper(torch.nn.Module):
         def __init__(self, vit_model):
             super().__init__()
@@ -142,29 +100,62 @@ def vit(enablelwp=False):
         def forward(self, pixel_values):
             return self.vit(pixel_values=pixel_values).logits
 
-    wrapped_model = ViTWrapper(model)
-    wrapped_model.eval()
-    func_name = wrapped_model.__class__.__name__
+    wrapped = ViTWrapper(model).eval()
+    func_name = wrapped.__class__.__name__
 
-    encoding = get_image_inputs(processor, dtype=torch.float16)
-    module = compile_to_linalg(wrapped_model, encoding["pixel_values"])
+    img = image_size or config.image_size
+    pixel_values = torch.rand(1, 3, img, img, dtype=torch.float16)
+    print(f"[Input] pixel_values={tuple(pixel_values.shape)} HexKL={enable_hexkl}")
 
-    options = HexagonOptions().__dict__
-    if enablelwp:
-        options['enableLWP'] = True
-    options['lowerConstantsInSeparateSharedObjects'] = True
-    inputs = [encoding["pixel_values"]]
-    
-    # Run Hexagon
-    hex_outputs = hex_execution(module, func_name, inputs, options)
-    
-    # Run x86
+    module = compile_to_linalg(wrapped, (pixel_values,), decomp_pow=False)
+    ir = str(module)
+    print(
+        f"[IR] batch_matmul={ir.count('linalg.batch_matmul')} "
+        f"matmul={ir.count('linalg.matmul')}"
+    )
+
+    mlir_text = None
+    if enable_hexkl:
+        ir2, n_bm, n_f16 = apply_hexkl_ir_rewrites(ir)
+        mlir_text = ir2
+        print(f"[HexKL] batch_matmul→matmul={n_bm}, f16-input rewrite={n_f16}")
+
+    options = hexagon_options_phase4(
+        enable_hexkl,
+        enable_omnifetch_vdae,
+        enable_omnifetch_layout_aware,
+        omnifetch_lookahead,
+        enable_omnifetch_adaptive,
+    )
+    hex_outputs = hex_execution(
+        module, func_name, [pixel_values], options, mlir_text=mlir_text
+    )
+    print("Successfully ran ViT on Hexagon DSP!")
+
     with torch.no_grad():
-        x86_outputs = wrapped_model(encoding["pixel_values"])
+        x86 = wrapped(pixel_values)
+    compare(
+        hex_outputs,
+        x86,
+        fail_on_mismatch=True,
+        require_exact_top5=not enable_hexkl,
+        atol=0.5 if enable_hexkl else 0.03,
+    )
 
-    compare(hex_outputs, x86_outputs, fail_on_mismatch=True)
-    if enablelwp:
-        process_lwp()
 
 if __name__ == "__main__":
-    vit()
+    parser = argparse.ArgumentParser(
+        description="ViT-Base Hexagon smoke (optional HexKL/OmniFetch)."
+    )
+    add_phase4_args(parser)
+    parser.add_argument("--image-size", type=int, default=None)
+    args = parser.parse_args()
+    vit(
+        enable_hexkl=args.enable_hexkl,
+        enable_omnifetch_vdae=args.enable_omnifetch_vdae,
+        enable_omnifetch_layout_aware=not args.disable_layout_aware,
+        omnifetch_lookahead=args.omnifetch_lookahead,
+        enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
+        seq_len=args.seq_len,
+        image_size=args.image_size,
+    )

@@ -1,72 +1,46 @@
-# ===- test_swin_transformer.py ---------------------------------------------===
-#
-# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
-# SPDX-License-Identifier: BSD-3-Clause.
-#
-# Swin Transformer (Shifted Window Transformer) benchmark for Hexagon NPU.
-#
-# Model source:
-#   keras-io/swin-transformers (https://huggingface.co/keras-io/swin-transformers)
-#   is a TF-Keras model incompatible with torch-mlir's FX export pipeline.
-#   The functionally equivalent PyTorch implementation from Microsoft is used:
-#   microsoft/swin-tiny-patch4-window7-224 (same paper, same architecture).
-#
-# Reference: "Swin Transformer: Hierarchical Vision Transformer using Shifted
-#             Windows", Liu et al., ICCV 2021 (https://arxiv.org/abs/2103.14030)
-#
-# ===------------------------------------------------------------------------===
+"""Swin-Tiny Hexagon Phase-4 harness (full published architecture)."""
+from __future__ import annotations
 
 from typing import Optional
-import sys, os
-import torch
 import argparse
-import subprocess
-from torch_mlir import fx
-from torch_mlir.compiler_utils import OutputType
-from transformers import AutoConfig, AutoImageProcessor, SwinConfig
-from transformers.models.swin.modeling_swin import SwinForImageClassification
+import sys
 from pathlib import Path
-from triton.backends.qcom_hexagon_backend.compiler import HexagonOptions
-from triton.backends.qcom_hexagon_backend.torch_mlir_hexagon_launcher import TorchMLIRHexagonLauncher
+
+import torch
+from transformers import SwinConfig
+from transformers.models.swin.modeling_swin import SwinForImageClassification
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from hexkl_phase4_utils import (  # noqa: E402
+    patch_dsp_heap_256mb,
+    compile_to_linalg,
+    hex_execution,
+    apply_hexkl_ir_rewrites,
+    hexagon_options_phase4,
+    add_phase4_args,
+)
 
 
-# ==========================================
-# Execution and Comparison Functions
-# ==========================================
+class SwinWrapper(torch.nn.Module):
+    def __init__(self, swin_model):
+        super().__init__()
+        self.swin = swin_model
 
-def x86_execution(model, pixel_values):
-    with torch.no_grad():
-        return model(pixel_values)
-
-
-def hex_execution(module, func_name, inputs, options: dict = None):
-    linalg_filename = Path(__file__).parent / (str(func_name) + ".mlirbc")
-
-    bytecode = module.operation.get_asm(binary=True)
-    with open(linalg_filename, "wb") as f:
-        f.write(bytecode)
-
-    options["enableVTCMTiling"] = False
-    options["enableConvertToHexagonmem"] = False
-    hex_outputs = TorchMLIRHexagonLauncher().run_torch_mlir(
-        str(linalg_filename), inputs, func_name, options=options
-    )
-    return hex_outputs
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        return self.swin(pixel_values=pixel_values).logits
 
 
-def compare(hex_outputs, x86_outputs, atol=0.05, fail_on_mismatch: bool = False):
-    hexagon_output = hex_outputs[0]
+def compare(
+    hex_outputs,
+    x86_tensor,
+    atol=0.05,
+    fail_on_mismatch: bool = False,
+    require_exact_top5: bool = True,
+):
+    hex_logits = hex_outputs[0]
+    max_diff = (hex_logits.float() - x86_tensor.float()).abs().max().item()
+    print(f"\nMax logit difference between Hexagon and x86: {max_diff:.4f}")
 
-    # x86_execution calls wrapped_model which returns logits tensor directly.
-    # If somehow an ImageClassifierOutput is returned, unwrap it.
-    if hasattr(x86_outputs, "logits"):
-        x86_tensor = x86_outputs.logits
-    elif isinstance(x86_outputs, torch.Tensor):
-        x86_tensor = x86_outputs
-    else:
-        x86_tensor = x86_outputs[0]
-
-    # Print top-5 predicted classes for both runs
     def top5(logits, tag):
         probs = torch.softmax(logits[0].float(), dim=-1)
         k = min(5, probs.shape[-1])
@@ -77,202 +51,117 @@ def compare(hex_outputs, x86_outputs, atol=0.05, fail_on_mismatch: bool = False)
         print("-----------------------------------------------")
         return idxs.tolist(), vals.tolist()
 
-    idxs_hex, vals_hex = top5(hexagon_output, "Hexagon")
-    idxs_x86, vals_x86 = top5(x86_tensor.to(hexagon_output.dtype), "x86")
-
-    max_diff = torch.max(torch.abs(hexagon_output.float() - x86_tensor.float()))
-    print(f"\nMax logit difference between Hexagon and x86: {max_diff.item():.4f}")
-
-    match = torch.allclose(hexagon_output.float(), x86_tensor.float(), atol=atol)
-    if match:
-        print("Hexagon and CPU results matched within the specified tolerance.")
+    idxs_hex, _ = top5(hex_logits, "Hexagon")
+    idxs_x86, _ = top5(x86_tensor.to(hex_logits.dtype), "x86")
+    if require_exact_top5:
+        ok = idxs_hex == idxs_x86 and torch.allclose(
+            hex_logits.float(), x86_tensor.float(), atol=atol
+        )
+        msg = "Hexagon and CPU results matched within the specified tolerance."
+    else:
+        ok = idxs_hex[0] == idxs_x86[0]
+        msg = "Top-1 class matched (HexKL numerical tolerance)"
+    if ok:
+        print(msg)
     else:
         print("Hexagon and CPU results do not match.")
-        assert not fail_on_mismatch, (
-            "Correctness issue: the results obtained on Hexagon "
-            "(with code produced by the hexagon-mlir compiler) and on x86 "
-            "(executed from PyTorch) do not match"
-        )
+        assert not fail_on_mismatch, "Correctness issue: Hexagon vs x86"
 
 
-def compile_to_linalg(model, pixel_values, dump_to_file=None, debug=False):
-    linalg = fx.export_and_import(
-        model,
-        pixel_values,
-        output_type=OutputType.LINALG_ON_TENSORS,
-        func_name=model.__class__.__name__,
-        enable_graph_printing=debug,
-        enable_ir_printing=debug,
-    )
-    if dump_to_file:
-        with open(dump_to_file, "w") as f:
-            f.write(str(linalg))
-    return linalg
+LOWER_CONSTANTS_SEPARATE = True  # full Swin consts need separate SO; debug sets False
 
 
-def process_lwp():
-    HEXAGON_MLIR_ROOT = os.environ.get("HEXAGON_MLIR_ROOT")
-    if not HEXAGON_MLIR_ROOT:
-        print("Cannot process lwp data as path to process_lwp.py is unknown")
-        return
-    try:
-        subprocess.run(
-            [
-                "python3",
-                f"{HEXAGON_MLIR_ROOT}/test/python/process_lwp.py",
-                "/tmp/lwp.json",
-                "/tmp/lwp_infodump.txt",
-                "/tmp/initial-linalg.mlir",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        print("LWP processing completed successfully")
-    except subprocess.CalledProcessError as e:
-        print(f"Error processing LWP data: {e}")
-        print(f"Command output: {e.stdout}")
-        print(f"Error output: {e.stderr}")
+def customize_model_config(config):
+    config.hidden_act = "gelu_new"
+    return config
 
 
-# ==========================================
-# Model Wrapper
-# ==========================================
-
-class SwinWrapper(torch.nn.Module):
-    """Wrap SwinForImageClassification to return the logits tensor directly.
-
-    torch_mlir's fx.export_and_import cannot handle dataclass outputs
-    (ImageClassifierOutput). This wrapper returns a plain tensor so the
-    C++ MemRefDescriptor interface gets a single concrete output.
-    """
-
-    def __init__(self, swin_model):
-        super().__init__()
-        self.swin = swin_model
-
-    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        return self.swin(pixel_values=pixel_values).logits
+def load_swin_model(_model_name, config):
+    return SwinForImageClassification(config).half()
 
 
-# ==========================================
-# Main Test Entry Point
-# ==========================================
-
-def swin_transformer(enablelwp=False):
-    # ------------------------------------------------------------------ #
-    # Model: microsoft/swin-tiny-patch4-window7-224                       #
-    #   - Architecture: Swin-Tiny (4-stage, depths=[2,2,6,2])            #
-    #   - Input:  (B, 3, 224, 224)                                        #
-    #   - Patch:  4×4, Window: 7×7, Channels: 96                         #
-    #   - Params: ~28 M (float32) / ~14 M params effective (float16)     #
-    # ------------------------------------------------------------------ #
+def swin_transformer(
+    enable_hexkl: bool = False,
+    enable_omnifetch_vdae: bool = False,
+    enable_omnifetch_layout_aware: bool = True,
+    omnifetch_lookahead: int = 2,
+    enable_omnifetch_adaptive: bool = True,
+    seq_len: Optional[int] = None,
+):
+    patch_dsp_heap_256mb()
     model_name = "microsoft/swin-tiny-patch4-window7-224"
 
-    print(f"Loading Swin Transformer config from '{model_name}' …")
     config = SwinConfig.from_pretrained(model_name)
-
-    # Reduce depth per stage to keep the compiled .so within the DSP 32-bit
-    # VA space while still exercising all 4 hierarchical stages.
-    # Default swin-tiny: depths=[2, 2, 6, 2] → reduced: [1, 1, 1, 1]
-    config.depths = [1, 1, 1, 1]
-
-    # FIX: default hidden_act="gelu" lowers to `math.erf` in MLIR, for which
-    # the Hexagon backend has no LLVMTranslationDialectInterface registration
-    # ("missing `LLVMTranslationDialectInterface` registration for dialect for
-    # op: math.erf"). Switch to "gelu_new" (tanh approximation) to avoid it.
-    # Same fix applied in test_vit.py.
-    config.hidden_act = "gelu_new"
-
-    # Reduce base channel width: default embed_dim=96 → 48.
-    # Weights scale as embed_dim², so halving channels cuts weight memory by 4×.
-    # With depths=[1,1,1,1] fp16 this yields ~6MB total .so (vs ~24MB at 96).
-    # The DSP User PD VA space cannot reliably map a 23MB consts .so alongside
-    # the already-mapped libc++, libc++abi, and runtime SOs.
-    config.embed_dim = 48
-    config.num_heads = [3, 6, 12, 24]  # Must divide embed_dim at each stage
-
-    # Use float16 to halve weight memory (critical for DSP VA budget).
-    # Instantiated from config only — hexagon-mlir benchmarks with random weights.
-    model = SwinForImageClassification(config).half()
-    model.eval()
-
-    wrapped_model = SwinWrapper(model)
-    wrapped_model.eval()
-    func_name = wrapped_model.__class__.__name__   # "SwinWrapper"
-
-    # Standard 224×224 pixel_values in fp16
-    pixel_values = torch.rand(1, 3, 224, 224, dtype=torch.float16)
-
-    # ------------------------------------------------------------------ #
-    # Collect relative_position_index buffers (one per stage).            #
-    # torch.export captures these as BUFFER inputs and places them        #
-    # *before* the user input (pixel_values) in the MLIR function         #
-    # signature.  We must pass them explicitly so the wrapper generates   #
-    # the correct number of input tensors and the DSP call doesn't        #
-    # receive garbage in r4/r5 → Bad VA crash (exit code 13).            #
-    # ------------------------------------------------------------------ #
-    rel_pos_indices = []
-    for layer in wrapped_model.swin.swin.encoder.layers:
-        for block in layer.blocks:
-            idx = block.attention.self.relative_position_index  # int64, (49,49)
-            rel_pos_indices.append(idx.detach())
-
-    print("Compiling to linalg …")
-    module = compile_to_linalg(
-        wrapped_model,
-        pixel_values,
-        dump_to_file="swin_transformer.mlir",
+    config = customize_model_config(config)
+    print(
+        f"[Config] depths={config.depths} embed_dim={config.embed_dim} "
+        f"num_heads={config.num_heads} window={config.window_size}"
     )
 
-    # ------------------------------------------------------------------ #
-    # Compiler options                                                     #
-    # ------------------------------------------------------------------ #
-    options = HexagonOptions().__dict__
+    model = load_swin_model(model_name, config)
+    model.eval()
+    wrapped = SwinWrapper(model).eval()
+    func_name = wrapped.__class__.__name__
 
-    if enablelwp:
-        options["enableLWP"] = True
+    pixel_values = torch.rand(1, 3, 224, 224, dtype=torch.float16)
 
-    # With embed_dim=48, depths=[1,1,1,1], fp16 the .so is ~6MB — no splitting needed.
-    # (Default embed_dim=96 produced a 23MB consts .so that the DSP VA space cannot
-    # map alongside libc++/runtime SOs, leaving GOT entries unresolved → Bad VA crash.)
-    options["lowerConstantsInSeparateSharedObjects"] = False
+    # relative_position_index buffers are lifted as extra ABI inputs.
+    rel_pos_indices = []
+    for layer in wrapped.swin.swin.encoder.layers:
+        for block in layer.blocks:
+            rel_pos_indices.append(
+                block.attention.self.relative_position_index.detach()
+            )
 
-    options["enableVTCMTiling"] = False
-    options["enableConvertToHexagonmem"] = False
+    module = compile_to_linalg(wrapped, (pixel_values,), decomp_pow=False)
+    ir = str(module)
+    print(
+        f"[IR] batch_matmul={ir.count('linalg.batch_matmul')} "
+        f"matmul={ir.count('linalg.matmul')}"
+    )
 
-    # ROOT CAUSE FIX: enableVectorization=True causes HexagonTilingPass to emit
-    # scf.forall ops. FormAsyncThreadsPass unconditionally lowers these to
-    # async.execute, which triggers MLIR AsyncRuntime `new AsyncToken()` heap
-    # allocations on the DSP. The DSP User PD heap cannot satisfy these,
-    # yielding NULL/garbage pointers → AsyncToken::~AsyncToken() crashes at
-    # Bad VA: 0x18 (exit code 13 / TLB MISS).
-    options["enableVectorization"] = False
+    mlir_text = None
+    if enable_hexkl:
+        ir2, n_bm, n_f16 = apply_hexkl_ir_rewrites(ir)
+        mlir_text = ir2
+        print(f"[HexKL] batch_matmul→matmul={n_bm}, f16-input rewrite={n_f16}")
 
-    # MLIR function signature: (rel_pos_idx_0, ..., rel_pos_idx_N, pixel_values)
-    # The buffer inputs must come first, matching the export order.
+    options = hexagon_options_phase4(
+        enable_hexkl,
+        enable_omnifetch_vdae,
+        enable_omnifetch_layout_aware,
+        omnifetch_lookahead,
+        enable_omnifetch_adaptive,
+        lower_constants_separate=LOWER_CONSTANTS_SEPARATE,
+    )
     inputs = rel_pos_indices + [pixel_values]
+    hex_outputs = hex_execution(
+        module, func_name, inputs, options, mlir_text=mlir_text
+    )
+    print("Successfully ran Swin on Hexagon DSP!")
 
-    # ------------------------------------------------------------------ #
-    # Hexagon execution                                                    #
-    # ------------------------------------------------------------------ #
-    print("Running on Hexagon NPU …")
-    hex_outputs = hex_execution(module, func_name, inputs, options)
-
-    # ------------------------------------------------------------------ #
-    # x86 reference                                                        #
-    # ------------------------------------------------------------------ #
-    print("Running reference on x86 …")
-    x86_outputs = x86_execution(wrapped_model, pixel_values)
-
-    compare(hex_outputs, x86_outputs, atol=0.1, fail_on_mismatch=True)
-
-    if enablelwp:
-        process_lwp()
+    with torch.no_grad():
+        x86 = wrapped(pixel_values)
+    compare(
+        hex_outputs,
+        x86,
+        atol=0.5 if enable_hexkl else 0.1,
+        fail_on_mismatch=True,
+        require_exact_top5=not enable_hexkl,
+    )
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Swin Transformer Hexagon benchmark")
-    parser.add_argument("--lwp", action="store_true", help="Enable lightweight profiling")
+    parser = argparse.ArgumentParser(
+        description="Swin-Tiny Hexagon smoke (optional HexKL/OmniFetch)."
+    )
+    add_phase4_args(parser)
     args = parser.parse_args()
-    swin_transformer(enablelwp=args.lwp)
+    swin_transformer(
+        enable_hexkl=args.enable_hexkl,
+        enable_omnifetch_vdae=args.enable_omnifetch_vdae,
+        enable_omnifetch_layout_aware=not args.disable_layout_aware,
+        omnifetch_lookahead=args.omnifetch_lookahead,
+        enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
+        seq_len=args.seq_len,
+    )

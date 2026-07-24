@@ -30,7 +30,8 @@ from sd_utils import (
     hex_execution,
     x86_execution,
     compare,
-    default_options,
+    add_phase4_cli,
+    options_from_args,
     process_lwp,
 )
 
@@ -163,25 +164,25 @@ class VAEDecodeWrapper(torch.nn.Module):
         return self.vae.decode(latents).sample
 
 
-def test_vae_decoder(enablelwp: bool = False, disable_mid_attn: bool = False):
+def test_vae_decoder(
+    enablelwp: bool = False,
+    disable_mid_attn: bool = False,
+    enable_hexkl: bool = False,
+    enable_omnifetch_vdae: bool = False,
+    enable_omnifetch_layout_aware: bool = True,
+    omnifetch_lookahead: int = 2,
+    enable_omnifetch_adaptive: bool = True,
+):
     print("\n=== Stable Diffusion — VAE Decoder ===")
 
-    # Use from_config (random weights) for fast compilation testing.
-    # Swap to AutoencoderKL.from_pretrained(...) for real-weight tests.
     config = AutoencoderKL.load_config(SD_MODEL_ID, subfolder="vae")
-    vae = AutoencoderKL.from_config(config)
+    config = customize_vae_config(config)
+    print(f"[Config] VAE sample_size={config.get('sample_size', '?')} HexKL={enable_hexkl}")
+    vae = load_vae(config)
 
-    # FIX: Replace all GroupNorm layers with GroupNormFP16.
-    #
-    # torch-mlir's built-in GroupNorm lowering hard-codes a promotion to f64
-    # for the variance reduction regardless of model dtype (f32 or f16).
-    # GroupNormFP16 implements the same operation with plain f16 arithmetic so
-    # torch-mlir emits pure f16 linalg.generic ops instead.
-    # The model structure (groups, affine params, eps) is unchanged.
     vae = vae.half()
     for name, module in list(vae.named_modules()):
         if isinstance(module, torch.nn.GroupNorm):
-            # Navigate to the parent and replace the child attribute.
             parts = name.rsplit(".", 1)
             parent = vae
             if len(parts) == 2:
@@ -189,63 +190,75 @@ def test_vae_decoder(enablelwp: bool = False, disable_mid_attn: bool = False):
                     parent = getattr(parent, part)
             setattr(parent, parts[-1], GroupNormFP16(module))
 
-    # DIAGNOSTIC: Optionally disable the mid-block self-attention.
-    # The VAE mid-block contains a self-attention over the full 64×64 latent
-    # grid (sequence length = 4096), producing a 4096×4096 attention matrix
-    # (64 MB) and ~34 GFLOPs of matmul work.  This flag removes it to isolate
-    # whether attention is the remaining performance bottleneck.
-    # WARNING: this changes model structure and degrades output quality.
-    # Use only for diagnostic purposes, not for production inference.
     if disable_mid_attn:
         print("  [diag] mid-block self-attention DISABLED")
         vae.decoder.mid_block.attentions = torch.nn.ModuleList()
 
-    # FIX: Replace all Conv2d with Conv2dAsMatmul so torch-mlir emits
-    # linalg.matmul instead of linalg.conv_2d_nchw_fchw.
-    # The Hexagon backend has no HVX vectorization for conv_2d_nchw_fchw
-    # (it falls through to scalar loops), but linalg.matmul is vectorized
-    # via the HVX tiling path.  unfold+matmul is mathematically identical.
     replace_conv2d_with_matmul(vae)
-    print(f"  Replaced Conv2d layers with unfold+matmul")
+    print("  Replaced Conv2d layers with unfold+matmul")
 
     model = VAEDecodeWrapper(vae)
     model.eval()
 
-    # Latent space: 64×64 with 4 channels (corresponds to 512×512 image).
-    latents = torch.rand(1, 4, 64, 64, dtype=torch.float16)
+    latents = customize_vae_latents(config)
     print(f"Input latents shape: {latents.shape}  dtype: {latents.dtype}")
 
-    # ---- compile ----
     print("\nCompiling VAE Decoder to linalg …")
     module = compile_to_linalg(model, latents)
 
-    # ---- Hexagon ----
-    options = default_options(enablelwp)
-    print("Running VAE Decoder on Hexagon NPU …")
-    # Use 256 MB heap: unfold+matmul intermediates for 512ch 3x3 conv at
-    # 64x64 need ~36 MB; at 128x128 ~150 MB; 256 MB covers all layers.
-    hex_out = hex_execution(module, "VAEDecodeWrapper", [latents], options,
-                            heap_size_mb=256)
+    class _Args:
+        pass
 
-    # ---- x86 reference ----
+    args = _Args()
+    args.lwp = enablelwp
+    args.enable_hexkl = enable_hexkl
+    args.enable_omnifetch_vdae = enable_omnifetch_vdae
+    args.disable_layout_aware = not enable_omnifetch_layout_aware
+    args.omnifetch_lookahead = omnifetch_lookahead
+    args.disable_omnifetch_adaptive = not enable_omnifetch_adaptive
+    options = options_from_args(args)
+
+    print("Running VAE Decoder on Hexagon NPU …")
+    hex_out = hex_execution(
+        module, "VAEDecodeWrapper", [latents], options, heap_size_mb=256
+    )
+
     print("Running reference on x86 …")
     x86_out = x86_execution(model, latents)
-
     compare(hex_out, x86_out, atol=0.05, fail_on_mismatch=True)
-
     if enablelwp:
         process_lwp()
-
     print("\nVAE Decoder test PASSED.")
+
+
+def customize_vae_config(config):
+    return config
+
+
+def load_vae(config):
+    return AutoencoderKL.from_config(config)
+
+
+def customize_vae_latents(config):
+    # Published latent grid 64×64 (→ 512×512 image). Debug may shrink.
+    return torch.rand(1, 4, 64, 64, dtype=torch.float16)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SD VAE Decoder Hexagon benchmark")
-    parser.add_argument("--lwp", action="store_true", help="Enable lightweight profiling")
+    add_phase4_cli(parser)
     parser.add_argument(
         "--no-mid-attn",
         action="store_true",
-        help="[diagnostic] Disable mid-block self-attention to isolate its perf cost",
+        help="[diagnostic] Disable mid-block self-attention",
     )
     args = parser.parse_args()
-    test_vae_decoder(enablelwp=args.lwp, disable_mid_attn=args.no_mid_attn)
+    test_vae_decoder(
+        enablelwp=args.lwp,
+        disable_mid_attn=args.no_mid_attn,
+        enable_hexkl=args.enable_hexkl,
+        enable_omnifetch_vdae=args.enable_omnifetch_vdae,
+        enable_omnifetch_layout_aware=not args.disable_layout_aware,
+        omnifetch_lookahead=args.omnifetch_lookahead,
+        enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
+    )

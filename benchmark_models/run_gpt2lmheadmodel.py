@@ -215,6 +215,12 @@ def process_lwp():
         print(f"Command output: {e.stdout}")
         print(f"Error output: {e.stderr}")
 
+
+def customize_gpt2_config(config):
+    """Identity hook. Debug scripts may replace this to shrink n_layer."""
+    return config
+
+
 def gpt2lmheadmodel(
     enablelwp: bool = False,
     # Mirror HexagonOptions defaults: HexKL off, VTCM tiling and hexagonmem
@@ -226,6 +232,9 @@ def gpt2lmheadmodel(
     enable_omnifetch_layout_aware: bool = True,
     omnifetch_lookahead: int = 2,
     enable_omnifetch_adaptive: bool = True,
+    # Fixed sequence length for fair ablations (HexKL vs HVX vs OmniFetch).
+    # None → legacy behaviour (short prompt; HexKL uses a hand-tuned 32-token string).
+    seq_len: Optional[int] = None,
 ):
 
     model_name = "openai-community/gpt2"
@@ -239,8 +248,9 @@ def gpt2lmheadmodel(
     )
     tokenizer = GPT2Tokenizer.from_pretrained(model_name)
 
-    config = GPT2Config.from_pretrained(model_name)
-    config.n_layer = 2  # layer == 1 isn't practical for checking accuracy
+    config = customize_gpt2_config(GPT2Config.from_pretrained(model_name))
+    print(f"[Config] n_layer={config.n_layer} n_embd={config.n_embd} "
+          f"n_head={config.n_head} vocab={config.vocab_size}")
 
     model = GPT2LMHeadModel.from_pretrained(
         model_name, config=config, torch_dtype=torch.float16
@@ -248,13 +258,37 @@ def gpt2lmheadmodel(
     model.eval()
     func_name = model.__class__.__name__
 
-    if enable_hexkl:
+    if seq_len is not None:
+        if seq_len <= 0:
+            raise ValueError(f"--seq-len must be positive, got {seq_len}")
+        if enable_hexkl and seq_len % 32 != 0:
+            raise ValueError(
+                f"--seq-len={seq_len} is not a multiple of 32 (required for HexKL)"
+            )
+        # Build a fixed-length *content* sequence (no pad_token).  Left-padding
+        # without an attention mask makes GPT-2 treat pads as real tokens and
+        # breaks fair ablations vs the HexKL hand-tuned prompt.
+        base = prompt_hexkl if seq_len >= 32 else prompt
+        ids = tokenizer.encode(base, add_special_tokens=False)
+        filler = tokenizer.encode(" true", add_special_tokens=False) or [
+            tokenizer.eos_token_id
+        ]
+        while len(ids) < seq_len:
+            ids.extend(filler)
+        ids = ids[:seq_len]
+        encoding = {
+            "input_ids": torch.tensor([ids], dtype=torch.long),
+        }
+        print(f"[Input] fair-compare seq_len={seq_len} (content-filled, "
+              f"HexKL={enable_hexkl})")
+    elif enable_hexkl:
         encoding = get_encodings(tokenizer, prompt_hexkl)
-        seq_len = encoding["input_ids"].shape[-1]
-        print(f"[Input] HexKL prompt seq_len={seq_len} (need multiple of 32)")
-        assert seq_len % 32 == 0, f"HexKL prompt length {seq_len} not aligned to 32"
+        got = encoding["input_ids"].shape[-1]
+        print(f"[Input] HexKL prompt seq_len={got} (need multiple of 32)")
+        assert got % 32 == 0, f"HexKL prompt length {got} not aligned to 32"
     else:
         encoding = get_encodings(tokenizer, prompt)
+        print(f"[Input] default prompt seq_len={encoding['input_ids'].shape[-1]}")
 
     module = compile_to_linalg(model, encoding["input_ids"])
 
@@ -324,6 +358,14 @@ if __name__ == "__main__":
                         help="Static prefetch look-ahead distance.")
     parser.add_argument("--disable-omnifetch-adaptive", action="store_true",
                         help="Disable PMU-driven adaptive prefetch distance.")
+    parser.add_argument(
+        "--seq-len",
+        type=int,
+        default=None,
+        help="Fixed sequence length for fair ablations (content-filled, no "
+             "pad_token). Use the same value with/without --enable-hexkl. "
+             "Must be a multiple of 32 when HexKL is enabled.",
+    )
 
     args = parser.parse_args()
 
@@ -336,6 +378,7 @@ if __name__ == "__main__":
         enable_omnifetch_layout_aware=not args.disable_layout_aware,
         omnifetch_lookahead=args.omnifetch_lookahead,
         enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
+        seq_len=args.seq_len,
     )
 
 

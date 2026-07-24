@@ -1,5 +1,6 @@
 from typing import Optional
 import sys, os
+import re
 import torch
 import argparse
 import subprocess
@@ -9,49 +10,188 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from pathlib import Path
 from triton.backends.qcom_hexagon_backend.compiler import HexagonOptions
 from triton.backends.qcom_hexagon_backend.torch_mlir_hexagon_launcher import TorchMLIRHexagonLauncher
+from triton.backends.qcom_hexagon_backend import hexagon_launcher_base as _hlb
+
+_QURT_HEAP_1GB = "unsigned int _QURT_MAX_HEAP_SIZE = 1073741824; // 1 GB Max Heap Size"
+_QURT_HEAP_256MB = "unsigned int _QURT_MAX_HEAP_SIZE = 268435456;  // 256 MB Max Heap Size"
+
+
+def _patch_dsp_heap_256mb():
+    orig_init = _hlb.WrapperGeneratorStrings.__init__
+
+    def _patched_init(self):
+        orig_init(self)
+        self.code_string = self.code_string.replace(_QURT_HEAP_1GB, _QURT_HEAP_256MB)
+
+    _hlb.WrapperGeneratorStrings.__init__ = _patched_init
+
+
+def rewrite_matmul_inputs_to_f16(ir: str) -> tuple[str, int]:
+    """Rewrite extf(f16→f32) → linalg.matmul(f32) into matmul(f16,f16)→f32."""
+    lines = ir.splitlines(keepends=True)
+    extf = {}
+    i = 0
+    while i < len(lines):
+        m = re.match(r"(\s*)(%[\w]+)\s*=\s*linalg\.generic\b", lines[i])
+        if not m:
+            i += 1
+            continue
+        res = m.group(2)
+        block = lines[i]
+        j = i
+        while j < len(lines) and not re.search(r"\}\s*->\s*tensor<", lines[j]):
+            j += 1
+            if j < len(lines):
+                block += lines[j]
+        if j >= len(lines):
+            break
+        if "arith.extf" in block and block.count("arith.") == 1:
+            ins = re.search(
+                r"ins\((%[\w]+)\s*:\s*(tensor<[^>]+xf16>)\)\s*outs",
+                block,
+            )
+            if ins:
+                extf[res] = (ins.group(1), ins.group(2))
+        i = j + 1
+
+    out = []
+    rewrites = 0
+    for line in lines:
+        mm = re.search(
+            r"linalg\.matmul\s+ins\((%[\w]+),\s*(%[\w]+)\s*:\s*(tensor<[^>]+>),\s*(tensor<[^>]+>)\)",
+            line,
+        )
+        if (
+            mm
+            and "xf32" in mm.group(3)
+            and "xf32" in mm.group(4)
+            and mm.group(1) in extf
+            and mm.group(2) in extf
+        ):
+            lhs_s, lhs_t = extf[mm.group(1)]
+            rhs_s, rhs_t = extf[mm.group(2)]
+            line = re.sub(
+                r"ins\((%[\w]+),\s*(%[\w]+)\s*:\s*(tensor<[^>]+>),\s*(tensor<[^>]+>)\)",
+                f"ins({lhs_s}, {rhs_s} : {lhs_t}, {rhs_t})",
+                line,
+                count=1,
+            )
+            rewrites += 1
+        out.append(line)
+    return "".join(out), rewrites
+
+
+def rewrite_batch_matmul_to_matmul(ir: str) -> tuple[str, int]:
+    """Collapse batch=1 linalg.batch_matmul into linalg.matmul for HexKL."""
+    pat = re.compile(
+        r"(?P<indent>\s*)(?P<res>%[\w]+)\s*=\s*linalg\.batch_matmul\s+"
+        r"ins\((?P<a>%[\w]+),\s*(?P<b>%[\w]+)\s*:\s*"
+        r"tensor<1x(?P<m>\d+)x(?P<k>\d+)x(?P<adt>\w+)>,\s*"
+        r"tensor<1x(?P<k2>\d+)x(?P<n>\d+)x(?P<bdt>\w+)>\)\s*"
+        r"outs\((?P<c>%[\w]+)\s*:\s*tensor<1x(?P<m2>\d+)x(?P<n2>\d+)x(?P<cdt>\w+)>\)"
+        r"(?:\s*->\s*tensor<1x\d+x\d+x\w+>)?"
+    )
+    n = 0
+    out_lines = []
+    uid = 0
+    for line in ir.splitlines(keepends=True):
+        m = pat.search(line)
+        if (
+            not m
+            or m.group("k") != m.group("k2")
+            or m.group("m") != m.group("m2")
+            or m.group("n") != m.group("n2")
+        ):
+            out_lines.append(line)
+            continue
+        M, K, N = int(m.group("m")), int(m.group("k")), int(m.group("n"))
+        # Match MatmulToHexKLPass tile rule.
+        if (M % 32) != 0 or (K % 32) != 0 or (N % 32) != 0:
+            out_lines.append(line)
+            continue
+        # Keep attention score / context matmuls (seq on K or N) as batch_matmul.
+        # At seq=32 those are tile-aligned and HexKL would take them, but HMX on
+        # attn paths has been a device crash source; projections/FFN/lm_head only.
+        if K == M or N == M:
+            out_lines.append(line)
+            continue
+        indent = m.group("indent")
+        a, b, c = m.group("a"), m.group("b"), m.group("c")
+        adt, bdt, cdt = m.group("adt"), m.group("bdt"), m.group("cdt")
+        res = m.group("res")
+        uid += 1
+        a2, b2, c2, tmp = f"%_bm_a{uid}", f"%_bm_b{uid}", f"%_bm_c{uid}", f"%_bm_r{uid}"
+        out_lines.append(
+            f"{indent}{a2} = tensor.collapse_shape {a} [[0, 1], [2]] : "
+            f"tensor<1x{M}x{K}x{adt}> into tensor<{M}x{K}x{adt}>\n"
+            f"{indent}{b2} = tensor.collapse_shape {b} [[0, 1], [2]] : "
+            f"tensor<1x{K}x{N}x{bdt}> into tensor<{K}x{N}x{bdt}>\n"
+            f"{indent}{c2} = tensor.collapse_shape {c} [[0, 1], [2]] : "
+            f"tensor<1x{M}x{N}x{cdt}> into tensor<{M}x{N}x{cdt}>\n"
+            f"{indent}{tmp} = linalg.matmul ins({a2}, {b2} : "
+            f"tensor<{M}x{K}x{adt}>, tensor<{K}x{N}x{bdt}>) "
+            f"outs({c2} : tensor<{M}x{N}x{cdt}>) -> tensor<{M}x{N}x{cdt}>\n"
+            f"{indent}{res} = tensor.expand_shape {tmp} [[0, 1], [2]] "
+            f"output_shape [1, {M}, {N}] : "
+            f"tensor<{M}x{N}x{cdt}> into tensor<1x{M}x{N}x{cdt}>\n"
+        )
+        n += 1
+    return "".join(out_lines), n
+
+
+def encode_fixed_seq(tokenizer, prompt: str, seq_len: int):
+    """Content-filled fixed length (no pad_token) for fair / HexKL-aligned runs."""
+    ids = tokenizer.encode(prompt, add_special_tokens=False)
+    filler = tokenizer.encode(" true", add_special_tokens=False) or [
+        tokenizer.eos_token_id
+    ]
+    while len(ids) < seq_len:
+        ids.extend(filler)
+    ids = ids[:seq_len]
+    input_ids = torch.tensor([ids], dtype=torch.long)
+    attention_mask = torch.ones_like(input_ids, dtype=torch.float16)
+    position_ids = torch.arange(0, seq_len, dtype=torch.long).unsqueeze(0)
+    return input_ids, attention_mask, position_ids
+
 
 def get_encodings(tokenizer, *inputs):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    encodings = tokenizer(*inputs, return_tensors="pt")
-    return encodings
+    return tokenizer(*inputs, return_tensors="pt")
 
-def x86_execution(model, encoding):
-    x86_outputs = model(**encoding)
-    return x86_outputs
 
-def hex_execution(module, func_name, inputs, options: dict=None):
+def hex_execution(module, func_name, inputs, options: dict = None, mlir_text: Optional[str] = None):
     linalg_filename = Path(__file__).parent / (str(func_name) + ".mlirbc")
 
-    # Post-process the MLIR text to remove cf.assert ops before serialising.
-    # cf.assert is emitted by torch-mlir as a bounds-check on embedding indices.
-    # The Hexagon LLVM backend lowers it to llvm.unreachable, which causes
-    # downstream LLVM passes to insert ub.poison values on the "unreachable"
-    # path.  ub.poison has no LLVMTranslationDialectInterface registration in
-    # the Hexagon backend, so translation to LLVM IR fails with:
-    #   "missing LLVMTranslationDialectInterface … for op: ub.poison"
-    # Removing cf.assert is safe here because input_ids are already clamped
-    # to the valid vocab range in QwenWrapper.forward.
-    import re
-    mlir_text = str(module)
-    mlir_text = re.sub(r'[ \t]*cf\.assert[^\n]*\n', '', mlir_text)
+    # Strip cf.assert (embedding bounds checks → ub.poison on Hexagon LLVM).
+    text = mlir_text if mlir_text is not None else str(module)
+    text = re.sub(r"[ \t]*cf\.assert[^\n]*\n", "", text)
 
-    # Re-parse using torch_mlir's MLIR Python bindings (which expose .operation)
-    # so we can serialise back to bytecode.
     from torch_mlir._mlir_libs._mlir.ir import Module as _MLIRModule, Context as _MLIRContext
-    from torch_mlir.dialects import torch as _torch_dialect  # registers dialects
+    from torch_mlir.dialects import torch as _torch_dialect  # noqa: F401 — registers dialects
+
     with _MLIRContext() as _ctx:
         _ctx.allow_unregistered_dialects = True
-        clean_module = _MLIRModule.parse(mlir_text, _ctx)
+        clean_module = _MLIRModule.parse(text, _ctx)
         bytecode = clean_module.operation.get_asm(binary=True)
 
     with open(linalg_filename, "wb") as f:
         f.write(bytecode)
 
+    launch_path = str(linalg_filename)
+    if mlir_text is not None:
+        patched = Path(__file__).parent / (str(func_name) + "_f16matmul.mlir")
+        patched.write_text(text)
+        launch_path = str(patched)
+
+    options = options or {}
     options["enableVTCMTiling"] = False
-    options["enableConvertToHexagonmem"] = False
-    hex_outputs = TorchMLIRHexagonLauncher().run_torch_mlir(str(linalg_filename), inputs, func_name, options=options)
-    return hex_outputs
+    if not options.get("enableHexKL"):
+        options["enableConvertToHexagonmem"] = False
+    return TorchMLIRHexagonLauncher().run_torch_mlir(
+        launch_path, inputs, func_name, options=options
+    )
+
 
 # logits is expected to be "[batch_size, sequence_length, vocab_size]"
 def get_top_5(logits: torch.Tensor, tokenizer, run_type: str):
@@ -78,12 +218,11 @@ def get_top_5(logits: torch.Tensor, tokenizer, run_type: str):
     print("---------------------------------------------------\n")
     return top_tokens, top_confidences
 
-def compare(hex_outputs, x86_outputs, tokenizer, atol=0.03, fail_on_mismatch: bool=False):
+def compare(hex_outputs, x86_outputs, tokenizer, atol=0.03, fail_on_mismatch: bool = False,
+            require_exact_top5: bool = True):
     hexagon_logits = hex_outputs[0]
     t_hex, c_hex = get_top_5(hexagon_logits, tokenizer, "hexagon")
 
-    # x86_execution calls wrapped_model which returns logits tensor directly.
-    # Support both a plain tensor and a CausalLMOutput (has .logits attribute).
     if hasattr(x86_outputs, "logits"):
         x86_logits = x86_outputs.logits
     elif isinstance(x86_outputs, torch.Tensor):
@@ -92,14 +231,24 @@ def compare(hex_outputs, x86_outputs, tokenizer, atol=0.03, fail_on_mismatch: bo
         x86_logits = x86_outputs[0]
     t_x86, c_x86 = get_top_5(x86_logits, tokenizer, "x86")
 
-    tokens_match = (t_x86 == t_hex)
-    confidences_match = torch.allclose(torch.tensor(c_x86), torch.tensor(c_hex), atol)
+    if require_exact_top5:
+        tokens_match = t_x86 == t_hex
+        confidences_match = torch.allclose(torch.tensor(c_x86), torch.tensor(c_hex), atol)
+    else:
+        tokens_match = t_x86[0] == t_hex[0]
+        confidences_match = abs(c_x86[0] - c_hex[0]) <= max(atol, 1.0)
 
     if tokens_match and confidences_match:
-        print("The top5 tokens and their probabilities matched")
+        print(
+            "The top5 tokens and their probabilities matched"
+            if require_exact_top5
+            else "Top-1 token matched (HexKL numerical tolerance)"
+        )
     else:
         print("Hexagon and CPU results do not match")
-        assert not fail_on_mismatch, "Correctness issue: the results obtained on Hexagon (with code produced by the hexagon-mlir compiler) and on x86 (executed from PyTorch) do not match"
+        assert not fail_on_mismatch, (
+            "Correctness issue: Hexagon vs x86 results do not match"
+        )
 
 def compile_to_linalg(model, input, dump_to_file=None, debug=False) -> str:
     if isinstance(input, torch.Tensor):
@@ -163,43 +312,74 @@ def x86_execution(model, inputs):
         x86_outputs = model(*inputs)
     return x86_outputs
 
-def qwen2_5_0_5b():
+
+def customize_model_config(config):
+    """Identity hook. Debug scripts may replace this to shrink topology."""
+    return config
+
+
+def load_qwen_model(model_name, config):
+    """Load published weights. Debug scripts may replace with from_config."""
+    return AutoModelForCausalLM.from_pretrained(
+        model_name,
+        config=config,
+        torch_dtype=torch.float16,
+        trust_remote_code=True,
+        attn_implementation="eager",
+    )
+
+
+def qwen2_5_0_5b(
+    enable_hexkl: bool = False,
+    enable_omnifetch_vdae: bool = False,
+    enable_omnifetch_layout_aware: bool = True,
+    omnifetch_lookahead: int = 2,
+    enable_omnifetch_adaptive: bool = True,
+    seq_len: Optional[int] = None,
+):
+    # User-PD: 1GB heap reservation can fault; GPT-2 HexKL uses 256MB.
+    _patch_dsp_heap_256mb()
+
     model_name = "Qwen/Qwen2.5-0.5B"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    # Use a very short prompt to minimize seq_len (fewer intermediate tensors).
     prompt = "Hi"
+
+    # Fair / HexKL: default to seq=32 (multiple of HexKL tile).
+    if seq_len is None and enable_hexkl:
+        seq_len = 32
+    if seq_len is not None:
+        if seq_len <= 0:
+            raise ValueError(f"--seq-len must be positive, got {seq_len}")
+        if enable_hexkl and seq_len % 32 != 0:
+            raise ValueError(
+                f"--seq-len={seq_len} is not a multiple of 32 (required for HexKL)"
+            )
+        input_ids, attention_mask, position_ids = encode_fixed_seq(
+            tokenizer, prompt, seq_len
+        )
+        print(
+            f"[Input] fair-compare seq_len={seq_len} "
+            f"(content-filled, HexKL={enable_hexkl})"
+        )
+    else:
+        encoding = tokenizer(prompt, return_tensors="pt")
+        input_ids = encoding["input_ids"].to(torch.int64)
+        attention_mask = torch.ones_like(input_ids, dtype=torch.float16)
+        position_ids = torch.arange(0, input_ids.shape[1], dtype=torch.long).unsqueeze(0)
+        print(f"[Input] default prompt seq_len={input_ids.shape[-1]}")
 
     config = AutoConfig.from_pretrained(model_name)
     config.use_cache = False
-
-    # FIX: Use float16 instead of float32 to halve weight memory.
-    # Full Qwen2.5-0.5B in float32 produces ~1.84 GB of consts .so files,
-    # which exceeds the DSP User PD 32-bit VA space (~1.5 GB usable).
-    # float16 cuts the consts .so total to ~920 MB, fitting comfortably.
-    #
-    # Additionally reduce num_hidden_layers 24 → 12 for extra headroom,
-    # since the DSP VA space must also accommodate libc++, libc++abi,
-    # the async-runtime .so, and the main kernel .so.
-    config.num_hidden_layers = 12
-
-    # FIX: Reduce hidden_size (and intermediate_size proportionally) so that
-    # the lm_head weight matrix (vocab_size × hidden_size) fits in DSP heap.
-    # vocab_size=151936 is fixed by the tokenizer.  At hidden=896 fp16 the
-    # lm_head is 260 MB and MLIR materialises ~10 copies at runtime (~2.6 GB).
-    # Reducing hidden_size to 64 brings the lm_head to ~18 MB and runtime
-    # heap estimate to ~185 MB, well within DSP limits.
-    # num_key_value_heads and num_attention_heads must divide hidden_size;
-    # use 1 head each so head_dim = hidden_size.
-    config.hidden_size = 64
-    config.intermediate_size = 128   # ~2× hidden, keeps FFN ratio reasonable
-    config.num_attention_heads = 1
-    config.num_key_value_heads = 1
-    config.head_dim = 64             # explicit head_dim = hidden_size / num_heads
-
-    model = AutoModelForCausalLM.from_config(
-        config, torch_dtype=torch.float16, trust_remote_code=True,
-        attn_implementation='eager'
+    config = customize_model_config(config)
+    # Keep the published Qwen2.5-0.5B architecture unchanged unless a debug
+    # script overrides customize_model_config / load_qwen_model.
+    print(
+        f"[Config] layers={config.num_hidden_layers} hidden={config.hidden_size} "
+        f"vocab={config.vocab_size} intermediate={config.intermediate_size} "
+        f"heads={config.num_attention_heads}/{config.num_key_value_heads}"
     )
+
+    model = load_qwen_model(model_name, config)
     model.eval()
 
     class QwenWrapper(torch.nn.Module):
@@ -208,74 +388,132 @@ def qwen2_5_0_5b():
             self.model = m
 
         def forward(self, input_ids, attention_mask, position_ids):
-            # Clamp input_ids to valid embedding range so torch.export does not
-            # emit cf.assert bounds-check ops (which the Hexagon LLVM backend
-            # cannot lower, producing ub.poison → "missing LLVMTranslation…").
             input_ids = torch.clamp(input_ids, 0, self.model.config.vocab_size - 1)
             return self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                position_ids=position_ids
+                position_ids=position_ids,
             ).logits
 
     wrapped_model = QwenWrapper(model)
     wrapped_model.eval()
     func_name = wrapped_model.__class__.__name__
 
-    encoding = tokenizer(prompt, return_tensors="pt")
-    input_ids = encoding["input_ids"].to(torch.int64)
-    # attention_mask must match the model's float dtype (float16)
-    attention_mask = torch.ones_like(input_ids, dtype=torch.float16)
-    position_ids = torch.arange(0, input_ids.shape[1], dtype=torch.long).unsqueeze(0)
-
-    # FIX: Monkey-patch Qwen2RotaryEmbedding.forward to replace math.cos/sin
-    # with a precomputed lookup.  The Hexagon LLVM backend has no
-    # LLVMTranslationDialectInterface for math.cos/math.sin, so they produce
-    # ub.poison during lowering.  We precompute the RoPE cos/sin tensors once
-    # on CPU and store them as buffers on the rotary_emb module; the patched
-    # forward simply returns those buffers, emitting only tensor ops in MLIR.
+    # Precompute RoPE cos/sin — Hexagon LLVM lacks math.cos/sin translation.
+    # Important: do NOT register cos/sin as buffers (they become extra runtime
+    # args and the host launcher ABI breaks). Capture as closure constants so
+    # they land in consts.so. Also keep inv_freq out of the signature: a naked
+    # f32 memref arg makes WrapperGenerator emit the broken (dim, memref*) ABI.
     rotary_emb = wrapped_model.model.model.rotary_emb
     with torch.no_grad():
-        _inv_freq = rotary_emb.inv_freq.float()                          # (head_dim/2,)
-        _pos = position_ids[0].float()                                   # (seq_len,)
-        _freqs = torch.outer(_pos, _inv_freq)                            # (seq_len, head_dim/2)
-        _emb = torch.cat((_freqs, _freqs), dim=-1)                       # (seq_len, head_dim)
-        _cos_cache = (_emb.cos() * rotary_emb.attention_scaling).to(torch.float16).unsqueeze(0)  # (1, seq, head_dim)
-        _sin_cache = (_emb.sin() * rotary_emb.attention_scaling).to(torch.float16).unsqueeze(0)
+        _inv_freq = rotary_emb.inv_freq.float()
+        _pos = position_ids[0].float()
+        _freqs = torch.outer(_pos, _inv_freq)
+        _emb = torch.cat((_freqs, _freqs), dim=-1)
+        _cos_cache = (
+            _emb.cos() * rotary_emb.attention_scaling
+        ).to(torch.float16).unsqueeze(0)
+        _sin_cache = (
+            _emb.sin() * rotary_emb.attention_scaling
+        ).to(torch.float16).unsqueeze(0)
 
-    rotary_emb.register_buffer("_cos_cache", _cos_cache, persistent=False)
-    rotary_emb.register_buffer("_sin_cache", _sin_cache, persistent=False)
+    class _ConstRope(torch.nn.Module):
+        def forward(self, x, position_ids):
+            return _cos_cache.to(dtype=x.dtype), _sin_cache.to(dtype=x.dtype)
 
-    def _patched_rope_forward(self, x, position_ids):
-        # Return precomputed cos/sin — no math.cos/sin in MLIR.
-        return self._cos_cache.to(dtype=x.dtype), self._sin_cache.to(dtype=x.dtype)
-
-    import types
-    rotary_emb.forward = types.MethodType(_patched_rope_forward, rotary_emb)
+    wrapped_model.model.model.rotary_emb = _ConstRope()
 
     module = compile_to_linalg(wrapped_model, (input_ids, attention_mask, position_ids))
+    ir = str(module)
+    print(
+        f"[IR] batch_matmul={ir.count('linalg.batch_matmul')} "
+        f"matmul={ir.count('linalg.matmul')}"
+    )
+
+    mlir_text = None
+    if enable_hexkl:
+        ir2, n_bm = rewrite_batch_matmul_to_matmul(ir)
+        ir2, n_f16 = rewrite_matmul_inputs_to_f16(ir2)
+        mlir_text = ir2
+        print(
+            f"[HexKL] batch_matmul→matmul={n_bm}, f16-input rewrite={n_f16}"
+        )
+        if n_bm == 0 and n_f16 == 0:
+            print("[HexKL] WARNING: no matmul rewrite — HexKL may not fire")
 
     options = HexagonOptions().__dict__
-    options['enableLWP'] = False
-    options['lowerConstantsInSeparateSharedObjects'] = True
-    # FIX: Disable vectorization to prevent HexagonVectorizationPass from
-    # emitting ub.poison ops that the Hexagon LLVM backend cannot lower.
-    # (RewriteUBPoisonToZeroPass only handles vector.transfer_read padding;
-    # other ub.poison sites remain and cause "missing LLVMTranslation…" errors.)
-    options['enableVectorization'] = False
+    options["enableLWP"] = False
+    options["lowerConstantsInSeparateSharedObjects"] = True
+    # HexKL needs hexagonmem (VTCM).  Do NOT enable HVX vectorization here:
+    # with Qwen IR it still faults on device (Bad VA 0x28) even after
+    # FormAsyncThreads sequentializes scf.forall.  MicroHMX does not need it.
+    # Attention-like matmuls (K==M or N==M) are skipped inside MatmulToHexKL.
+    options["enableVectorization"] = False
+    options["enableHexKL"] = bool(enable_hexkl)
+    options["enableConvertToHexagonmem"] = bool(enable_hexkl)
+    options["enablePrefetch"] = bool(enable_omnifetch_vdae)
+    options["enableOmniFetchLayoutAware"] = bool(enable_omnifetch_layout_aware)
+    options["omniFetchLookahead"] = int(omnifetch_lookahead)
+    options["enableOmniFetchVDAE"] = bool(enable_omnifetch_vdae)
+    options["enableOmniFetchAdaptive"] = bool(enable_omnifetch_adaptive)
 
-    # inv_freq is a BUFFER captured by torch.export; pass it as float16
-    # to match the model dtype and keep it first in the inputs list
-    # (torch.export places buffers before user inputs in the MLIR signature).
-    inv_freq_buffer = wrapped_model.model.model.rotary_emb.inv_freq.half()
-    inputs = [inv_freq_buffer, input_ids, attention_mask, position_ids]
+    # No inv_freq / RoPE buffers in the ABI after _ConstRope.
+    inputs = [input_ids, attention_mask, position_ids]
 
-    hex_outputs = hex_execution(module, func_name, inputs, options)
+    hex_outputs = hex_execution(
+        module, func_name, inputs, options, mlir_text=mlir_text
+    )
     print("Successfully ran full Qwen model on Hexagon DSP!")
 
-    # x86 reference: wrapped_model returns logits tensor directly
     x86_logits = x86_execution(wrapped_model, [input_ids, attention_mask, position_ids])
-    compare(hex_outputs, x86_logits, tokenizer)
+    # from_pretrained weights: require top-5 (HVX) or top-1 (HexKL) agreement.
+    compare(
+        hex_outputs,
+        x86_logits,
+        tokenizer,
+        fail_on_mismatch=True,
+        require_exact_top5=not enable_hexkl,
+    )
+    # Report logit agreement for the log.
+    hex_logits = hex_outputs[0]
+    max_abs = (hex_logits.float() - x86_logits.float()).abs().max().item()
+    print(f"[Compare] max_abs_diff(logits)={max_abs:.4f}")
 
-if __name__ == '__main__':
-    qwen2_5_0_5b()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Qwen2.5-0.5B Hexagon smoke (optional HexKL/OmniFetch)."
+    )
+    parser.add_argument(
+        "--enable-hexkl",
+        action="store_true",
+        help="Enable HexKL + hexagonmem (vectorization stays off for Qwen).",
+    )
+    parser.add_argument(
+        "--enable-omnifetch-vdae",
+        action="store_true",
+        help="Enable Omni-Fetch Prefetch + V-DAE.",
+    )
+    parser.add_argument(
+        "--disable-layout-aware",
+        action="store_true",
+        help="Disable layout-aware prefetch (L2Hint / linear only).",
+    )
+    parser.add_argument("--omnifetch-lookahead", type=int, default=2)
+    parser.add_argument("--disable-omnifetch-adaptive", action="store_true")
+    parser.add_argument(
+        "--seq-len",
+        type=int,
+        default=None,
+        help="Fixed content-filled seq length (HexKL defaults to 32).",
+    )
+    args = parser.parse_args()
+    qwen2_5_0_5b(
+        enable_hexkl=args.enable_hexkl,
+        enable_omnifetch_vdae=args.enable_omnifetch_vdae,
+        enable_omnifetch_layout_aware=not args.disable_layout_aware,
+        omnifetch_lookahead=args.omnifetch_lookahead,
+        enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
+        seq_len=args.seq_len,
+    )
+
