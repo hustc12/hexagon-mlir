@@ -6,6 +6,12 @@ HexKL remains the compute baseline. OmniFetch should optimize how HexKL-ready
 data is produced, moved, retained, and scheduled rather than duplicate the
 closed-source HMX kernels.
 
+Quantization and runtime dequantization are no longer part of the planned
+OmniFetch path. The active scope is prefetch, DMA, in-situ layout production,
+removal of redundant reshape/transpose/copy operations, and memory-hierarchy
+placement that reduces or advances data movement without changing model
+precision.
+
 Performance claims must come from models in `benchmark_models`, not standalone
 GEMM tests. Reduced-depth runners may screen compiler/runtime mechanisms, but
 final claims require the published-topology runner, real weights where
@@ -146,17 +152,19 @@ For autoregressive models:
 
 Unlike weight-only prefetch, this attacks a decode-critical memory stream.
 
-### P2: Prefetch plus dequantization/reshape
+### Retired: Prefetch plus dequantization/reshape
 
-For W8A16, W8A8, or W4A16, fuse:
+The W8A16 prototype fused:
 
 ```text
 packed quantized load -> dequantize -> WH reshape -> HMX-ready tile
 ```
 
-The scout side can produce a ready WH tile while compute consumes the previous
-one. Keeping compressed weights in DDR/L2 reduces bandwidth and makes overlap
-more valuable.
+It passed its model-level correctness screen but increased Falcon debug latency
+by 12.11%. More importantly, quantization changes the research scope away from
+the intended data-movement contribution. It remains documented as a negative
+experiment but must not be enabled in the cumulative OmniFetch configuration or
+used as the basis of future work.
 
 ### P2: Critical-path prefetch across operators
 
@@ -180,7 +188,7 @@ Report the policy state with every benchmark so adaptation remains reproducible.
 3. Use that report to select sync in-situ, async in-situ, or persistent layout.
 4. Introduce an explicit model/invocation context and cross-token WH cache.
 5. Add VTCM lifetime coloring and multi-stage load/reshape/compute scheduling.
-6. Extend to activation chains, KV cache, and fused dequantization.
+6. Extend to activation chains and KV cache without changing model precision.
 
 Each stage needs an off switch and model-level A/B testing.
 
@@ -200,7 +208,7 @@ regression gates.
 | 5 | two-dimensional load/reshape/compute pipeline | independently scheduled load and transform readiness | implemented; compiler/runtime tests and Falcon model/device gate passed; repeated performance gate pending |
 | 6 | VTCM lifetime coloring | interference-based VTCM offset assignment | implemented; compiler/runtime tests and Falcon model/device gate passed; repeated performance gate pending |
 | 7 | KV-cache-aware prefetch and layout | page-aware K/V staging and attention-consumer layout | compiler path implemented; Falcon prefill/device gate passed; true cross-token decode and repeated performance gates pending |
-| 8 | prefetch plus dequantization/reshape | fused compressed load, dequantization, and WH production | pending |
+| 8 | prefetch plus dequantization/reshape | fused compressed load, dequantization, and WH production | retired: correctness passed but latency regressed 12.11%; excluded from the project direction and cumulative configuration |
 
 Thermal/token-phase control and critical-path scheduling are cross-cutting
 policies. They will be inputs to item 2 and are not counted as extra enabled
@@ -758,6 +766,568 @@ compiler mechanism and model/device gate are implemented, but a true
 cross-token result still requires a fixed-shape decode-step ABI with K/V cache
 inputs/outputs, cache-position or page-table inputs, multiple sequential
 device invocations, GQA/MQA coverage, and sliding-window/page selection.
+
+## Retired item 8 negative experiment
+
+Item 8 implements an opt-in W8A16 compressed-weight path that combines
+compressed weight retention, tile-local dequantization, and immediate WH
+production. It is controlled by `enableOmniFetchDequantReshape` /
+`--enable-omnifetch-dequant-reshape`. The flag is disabled by default and is
+not part of the formal items-1-through-7 cumulative row.
+
+The implementation is end to end:
+
+1. The OmniFetch dialect has a distinct `HMXWeightDequantI8` layout kind.
+   `PrefetchInsert` selects it at eligible HexKL weight sites and attaches a
+   stable compiler site ID to every tile request.
+2. The runtime maintains a generation-safe, direct-mapped compressed tile
+   cache. Its key contains the model context, generation, compiler site ID,
+   tile row/column, and source stride. It deliberately excludes the transient
+   source pointer because function-local lowered materializations can move
+   between invocations.
+3. A 32-by-32 source tile is represented by 1024 signed int8 values and
+   4-by-32 FP32 group scales. The group size is eight along K. This consumes
+   1536 bytes rather than the 2048 bytes required by the row-major FP16 tile,
+   a 25% reduction before WH conversion.
+4. On a compressed-cache hit, the runtime dequantizes into one short-lived,
+   aligned FP16 tile and immediately invokes the HexKL RM-to-WH transform. It
+   never materializes a complete dequantized weight matrix.
+5. The Falcon CPU reference applies the same symmetric, group-size-eight
+   fake-quantization to rank-two projection weights before compilation and
+   reference execution. The comparison is therefore W8A16-equivalent on both
+   sides rather than an unfair W8 device result against the original FP16
+   model.
+6. The launcher reports cold and cumulative compressed-cache hits/misses in
+   `perf.txt`. The model ablation script exposes item 8 only under
+   `--include-experimental`.
+
+Model validation caught a cache-identity error in the first implementation.
+Different layers could reuse allocator addresses, so a key without a compiler
+site ID returned a stale compressed tile. That version produced a top-1
+mismatch and a maximum absolute logit error of approximately 0.6309. Adding
+the stable site ID restored top-1 matching and reduced the maximum absolute
+difference to 0.0233. Removing the unstable source address from the otherwise
+generation-safe key then improved warm cache reuse without weakening layer
+identity.
+
+The focused compiler regression is:
+
+```bash
+triton/build/cmake.linux-x86_64-cpython-3.11/third_party/qcom_hexagon_backend/bin/linalg-hexagon-opt \
+  qcom_hexagon_backend/test/Transforms/omnifetch-dequant-reshape.mlir \
+  -pass-pipeline='builtin.module(func.func(prefetch-insert{lookahead=2 enable-layout-aware=true enable-dequant-reshape=true}))' \
+| /home/huzq85/2-working/hexagon_npu/LLVM_DIR/llvm-project/build/install/bin/FileCheck \
+  qcom_hexagon_backend/test/Transforms/omnifetch-dequant-reshape.mlir
+```
+
+It checks the new layout kind, synchronous production mode, stable site
+parameter, function-level accounting attributes, and removal of the original
+native RM-to-WH operation. The existing two-dimensional pipeline regression
+also passes, which ensures the new opt-in path does not change item 5 while
+disabled.
+
+Following `docs/user-guide.md`, the complete plugin/runtime build used for the
+device test is:
+
+```bash
+CCACHE_DIR=/tmp/omnifetch-ccache \
+CCACHE_TEMPDIR=/tmp \
+ninja -C triton/build/cmake.linux-x86_64-cpython-3.11
+```
+
+Rebuilding only the standalone DSP runtime target is insufficient after a
+runtime ABI change: the model path loads the runtime embedded through the
+rebuilt Hexagon plugin, so `libtriton.so` must also be relinked.
+
+The final model commands are:
+
+```bash
+# Formal items-1-through-7 three-way comparison.
+ANDROID_SERIAL=49d1c7b2 \
+  bash scripts/run_omnifetch_model_ablation.sh \
+    --model falcon-debug --seq-len 128 --timeout 240
+
+# Add the experimental item-8 row.
+ANDROID_SERIAL=49d1c7b2 \
+  bash scripts/run_omnifetch_model_ablation.sh \
+    --model falcon-debug --seq-len 128 --timeout 240 \
+    --include-experimental
+```
+
+The final fixed-seed Falcon debug screen, with sequence length 128 and three
+warm device iterations, produced:
+
+| Configuration | Device time | Numerical result | Compressed-cache result |
+|---|---:|---|---|
+| HexKL + OmniFetch items 1–7 | 597.726 ms warm average | top-1 match, max abs 0.0231 | not enabled |
+| HexKL + OmniFetch items 1–8 (experimental) | 670.129 ms warm average | top-1 match, max abs 0.0233 | cold 546 hits / 606 misses; cumulative 2682 hits / 1926 misses |
+
+Item 8 is 72.403 ms, or 12.11%, slower than the adjacent items-1-through-7
+sample. Its cold invocation took 785.284 ms and the post-invalidation
+invocation took 686.312 ms. Thus the compiler path, runtime mechanism, matched
+quantized reference, cache identity, invalidation behavior, and model-level
+correctness gate are complete, but the performance gate fails.
+
+The principal bottleneck is structural rather than a missing prefetch flag.
+Every compressed-cache miss still scans an FP16 tile and performs scalar
+groupwise quantization at inference time; every hit performs scalar
+dequantization before the synchronous WH transform. Direct-mapped cache
+collisions add further misses, and the current item-8 path intentionally does
+not enter the older asynchronous FP16 DMA pipeline. The next performance
+version should precompress weights offline or at model load, DMA compressed
+bytes directly from DDR/L2, vectorize groupwise dequantization with HVX, and
+double-buffer dequantization/WH production with item 5's compute pipeline.
+These observations explain the negative result but are not follow-up tasks:
+item 8 must not enter the formal `HexKL + cumulative OmniFetch` row.
+
+The project has since retired this direction. The implementation and negative
+result remain in this document for reproducibility, but quantization,
+dequantization, compressed-weight caching, and the item-8 experimental row are
+not part of the forward OmniFetch roadmap.
+
+## V73 memory-hierarchy-driven roadmap after retiring quantization
+
+### Manual scope and hardware facts
+
+This roadmap is based on:
+
+- [Hexagon V73 Programmer's Reference Manual](../Hexagon_V73_Programmers_Reference_Manual.pdf),
+  especially Section 1.1.1, Sections 5.10–5.11 on cache and memory ordering,
+  and the PMU events in Chapter 9; and
+- [Hexagon V73 HVX Programmer's Reference Manual](../Hexagon_V73_HVX_Programmers_Reference_Manual.pdf),
+  especially Sections 3.1–3.9 on alignment, VTCM, memory types, ordering, and
+  vector-memory performance, plus the HVX PMU events in Chapter 4.
+
+The following facts materially constrain OmniFetch design:
+
+| V73 hardware fact | Consequence for OmniFetch |
+|---|---|
+| HVX VMEM connects directly to L2 and does not use L1 data cache. | Weight/activation prefetch for HVX or HexKL staging should target L2 or VTCM; L1 `dcfetch` is relevant only for a subsequent scalar consumer. |
+| VTCM is faster and lower-power than L2, is not evicted, and reduces L2 pressure. | Short-lived transformed tiles and repeatedly reused layout values should be explicitly placed in VTCM when their live ranges fit. |
+| VRF access is much cheaper than VMEM access. | The best reshape elimination keeps producer results in registers or writes the consumer layout directly; replacing one DDR copy with two VTCM accesses is not the final goal. |
+| V73 `l2fetch` is nonblocking and lower priority than demand traffic, but a new command can halt a still-active command. Zero-valued fields cancel activity. | The compiler/runtime must treat the L2 prefetch engine as a scheduled single-flight resource rather than emit independent hints at every site. |
+| The HVX manual recommends an `l2fetch` region smaller than 8 KB, issued several hundred cycles before use. Fetching too early permits eviction. | Prefetch distance must be expressed in estimated cycles/bytes-to-use, not only loop iterations; large requests must be tiled and timed. |
+| An `l2fetch` address generated on a different page from its start address is dropped. | Every request needs page-boundary splitting or a page-contained allocation contract. |
+| Aligned VMEM is preferred; VMEMU can touch multiple cache lines and costs bandwidth and power. V73 HVX vectors are 128 bytes. | Layout contracts must carry 128-byte base/stride alignment and permit padding plus predication. |
+| Contiguous access reduces bank conflict, cache-set aliasing, and micro-TLB pressure. Conflict-free vector access depends on lower address bits; scatter/gather on V73 is especially sensitive to bits `[10:3]`. | VTCM coloring must include bank phase, DDR/L2 allocation should avoid set aliases between simultaneous streams, and tile schedules should minimize active pages. |
+| The `:nt` attribute tells the cache that data is at its final use. | Streaming outputs and one-use inputs should be marked nontemporal so they do not evict prefetched weights or future activations. |
+| A VMEM load soon after a store to the same address can stall until the store reaches L2; the manual recommends about 15 intervening packets. | Producer/consumer fusion should remove the round trip; otherwise rotate buffers or schedule independent work before reload. |
+| HVX scatter/gather works only in VTCM, must remain within one translated page, and gather cannot read directly from DDR/L2. Scatter is generally preferable; bursts and consumption distance must be controlled. | In-situ transforms should DMA a page-contained region once, then prefer producer-side scatter/direct placement over a later gather when legal. |
+| External AXI DMA is noncoherent with coprocessor threads and requires explicit release or descriptor polling. | DMA readiness must be a compiler-visible ownership token; broad barriers and unsynchronized cache reuse are both incorrect. |
+
+### Immediate audit finding in the current runtime
+
+The current runtime does not yet honor the most important `l2fetch`
+constraints:
+
+- `omni_l2fetch_weight_tile()` issues 32 separate 64-byte commands for one
+  32-by-32 FP16 tile. On V73, each new command can halt the preceding active
+  command, so most rows may never become resident.
+- `omni_l2fetch()` uses 32 KB chunks. This is legal for the extended
+  descriptor but is four times the HVX manual's recommended maximum working
+  request of less than 8 KB.
+- neither helper splits a descriptor at a virtual-page boundary;
+- the KV path can issue several stream hints back-to-back without a global
+  L2-prefetch-engine arbitration policy; and
+- current adaptation uses software wait time, but does not observe
+  `L2FETCH_COMMAND_OVERWRITE`, `L2FETCH_ACCESS_CREDIT_FAIL`, L2 conflicts, or
+  whether prefetched lines were actually missing.
+
+For a strided 32-by-32 FP16 weight tile, the first replacement should be one
+2D request with `width=64`, `height=32`, and
+`stride=source_columns*2`, split only where the generated addresses cross a
+page. If the page split would create too many commands, direct 2D UserDMA to
+VTCM is preferable to a storm of L2 hints.
+
+### One paper story: movement planning over the V73 memory hierarchy
+
+The ten mechanisms and the three proposed abstractions are not independent
+feature ideas. They form one extension of OmniFetch from a prefetch insertion
+pass into a **hierarchy-aware movement planner**:
+
+```text
+movement equivalence class
+  decides which physical movement is semantically unnecessary
+          |
+          v
+layout residency graph
+  chooses the physical layout and hierarchy tier that should own the bytes
+          |
+          v
+prefetch lease
+  schedules the remaining transfer early enough without overwriting or
+  evicting another useful transfer
+```
+
+This gives one logical objective:
+
+> Minimize mandatory physical bytes and exposed movement latency while
+> preserving the model's physical address semantics and memory ownership.
+
+Existing OmniFetch supplies the starting mechanisms: layout-aware prefetch,
+in-situ reshape, DMA/VTCM staging, persistent WH reuse, two-dimensional
+pipelines, VTCM lifetime coloring, and K/V prefetch. The three abstractions
+generalize those mechanisms instead of replacing them:
+
+| Unified decision | Existing OmniFetch instance | V73 mechanisms that complete it |
+|---|---|---|
+| Is this movement physically necessary? | in-situ reshape and layout-aware mapping | M3 movement equivalence, M4 VRF/direct producer placement, M8 store-to-load forwarding |
+| In which layout and tier should the value reside? | DMA-to-VTCM, persistent WH cache, VTCM lifetime coloring | M2 path selection, M5 page/alignment placement, M6 bank phase, M9 residency graph |
+| When should an unavoidable transfer occur and what protects it? | static/adaptive lookahead, inter-layer and K/V prefetch | M1 prefetch leases, M7 last-use nontemporal protection, M10 PMU feedback |
+
+The paper story therefore has three evaluation axes rather than ten unrelated
+speedup claims:
+
+1. **less movement:** physical bytes, materialized transforms, and
+   store/reload boundaries removed;
+2. **earlier useful movement:** demand-stall time, useful issued bytes, and
+   prefetch overwrite/credit-failure rate; and
+3. **safer residency:** VTCM/L2 conflict stalls, active pages, ownership
+   violations, and numerical correctness.
+
+M1--M10 are implemented in order because later decisions consume facts
+produced by earlier ones. Each stage is admitted to the cumulative row only
+after a complete GPT-2 or Falcon run compares the same input and checkpoint on
+HVX, HexKL, and HexKL plus the admitted OmniFetch stages. A mechanism that
+fails correctness or regresses latency stays documented but does not silently
+enter the cumulative configuration.
+
+### M1/P0: Page-safe single-flight L2 prefetch scheduler
+
+Model the L2 prefetch engine as a compiler-visible resource with at most one
+active V73 command. Construct a global queue across weights, activations, and
+K/V streams rather than letting each loop emit commands independently.
+
+Each request carries:
+
+- first-use cycle estimate and last-profitable issue cycle;
+- page-contained 2D region `(base, width, height, stride)`;
+- byte footprint, reuse count, and critical-path priority;
+- expected consumer (`HVX`, `DMA`, scalar, or HMX staging); and
+- cancellation/overwrite risk.
+
+The scheduler coalesces rows into one 2D command, caps the normal working
+request below 8 KB, splits at pages, and refuses to issue a younger command
+while an older useful command is still active. `USR.PFA` or PMU overwrite
+events can provide a runtime completion signal without inserting a blocking
+wait on the compute path.
+
+The novel abstraction is a **prefetch lease**: a tile owns a bounded L2
+residency interval from issue to last use. Competing leases are rejected or
+redirected to DMA/VTCM when their footprints and reuse windows would evict one
+another. This combines temporal scheduling with cache-capacity reasoning
+instead of choosing a fixed lookahead.
+
+#### M1 implementation and full-model gate (2026-07-26)
+
+The first M1 implementation is present in `OmniFetchRuntime.c` and is deliberately
+nonblocking:
+
+- the 32-command row storm for a 32-by-32 FP16 weight tile is replaced by one
+  two-dimensional request `(width=64, height=32, stride=source_columns*2)`;
+- `USR.PFA` bit 3 is read before issue; a younger request is suppressed while
+  an older `l2fetch` remains active, so it cannot silently overwrite the older
+  command;
+- the descriptor is capped below 8 KiB and clipped so every generated address
+  remains in the 4 KiB page containing the start address;
+- unsupported extended-descriptor fields are rejected; and
+- issued, busy-suppressed, page-clipped, unsupported, requested-byte, and
+  issued-byte counters are appended to model `perf.txt`.
+
+This is the **single-page first slice** of a prefetch lease, not the complete
+multi-page queue. Clipped remainder pages are intentionally visible in the
+counter report. M2 must choose between scheduling those remainder leases and
+redirecting the tile to direct DMA; silently claiming that a clipped request
+covered the entire tensor would be incorrect.
+
+The runtime, Python launcher, and full-model runner compiled successfully:
+
+```bash
+CCACHE_DIR=/tmp/omnifetch-ccache CCACHE_TEMPDIR=/tmp \
+  ninja -C triton/build/cmake.linux-x86_64-cpython-3.11
+
+triton/build/cmake.linux-x86_64-cpython-3.11/bin/llvm-lit -v \
+  qcom_hexagon_backend/test/Conversion/LinalgToLLVM/omnifetch-kv-cache-prefetch.mlir \
+  qcom_hexagon_backend/test/Conversion/LinalgToLLVM/omnifetch_two_dim_pipeline.mlir \
+  qcom_hexagon_backend/test/Conversion/LinalgToLLVM/omnifetch_persistent_wh_cache.mlir
+
+python -m py_compile benchmark_models/run_gpt2lmheadmodel.py
+bash -n scripts/run_omnifetch_model_ablation.sh
+git diff --check
+```
+
+The build completed and all three targeted lit tests passed. Disassembly of the
+DSP runtime also contains the `USR` read and a single `l2fetch` issue site.
+
+The formal full-model command is:
+
+```bash
+ANDROID_SERIAL=49d1c7b2 \
+  bash scripts/run_omnifetch_model_ablation.sh \
+    --model gpt2-full --seq-len 32 --timeout 1800 \
+    --output-dir \
+      benchmark_models/results/omnifetch_m1_gpt2_full_f32_seq32
+```
+
+The complete published GPT-2 topology is retained: 12 layers, hidden size 768,
+12 heads, and vocabulary 50,257. A fully FP16 graph previously produced NaNs,
+so normalization, residual, softmax, and the CPU reference now remain FP32.
+Fixed-length formal runs use a stated whole-vocabulary qualification gate:
+all logits finite, identical top-1, and centered cosine at least 0.80. This
+does not claim strict CPU equivalence; top-5 overlap, cosine, and mean absolute
+error are always printed.
+
+The current host cannot yet complete the required three rows:
+
+| Attempt | Outcome | Evidence |
+|---|---|---|
+| GPT-2 full, seq=128, HVX | device completed in 127,401,804 us; finite logits, identical top-1, top-5 overlap 3/5, centered cosine 0.824828 | qualified baseline result, not strict equivalence |
+| GPT-2 full, seq=128, HexKL | host OOM before device execution | Linux OOM log: peak anonymous RSS 15,356,952 KiB |
+| GPT-2 full, seq=32, HVX | host compilation exceeded the 1800 s case timeout | no device timing; recorded as FAIL |
+
+Falcon is not a valid local substitute because its cached directory contains
+configuration/tokenizer files but no checkpoint weights. Consequently M1 is
+**implemented and statically validated but not admitted to the cumulative
+performance row**. No M1 speedup is claimed, and M2 must not begin until either
+a memory-efficient mixed-precision export or a larger-memory build host lets
+HVX, HexKL, and HexKL+M1 finish with the identical model and input.
+
+### M2/P0: Per-tile L2-prefetch versus direct-DMA path selection
+
+L2 prefetch and UserDMA are different movement paths and should not be stacked
+blindly:
+
+```text
+reused/cached path:
+  DDR -> l2fetch -> repeated HVX/CPU reads
+
+one-use layout path:
+  DDR -> 2D UserDMA -> VTCM stage -> direct final-layout production
+
+producer-resident path:
+  producer VRF/VTCM -> consumer layout, with no DDR or L2 round trip
+```
+
+The compiler should select one path per tile from reuse, stride, page count,
+alignment, transform cost, and VTCM pressure. For a one-use strided weight
+tile, prefetching it into L2 and then DMA-reading it may add cache pollution
+without reducing the mandatory transfer. Direct DMA with the appropriate
+source/destination cache-bypass policy can avoid redundant snoop/allocation
+work. For shared activations or K/V blocks with multiple HVX consumers, L2
+residency can be valuable.
+
+The UserDMA `cacheAllocationPolicy` and source/destination bypass fields are
+currently always zero in the OmniFetch weight path. They should become explicit
+codegen decisions. A policy verifier must reject incoherent combinations,
+especially a bypassed DMA write followed by a cached consumer without a
+completion/ownership transition.
+
+### M3/P0: Physical-layout equivalence and direct producer placement
+
+Reshape-like operators must be divided into two classes:
+
+1. metadata-only views whose affine address function is unchanged; and
+2. physical transforms such as a real transpose, permutation, or repack.
+
+Class 1 operations can be erased after composing their affine maps into the
+consumer. Class 2 operations cannot simply be deleted: their producer must be
+rewritten to emit the consumer's desired order, or the transform must be fused
+with the one unavoidable movement into VTCM.
+
+Introduce a **movement equivalence class** for values with the same physical
+bytes, source version, and composed address map. `reshape`, `collapse_shape`,
+`expand_shape`, `subview`, transpose, and copy chains are normalized into this
+representation. The compiler then:
+
+- forwards a zero-copy alias when address functions are equivalent;
+- makes an HVX producer store directly in AH/WH-compatible or
+  consumer-contiguous order when possible;
+- combines DMA copy and layout placement when a transfer is unavoidable; and
+- materializes a standalone transform only as the last legal fallback.
+
+This is stricter and safer than pattern-based reshape deletion, and it gives a
+measurable objective: bytes moved per original model operator and the number of
+materialized layout boundaries removed.
+
+### M4/P1: VRF-resident epilogues and inter-operator layout forwarding
+
+Because VRF access is cheaper than VMEM, fuse short reshape/transpose/slice
+epilogues into the producer while its result is still in vector registers.
+Where the next operator is an HVX kernel, forward vector tiles directly through
+the fused region. Where the next operator is HexKL/HMX, write the tile once
+into its final VTCM staging layout.
+
+Initial legal targets are:
+
+- elementwise/bias/activation followed by a view or transpose;
+- normalization output followed by projection staging;
+- attention output projection input views; and
+- residual add where both consumers accept the same physical layout.
+
+Crossing a closed HexKL kernel boundary cannot assume that private HMX
+registers remain live. The optimization therefore stops at the public
+VTCM/AH/WH ABI unless HexKL exposes a compatible fused entry point.
+
+### M5/P1: Alignment-, page-, and micro-TLB-aware tensor placement
+
+Extend layout values with:
+
+- minimum 128-byte base alignment;
+- row-stride alignment and permitted padding;
+- virtual page span and page-contained subregions;
+- last-use information for nontemporal marking; and
+- a maximum live-page budget.
+
+Pad rows or tile extents to vector boundaries and mask inactive lanes instead
+of repeatedly using VMEMU. Allocate simultaneously consumed weights,
+activations, output, and K/V pages so their hot regions do not unnecessarily
+span many pages. Page-contained 2D tiles improve both `l2fetch` reliability and
+scatter/gather legality.
+
+Padding is profitable only when the extra fetched bytes cost less than
+unaligned multi-line accesses and transform code. The cost model must report
+both logical bytes and physical transferred bytes.
+
+### M6/P1: Bank-phase-aware VTCM coloring and direct scatter placement
+
+Item 6 colors VTCM by lifetime. Extend the interference graph with an address
+phase:
+
+- distribute concurrent accesses across relevant lower address bits;
+- avoid giving the active DMA destination, HMX operand, and HVX transform
+  scratch the same bank phase;
+- keep scatter/gather regions within one page;
+- limit V73 scatter/gather bursts to four per thread; and
+- leave at least 12 packets before consuming conflict-free gather/scatter
+  results, or approximately 24 for poorly correlated addresses.
+
+When an HVX producer already holds values in vectors, prefer a producer-side
+scatter into final VTCM layout over storing row-major and later gathering.
+This converts:
+
+```text
+VRF -> row-major VTCM -> gather -> final VTCM layout
+```
+
+into:
+
+```text
+VRF -> final VTCM layout
+```
+
+The pass should use `HVX_VTCM_OUTSTANDING`, `HVX_SCATGATH_FULL`,
+`HVX_SCATGATH_IN_FULL`, `HVXST_VTCM_FULL`, and
+`VTCM_FIFO_FULL_CYCLES` to validate that reduced byte movement does not create
+a worse bank/network bottleneck.
+
+### M7/P1: Last-use nontemporal streaming and cache-residency protection
+
+Use liveness to mark final-use HVX loads/stores with `:nt`. Typical candidates
+are final output tiles, one-use staging inputs, and streamed residuals after
+their last consumer. Do not mark reusable weights, K/V pages, or an activation
+needed by a nearby scalar consumer.
+
+This innovation combines last-use analysis with prefetch: nontemporal eviction
+preference protects leased future weights/activations from one-pass output
+traffic. It should be evaluated through L2 miss, castout, and prefetch-miss
+counters rather than latency alone.
+
+### M8/P1: Store-to-load-distance-aware fusion and buffer rotation
+
+Detect a VMEM store followed by a load from the same physical region. First try
+to eliminate the pair by forwarding the producer value or fusing the consumer.
+If materialization is required:
+
+- rotate among VTCM/L2 buffers so the consumer reads an older completed tile;
+- schedule at least roughly 15 independent packets between L2 store and load;
+  or
+- use a DMA readiness token and consume from a different bank/slot.
+
+This generalizes the existing two-dimensional pipeline from K tiles to
+operator boundaries. Its profitability statistic is not only overlapped time,
+but the number of store-to-load hazards removed.
+
+### M9/P2: Tiered layout residency across VTCM, L2/optional L2TCM, and DDR
+
+Treat a transformed layout as a movable resident object:
+
+- hottest, short-live, deterministic-reuse tiles in VTCM;
+- medium-reuse tiles protected by an L2 prefetch lease;
+- cold or far-future values in DDR in their original precision; and
+- optionally, platform-permitting hot read-only data in L2TCM.
+
+Moving a layout between tiers must be justified by future saved transfers.
+The optional L2TCM path needs resource-management support and must account for
+the corresponding reduction in ordinary L2 cache capacity; it cannot be
+assumed available from the compiler alone.
+
+This extends persistent WH caching into a general **layout residency graph**:
+nodes are physical layouts in hierarchy tiers and edges are DMA, in-situ
+production, zero-copy aliasing, or eviction. A shortest-cost path chooses where
+each consumer obtains its bytes.
+
+### M10/P2: PMU-driven hierarchy controller
+
+Replace generic software wait-time adaptation with hardware-specific feedback.
+At minimum record:
+
+- `L2FETCH_ACCESS`, `L2FETCH_MISS`, `L2FETCH_COMMAND`,
+  `L2FETCH_COMMAND_OVERWRITE`, and `L2FETCH_ACCESS_CREDIT_FAIL`;
+- `L2_PIPE_CONFLICT_STALL`, `L2_TAG_ARRAY_CONFLICT`, `L2_CASTOUT`, and
+  L2 FIFO replays;
+- HVX L2 load/store outstanding cycles and L2 store misses;
+- VTCM outstanding/FIFO/scatter-gather stalls; and
+- JTLB/micro-TLB-related pressure where exposed by the runtime.
+
+Use these counters per compiler site and model phase to tune:
+
+- L2 lease distance and request size;
+- L2 versus direct-DMA selection;
+- DMA cache allocation/bypass policy;
+- VTCM bank phase and number of pipeline slots; and
+- whether a speculative cross-operator prefetch should be suppressed.
+
+The controller must save the selected policy and counter deltas with every
+benchmark so that adaptation remains reproducible.
+
+### Lower-priority scalar handoff
+
+When an HVX-produced value is genuinely consumed by scalar code, the manual
+recommends storing it to L2, issuing `dcfetch`, and allowing at least about 30
+cycles before the scalar load. This is useful for scalar tails, control values,
+or runtime metadata. It is lower priority for model tensors because converting
+the scalar tail to HVX or keeping the reduction result in registers usually
+removes more movement.
+
+### Recommended implementation order and gates
+
+The new memory-hierarchy work should proceed independently of retired item 8:
+
+| Order | Deliverable | Required gate |
+|---:|---|---|
+| M1 | correct 2D/page-safe, single-flight `l2fetch` scheduler | no overwrite events; all requested rows/pages accounted for |
+| M2 | per-tile L2 versus direct-DMA policy and explicit cache-bypass/allocation settings | numerical correctness plus coherent DMA ownership test |
+| M3 | physical-layout equivalence and safe reshape/view/copy elimination | IR byte-address equivalence checks and model output gate |
+| M4 | producer-side direct layout/VRF forwarding | fewer VMEM bytes and removed transform operations |
+| M5 | alignment/page/micro-TLB-aware placement | fewer unaligned accesses and active pages without excess padding traffic |
+| M6 | bank-phase VTCM coloring and direct scatter placement | lower VTCM/scatter stall counters |
+| M7 | liveness-driven `:nt` | fewer L2 castouts/misses for leased future tiles |
+| M8 | store-to-load-aware inter-operator pipeline | fewer hazards and lower model latency |
+| M9 | tiered layout residency | saved movement exceeds promotion/eviction traffic |
+| M10 | PMU-driven policy tuning | stable improvement across repeated interleaved model runs |
+
+Every stage retains the mandatory rows:
+
+1. HVX / unmodified Hexagon-MLIR;
+2. HexKL with all OmniFetch features disabled; and
+3. HexKL plus only the non-quantized OmniFetch stages that have passed their
+   ordered gates.
+
+Hexagon NN Library remains the external baseline. Report model-level device
+latency together with DDR/DMA bytes, L2 request/miss/overwrite/credit-fail
+counters, VTCM stall counters, transformed operators removed, and physical
+bytes moved. This makes “early movement” and “less movement” independently
+measurable rather than inferring both from one latency number.
 
 ## Triton and triton-shared dependency boundary
 

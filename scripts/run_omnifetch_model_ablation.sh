@@ -6,9 +6,11 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: $0 [--model falcon-debug|gpt2-debug] [--seq-len N]"
+  echo "Usage: $0 [--model falcon-full|gpt2-full|falcon-debug|gpt2-debug]"
+  echo "          [--seq-len N]"
   echo "          [--device-iterations N] [--timeout SEC] [--serial SERIAL]"
   echo "          [--output-dir DIR]"
+  echo "          [--m1-only]"
   echo "          [--include-experimental]"
 }
 
@@ -19,6 +21,7 @@ DEVICE_ITERATIONS=3
 DEVICE_SERIAL="${ANDROID_SERIAL:-49d1c7b2}"
 OUTPUT_DIR=""
 INCLUDE_EXPERIMENTAL=0
+M1_ONLY=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -28,6 +31,7 @@ while [[ $# -gt 0 ]]; do
     --timeout) RUN_TIMEOUT="$2"; shift 2 ;;
     --serial) DEVICE_SERIAL="$2"; shift 2 ;;
     --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
+    --m1-only) M1_ONLY=1; shift ;;
     --include-experimental) INCLUDE_EXPERIMENTAL=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage; exit 2 ;;
@@ -35,6 +39,12 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "${MODEL}" in
+  falcon-full)
+    RUNNER="benchmark_models/run_falcon_rw_1b.py"
+    ;;
+  gpt2-full)
+    RUNNER="benchmark_models/run_gpt2lmheadmodel.py"
+    ;;
   falcon-debug)
     RUNNER="benchmark_models/debug_running/run_falcon_rw_1b_debug.py"
     ;;
@@ -67,13 +77,14 @@ cd "${REPO_DIR}"
 export ANDROID_SERIAL="${DEVICE_SERIAL}"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
+export PYTHONUNBUFFERED=1
 
 run_case() {
   local name="$1"
   shift
   local log="${OUTPUT_DIR}/${MODEL}_seq${SEQ_LEN}_${name}.log"
   local iteration_args=()
-  if [[ "${MODEL}" == "falcon-debug" ]]; then
+  if [[ "${MODEL}" == "falcon-debug" || "${MODEL}" == "falcon-full" ]]; then
     iteration_args=(--device-iterations "${DEVICE_ITERATIONS}")
   fi
   echo "=== ${name}: ${MODEL}, seq_len=${SEQ_LEN} ==="
@@ -93,7 +104,8 @@ run_case() {
 run_case hvx
 run_case hexkl --enable-hexkl
 CUMULATIVE_ARGS=(--enable-hexkl --enable-omnifetch-vdae)
-if [[ "${MODEL}" == "falcon-debug" ]]; then
+if [[ "${M1_ONLY}" -eq 0 ]] &&
+   [[ "${MODEL}" == "falcon-debug" || "${MODEL}" == "falcon-full" ]]; then
   CUMULATIVE_ARGS+=(--enable-omnifetch-persistent-wh-cache)
   CUMULATIVE_ARGS+=(--enable-omnifetch-two-dim-pipeline)
   CUMULATIVE_ARGS+=(--enable-omnifetch-vtcm-coloring)
@@ -108,4 +120,9 @@ if [[ "${INCLUDE_EXPERIMENTAL}" -eq 1 ]]; then
     --enable-omnifetch-vdae \
     --enable-omnifetch-weight-prepack \
     --enable-hexkl-persistent-vtcm
+  if [[ "${MODEL}" == "falcon-debug" ]]; then
+    run_case experimental_dequant_reshape \
+      "${CUMULATIVE_ARGS[@]}" \
+      --enable-omnifetch-dequant-reshape
+  fi
 fi

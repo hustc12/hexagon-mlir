@@ -77,6 +77,7 @@ class HexagonOptions:
     enableOmniFetchTwoDimPipeline: bool = False
     enableOmniFetchVtcmColoring: bool = False
     enableOmniFetchKvCachePrefetch: bool = False
+    enableOmniFetchDequantReshape: bool = False
     omniFetchKvCachePageTokens: int = 32
     # True dual-thread DAE scout (default off). Flag off ≡ current single-thread OF.
     enableOmniFetchDualThreadDae: bool = False

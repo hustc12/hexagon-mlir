@@ -145,6 +145,11 @@ void setLinalgToLLVMOptions(
         (it != arch_kwargs.end() && !it->second.compare(TRUE));
   }
   {
+    auto it = arch_kwargs.find("enableOmniFetchDequantReshape");
+    options.enableOmniFetchDequantReshape =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
     auto it = arch_kwargs.find("omniFetchKvCachePageTokens");
     if (it != arch_kwargs.end())
       options.omniFetchKvCachePageTokens = std::stoi(it->second);

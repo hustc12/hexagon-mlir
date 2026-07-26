@@ -77,6 +77,8 @@ def main():
                         action="store_true")
     parser.add_argument("--enable-omnifetch-kv-cache-prefetch",
                         action="store_true")
+    parser.add_argument("--enable-omnifetch-dequant-reshape",
+                        action="store_true")
     parser.add_argument("--omnifetch-kv-cache-page-tokens", type=int,
                         default=32)
     parser.add_argument("--device-iterations", type=int, default=1)
@@ -102,6 +104,9 @@ def main():
         ),
         enable_omnifetch_kv_cache_prefetch=(
             args.enable_omnifetch_kv_cache_prefetch
+        ),
+        enable_omnifetch_dequant_reshape=(
+            args.enable_omnifetch_dequant_reshape
         ),
         omnifetch_kv_cache_page_tokens=(
             args.omnifetch_kv_cache_page_tokens

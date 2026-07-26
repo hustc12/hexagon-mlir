@@ -512,6 +512,34 @@ def load_falcon_model(model_name, config):
     )
 
 
+def apply_omnifetch_groupwise_w8(model, group_size: int = 8) -> int:
+    """Make the CPU reference use the same W8A16 weights as item 8.
+
+    Falcon stores projection weights as [output, input], whereas the lowered
+    matmul consumes their [input, output] transpose.  Grouping the last model
+    dimension therefore matches the runtime's K-axis group quantization.
+    """
+    quantized = 0
+    with torch.no_grad():
+        for parameter in model.parameters():
+            if parameter.ndim != 2 or parameter.shape[1] % group_size:
+                continue
+            weight = parameter.detach().float()
+            grouped = weight.reshape(weight.shape[0], -1, group_size)
+            max_abs = grouped.abs().amax(dim=2, keepdim=True)
+            scale = torch.where(
+                max_abs > 0, max_abs / 127.0, torch.ones_like(max_abs)
+            )
+            fake_quant = (grouped / scale).round().clamp(-127, 127) * scale
+            parameter.copy_(fake_quant.reshape_as(weight).to(parameter.dtype))
+            quantized += 1
+    print(
+        f"[OmniFetch-W8] fake-quantized {quantized} rank-2 weights "
+        f"with K-group={group_size} for the matched CPU reference"
+    )
+    return quantized
+
+
 def _install_alibi_patch():
     """Avoid Hexagon-incompatible powf/bf16 in Falcon ALiBi slope construction."""
     import transformers.models.falcon.modeling_falcon as falcon_modeling
@@ -563,6 +591,7 @@ def falcon_rw_1b(
     enable_omnifetch_two_dim_pipeline: bool = False,
     enable_omnifetch_vtcm_coloring: bool = False,
     enable_omnifetch_kv_cache_prefetch: bool = False,
+    enable_omnifetch_dequant_reshape: bool = False,
     omnifetch_kv_cache_page_tokens: int = 32,
     device_iterations: int = 1,
     enable_hexkl_persistent_vtcm: bool = False,
@@ -608,6 +637,8 @@ def falcon_rw_1b(
     _install_alibi_patch()
     model = load_falcon_model(model_name, config)
     model.eval()
+    if enable_omnifetch_dequant_reshape:
+        apply_omnifetch_groupwise_w8(model)
     func_name = model.__class__.__name__
 
     # Debug may shrink vocab; clamp so embedding / compare stay in-range.
@@ -654,6 +685,9 @@ def falcon_rw_1b(
     )
     options["enableOmniFetchKvCachePrefetch"] = bool(
         enable_omnifetch_kv_cache_prefetch
+    )
+    options["enableOmniFetchDequantReshape"] = bool(
+        enable_omnifetch_dequant_reshape
     )
     options["omniFetchKvCachePageTokens"] = int(
         omnifetch_kv_cache_page_tokens
@@ -716,6 +750,8 @@ if __name__ == "__main__":
                         action="store_true")
     parser.add_argument("--enable-omnifetch-kv-cache-prefetch",
                         action="store_true")
+    parser.add_argument("--enable-omnifetch-dequant-reshape",
+                        action="store_true")
     parser.add_argument("--omnifetch-kv-cache-page-tokens", type=int,
                         default=32)
     parser.add_argument("--device-iterations", type=int, default=1)
@@ -745,6 +781,9 @@ if __name__ == "__main__":
         ),
         enable_omnifetch_kv_cache_prefetch=(
             args.enable_omnifetch_kv_cache_prefetch
+        ),
+        enable_omnifetch_dequant_reshape=(
+            args.enable_omnifetch_dequant_reshape
         ),
         omnifetch_kv_cache_page_tokens=(
             args.omnifetch_kv_cache_page_tokens

@@ -29,12 +29,14 @@ def OmniFetch_LayoutHMXActivation : I32EnumAttrCase<"HMXActivation", 2,
 def OmniFetch_LayoutCustom      : I32EnumAttrCase<"Custom",      3>;
 def OmniFetch_LayoutL2Hint      : I32EnumAttrCase<"L2Hint",      4,
     "l2_hint">;
+def OmniFetch_LayoutHMXWeightDequantI8 :
+    I32EnumAttrCase<"HMXWeightDequantI8", 5, "hmx_weight_dequant_i8">;
 
 def OmniFetch_LayoutTransformAttr : I32EnumAttr<"LayoutTransform",
     "Describes the in-situ layout reshaping required during prefetch",
     [OmniFetch_LayoutNone, OmniFetch_LayoutHMXWeight,
      OmniFetch_LayoutHMXActivation, OmniFetch_LayoutCustom,
-     OmniFetch_LayoutL2Hint]> {
+     OmniFetch_LayoutL2Hint, OmniFetch_LayoutHMXWeightDequantI8]> {
   let cppNamespace = "::mlir::omni_fetch";
   let genSpecializedAttr = 1;
 }
@@ -122,7 +124,8 @@ def OmniFetch_PrefetchInSituOp : OmniFetch_Op<"prefetch_in_situ",
     When `layout_transform` is `None`, the op performs a straight
     `l2fetch`-style linear copy.
 
-    When `layout_transform` is `HMXWeight` or `HMXActivation`, the
+    When `layout_transform` is `HMXWeight`, `HMXWeightDequantI8`, or
+    `HMXActivation`, the
     runtime uses `vgather`-based scatter-gather to place each element
     directly in the HMX-preferred interleaved format, eliminating a
     separate reshape step (the "Layout Wall" problem).
@@ -157,6 +160,8 @@ def OmniFetch_PrefetchInSituOp : OmniFetch_Op<"prefetch_in_situ",
     //   Activation (6): [tile_row, tile_col, src_cols, act_off, scr_off, src_rows]
     // When present with HMXWeight, runtime calls hexkl_micro_hmx_rm_to_wh_f16
     // on the full src matrix (handles strided DDR tiles correctly).
+    // HMXWeightDequantI8 retains an int8+scale tile in the runtime cache and
+    // fuses compressed load, dequantization, and RM->WH production.
     // When present with HMXActivation (6), runtime runs CopySubmatrix+RmToAh.
     Variadic<I32>:$tile_params
   );

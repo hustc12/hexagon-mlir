@@ -439,6 +439,8 @@ public:
           enableOmniFetchTwoDimPipeline;
       prefetchOptions.enableKvCachePrefetch =
           enableOmniFetchKvCachePrefetch;
+      prefetchOptions.enableDequantReshape =
+          enableOmniFetchDequantReshape;
       prefetchOptions.kvCachePageTokens = omniFetchKvCachePageTokens;
       pm.addNestedPass<func::FuncOp>(
           hexagon::createPrefetchInsertPass(prefetchOptions));

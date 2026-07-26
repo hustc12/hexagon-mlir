@@ -56,7 +56,8 @@ LogicalResult PrefetchInSituOp::verify() {
   bool hexklSlabFusion =
       (getLayoutTransform() == LayoutTransform::HMXActivation &&
        getTileParams().size() == 6) ||
-      (getLayoutTransform() == LayoutTransform::HMXWeight &&
+      ((getLayoutTransform() == LayoutTransform::HMXWeight ||
+        getLayoutTransform() == LayoutTransform::HMXWeightDequantI8) &&
        getTileParams().size() >= 4);
   if (!hexklSlabFusion &&
       srcType.getElementType() != dstType.getElementType())

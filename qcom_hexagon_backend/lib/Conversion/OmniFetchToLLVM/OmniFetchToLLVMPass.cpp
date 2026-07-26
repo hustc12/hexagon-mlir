@@ -259,7 +259,8 @@ struct LowerPrefetchInSitu
         op.getLayoutTransform() == LayoutTransform::HMXActivation &&
         op.getTileParams().size() >= 6;
     const bool hexklWeightSlab =
-        op.getLayoutTransform() == LayoutTransform::HMXWeight &&
+        (op.getLayoutTransform() == LayoutTransform::HMXWeight ||
+         op.getLayoutTransform() == LayoutTransform::HMXWeightDequantI8) &&
         op.getTileParams().size() >= 4;
     Value srcPtr;
     Value destPtr;
@@ -354,7 +355,8 @@ struct LowerPrefetchInSitu
       numElems = 0;
     // HexKL HMXWeight with tile_params uses the full matrix as src; volume is
     // one 32×32 f16 tile (not the whole matrix / i8 VTCM slab).
-    if (op.getLayoutTransform() == LayoutTransform::HMXWeight &&
+    if ((op.getLayoutTransform() == LayoutTransform::HMXWeight ||
+         op.getLayoutTransform() == LayoutTransform::HMXWeightDequantI8) &&
         op.getTileParams().size() >= 3) {
       numElems = 1024;
       elemBytesVal = cI32(2);

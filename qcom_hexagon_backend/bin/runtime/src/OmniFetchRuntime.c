@@ -42,6 +42,7 @@ int hexkl_micro_hmx_copy_submatrix_to_f16(uint8_t *vtcm_base,
 #define LAYOUT_HMX_ACTIVATION  2
 #define LAYOUT_CUSTOM          3
 #define LAYOUT_L2_HINT         4
+#define LAYOUT_HMX_WEIGHT_DEQUANT_I8 5
 
 /* -------------------------------------------------------------------------
  * Adaptive prefetch parameters
@@ -89,6 +90,184 @@ static uint32_t omni_wh_generation = 0;
 static uint32_t omni_wh_epoch = 1;
 static unsigned omni_wh_hits = 0;
 static unsigned omni_wh_misses = 0;
+
+/* M1: V73-aware L2 prefetch scheduler statistics.  V73 can terminate an
+ * active l2fetch when a younger command is issued, and silently drops
+ * generated addresses that leave the start page.  Keep those decisions
+ * visible in model benchmark logs rather than treating l2fetch as an
+ * unobservable hint. */
+static unsigned omni_l2_issued = 0;
+static unsigned omni_l2_busy_suppressed = 0;
+static unsigned omni_l2_page_clipped = 0;
+static unsigned omni_l2_unsupported = 0;
+static uint64_t omni_l2_requested_bytes = 0;
+static uint64_t omni_l2_issued_bytes = 0;
+
+uint64_t __omni_fetch_l2_scheduler_counts(void) {
+  uint64_t issued = __atomic_load_n(&omni_l2_issued, __ATOMIC_RELAXED);
+  uint64_t busy =
+      __atomic_load_n(&omni_l2_busy_suppressed, __ATOMIC_RELAXED);
+  return (issued << 32) | (busy & UINT64_C(0xffffffff));
+}
+
+uint64_t __omni_fetch_l2_scheduler_limits(void) {
+  uint64_t clipped =
+      __atomic_load_n(&omni_l2_page_clipped, __ATOMIC_RELAXED);
+  uint64_t unsupported =
+      __atomic_load_n(&omni_l2_unsupported, __ATOMIC_RELAXED);
+  return (clipped << 32) | (unsupported & UINT64_C(0xffffffff));
+}
+
+uint64_t __omni_fetch_l2_requested_bytes(void) {
+  return __atomic_load_n(&omni_l2_requested_bytes, __ATOMIC_RELAXED);
+}
+
+uint64_t __omni_fetch_l2_issued_bytes(void) {
+  return __atomic_load_n(&omni_l2_issued_bytes, __ATOMIC_RELAXED);
+}
+
+/* Item 8: generation-safe compressed weight stream.  Each entry keeps one
+ * 32x32 symmetric W8 tile (1 KiB) plus its scale instead of a 4 KiB WH tile.
+ * A miss quantizes the immutable FP16 source once.  A hit reads the compressed
+ * tile, dequantizes into a short-lived FP16 tile, and immediately performs
+ * RM->WH, avoiding a separately materialized dequantized matrix. */
+#define OMNI_W8_CACHE_SLOTS 512
+#define OMNI_W8_TILE_ELEMS 1024
+#define OMNI_W8_GROUP_ROWS 8
+#define OMNI_W8_GROUPS (32 / OMNI_W8_GROUP_ROWS)
+typedef struct {
+  uint64_t context;
+  uint32_t generation;
+  uint32_t epoch;
+  const void *source;
+  int32_t tile_row;
+  int32_t tile_col;
+  int32_t source_cols;
+  int32_t site_id;
+  /* Group-wise symmetric scales: four K groups per output column.  The
+   * compressed representation is 1024 B weights + 512 B scales, still 25%
+   * smaller than the 2048 B FP16 tile while avoiding tile-wide outliers. */
+  float scales[OMNI_W8_GROUPS * 32];
+  volatile int valid;
+  int8_t data[OMNI_W8_TILE_ELEMS] __attribute__((aligned(128)));
+} OmniW8CacheEntry;
+
+static OmniW8CacheEntry omni_w8_cache[OMNI_W8_CACHE_SLOTS];
+static unsigned omni_w8_hits = 0;
+static unsigned omni_w8_misses = 0;
+static void hmx_weight_gather(const void *src, void *dest, int32_t elem_bytes,
+                              int32_t M, int32_t K);
+
+uint64_t __omni_fetch_w8_cache_stats(void) {
+  uint64_t hits = __atomic_load_n(&omni_w8_hits, __ATOMIC_RELAXED);
+  uint64_t misses = __atomic_load_n(&omni_w8_misses, __ATOMIC_RELAXED);
+  return (hits << 32) | (misses & 0xffffffffu);
+}
+
+static unsigned omni_w8_hash(const void *source, int32_t tile_row,
+                             int32_t tile_col, int32_t source_cols,
+                             int32_t site_id,
+                             uint64_t context, uint32_t generation) {
+  /* The lowered source is often a function-local materialization whose
+   * address changes between invocations.  Site ID + generation identify the
+   * immutable logical weight; keeping the transient pointer in the key turns
+   * every allocator address change into a false miss. */
+  (void)source;
+  uint64_t x = context;
+  x ^= (uint64_t)generation * UINT64_C(0x9e3779b185ebca87);
+  x ^= (uint64_t)(uint32_t)tile_row * UINT64_C(0x165667b19e3779f9);
+  x ^= (uint64_t)(uint32_t)tile_col * UINT64_C(0x85ebca77c2b2ae63);
+  x ^= (uint64_t)(uint32_t)source_cols * UINT64_C(0x27d4eb2f165667c5);
+  x ^= (uint64_t)(uint32_t)site_id * UINT64_C(0xc2b2ae3d27d4eb4f);
+  x ^= x >> 33;
+  return (unsigned)x & (OMNI_W8_CACHE_SLOTS - 1);
+}
+
+static OmniW8CacheEntry *
+omni_w8_lookup_or_quantize(const _Float16 *source, int32_t tile_row,
+                           int32_t tile_col, int32_t source_cols,
+                           int32_t site_id) {
+  uint64_t context = __atomic_load_n(&omni_wh_context, __ATOMIC_ACQUIRE);
+  uint32_t generation =
+      __atomic_load_n(&omni_wh_generation, __ATOMIC_ACQUIRE);
+  uint32_t epoch = __atomic_load_n(&omni_wh_epoch, __ATOMIC_ACQUIRE);
+  unsigned slot = omni_w8_hash(source, tile_row, tile_col, source_cols,
+                               site_id, context, generation);
+  OmniW8CacheEntry *entry = &omni_w8_cache[slot];
+  if (__atomic_load_n(&entry->valid, __ATOMIC_ACQUIRE) &&
+      entry->context == context && entry->generation == generation &&
+      entry->epoch == epoch &&
+      entry->tile_row == tile_row && entry->tile_col == tile_col &&
+      entry->source_cols == source_cols && entry->site_id == site_id) {
+    __atomic_fetch_add(&omni_w8_hits, 1, __ATOMIC_RELAXED);
+    return entry;
+  }
+
+  __atomic_store_n(&entry->valid, 0, __ATOMIC_RELEASE);
+  const _Float16 *row0 =
+      source + (size_t)tile_row * 32 * (size_t)source_cols +
+      (size_t)tile_col * 32;
+  for (int group = 0; group < OMNI_W8_GROUPS; ++group)
+    for (int c = 0; c < 32; ++c) {
+      float max_abs = 0.0f;
+      int row_begin = group * OMNI_W8_GROUP_ROWS;
+      for (int rr = 0; rr < OMNI_W8_GROUP_ROWS; ++rr) {
+        float value = (float)row0[(size_t)(row_begin + rr) *
+                                      (size_t)source_cols +
+                                  c];
+        float abs_value = value < 0.0f ? -value : value;
+        if (abs_value > max_abs)
+          max_abs = abs_value;
+      }
+      float scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f;
+      entry->scales[group * 32 + c] = scale;
+      float inv_scale = 1.0f / scale;
+      for (int rr = 0; rr < OMNI_W8_GROUP_ROWS; ++rr) {
+        int r = row_begin + rr;
+        float scaled =
+            (float)row0[(size_t)r * (size_t)source_cols + c] * inv_scale;
+        int q = (int)(scaled + (scaled >= 0.0f ? 0.5f : -0.5f));
+        if (q > 127)
+          q = 127;
+        if (q < -127)
+          q = -127;
+        entry->data[r * 32 + c] = (int8_t)q;
+      }
+    }
+  entry->context = context;
+  entry->generation = generation;
+  entry->epoch = epoch;
+  entry->source = source;
+  entry->tile_row = tile_row;
+  entry->tile_col = tile_col;
+  entry->source_cols = source_cols;
+  entry->site_id = site_id;
+  __atomic_store_n(&entry->valid, 1, __ATOMIC_RELEASE);
+  __atomic_fetch_add(&omni_w8_misses, 1, __ATOMIC_RELAXED);
+  return entry;
+}
+
+static void omni_w8_dequant_to_wh(const _Float16 *source, void *dest,
+                                  int32_t weight_off, int32_t tile_row,
+                                  int32_t tile_col, int32_t source_cols,
+                                  int32_t site_id) {
+  OmniW8CacheEntry *entry =
+      omni_w8_lookup_or_quantize(source, tile_row, tile_col, source_cols,
+                                 site_id);
+  _Float16 dequant[OMNI_W8_TILE_ELEMS] __attribute__((aligned(128)));
+  for (int r = 0; r < 32; ++r)
+    for (int c = 0; c < 32; ++c) {
+      float scale = entry->scales[(r / OMNI_W8_GROUP_ROWS) * 32 + c];
+      dequant[r * 32 + c] =
+          (_Float16)((float)entry->data[r * 32 + c] * scale);
+    }
+#ifdef __hexagon__
+  hexkl_micro_hmx_rm_to_wh_f16((uint8_t *)dest, (uint32_t)weight_off, dequant,
+                               0, 0, 32);
+#else
+  hmx_weight_gather(dequant, (char *)dest + weight_off, 2, 32, 32);
+#endif
+}
 
 static unsigned
 omni_wh_cache_hash(const void *source, int32_t tile_row, int32_t tile_col,
@@ -523,12 +702,18 @@ static void omni_async_complete(void) {
 }
 
 #ifdef __hexagon__
+static void omni_l2fetch_2d(const void *ptr, uint32_t width, uint32_t height,
+                            uint32_t stride);
+
 static void omni_l2fetch_weight_tile(const _Float16 *src, int32_t tile_row,
                                      int32_t tile_col, int32_t src_cols) {
   const _Float16 *row0 =
       src + (size_t)tile_row * 32 * (size_t)src_cols + (size_t)tile_col * 32;
-  for (int32_t r = 0; r < 32; ++r)
-    omni_l2fetch(row0 + (size_t)r * (size_t)src_cols, 32u * 2u);
+  /* One V73 2-D command replaces the old 32-command row storm.  The helper
+   * clips height at the first virtual-page boundary and suppresses the issue
+   * if an older useful command is still active. */
+  omni_l2fetch_2d(row0, /*width=*/32u * 2u, /*height=*/32u,
+                  /*stride=*/(uint32_t)src_cols * 2u);
 }
 #endif
 
@@ -790,25 +975,85 @@ static void hmx_activation_gather(const void *src, void *dest,
  * We use it as a low-overhead "warm-up" hint before the blocking memcpy so
  * that by the time memcpy reads the source data it is already in L2 cache.
  *
- * l2fetch encoding:  l2fetch(Rtt, Rs)
- *   Rtt[63:32] = stride (bytes between rows)
+ * V73 extended l2fetch encoding:
+ *   Rtt[63:48] = direction (zero for forward)
+ *   Rtt[47:32] = stride (bytes between rows)
  *   Rtt[31:16] = width  (bytes per row)
  *   Rtt[15:0]  = height (number of rows)
- * For a flat 1-D buffer we use stride=width=total_bytes, height=1.
- * Maximum single l2fetch = 64 kB; split into chunks if larger.
+ *
+ * M1 treats the engine as single-flight, caps a normal command below 8 KiB
+ * per the HVX guide, and never programs an address outside the start page.
  * ------------------------------------------------------------------------- */
 #ifdef __hexagon__
-static void omni_l2fetch(const void *ptr, uint32_t total_bytes) {
-  const char *p = (const char *)ptr;
-  const uint32_t kChunk = 0x8000u;  /* 32 kB per l2fetch call */
-  while (total_bytes > 0) {
-    uint32_t chunk = total_bytes < kChunk ? total_bytes : kChunk;
-    /* Pack the l2fetch descriptor: stride=chunk, width=chunk, height=1 */
-    uint64_t spec = ((uint64_t)chunk << 32) | ((uint64_t)chunk << 16) | 1ULL;
-    __asm__ volatile("l2fetch(%0, %1)" : : "r"(p), "r"(spec) : "memory");
-    p += chunk;
-    total_bytes -= chunk;
+enum {
+  OMNI_L2_PAGE_BYTES = 4096,
+  OMNI_L2_RECOMMENDED_MAX_BYTES = 8191,
+  OMNI_USR_PFA_BIT = 3
+};
+
+static unsigned omni_l2fetch_active(void) {
+  uint32_t usr;
+  __asm__ volatile("%0 = usr" : "=r"(usr));
+  return (usr >> OMNI_USR_PFA_BIT) & 1u;
+}
+
+static void omni_l2fetch_2d(const void *ptr, uint32_t width, uint32_t height,
+                            uint32_t stride) {
+  uint64_t requested = (uint64_t)width * (uint64_t)height;
+  __atomic_fetch_add(&omni_l2_requested_bytes, requested, __ATOMIC_RELAXED);
+  if (!ptr || width == 0 || height == 0 || stride == 0 ||
+      width > UINT16_MAX || height > UINT16_MAX || stride > UINT16_MAX) {
+    __atomic_fetch_add(&omni_l2_unsupported, 1, __ATOMIC_RELAXED);
+    return;
   }
+
+  uintptr_t start = (uintptr_t)ptr;
+  uintptr_t startPage = start & ~(uintptr_t)(OMNI_L2_PAGE_BYTES - 1);
+  uint32_t pageRoom =
+      OMNI_L2_PAGE_BYTES - (uint32_t)(start - startPage);
+  uint32_t safeWidth = width < pageRoom ? width : pageRoom;
+  uint32_t maxRowsByBytes = OMNI_L2_RECOMMENDED_MAX_BYTES / safeWidth;
+  uint32_t safeHeight =
+      height < maxRowsByBytes ? height : maxRowsByBytes;
+
+  while (safeHeight > 1) {
+    uintptr_t lastStart = start + (uintptr_t)(safeHeight - 1) * stride;
+    uintptr_t lastEnd = lastStart + safeWidth - 1;
+    if ((lastStart & ~(uintptr_t)(OMNI_L2_PAGE_BYTES - 1)) == startPage &&
+        (lastEnd & ~(uintptr_t)(OMNI_L2_PAGE_BYTES - 1)) == startPage)
+      break;
+    --safeHeight;
+  }
+  if (safeWidth != width || safeHeight != height)
+    __atomic_fetch_add(&omni_l2_page_clipped, 1, __ATOMIC_RELAXED);
+  if (safeWidth == 0 || safeHeight == 0) {
+    __atomic_fetch_add(&omni_l2_unsupported, 1, __ATOMIC_RELAXED);
+    return;
+  }
+
+  /* Do not overwrite a useful V73 command.  This is deliberately a
+   * nonblocking suppression rather than a compute-thread spin. */
+  if (omni_l2fetch_active()) {
+    __atomic_fetch_add(&omni_l2_busy_suppressed, 1, __ATOMIC_RELAXED);
+    return;
+  }
+
+  uint64_t spec = ((uint64_t)stride << 32) | ((uint64_t)safeWidth << 16) |
+                  (uint64_t)safeHeight;
+  __asm__ volatile("l2fetch(%0, %1)" : : "r"(ptr), "r"(spec) : "memory");
+  __atomic_fetch_add(&omni_l2_issued, 1, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&omni_l2_issued_bytes,
+                     (uint64_t)safeWidth * (uint64_t)safeHeight,
+                     __ATOMIC_RELAXED);
+}
+
+static void omni_l2fetch(const void *ptr, uint32_t total_bytes) {
+  if (total_bytes == 0)
+    return;
+  uint32_t width = total_bytes;
+  if (width > OMNI_L2_RECOMMENDED_MAX_BYTES)
+    width = OMNI_L2_RECOMMENDED_MAX_BYTES;
+  omni_l2fetch_2d(ptr, width, /*height=*/1, /*stride=*/width);
 }
 #endif
 
@@ -859,6 +1104,12 @@ void __omni_fetch_prefetch_insitu(const void *src, void *dest,
     (void)num_elems;
     (void)index_map;
     (void)lookahead;
+    /* Activation and weight tiles share the same 32x32 FP16 source geometry.
+     * Run both through the M1 single-flight/page-safe scheduler; otherwise
+     * activation-only model graphs bypass M1 completely and produce a false
+     * "OmniFetch enabled" ablation with zero issued requests. */
+    omni_l2fetch_weight_tile((const _Float16 *)src, tile_row, tile_col,
+                             src_cols);
     hexkl_micro_hmx_copy_submatrix_to_f16(
         (uint8_t *)dest, (uint32_t)scr_off, (const _Float16 *)src,
         (uint32_t)tile_row, (uint32_t)tile_col, (uint32_t)src_rows,
@@ -879,6 +1130,16 @@ void __omni_fetch_prefetch_insitu(const void *src, void *dest,
     hmx_activation_gather(src, (char *)dest + act_off, elem_bytes, 1,
                           num_elems > 0 ? num_elems : 1024, 1, 1);
 #endif
+    return;
+  }
+
+  /* W8A16 item-8 path. The persistent entry is the compressed stream; the
+   * dequantized FP16 tile exists only on the stack and feeds WH immediately. */
+  if (layout_kind == LAYOUT_HMX_WEIGHT_DEQUANT_I8 && src_cols > 0 &&
+      tile_row >= 0 && tile_col >= 0) {
+    int32_t weight_off = act_off >= 0 ? act_off : 0;
+    omni_w8_dequant_to_wh((const _Float16 *)src, dest, weight_off, tile_row,
+                          tile_col, src_cols, src_rows);
     return;
   }
 

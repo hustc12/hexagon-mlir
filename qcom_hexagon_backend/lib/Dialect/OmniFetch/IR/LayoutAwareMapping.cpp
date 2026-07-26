@@ -202,6 +202,7 @@ mlir::omni_fetch::computeHMXIndexMap(MLIRContext * /*ctx*/,
     return id;
   }
   case LayoutTransform::HMXWeight:
+  case LayoutTransform::HMXWeightDequantI8:
     // Use destination tile shape for map computation
     return computeHMXWeightMap(dstShape);
   case LayoutTransform::HMXActivation:

@@ -90,6 +90,7 @@ struct TransformStats {
   int64_t async = 0;
   int64_t persistentCandidates = 0;
   int64_t persistent = 0;
+  int64_t dequant = 0;
 };
 
 struct KvCachePrefetchStats {
@@ -867,6 +868,7 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
                                          int lookahead, bool enableDmaToVtcm,
                                          bool enablePersistentWhCache,
                                          bool enableTwoDimPipeline,
+                                         bool enableDequantReshape,
                                          TransformStats &stats) {
   if (!enableLayoutAware) {
     // ----- Phase 1 path: L2 hints only -----
@@ -972,6 +974,12 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
         getStaticTripCount(loop).value_or(0) >= 2 &&
         decision.usefulTiles >= 2)
       decision.mode = TransformMode::AsyncInSitu;
+    // Item 8 owns a persistent W8 tile cache in the runtime.  Its first
+    // implementation keeps production synchronous: a warm hit reads 1 KiB
+    // of W8 data, dequantizes directly into a 2 KiB tile, and immediately
+    // produces WH.  It must not enter the older FP16 DMA descriptor path.
+    if (enableDequantReshape)
+      decision.mode = TransformMode::SyncInSitu;
     if (decision.mode == TransformMode::AsyncInSitu && !mmOp)
       decision.mode = TransformMode::SyncInSitu;
     annotateTransformDecision(wh, decision);
@@ -1024,8 +1032,10 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
       }
 
       auto emitSyncCurrent = [&](OpBuilder &syncBuilder, Location syncLoc) {
-        auto syncPrefetch = syncBuilder.create<PrefetchInSituOp>(
-            syncLoc, srcMem, vtcmMem, LayoutTransform::HMXWeight,
+      auto syncPrefetch = syncBuilder.create<PrefetchInSituOp>(
+            syncLoc, srcMem, vtcmMem,
+            enableDequantReshape ? LayoutTransform::HMXWeightDequantI8
+                                 : LayoutTransform::HMXWeight,
             hybridSiteId ? /*persistent cache*/ -1 : 0,
             DenseI32ArrayAttr{}, syncParams);
         annotateTransformDecision(syncPrefetch, decision);
@@ -1075,7 +1085,9 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
               asyncParams.push_back(hybridSiteId);
             }
             auto asyncPrefetch = thenBuilder.create<PrefetchInSituOp>(
-                thenLoc, srcMem, vtcmMem, LayoutTransform::HMXWeight,
+                thenLoc, srcMem, vtcmMem,
+                enableDequantReshape ? LayoutTransform::HMXWeightDequantI8
+                                     : LayoutTransform::HMXWeight,
                 /*lookahead=*/1, DenseI32ArrayAttr{}, asyncParams);
             annotateTransformDecision(asyncPrefetch, decision);
             thenBuilder.create<scf::YieldOp>(thenLoc);
@@ -1084,7 +1096,15 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
     } else {
       int selectedLookahead = 0;
       SmallVector<Value, 6> persistentParams = {ktVal, colVal, wtCols, curOff};
-      if (decision.mode == TransformMode::Persistent) {
+      if (enableDequantReshape) {
+        Value noStage =
+            b.create<arith::ConstantIntOp>(loc, b.getI32Type(), -1);
+        Value siteId = b.create<arith::ConstantIntOp>(
+            loc, b.getI32Type(), stats.dequant++);
+        persistentParams.push_back(noStage);
+        persistentParams.push_back(siteId);
+        ++stats.sync;
+      } else if (decision.mode == TransformMode::Persistent) {
         Value noStage =
             b.create<arith::ConstantIntOp>(loc, b.getI32Type(), -1);
         Value siteId = b.create<arith::ConstantIntOp>(
@@ -1097,7 +1117,9 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
         ++stats.sync;
       }
       auto syncPrefetch = b.create<PrefetchInSituOp>(
-          loc, srcMem, vtcmMem, LayoutTransform::HMXWeight,
+          loc, srcMem, vtcmMem,
+          enableDequantReshape ? LayoutTransform::HMXWeightDequantI8
+                               : LayoutTransform::HMXWeight,
           selectedLookahead, DenseI32ArrayAttr{},
           persistentParams);
       annotateTransformDecision(syncPrefetch, decision);
@@ -1166,6 +1188,7 @@ static void insertPrefetchForLoop(scf::ForOp loop, int lookahead,
                                   bool enableDmaToVtcm,
                                   bool enablePersistentWhCache,
                                   bool enableTwoDimPipeline,
+                                  bool enableDequantReshape,
                                   TransformStats &stats) {
   OpBuilder builder(loop);
   Location loc = loop.getLoc();
@@ -1178,7 +1201,8 @@ static void insertPrefetchForLoop(scf::ForOp loop, int lookahead,
     int n = insertHexKLMicroPrefetchHints(builder, loop, enableLayoutAware,
                                           lookahead, enableDmaToVtcm,
                                           enablePersistentWhCache,
-                                          enableTwoDimPipeline, stats);
+                                          enableTwoDimPipeline,
+                                          enableDequantReshape, stats);
     llvm::errs() << "[PrefetchInsert] Total prefetch sites: " << n
                  << " shadow_kb=0\n";
     return;
@@ -1369,6 +1393,7 @@ struct PrefetchInsertPass
                  << ", enableTwoDimPipeline=" << enableTwoDimPipeline
                  << ", enableInterLayerPrefetch=" << enableInterLayerPrefetch
                  << ", enableKvCachePrefetch=" << enableKvCachePrefetch
+                 << ", enableDequantReshape=" << enableDequantReshape
                  << ", kvCachePageTokens=" << kvCachePageTokens
                  << " (forced off in HVX insert for safety)\n";
 
@@ -1409,7 +1434,7 @@ struct PrefetchInsertPass
                    << " at " << loop.getLoc() << " ---\n";
       insertPrefetchForLoop(loop, lookahead, enableLayoutAware,
                             enableDmaToVtcm, enablePersistentWhCache,
-                            enableTwoDimPipeline, stats);
+                            enableTwoDimPipeline, enableDequantReshape, stats);
     }
 
     Builder builder(func.getContext());
@@ -1423,11 +1448,16 @@ struct PrefetchInsertPass
                   builder.getI64IntegerAttr(stats.persistentCandidates));
     func->setAttr("omni_fetch.cost_persistent_sites",
                   builder.getI64IntegerAttr(stats.persistent));
+    func->setAttr("omni_fetch.dequant_reshape_enabled",
+                  builder.getBoolAttr(enableDequantReshape));
+    func->setAttr("omni_fetch.dequant_reshape_sites",
+                  builder.getI64IntegerAttr(stats.dequant));
     llvm::errs() << "[TransformCostModel] function=" << func.getName()
                  << " native=" << stats.native << " sync=" << stats.sync
                  << " async=" << stats.async
                  << " persistent=" << stats.persistent
                  << " persistent_candidates=" << stats.persistentCandidates
+                 << " dequant=" << stats.dequant
                  << "\n";
 
     if (candidates.empty()) {

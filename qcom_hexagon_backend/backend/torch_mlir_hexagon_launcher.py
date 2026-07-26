@@ -89,9 +89,36 @@ class TorchMlirHexagonWrapperGenerator(HexagonWrapperGenerator):
             func_name=self.func_name, descriptor_string=function_call_descriptor_string
         )
 
+    def generate_l2_scheduler_report(self):
+        if not self.options.get("enableOmniFetchVDAE", False):
+            return ""
+        return """
+uint64_t l2_scheduler_counts = __omni_fetch_l2_scheduler_counts();
+uint64_t l2_scheduler_limits = __omni_fetch_l2_scheduler_limits();
+uint64_t l2_requested_bytes = __omni_fetch_l2_requested_bytes();
+uint64_t l2_issued_bytes = __omni_fetch_l2_issued_bytes();
+FILE *l2_scheduler_report = fopen("perf.txt", "a");
+if (l2_scheduler_report) {
+  fprintf(l2_scheduler_report,
+          "OmniFetchL2Scheduler: issued=%u busy_suppressed=%u "
+          "page_clipped=%u unsupported=%u requested_bytes=%llu "
+          "issued_bytes=%llu\\n",
+          (unsigned)(l2_scheduler_counts >> 32),
+          (unsigned)l2_scheduler_counts,
+          (unsigned)(l2_scheduler_limits >> 32),
+          (unsigned)l2_scheduler_limits,
+          (unsigned long long)l2_requested_bytes,
+          (unsigned long long)l2_issued_bytes);
+  fclose(l2_scheduler_report);
+}
+"""
+
     def generate_benchmarking_and_reporting(self, function_call):
         if not self.options.get("enableOmniFetchPersistentWhCache", False):
-            return super().generate_benchmarking_and_reporting(function_call)
+            return (
+                super().generate_benchmarking_and_reporting(function_call)
+                + self.generate_l2_scheduler_report()
+            )
         context = int.from_bytes(
             hashlib.sha256(self.func_name.encode("utf-8")).digest()[:8], "little"
         )
@@ -102,10 +129,12 @@ uint64_t cold_time_us = benchmark_time_us(1, [&]() {{
     {function_call}
 }});
 uint64_t cold_stats = __omni_fetch_wh_cache_stats();
+uint64_t cold_w8_stats = __omni_fetch_w8_cache_stats();
 uint64_t warm_time_us = benchmark_time_us({self.iterations}, [&]() {{
     {function_call}
 }});
 uint64_t wh_cache_stats = __omni_fetch_wh_cache_stats();
+uint64_t w8_cache_stats = __omni_fetch_w8_cache_stats();
 __omni_fetch_wh_cache_invalidate(UINT64_C({context}), {generation}u);
 uint64_t invalidated_time_us = benchmark_time_us(1, [&]() {{
     {function_call}
@@ -128,7 +157,16 @@ if (wh_cache_report) {{
           (unsigned)(invalidated_stats >> 32), (unsigned)invalidated_stats);
   fclose(wh_cache_report);
 }}
-"""
+FILE *w8_cache_report = fopen("perf.txt", "a");
+if (w8_cache_report) {{
+  fprintf(w8_cache_report,
+          "OmniFetchW8Cache: cold_hits=%u cold_misses=%u "
+          "total_hits=%u total_misses=%u\\n",
+          (unsigned)(cold_w8_stats >> 32), (unsigned)cold_w8_stats,
+          (unsigned)(w8_cache_stats >> 32), (unsigned)w8_cache_stats);
+  fclose(w8_cache_report);
+}}
+""" + self.generate_l2_scheduler_report()
 
     def generate_input_wrapper_struct_def(self):
         """Generates template for input wrapper structs"""
@@ -148,6 +186,14 @@ if (wh_cache_report) {{
 extern "C" void __omni_fetch_wh_cache_set_context(uint64_t, uint32_t);
 extern "C" void __omni_fetch_wh_cache_invalidate(uint64_t, uint32_t);
 extern "C" uint64_t __omni_fetch_wh_cache_stats(void);
+extern "C" uint64_t __omni_fetch_w8_cache_stats(void);
+"""
+        if self.options.get("enableOmniFetchVDAE", False):
+            code_headers += """
+extern "C" uint64_t __omni_fetch_l2_scheduler_counts(void);
+extern "C" uint64_t __omni_fetch_l2_scheduler_limits(void);
+extern "C" uint64_t __omni_fetch_l2_requested_bytes(void);
+extern "C" uint64_t __omni_fetch_l2_issued_bytes(void);
 """
 
         code_define = self.common_strings.code_define.format(
