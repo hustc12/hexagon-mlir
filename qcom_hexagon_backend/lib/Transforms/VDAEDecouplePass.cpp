@@ -152,6 +152,20 @@ static void addSynchronizationToLoop(scf::ForOp loop, bool enableAdaptive) {
     return;
   }
 
+  // Sync-only in-situ prefetches (lookahead==0) complete before signal would
+  // fire; wrapping them in wait/signal is pure overhead and — worse — wait()
+  // drains OmniFetchRuntime async DMA jobs belonging to sibling loops
+  // (e.g. activation loop wait completing a weight-loop deferred WH).
+  auto hasAsyncPrefetch = [](ArrayRef<PrefetchInSituOp> ops) {
+    return llvm::any_of(ops,
+                        [](PrefetchInSituOp p) { return p.getLookahead() > 0; });
+  };
+  if (!hasAsyncPrefetch(prologuePrefetches) &&
+      !hasAsyncPrefetch(loopBodyPrefetches)) {
+    llvm::dbgs() << "[VDAEDecouple]   Sync-only prefetches, skipping wait/signal\n";
+    return;
+  }
+
   llvm::dbgs() << "[VDAEDecouple]   Adding synchronization (semaphore + wait/signal)\n";
 
   // Create semaphore before the loop

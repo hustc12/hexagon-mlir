@@ -222,8 +222,11 @@ public:
     // Remove quant.scast ops
     pm.addPass(createCSEPass());
 
-    if (enableHexKL)
-      pm.addNestedPass<func::FuncOp>(createMatmulToHexKLPass());
+    if (enableHexKL) {
+      MatmulToHexKLOptions hexklOpts{};
+      hexklOpts.enableAttentionHmx = enableOmniFetchAttentionHmx;
+      pm.addNestedPass<func::FuncOp>(createMatmulToHexKLPass(hexklOpts));
+    }
 
     if (enableConvTiling) {
       pm.addNestedPass<func::FuncOp>(
@@ -395,8 +398,13 @@ public:
 
     // Decompose hexkl.matmul to micro ops first so PrefetchInsert can see
     // MicroHMX DDR→VTCM copies (tile_row/tile_col) in innermost loops.
-    if (enableHexKL)
-      pm.addNestedPass<func::FuncOp>(createDecomposeHexKLMatmulPass());
+    if (enableHexKL) {
+      auto decomposeOptions = DecomposeHexKLMatmulOptions{};
+      decomposeOptions.enableWeightPrepack = enableOmniFetchWeightPrepack;
+      decomposeOptions.enablePersistentVtcm = enableHexKLPersistentVtcm;
+      pm.addNestedPass<func::FuncOp>(
+          createDecomposeHexKLMatmulPass(decomposeOptions));
+    }
 
     // ===== Omni-Fetch: Plan-A 3-component architecture =====
     //
@@ -414,6 +422,11 @@ public:
       prefetchOptions.lookahead = omniFetchLookahead;
       // Layout-aware flag controls in-situ reshape during prefetch.
       prefetchOptions.enableLayoutAware = enableOmniFetchLayoutAware;
+      prefetchOptions.enableDmaToVtcm = enableOmniFetchDmaToVtcm;
+      prefetchOptions.enableInterLayerPrefetch =
+          enableOmniFetchInterLayerPrefetch;
+      prefetchOptions.enablePersistentWhCache =
+          enableOmniFetchPersistentWhCache;
       pm.addNestedPass<func::FuncOp>(
           hexagon::createPrefetchInsertPass(prefetchOptions));
       pm.addPass(createCanonicalizerPass());
@@ -482,9 +495,13 @@ public:
     pm.addPass(hexkl::createHexKLToLLVMPass());
     // Lower omni_fetch dialect ops to extern-C runtime calls.
     // Required whenever Prefetch (Component 1) has emitted prefetch_in_situ ops,
-    // regardless of whether V-DAE (Component 3) is also active.
-    if (enablePrefetch)
-      pm.addPass(omni_fetch::createOmniFetchToLLVMPass());
+    // or when weight prepack emitted prefetch_in_situ copies in DecomposeHexKL.
+    if (enablePrefetch || enableOmniFetchWeightPrepack) {
+      mlir::omni_fetch::OmniFetchToLLVMOptions ofOpts{};
+      ofOpts.enableDualThreadDae =
+          enableOmniFetchDualThreadDae && enableOmniFetchVDAE;
+      pm.addPass(omni_fetch::createOmniFetchToLLVMPass(ofOpts));
+    }
 
     if (enableCollapseAddressSpace) {
       pm.addPass(createCollapseAddressSpacePass());

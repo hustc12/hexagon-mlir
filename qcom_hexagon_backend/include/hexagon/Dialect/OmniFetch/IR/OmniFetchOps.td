@@ -152,9 +152,12 @@ def OmniFetch_PrefetchInSituOp : OmniFetch_Op<"prefetch_in_situ",
     OmniFetch_LayoutTransformAttr:$layout_transform,
     DefaultValuedAttr<I32Attr, "2">:$lookahead,
     OptionalAttr<DenseI32ArrayAttr>:$index_map,
-    // Optional HexKL tile metadata: [tile_row, tile_col, src_cols].
+    // Optional HexKL tile metadata:
+    //   Weight (3): [tile_row, tile_col, src_cols]
+    //   Activation (6): [tile_row, tile_col, src_cols, act_off, scr_off, src_rows]
     // When present with HMXWeight, runtime calls hexkl_micro_hmx_rm_to_wh_f16
     // on the full src matrix (handles strided DDR tiles correctly).
+    // When present with HMXActivation (6), runtime runs CopySubmatrix+RmToAh.
     Variadic<I32>:$tile_params
   );
 

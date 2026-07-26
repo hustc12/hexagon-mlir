@@ -112,6 +112,9 @@ int main(int argc, char **argv) {
   mlir::hexagon::registerLowerTTXPass();
   mlir::hexagon::registerLowerTPtrPass();
   mlir::hexagon::registerFoldMulFByZeroPass();
+  mlir::hexagon::registerPrefetchInsertPass();
+  mlir::hexagon::registerOmniFetchVDAEInsertPass();
+  mlir::hexagon::registerLayoutOpsEliminationPass();
 
   // Register all external models.
   mlir::hexkl::registerBufferizableOpInterfaceExternalModels(registry);

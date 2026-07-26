@@ -109,10 +109,46 @@ void setLinalgToLLVMOptions(
   options.enableOmniFetchLayoutAware =
       !arch_kwargs.at("enableOmniFetchLayoutAware").compare(TRUE);
   options.omniFetchLookahead = std::stoi(arch_kwargs.at("omniFetchLookahead"));
+  {
+    auto it = arch_kwargs.find("enableOmniFetchDmaToVtcm");
+    options.enableOmniFetchDmaToVtcm =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
   options.enableOmniFetchVDAE =
       !arch_kwargs.at("enableOmniFetchVDAE").compare(TRUE);
   options.enableOmniFetchAdaptive =
       !arch_kwargs.at("enableOmniFetchAdaptive").compare(TRUE);
+  {
+    auto it = arch_kwargs.find("enableOmniFetchWeightPrepack");
+    options.enableOmniFetchWeightPrepack =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableOmniFetchPersistentWhCache");
+    options.enableOmniFetchPersistentWhCache =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableOmniFetchDualThreadDae");
+    options.enableOmniFetchDualThreadDae =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableOmniFetchInterLayerPrefetch");
+    options.enableOmniFetchInterLayerPrefetch =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableOmniFetchAttentionHmx");
+    options.enableOmniFetchAttentionHmx =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableHexKLPersistentVtcm");
+    // Default false when key absent (matches Passes.td / HexagonOptions).
+    options.enableHexKLPersistentVtcm =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
 }
 
 namespace mlir {

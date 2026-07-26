@@ -48,6 +48,7 @@ def compile_and_run(
     enable_omnifetch: bool = False,
     enable_hexkl: bool = True,
     enable_layout_aware: bool = False,
+    enable_weight_prepack: bool = False,
     lookahead: int = 2,
     adaptive: bool = True,
     m: int = 256,
@@ -60,7 +61,7 @@ def compile_and_run(
         print(f"\n{'='*60}")
         print(f"  GEMM [{m}x{k}] @ [{k}x{n}] f16")
         print(f"  HexKL={enable_hexkl} OmniFetch={enable_omnifetch} "
-              f"LayoutAware={enable_layout_aware}")
+              f"LayoutAware={enable_layout_aware} Prepack={enable_weight_prepack}")
         print(f"{'='*60}\n")
 
     model = GemmModel().half().eval()
@@ -81,6 +82,7 @@ def compile_and_run(
         enablePrefetch=enable_omnifetch,
         enableOmniFetchVDAE=enable_omnifetch,
         enableOmniFetchLayoutAware=enable_layout_aware and enable_omnifetch,
+        enableOmniFetchWeightPrepack=enable_weight_prepack,
         omniFetchLookahead=lookahead,
         enableOmniFetchAdaptive=adaptive and enable_omnifetch,
         lowerConstantsInSeparateSharedObjects=False,
@@ -160,6 +162,7 @@ if __name__ == "__main__":
     parser.add_argument("--enable-hexkl", action="store_true")
     parser.add_argument("--enable-omnifetch", action="store_true")
     parser.add_argument("--enable-layout-aware", action="store_true")
+    parser.add_argument("--enable-omnifetch-weight-prepack", action="store_true")
     parser.add_argument("--m", type=int, default=256)
     parser.add_argument("--k", type=int, default=256)
     parser.add_argument("--n", type=int, default=256)
@@ -171,5 +174,6 @@ if __name__ == "__main__":
             enable_omnifetch=args.enable_omnifetch,
             enable_hexkl=args.enable_hexkl,
             enable_layout_aware=args.enable_layout_aware,
+            enable_weight_prepack=args.enable_omnifetch_weight_prepack,
             m=args.m, k=args.k, n=args.n,
         )

@@ -8,6 +8,7 @@
 # ===------------------------------------------------------------------------===
 
 import os
+import hashlib
 import shutil
 from pathlib import Path
 from typing import Optional
@@ -56,6 +57,7 @@ return 0;
 
 class TorchMlirHexagonWrapperGenerator(HexagonWrapperGenerator):
     def __init__(self, input_profs, iterations, func_name, output_profs, options: dict):
+        self.options = options
         super().__init__(
             input_profs,
             iterations,
@@ -87,6 +89,47 @@ class TorchMlirHexagonWrapperGenerator(HexagonWrapperGenerator):
             func_name=self.func_name, descriptor_string=function_call_descriptor_string
         )
 
+    def generate_benchmarking_and_reporting(self, function_call):
+        if not self.options.get("enableOmniFetchPersistentWhCache", False):
+            return super().generate_benchmarking_and_reporting(function_call)
+        context = int.from_bytes(
+            hashlib.sha256(self.func_name.encode("utf-8")).digest()[:8], "little"
+        )
+        generation = int(self.options.get("omniFetchWhCacheGeneration", 1))
+        return f"""
+__omni_fetch_wh_cache_set_context(UINT64_C({context}), {generation}u);
+uint64_t cold_time_us = benchmark_time_us(1, [&]() {{
+    {function_call}
+}});
+uint64_t cold_stats = __omni_fetch_wh_cache_stats();
+uint64_t warm_time_us = benchmark_time_us({self.iterations}, [&]() {{
+    {function_call}
+}});
+uint64_t wh_cache_stats = __omni_fetch_wh_cache_stats();
+__omni_fetch_wh_cache_invalidate(UINT64_C({context}), {generation}u);
+uint64_t invalidated_time_us = benchmark_time_us(1, [&]() {{
+    {function_call}
+}});
+uint64_t invalidated_stats = __omni_fetch_wh_cache_stats();
+TestReport tr("{self.func_name}", warm_time_us, "us", Result::Pass);
+tr.save();
+FILE *wh_cache_report = fopen("perf.txt", "a");
+if (wh_cache_report) {{
+  fprintf(wh_cache_report,
+          "OmniFetchWHCache: cold_us=%llu warm_avg_us=%llu "
+          "cold_hits=%u cold_misses=%u total_hits=%u total_misses=%u "
+          "invalidated_us=%llu "
+          "post_invalidate_hits=%u post_invalidate_misses=%u\\n",
+          (unsigned long long)cold_time_us,
+          (unsigned long long)warm_time_us,
+          (unsigned)(cold_stats >> 32), (unsigned)cold_stats,
+          (unsigned)(wh_cache_stats >> 32), (unsigned)wh_cache_stats,
+          (unsigned long long)invalidated_time_us,
+          (unsigned)(invalidated_stats >> 32), (unsigned)invalidated_stats);
+  fclose(wh_cache_report);
+}}
+"""
+
     def generate_input_wrapper_struct_def(self):
         """Generates template for input wrapper structs"""
         return ""
@@ -100,6 +143,12 @@ class TorchMlirHexagonWrapperGenerator(HexagonWrapperGenerator):
         Generates skeleton cpp file which launches the kernel.
         """
         code_headers = self.common_strings.code_headers
+        if self.options.get("enableOmniFetchPersistentWhCache", False):
+            code_headers += """
+extern "C" void __omni_fetch_wh_cache_set_context(uint64_t, uint32_t);
+extern "C" void __omni_fetch_wh_cache_invalidate(uint64_t, uint32_t);
+extern "C" uint64_t __omni_fetch_wh_cache_stats(void);
+"""
 
         code_define = self.common_strings.code_define.format(
             llvm_func_sign=self.generate_llvm_function_signature(),

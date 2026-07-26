@@ -80,10 +80,12 @@ std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>> createLowerTTXPass();
 
 std::unique_ptr<OperationPass<func::FuncOp>> createMatmulToConvPass();
 
-std::unique_ptr<InterfacePass<FunctionOpInterface>> createMatmulToHexKLPass();
+std::unique_ptr<InterfacePass<FunctionOpInterface>> createMatmulToHexKLPass(
+    const MatmulToHexKLOptions &options = MatmulToHexKLOptions());
 
 std::unique_ptr<InterfacePass<FunctionOpInterface>>
-createDecomposeHexKLMatmulPass();
+createDecomposeHexKLMatmulPass(
+    const DecomposeHexKLMatmulOptions &options = DecomposeHexKLMatmulOptions());
 
 std::unique_ptr<OperationPass<func::FuncOp>> createMemoryOffsetsPass();
 

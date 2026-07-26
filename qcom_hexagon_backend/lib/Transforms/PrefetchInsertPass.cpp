@@ -51,6 +51,8 @@
 #include "llvm/Support/Debug.h"
 
 #include <algorithm>
+#include <limits>
+#include <optional>
 
 #define DEBUG_TYPE "prefetch-insert"
 
@@ -66,6 +68,134 @@ namespace {
 //===----------------------------------------------------------------------===//
 // Helper functions
 //===----------------------------------------------------------------------===//
+
+enum class TransformMode {
+  Native,
+  SyncInSitu,
+  AsyncInSitu,
+  Persistent,
+};
+
+struct TransformDecision {
+  TransformMode mode = TransformMode::Native;
+  int64_t score = 0;
+  int64_t usefulTiles = 0;
+  int64_t outerReuse = -1;
+  bool persistentCandidate = false;
+};
+
+struct TransformStats {
+  int64_t native = 0;
+  int64_t sync = 0;
+  int64_t async = 0;
+  int64_t persistentCandidates = 0;
+  int64_t persistent = 0;
+};
+
+static StringRef stringifyTransformMode(TransformMode mode) {
+  switch (mode) {
+  case TransformMode::Native:
+    return "native";
+  case TransformMode::SyncInSitu:
+    return "sync";
+  case TransformMode::AsyncInSitu:
+    return "async";
+  case TransformMode::Persistent:
+    return "persistent";
+  }
+  llvm_unreachable("unknown transform mode");
+}
+
+static std::optional<int64_t> getConstantInt(Value value) {
+  Attribute attr;
+  if (!matchPattern(value, m_Constant(&attr)))
+    return std::nullopt;
+  auto intAttr = dyn_cast<IntegerAttr>(attr);
+  if (!intAttr)
+    return std::nullopt;
+  return intAttr.getInt();
+}
+
+static std::optional<int64_t> getStaticTripCount(scf::ForOp loop) {
+  auto lower = getConstantInt(loop.getLowerBound());
+  auto upper = getConstantInt(loop.getUpperBound());
+  auto step = getConstantInt(loop.getStep());
+  if (!lower || !upper || !step || *step <= 0)
+    return std::nullopt;
+  if (*upper <= *lower)
+    return 0;
+  return (*upper - *lower + *step - 1) / *step;
+}
+
+static int64_t estimateOuterReuse(scf::ForOp loop) {
+  int64_t reuse = 1;
+  for (Operation *parent = loop->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    auto outer = dyn_cast<scf::ForOp>(parent);
+    if (!outer)
+      continue;
+    auto trips = getStaticTripCount(outer);
+    if (!trips)
+      return -1;
+    if (*trips != 0 &&
+        reuse > std::numeric_limits<int64_t>::max() / *trips)
+      return -1;
+    reuse *= *trips;
+  }
+  return reuse;
+}
+
+/// A deliberately conservative first cost model. Native HexKL wins for a
+/// one-to-one synchronous weight transform. Async is selected only when enough
+/// K tiles exist to amortize queue, semaphore, and staging costs. High outer
+/// reuse is reported for the future persistent-layout implementation but does
+/// not enable the previously regressing loop-interchange path.
+static TransformDecision decideWeightTransform(scf::ForOp loop,
+                                               MemRefType weightType,
+                                               int lookahead,
+                                               bool enablePersistentWhCache) {
+  TransformDecision decision;
+  auto trips = getStaticTripCount(loop);
+  decision.outerReuse = estimateOuterReuse(loop);
+  if (!trips || !weightType || !weightType.hasStaticShape() ||
+      weightType.getRank() != 2)
+    return decision;
+
+  decision.usefulTiles =
+      std::min(weightType.getShape()[0], weightType.getShape()[1]) / 32;
+  decision.persistentCandidate =
+      decision.outerReuse < 0 || decision.outerReuse >= 4;
+
+  // Approximate saved/hidden work in arbitrary stable cost units:
+  // 100 per useful tile, versus ~800 units of queue/sync/staging overhead.
+  constexpr int64_t kAsyncFixedCost = 800;
+  constexpr int64_t kBenefitPerTile = 100;
+  decision.score =
+      decision.usefulTiles * kBenefitPerTile - kAsyncFixedCost;
+  if (enablePersistentWhCache && decision.persistentCandidate)
+    decision.mode = TransformMode::Persistent;
+  else if (lookahead >= 1 && *trips >= 8 && decision.usefulTiles >= 8 &&
+      decision.score >= 0)
+    decision.mode = TransformMode::AsyncInSitu;
+  else if (lookahead == 0)
+    decision.mode = TransformMode::SyncInSitu;
+  return decision;
+}
+
+static void annotateTransformDecision(Operation *op,
+                                      const TransformDecision &decision) {
+  Builder builder(op->getContext());
+  op->setAttr("omni_fetch.transform_mode",
+              builder.getStringAttr(stringifyTransformMode(decision.mode)));
+  op->setAttr("omni_fetch.transform_score",
+              builder.getI64IntegerAttr(decision.score));
+  op->setAttr("omni_fetch.transform_useful_tiles",
+              builder.getI64IntegerAttr(decision.usefulTiles));
+  op->setAttr("omni_fetch.transform_outer_reuse",
+              builder.getI64IntegerAttr(decision.outerReuse));
+  if (decision.persistentCandidate)
+    op->setAttr("omni_fetch.persistent_candidate", builder.getUnitAttr());
+}
 
 /// Returns true if `op` or any op in its nest uses HMX or HVX compute operations.
 /// This includes:
@@ -607,7 +737,9 @@ static Value createDdrTileSubview(OpBuilder &b, Location loc, Value src,
 ///   overlaps the transfer with Mm when lookahead>0).
 static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
                                          bool enableLayoutAware,
-                                         int lookahead) {
+                                         int lookahead, bool enableDmaToVtcm,
+                                         bool enablePersistentWhCache,
+                                         TransformStats &stats) {
   if (!enableLayoutAware) {
     // ----- Phase 1 path: L2 hints only -----
     SmallVector<Operation *> ddrLoads;
@@ -662,16 +794,14 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
   }
 
   // ----- Phase 2a/2b: layout-aware path -----
-  // Weight only: replace RmToWh with prefetch_in_situ → hexkl_micro WH layout.
+  // Weight: replace RmToWh with prefetch_in_situ → hexkl_micro WH layout.
   // Phase 2b software pipeline (lookahead>=1, dual weight slots):
-  //   kt==0: sync fill current slot
-  //   after Mm: async kick of tile kt+1 into the idle slot (l2fetch/DMA;
-  //             WH layout completes in __omni_fetch_wait at next iter)
-  //   kt>0:  skip sync fill — wait already populated the current slot
+  //   always sync-fill current (correctness)
+  //   async kick of tile kt+1 into the idle slot (dma2d→stage; WH in wait)
+  // Activation: replace CopySubmatrix+RmToAh with HexKL-accurate HMXActivation
+  //   prefetch into the VTCM slab (sync only; no Mm overlap in this loop).
   int inserted = 0;
   int erased = 0;
-  const bool doAsync = lookahead >= 1;
-
   SmallVector<hexkl::MicroHMXRmToWhF16Op> whOps;
   for (Operation &op : *loop.getBody())
     if (auto wh = dyn_cast<hexkl::MicroHMXRmToWhF16Op>(&op))
@@ -698,8 +828,29 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
     Value wtCols = wh.getWtCols();
 
     OpBuilder b(wh);
+    auto wtTy = dyn_cast<MemRefType>(srcMem.getType());
+    TransformDecision decision =
+        decideWeightTransform(loop, wtTy, lookahead,
+                              enablePersistentWhCache);
+    if (decision.mode == TransformMode::AsyncInSitu && !mmOp)
+      decision.mode = TransformMode::SyncInSitu;
+    annotateTransformDecision(wh, decision);
+    stats.persistentCandidates += decision.persistentCandidate;
 
-    if (doAsync && mmOp) {
+    if (decision.mode == TransformMode::Native) {
+      ++stats.native;
+      llvm::errs() << "[TransformCostModel] kind=weight mode=native"
+                   << " tiles=" << decision.usefulTiles
+                   << " outer_reuse=" << decision.outerReuse
+                   << " score=" << decision.score
+                   << (decision.persistentCandidate
+                           ? " persistent_candidate=1\n"
+                           : "\n");
+      continue;
+    }
+
+    if (decision.mode == TransformMode::AsyncInSitu && mmOp) {
+      ++stats.async;
       auto i32Ty = b.getI32Type();
       Value c0 = b.create<arith::ConstantIntOp>(loc, i32Ty, 0);
       Value c1 = b.create<arith::ConstantIntOp>(loc, i32Ty, 1);
@@ -707,50 +858,124 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
       Value c4096 = b.create<arith::ConstantIntOp>(loc, i32Ty, 4096);
       Value neg4096 = b.create<arith::ConstantIntOp>(loc, i32Ty, -4096);
 
-      // Always sync-fill current (correctness). Async kick of next overlaps Mm.
-      Value destView = createVtcmF16TileView(b, loc, vtcmMem, curOff);
-      b.create<PrefetchInSituOp>(
-          loc, srcMem, destView, LayoutTransform::HMXWeight,
-          /*lookahead=*/0, DenseI32ArrayAttr{},
-          ValueRange{ktVal, colVal, wtCols});
-      ++inserted;
-
       Value ub = loop.getUpperBound();
       Value ubI32 = b.create<arith::IndexCastOp>(loc, i32Ty, ub);
-      Value lastKt = b.create<arith::SubIOp>(loc, ubI32, c1);
+
+      // Optional VTCM DMA stage at flatOff=(kTiles+2)*4096.  When disabled,
+      // runtime packs into DDR omni_stage instead (tile_params size 4).
+      SmallVector<Value, 5> syncParams = {ktVal, colVal, wtCols, curOff};
+      if (enableDmaToVtcm) {
+        Value kTilesPlus2 = b.create<arith::AddIOp>(
+            loc, ubI32, b.create<arith::ConstantIntOp>(loc, i32Ty, 2));
+        Value stageOff = b.create<arith::MulIOp>(loc, kTilesPlus2, c4096);
+        syncParams.push_back(stageOff);
+      }
+
+      auto syncPrefetch = b.create<PrefetchInSituOp>(
+          loc, srcMem, vtcmMem, LayoutTransform::HMXWeight,
+          /*lookahead=*/0, DenseI32ArrayAttr{}, syncParams);
+      annotateTransformDecision(syncPrefetch, decision);
+      ++inserted;
+
       Value nextKtRaw = b.create<arith::AddIOp>(loc, ktVal, c1);
-      Value nextGt = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt,
-                                             nextKtRaw, lastKt);
-      Value nextKt =
-          b.create<arith::SelectOp>(loc, nextGt, lastKt, nextKtRaw);
-      Value phase = b.create<arith::RemUIOp>(loc, ktVal, c2);
-      Value isEven = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
-                                             phase, c0);
-      Value delta = b.create<arith::SelectOp>(loc, isEven, c4096, neg4096);
-      Value nextOff = b.create<arith::AddIOp>(loc, curOff, delta);
-      Value nextView = createVtcmF16TileView(b, loc, vtcmMem, nextOff);
-      // Kick before Mm so DMA/l2fetch overlaps compute; wait finishes layout.
-      b.create<PrefetchInSituOp>(
-          loc, srcMem, nextView, LayoutTransform::HMXWeight,
-          /*lookahead=*/1, DenseI32ArrayAttr{},
-          ValueRange{nextKt, colVal, wtCols});
+      Value hasNext = b.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::slt, nextKtRaw, ubI32);
+      b.create<scf::IfOp>(
+          loc, hasNext,
+          [&](OpBuilder &thenBuilder, Location thenLoc) {
+            Value phase =
+                thenBuilder.create<arith::RemUIOp>(thenLoc, ktVal, c2);
+            Value isEven = thenBuilder.create<arith::CmpIOp>(
+                thenLoc, arith::CmpIPredicate::eq, phase, c0);
+            Value delta = thenBuilder.create<arith::SelectOp>(
+                thenLoc, isEven, c4096, neg4096);
+            Value nextOff = thenBuilder.create<arith::AddIOp>(
+                thenLoc, curOff, delta);
+
+            SmallVector<Value, 5> asyncParams = {nextKtRaw, colVal, wtCols,
+                                                 nextOff};
+            if (enableDmaToVtcm)
+              asyncParams.push_back(syncParams.back()); // same stageOff
+            auto asyncPrefetch = thenBuilder.create<PrefetchInSituOp>(
+                thenLoc, srcMem, vtcmMem, LayoutTransform::HMXWeight,
+                /*lookahead=*/1, DenseI32ArrayAttr{}, asyncParams);
+            annotateTransformDecision(asyncPrefetch, decision);
+            thenBuilder.create<scf::YieldOp>(thenLoc);
+          });
       ++inserted;
     } else {
-      Value destView = createVtcmF16TileView(b, loc, vtcmMem, curOff);
-      b.create<PrefetchInSituOp>(
-          loc, srcMem, destView, LayoutTransform::HMXWeight,
-          /*lookahead=*/0, DenseI32ArrayAttr{},
-          ValueRange{ktVal, colVal, wtCols});
+      int selectedLookahead = 0;
+      SmallVector<Value, 6> persistentParams = {ktVal, colVal, wtCols, curOff};
+      if (decision.mode == TransformMode::Persistent) {
+        Value noStage =
+            b.create<arith::ConstantIntOp>(loc, b.getI32Type(), -1);
+        Value siteId = b.create<arith::ConstantIntOp>(
+            loc, b.getI32Type(), stats.persistent);
+        persistentParams.push_back(noStage);
+        persistentParams.push_back(siteId);
+        ++stats.persistent;
+        selectedLookahead = -1;
+      } else {
+        ++stats.sync;
+      }
+      auto syncPrefetch = b.create<PrefetchInSituOp>(
+          loc, srcMem, vtcmMem, LayoutTransform::HMXWeight,
+          selectedLookahead, DenseI32ArrayAttr{},
+          persistentParams);
+      annotateTransformDecision(syncPrefetch, decision);
       ++inserted;
     }
     wh->erase();
     ++erased;
   }
 
+  // Activation fusion: CopySubmatrix + RmToAh → prefetch_in_situ(HMXActivation).
+  SmallVector<hexkl::MicroHMXCopySubmatrixToF16Op> copyOps;
+  for (Operation &op : *loop.getBody())
+    if (auto c = dyn_cast<hexkl::MicroHMXCopySubmatrixToF16Op>(&op))
+      copyOps.push_back(c);
+
+  for (auto copy : copyOps) {
+    hexkl::MicroHMXRmToAhF16Op rmAh;
+    for (Operation *op = copy->getNextNode(); op; op = op->getNextNode()) {
+      if (auto ah = dyn_cast<hexkl::MicroHMXRmToAhF16Op>(op)) {
+        if (ah.getHmxBlock() == copy.getHmxBlock()) {
+          rmAh = ah;
+          break;
+        }
+      }
+      if (isa<scf::YieldOp, hexkl::MicroHMXMmF16Op, hexkl::MicroHMXRmToWhF16Op,
+              hexkl::MicroHMXCopySubmatrixToF16Op>(op))
+        break;
+    }
+    if (!rmAh)
+      continue;
+
+    Location loc = copy.getLoc();
+    OpBuilder b(rmAh);
+    b.setInsertionPointAfter(rmAh);
+    auto activationPrefetch = b.create<PrefetchInSituOp>(
+        loc, copy.getSrc(), copy.getHmxBlock(), LayoutTransform::HMXActivation,
+        /*lookahead=*/0, DenseI32ArrayAttr{},
+        ValueRange{copy.getTileRow(), copy.getTileCol(), copy.getInputCols(),
+                   rmAh.getActivationOutOffset(), rmAh.getFlatInOffset(),
+                   copy.getInputRows()});
+    TransformDecision activationDecision;
+    activationDecision.mode = TransformMode::SyncInSitu;
+    activationDecision.score = 100;
+    activationDecision.outerReuse = estimateOuterReuse(loop);
+    annotateTransformDecision(activationPrefetch, activationDecision);
+    ++inserted;
+    ++stats.sync;
+    rmAh->erase();
+    copy->erase();
+    erased += 2;
+  }
+
   if (inserted || erased)
     llvm::errs() << "[PrefetchInsert]     HexKL layout-fusion sites: "
                  << inserted << " erased_hexkl_ops=" << erased
-                 << (doAsync ? " async_pipeline=1\n" : "\n");
+                 << (enableDmaToVtcm ? " dma_to_vtcm=1\n" : "\n");
   return inserted;
 }
 
@@ -759,7 +984,10 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
 //===----------------------------------------------------------------------===//
 
 static void insertPrefetchForLoop(scf::ForOp loop, int lookahead,
-                                  bool enableLayoutAware) {
+                                  bool enableLayoutAware,
+                                  bool enableDmaToVtcm,
+                                  bool enablePersistentWhCache,
+                                  TransformStats &stats) {
   OpBuilder builder(loop);
   Location loc = loop.getLoc();
   MLIRContext *ctx = loop.getContext();
@@ -769,7 +997,8 @@ static void insertPrefetchForLoop(scf::ForOp loop, int lookahead,
   // HexKL MicroHMX path first: warm / fuse DDR tiles that feed Copy / RmToWh.
   if (containsHexKLCompute(loop)) {
     int n = insertHexKLMicroPrefetchHints(builder, loop, enableLayoutAware,
-                                          lookahead);
+                                          lookahead, enableDmaToVtcm,
+                                          enablePersistentWhCache, stats);
     llvm::errs() << "[PrefetchInsert] Total prefetch sites: " << n
                  << " shadow_kb=0\n";
     return;
@@ -954,6 +1183,10 @@ struct PrefetchInsertPass
     llvm::dbgs() << "[PrefetchInsert] Function: " << func.getName() << "\n";
     llvm::dbgs() << "[PrefetchInsert] Options: lookahead=" << lookahead
                  << ", enableLayoutAware=" << enableLayoutAware
+                 << ", enableDmaToVtcm=" << enableDmaToVtcm
+                 << ", enablePersistentWhCache="
+                 << enablePersistentWhCache
+                 << ", enableInterLayerPrefetch=" << enableInterLayerPrefetch
                  << " (forced off in HVX insert for safety)\n";
 
     const bool funcHasHexKL = containsHexKLCompute(func);
@@ -961,7 +1194,9 @@ struct PrefetchInsertPass
     func.walk([&](scf::ForOp loop) {
       bool hasNestedFor = false;
       loop.getBody()->walk([&](scf::ForOp) { hasNestedFor = true; });
-      if (hasNestedFor)
+      // Default: innermost only.  Inter-layer mode also takes outer HexKL
+      // loops so next-layer weights can be async-prefetched (§2.6/§4.4).
+      if (hasNestedFor && !enableInterLayerPrefetch)
         return;
       if (funcHasHexKL) {
         // Prefer HexKL MicroHMX loops; skip Softmax/HVX strip loops that only
@@ -969,7 +1204,8 @@ struct PrefetchInsertPass
         if (containsHexKLCompute(loop))
           candidates.push_back(loop);
       } else if (containsAcceleratorCompute(loop)) {
-        candidates.push_back(loop);
+        if (!hasNestedFor)
+          candidates.push_back(loop);
       }
     });
 
@@ -981,11 +1217,31 @@ struct PrefetchInsertPass
                  << " candidate loops for prefetch insertion\n";
 
     int loopIdx = 0;
+    TransformStats stats;
     for (auto loop : candidates) {
       llvm::dbgs() << "\n[PrefetchInsert] --- Processing loop " << loopIdx++
                    << " at " << loop.getLoc() << " ---\n";
-      insertPrefetchForLoop(loop, lookahead, enableLayoutAware);
+      insertPrefetchForLoop(loop, lookahead, enableLayoutAware,
+                            enableDmaToVtcm, enablePersistentWhCache, stats);
     }
+
+    Builder builder(func.getContext());
+    func->setAttr("omni_fetch.cost_native_sites",
+                  builder.getI64IntegerAttr(stats.native));
+    func->setAttr("omni_fetch.cost_sync_sites",
+                  builder.getI64IntegerAttr(stats.sync));
+    func->setAttr("omni_fetch.cost_async_sites",
+                  builder.getI64IntegerAttr(stats.async));
+    func->setAttr("omni_fetch.cost_persistent_candidates",
+                  builder.getI64IntegerAttr(stats.persistentCandidates));
+    func->setAttr("omni_fetch.cost_persistent_sites",
+                  builder.getI64IntegerAttr(stats.persistent));
+    llvm::errs() << "[TransformCostModel] function=" << func.getName()
+                 << " native=" << stats.native << " sync=" << stats.sync
+                 << " async=" << stats.async
+                 << " persistent=" << stats.persistent
+                 << " persistent_candidates=" << stats.persistentCandidates
+                 << "\n";
 
     if (candidates.empty()) {
       llvm::dbgs() << "[PrefetchInsert] No candidate loops found - "

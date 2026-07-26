@@ -34,9 +34,12 @@ inline llvm::StringRef getWaitFnName() { return "__omni_fetch_wait"; }
 ///       int32_t elem_bytes, int32_t num_elems,
 ///       int32_t layout_kind, int32_t lookahead,
 ///       const int32_t *index_map,   // NULL for non-Custom layouts
-///       int32_t tile_row, int32_t tile_col, int32_t src_cols);
+///       int32_t tile_row, int32_t tile_col, int32_t src_cols,
+///       int32_t act_off, int32_t scr_off, int32_t src_rows);
 /// tile_row/col/src_cols are -1 when unused; for HMXWeight+HexKL they select
 /// a tile in the full src matrix (src_cols = matrix width).
+/// act_off/scr_off/src_rows are -1 when unused; for HMXActivation+HexKL they
+/// select VTCM byte offsets and activation matrix height.
 inline llvm::StringRef getPrefetchInSituFnName() {
   return "__omni_fetch_prefetch_insitu";
 }
@@ -52,6 +55,27 @@ inline llvm::StringRef getCopy2DFnName() { return "__omni_fetch_copy2d"; }
 /// Reads PMU AXI-stall counter and returns adjusted prefetch distance.
 inline llvm::StringRef getUpdateDistanceFnName() {
   return "__omni_fetch_update_distance";
+}
+
+/// Enable/disable dual-thread DAE scout (default off). Signature:
+///   void __omni_fetch_set_dual_thread_dae(int32_t enable);
+inline llvm::StringRef getSetDualThreadDaeFnName() {
+  return "__omni_fetch_set_dual_thread_dae";
+}
+
+/// Select the model/invocation generation used by the cross-token WH cache.
+/// The embedding runtime must increment generation whenever weights belonging
+/// to the same context ID may have changed.
+inline llvm::StringRef getWhCacheSetContextFnName() {
+  return "__omni_fetch_wh_cache_set_context";
+}
+
+inline llvm::StringRef getWhCacheInvalidateFnName() {
+  return "__omni_fetch_wh_cache_invalidate";
+}
+
+inline llvm::StringRef getWhCacheStatsFnName() {
+  return "__omni_fetch_wh_cache_stats";
 }
 
 } // namespace omni_fetch

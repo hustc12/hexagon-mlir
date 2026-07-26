@@ -8,14 +8,18 @@
 #ifndef HEXAGON_CONVERSION_OMNIFETCHTOLLVM_OMNIFETCHTOLLVM_H
 #define HEXAGON_CONVERSION_OMNIFETCHTOLLVM_OMNIFETCHTOLLVM_H
 
+#include "mlir/Pass/Pass.h"
 #include <memory>
 
 namespace mlir {
-class Pass;
 namespace omni_fetch {
 
+#define GEN_PASS_DECL
+#include "hexagon/Conversion/OmniFetchToLLVM/Passes.h.inc"
+
 /// Create the pass that lowers omni_fetch dialect ops to LLVM runtime calls.
-std::unique_ptr<Pass> createOmniFetchToLLVMPass();
+std::unique_ptr<Pass> createOmniFetchToLLVMPass(
+    const OmniFetchToLLVMOptions &options = OmniFetchToLLVMOptions());
 
 } // namespace omni_fetch
 } // namespace mlir

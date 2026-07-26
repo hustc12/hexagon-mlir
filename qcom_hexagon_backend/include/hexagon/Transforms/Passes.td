@@ -227,6 +227,12 @@ def MatmulToConv : Pass<"matmul-to-conv", "func::FuncOp"> {
 def MatmulToHexKL :
     InterfacePass<"matmul-to-hexkl", "mlir::FunctionOpInterface"> {
   let summary = "Convert linalg.matmul to hexkl ops";
+  let options = [
+    Option<"enableAttentionHmx", "enable-attention-hmx", "bool",
+           /*default=*/"false",
+           "Pad attention-like matmuls (K==M or N==M) to break the skip heuristic "
+           "and lower them through HexKL (unpad results).">,
+  ];
   let constructor = "hexagon::createMatmulToHexKLPass()";
 }
 
@@ -245,6 +251,22 @@ def DecomposeHexKLMatmul :
     - HMX matrix multiplication with accumulation
     - Result readback and format conversion (f16 to f32)
   }];
+
+  let options = [
+    Option<"enableWeightPrepack", "enable-weight-prepack", "bool",
+           /*default=*/"false",
+           "Hoist the RM->WH weight transform out of the M-loop into a one-time "
+           "prologue that pre-packs every (kt,colTile) tile into a DDR WH buffer; "
+           "the inner K-loop then only copies the pre-packed tile into VTCM.">,
+    Option<"enablePersistentVtcm", "enable-persistent-vtcm", "bool",
+           /*default=*/"false",
+           "Allocate one function-scoped VTCM slab sized to the max HexKL matmul "
+           "requirement and reuse it across matmuls (avoids per-matmul "
+           "alloc/dealloc churn). Falls back to per-matmul alloc when any K is "
+           "dynamic. Default off: measured gain is noise-level and OmniFetch "
+           "interaction needs more validation.">,
+  ];
+
   let constructor = "hexagon::createDecomposeHexKLMatmulPass()";
 }
 
@@ -370,6 +392,15 @@ def PrefetchInsert :
     Option<"enableLayoutAware", "enable-layout-aware", "bool",
            /*default=*/"true",
            "Enable in-situ layout-aware prefetch; when false, emit linear prefetches only.">,
+    Option<"enableDmaToVtcm", "enable-dma-to-vtcm", "bool",
+           /*default=*/"false",
+           "DMA-pack weight tiles into VTCM staging (flatOff); when false, pack into DDR stage.">,
+    Option<"enableInterLayerPrefetch", "enable-inter-layer-prefetch", "bool",
+           /*default=*/"false",
+           "Also consider outer (non-innermost) HexKL loops for weight prefetch.">,
+    Option<"enablePersistentWhCache", "enable-persistent-wh-cache", "bool",
+           /*default=*/"false",
+           "Use the generation-safe runtime WH cache for profitable weight sites.">,
   ];
 
   let constructor = "hexagon::createPrefetchInsertPass()";

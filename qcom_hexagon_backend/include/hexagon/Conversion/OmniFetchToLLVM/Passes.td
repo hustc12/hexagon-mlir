@@ -31,6 +31,12 @@ def OmniFetchToLLVM : Pass<"omni-fetch-to-llvm", "mlir::ModuleOp"> {
     - `omni_fetch.adaptive_control`   → `__omni_fetch_update_distance(cur: i32) -> i32`
   }];
 
+  let options = [
+    Option<"enableDualThreadDae", "enable-dual-thread-dae", "bool",
+           /*default=*/"false",
+           "Emit __omni_fetch_set_dual_thread_dae(1) so deferred WH runs on scout.">,
+  ];
+
   let constructor = "mlir::omni_fetch::createOmniFetchToLLVMPass()";
 
   let dependentDialects = [

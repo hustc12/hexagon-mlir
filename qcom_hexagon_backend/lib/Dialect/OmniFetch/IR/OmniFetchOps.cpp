@@ -51,8 +51,15 @@ LogicalResult PrefetchInSituOp::verify() {
   if (destAS != 0 && destAS != 1)
     return emitOpError("dest memref must be in DDR (address space 0) or VTCM (address space 1)");
 
-  // Element types must match
-  if (srcType.getElementType() != dstType.getElementType())
+  // Element types must match, except HexKL HMX* fusion which writes into the
+  // i8 VTCM slab via hexkl_micro (src is f16 DDR, dest is i8 VTCM).
+  bool hexklSlabFusion =
+      (getLayoutTransform() == LayoutTransform::HMXActivation &&
+       getTileParams().size() == 6) ||
+      (getLayoutTransform() == LayoutTransform::HMXWeight &&
+       getTileParams().size() >= 4);
+  if (!hexklSlabFusion &&
+      srcType.getElementType() != dstType.getElementType())
     return emitOpError(
         "src and dest element types must match; got ")
         << srcType.getElementType() << " vs " << dstType.getElementType();
@@ -70,11 +77,13 @@ LogicalResult PrefetchInSituOp::verify() {
     }
   }
 
-  // HexKL tile_params must be empty or exactly {row, col, src_cols}.
+  // HexKL tile_params: empty, weight (3/4/5), or activation (6).
   auto tileParams = getTileParams();
-  if (!tileParams.empty() && tileParams.size() != 3)
-    return emitOpError("tile_params must be empty or 3 i32 values "
-                       "(tile_row, tile_col, src_cols)");
+  unsigned n = tileParams.size();
+  if (!tileParams.empty() && n != 3 && n != 4 && n != 5 && n != 6)
+    return emitOpError("tile_params must be empty, 3-5 i32 values "
+                       "(tile_row, tile_col, src_cols[, weight_off[, stage_off]]), "
+                       "or 6 i32 values (…, act_off, scr_off, src_rows)");
 
   return success();
 }

@@ -132,6 +132,31 @@ Projections / FFN / lm_head (e.g. `32×64×64`, `32×64×128`) still convert.
 
 ---
 
+### F. GPT-2 logits-only / last-token — Bad VA `0x0` at `_mlir_ciface_*+0x14`
+
+**Symptom (2026-07-24):** `GPT2LogitsWrapper` + HexKL compiles; dlopen OK; crash in \<1s; logcat:
+
+```text
+TLBMISS RW
+Bad VA     : 0x0
+Fault PC   : ... _mlir_ciface_GPT2LogitsWrapper+0x14
+```
+
+**Cause (same family as A — extra buffers in FX signature):**
+
+1. GPT-2 `Attention` keeps `bias` / `masked_bias` as `register_buffer`.
+2. torch-mlir FX promotes them to **runtime args** (12× `1x1x1024x1024xi1` + 12× `f16` scalars + `input_ids` = 25 args).
+3. WrapperGenerator emits a starter with only `(logits*, input_ids*)`.
+4. Compiled `_mlir_ciface_*` still loads further args from the Hexagon **stack** (`memw(r29+#0x544)` → NULL).
+
+**Why full `GPT2LMHeadModel` “worked” before:** it returned logits **plus 24 past_kv** outputs → many output `MemRef*` pointers were passed on the stack and accidentally satisfied those loads. Logits-only / last-token (1 output) removes that luck.
+
+**Fix (harness):** `freeze_gpt2_attn_bias_buffers()` in `run_gpt2lmheadmodel.py` — pop buffers, reattach as plain tensor attributes (optionally sliced to `seq_len`) so FX folds them as constants. Export arity becomes **1** (`tensor<1xSxi64>`).
+
+**Triage tip:** after export, `func.func` must have a single `%arg0: tensor<…xi64>`; if you still see `1024x1024xi1` args, the freeze did not take effect.
+
+---
+
 ## Working flag matrix (tiny debug, seq=32, after fixes)
 
 | enableHexKL | enableConvertToHexagonmem | enableVectorization | Result (post-fix) |

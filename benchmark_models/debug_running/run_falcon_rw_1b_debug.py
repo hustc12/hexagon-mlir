@@ -38,6 +38,9 @@ def _tiny_config(config):
 
 
 def _load_tiny(_model_name, config):
+    # Keep independently launched ablation cases on byte-identical weights.
+    # Without this, every subprocess benchmarks a different random model.
+    torch.manual_seed(0)
     return AutoModelForCausalLM.from_config(
         config,
         torch_dtype=torch.float16,
@@ -65,6 +68,11 @@ def main():
     parser.add_argument("--disable-layout-aware", action="store_true")
     parser.add_argument("--omnifetch-lookahead", type=int, default=2)
     parser.add_argument("--disable-omnifetch-adaptive", action="store_true")
+    parser.add_argument("--enable-omnifetch-weight-prepack", action="store_true")
+    parser.add_argument("--enable-omnifetch-persistent-wh-cache",
+                        action="store_true")
+    parser.add_argument("--device-iterations", type=int, default=1)
+    parser.add_argument("--enable-hexkl-persistent-vtcm", action="store_true")
     parser.add_argument("--seq-len", type=int, default=None)
     args = parser.parse_args()
     _MOD.falcon_rw_1b(
@@ -74,6 +82,12 @@ def main():
         enable_omnifetch_layout_aware=not args.disable_layout_aware,
         omnifetch_lookahead=args.omnifetch_lookahead,
         enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
+        enable_omnifetch_weight_prepack=args.enable_omnifetch_weight_prepack,
+        enable_omnifetch_persistent_wh_cache=(
+            args.enable_omnifetch_persistent_wh_cache
+        ),
+        device_iterations=args.device_iterations,
+        enable_hexkl_persistent_vtcm=args.enable_hexkl_persistent_vtcm,
         seq_len=args.seq_len,
     )
 

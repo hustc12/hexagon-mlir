@@ -63,9 +63,27 @@ class HexagonOptions:
     # Component 2 – In-Situ Reshape (depends on enablePrefetch)
     enableOmniFetchLayoutAware: bool = True  # enable in-situ layout-aware prefetch mapping
     omniFetchLookahead: int = 2  # static prefetch look-ahead distance
+    # DMA pack destination for HexKL weight async: False=DDR stage, True=VTCM stage
+    enableOmniFetchDmaToVtcm: bool = False
     # Component 3 – V-DAE (depends on enablePrefetch)
     enableOmniFetchVDAE: bool = False  # decouple Access/Execute via hardware semaphores
     enableOmniFetchAdaptive: bool = True  # enable PMU-based adaptive control
+    # Hoist the HexKL RM->WH weight layout transform out of the M-loop: pre-pack
+    # every (kt,colTile) weight tile once into a DDR WH buffer, then the inner
+    # K-loop only DMA/copies the pre-packed tile into the VTCM slot. Requires
+    # enableHexKL. Win scales with numMTiles = ceil(M/32).
+    enableOmniFetchWeightPrepack: bool = False
+    enableOmniFetchPersistentWhCache: bool = False
+    # True dual-thread DAE scout (default off). Flag off ≡ current single-thread OF.
+    enableOmniFetchDualThreadDae: bool = False
+    # Prefetch next-layer weights from outer HexKL loops (default off).
+    enableOmniFetchInterLayerPrefetch: bool = False
+    # Pad attention-like (K==M/N==M) matmuls into HexKL (default off).
+    enableOmniFetchAttentionHmx: bool = False
+    # Reuse one max-sized VTCM slab across HexKL matmuls in a function
+    # (DecomposeHexKLMatmul). Off by default — measured gain is ~noise and
+    # OmniFetch combo needs more validation.
+    enableHexKLPersistentVtcm: bool = False
     enableMultiThreading: bool = False  # linalg-generic based multi-threading
     enableSCFThreading: bool = False  # scf based multi-threading
     enableSplitReduction: bool = False  # split-reduction optimization

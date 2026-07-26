@@ -42,7 +42,7 @@
 using namespace mlir;
 using namespace mlir::omni_fetch;
 
-#define GEN_PASS_CLASSES
+#define GEN_PASS_DEF_OMNIFETCHTOLLVM
 #include "hexagon/Conversion/OmniFetchToLLVM/Passes.h.inc"
 
 namespace {
@@ -107,9 +107,10 @@ getOrInsertPrefetchInSitu(ModuleOp module,
   auto i32Ty  = IntegerType::get(ctx, 32);
   auto voidTy = LLVM::LLVMVoidType::get(ctx);
   // (src_ptr, dest_ptr, elem_bytes, num_elems, layout_kind, lookahead,
-  //  index_map_ptr, tile_row, tile_col, src_cols)
-  SmallVector<Type, 10> argTys = {ptrTy, ptrTy, i32Ty, i32Ty, i32Ty, i32Ty,
-                                  ptrTy, i32Ty, i32Ty, i32Ty};
+  //  index_map_ptr, tile_row, tile_col, src_cols, act_off, scr_off, src_rows)
+  SmallVector<Type, 13> argTys = {ptrTy, ptrTy, i32Ty, i32Ty, i32Ty, i32Ty,
+                                  ptrTy, i32Ty, i32Ty, i32Ty, i32Ty, i32Ty,
+                                  i32Ty};
   return LLVM::lookupOrCreateFn(rewriter, module, getPrefetchInSituFnName(),
                                 argTys, voidTy);
 }
@@ -232,7 +233,8 @@ struct LowerWait : public ConvertOpToLLVMPattern<WaitOp> {
 //       int32_t elem_bytes, int32_t num_elems,
 //       int32_t layout_kind, int32_t lookahead,
 //       const int32_t *index_map,  // NULL for non-Custom
-//       int32_t tile_row, int32_t tile_col, int32_t src_cols);
+//       int32_t tile_row, int32_t tile_col, int32_t src_cols,
+//       int32_t act_off, int32_t scr_off, int32_t src_rows);
 //===----------------------------------------------------------------------===//
 struct LowerPrefetchInSitu
     : public ConvertOpToLLVMPattern<PrefetchInSituOp> {
@@ -251,10 +253,25 @@ struct LowerPrefetchInSitu
     // --- src / dest pointers (aligned + memref offset) ---
     auto srcMemrefTy = cast<MemRefType>(op.getSrc().getType());
     auto destMemref = cast<MemRefType>(op.getDest().getType());
-    Value srcPtr = alignedPtrWithOffset(rewriter, loc, adaptor.getSrc(),
-                                        srcMemrefTy.getElementType());
-    Value destPtr = alignedPtrWithOffset(rewriter, loc, adaptor.getDest(),
-                                         destMemref.getElementType());
+    // HexKL HMX* fusion writes into the full i8 VTCM slab with absolute byte
+    // offsets — match HexKLToLLVM (alignedPtr, no descriptor offset).
+    const bool hexklActFusion =
+        op.getLayoutTransform() == LayoutTransform::HMXActivation &&
+        op.getTileParams().size() >= 6;
+    const bool hexklWeightSlab =
+        op.getLayoutTransform() == LayoutTransform::HMXWeight &&
+        op.getTileParams().size() >= 4;
+    Value srcPtr;
+    Value destPtr;
+    if (hexklActFusion || hexklWeightSlab) {
+      srcPtr = alignedPtr(rewriter, loc, adaptor.getSrc());
+      destPtr = alignedPtr(rewriter, loc, adaptor.getDest());
+    } else {
+      srcPtr = alignedPtrWithOffset(rewriter, loc, adaptor.getSrc(),
+                                    srcMemrefTy.getElementType());
+      destPtr = alignedPtrWithOffset(rewriter, loc, adaptor.getDest(),
+                                     destMemref.getElementType());
+    }
 
     // Cast to generic address space (0) if needed using proper LLVM addrspacecast
     if (srcPtr.getType() != ptrTy) {
@@ -336,10 +353,18 @@ struct LowerPrefetchInSitu
     if (numElems < 0)
       numElems = 0;
     // HexKL HMXWeight with tile_params uses the full matrix as src; volume is
-    // the dest tile (32×32), not the whole matrix.
+    // one 32×32 f16 tile (not the whole matrix / i8 VTCM slab).
     if (op.getLayoutTransform() == LayoutTransform::HMXWeight &&
-        op.getTileParams().size() == 3)
-      numElems = dstElems > 0 ? dstElems : 1024;
+        op.getTileParams().size() >= 3) {
+      numElems = 1024;
+      elemBytesVal = cI32(2);
+    }
+    // HexKL HMXActivation writes into the i8 VTCM slab; force one 32×32 tile.
+    if (op.getLayoutTransform() == LayoutTransform::HMXActivation &&
+        op.getTileParams().size() >= 6) {
+      numElems = 1024;
+      elemBytesVal = cI32(2);
+    }
     Value numElemsVal = cI32(static_cast<int32_t>(numElems));
 
     // --- layout kind ---
@@ -357,17 +382,32 @@ struct LowerPrefetchInSitu
     Value tileRow = cI32(-1);
     Value tileCol = cI32(-1);
     Value srcCols = cI32(-1);
+    Value actOff = cI32(-1);
+    Value scrOff = cI32(-1);
+    Value srcRows = cI32(-1);
     auto tileParams = adaptor.getTileParams();
-    if (tileParams.size() == 3) {
+    if (tileParams.size() >= 3) {
       tileRow = tileParams[0];
       tileCol = tileParams[1];
       srcCols = tileParams[2];
+    }
+    // Weight slab form: [3]=weight_off, optional [4]=VTCM stage_off for DMA.
+    if (tileParams.size() == 4 || tileParams.size() == 5) {
+      actOff = tileParams[3];
+      if (tileParams.size() == 5)
+        scrOff = tileParams[4];
+    }
+    if (tileParams.size() >= 6) {
+      actOff = tileParams[3];
+      scrOff = tileParams[4];
+      srcRows = tileParams[5];
     }
 
     rewriter.replaceOpWithNewOp<LLVM::CallOp>(
         op, *fnOrErr,
         ValueRange{srcPtr, destPtr, elemBytesVal, numElemsVal, layoutKindVal,
-                   lookaheadVal, indexMapPtr, tileRow, tileCol, srcCols});
+                   lookaheadVal, indexMapPtr, tileRow, tileCol, srcCols, actOff,
+                   scrOff, srcRows});
     return success();
   }
 };
@@ -400,7 +440,9 @@ struct LowerAdaptiveControl
 // Pass definition
 //===----------------------------------------------------------------------===//
 struct OmniFetchToLLVMPass
-    : public OmniFetchToLLVMBase<OmniFetchToLLVMPass> {
+    : public ::impl::OmniFetchToLLVMBase<OmniFetchToLLVMPass> {
+
+  using OmniFetchToLLVMBase::OmniFetchToLLVMBase;
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
@@ -417,8 +459,41 @@ struct OmniFetchToLLVMPass
     target.addLegalDialect<LLVM::LLVMDialect, arith::ArithDialect>();
     target.addLegalOp<ModuleOp>();
 
-    if (failed(applyPartialConversion(module, target, std::move(patterns))))
+    if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
       signalPassFailure();
+      return;
+    }
+
+    // After lowering: optionally arm the dual-thread scout for functions that
+    // actually use OmniFetch wait/signal.
+    if (!enableDualThreadDae)
+      return;
+
+    auto i32Ty = IntegerType::get(ctx, 32);
+    auto voidTy = LLVM::LLVMVoidType::get(ctx);
+    for (auto func : module.getOps<LLVM::LLVMFuncOp>()) {
+      if (func.isDeclaration() || func.empty())
+        continue;
+      bool usesOmni = false;
+      func.walk([&](LLVM::CallOp call) {
+        if (auto callee = call.getCallee()) {
+          if (callee->starts_with("__omni_fetch_"))
+            usesOmni = true;
+        }
+      });
+      if (!usesOmni)
+        continue;
+
+      OpBuilder b(&func.front(), func.front().begin());
+      Location loc = func.getLoc();
+      FailureOr<LLVM::LLVMFuncOp> setFn = LLVM::lookupOrCreateFn(
+          b, module, getSetDualThreadDaeFnName(), {i32Ty}, voidTy);
+      if (failed(setFn))
+        continue;
+      Value one = b.create<LLVM::ConstantOp>(loc, i32Ty, b.getI32IntegerAttr(1));
+      b.create<LLVM::CallOp>(loc, *setFn, ValueRange{one});
+      break; // once per module is enough (global runtime flag)
+    }
   }
 };
 
@@ -427,6 +502,7 @@ struct OmniFetchToLLVMPass
 //===----------------------------------------------------------------------===//
 // Public factory
 //===----------------------------------------------------------------------===//
-std::unique_ptr<Pass> mlir::omni_fetch::createOmniFetchToLLVMPass() {
-  return std::make_unique<OmniFetchToLLVMPass>();
+std::unique_ptr<Pass> mlir::omni_fetch::createOmniFetchToLLVMPass(
+    const OmniFetchToLLVMOptions &options) {
+  return std::make_unique<OmniFetchToLLVMPass>(options);
 }

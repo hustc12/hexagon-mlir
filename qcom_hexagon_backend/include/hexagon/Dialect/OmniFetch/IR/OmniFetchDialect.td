@@ -51,6 +51,7 @@ def OmniFetch_Dialect : Dialect {
     void registerTypes();
   }];
 
+  let useDefaultAttributePrinterParser = 1;
   let usePropertiesForAttributes = 1;
 }
 

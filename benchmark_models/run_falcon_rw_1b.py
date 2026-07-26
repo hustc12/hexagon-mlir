@@ -359,7 +359,8 @@ def x86_execution(model, encoding):
     x86_outputs = model(**encoding)
     return x86_outputs
 
-def hex_execution(module, func_name, inputs, options: dict = None, mlir_text: Optional[str] = None):
+def hex_execution(module, func_name, inputs, options: dict = None,
+                  mlir_text: Optional[str] = None, iterations: int = 1):
     linalg_filename = Path(__file__).parent / (str(func_name) + ".mlirbc")
 
     text = mlir_text if mlir_text is not None else module.operation.get_asm(binary=False)
@@ -380,7 +381,8 @@ def hex_execution(module, func_name, inputs, options: dict = None, mlir_text: Op
     if not options.get("enableHexKL"):
         options["enableConvertToHexagonmem"] = False
     return TorchMLIRHexagonLauncher().run_torch_mlir(
-        str(patched_filename), inputs, func_name, options=options
+        str(patched_filename), inputs, func_name, options=options,
+        iterations=iterations
     )
 
 
@@ -556,6 +558,10 @@ def falcon_rw_1b(
     enable_omnifetch_layout_aware: bool = True,
     omnifetch_lookahead: int = 2,
     enable_omnifetch_adaptive: bool = True,
+    enable_omnifetch_weight_prepack: bool = False,
+    enable_omnifetch_persistent_wh_cache: bool = False,
+    device_iterations: int = 1,
+    enable_hexkl_persistent_vtcm: bool = False,
     seq_len: Optional[int] = None,
 ):
     _patch_dsp_heap_256mb()
@@ -630,6 +636,13 @@ def falcon_rw_1b(
     options["omniFetchLookahead"] = int(omnifetch_lookahead)
     options["enableOmniFetchVDAE"] = bool(enable_omnifetch_vdae)
     options["enableOmniFetchAdaptive"] = bool(enable_omnifetch_adaptive)
+    options["enableOmniFetchWeightPrepack"] = bool(
+        enable_omnifetch_weight_prepack
+    )
+    options["enableOmniFetchPersistentWhCache"] = bool(
+        enable_omnifetch_persistent_wh_cache
+    )
+    options["enableHexKLPersistentVtcm"] = bool(enable_hexkl_persistent_vtcm)
 
     # torch-mlir may lift unused ALiBi slopes buffer as arg0; keep a matching dummy.
     n_heads = config.num_attention_heads
@@ -637,7 +650,8 @@ def falcon_rw_1b(
     inputs = [dummy_slopes, input_ids]
 
     hex_outputs = hex_execution(
-        module, func_name, inputs, options, mlir_text=mlir_text
+        module, func_name, inputs, options, mlir_text=mlir_text,
+        iterations=device_iterations
     )
     print("Successfully ran Falcon on Hexagon DSP!")
 
@@ -668,6 +682,20 @@ if __name__ == "__main__":
     parser.add_argument("--omnifetch-lookahead", type=int, default=2)
     parser.add_argument("--disable-omnifetch-adaptive", action="store_true")
     parser.add_argument(
+        "--enable-omnifetch-weight-prepack",
+        action="store_true",
+        help="Reshape each RM weight tile to WH once per column and reuse it "
+             "across sequence-row tiles.",
+    )
+    parser.add_argument(
+        "--enable-hexkl-persistent-vtcm",
+        action="store_true",
+        help="Reuse one function-scoped VTCM arena across HexKL matmuls.",
+    )
+    parser.add_argument("--enable-omnifetch-persistent-wh-cache",
+                        action="store_true")
+    parser.add_argument("--device-iterations", type=int, default=1)
+    parser.add_argument(
         "--seq-len",
         type=int,
         default=None,
@@ -681,5 +709,11 @@ if __name__ == "__main__":
         enable_omnifetch_layout_aware=not args.disable_layout_aware,
         omnifetch_lookahead=args.omnifetch_lookahead,
         enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
+        enable_omnifetch_weight_prepack=args.enable_omnifetch_weight_prepack,
+        enable_omnifetch_persistent_wh_cache=(
+            args.enable_omnifetch_persistent_wh_cache
+        ),
+        device_iterations=args.device_iterations,
+        enable_hexkl_persistent_vtcm=args.enable_hexkl_persistent_vtcm,
         seq_len=args.seq_len,
     )
