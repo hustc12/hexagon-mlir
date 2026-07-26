@@ -21,6 +21,7 @@
 #include "hexagon/Dialect/HexKL/IR/HexKLDialect.h"
 #include "hexagon/Dialect/HexagonMem/IR/HexagonMemDialect.h"
 #include "hexagon/Dialect/HexagonTPtr/IR/HexagonTPtrDialect.h"
+#include "hexagon/Dialect/OmniFetch/IR/OmniFetchDialect.h"
 #include "hexagon/Dialect/TTX/IR/TTXDialect.h"
 #include "hexagon/Transforms/Passes.h"
 
@@ -75,7 +76,8 @@ public:
                     vector::VectorDialect, memref::MemRefDialect,
                     LLVM::LLVMDialect, ttx::TTXDialect,
                     tptr::HexagonTPtrDialect, hexagonmem::HexagonMemDialect,
-                    hexkl::HexKLDialect, quant::QuantDialect>();
+                    hexkl::HexKLDialect, omni_fetch::OmniFetchDialect,
+                    quant::QuantDialect>();
   }
 
   void runOnOperation() override {
@@ -205,7 +207,10 @@ public:
     pm.addNestedPass<func::FuncOp>(createLowerTTXPass());
     pm.addPass(createLowerLibdevicePass());
     pm.addNestedPass<func::FuncOp>(createLowerTPtrPass());
-    pm.addNestedPass<func::FuncOp>(createHexagonLowerTmTensorPass());
+    HexagonLowerTmTensorOptions lowerTmOpts{};
+    lowerTmOpts.emitKvCacheMetadata = enableOmniFetchKvCachePrefetch;
+    pm.addNestedPass<func::FuncOp>(
+        createHexagonLowerTmTensorPass(lowerTmOpts));
     pm.addNestedPass<func::FuncOp>(createReduceContractionRankPass());
     pm.addPass(createLinalgFoldUnitExtentDimsPass());
     pm.addPass(createCanonicalizerPass());
@@ -402,6 +407,9 @@ public:
       auto decomposeOptions = DecomposeHexKLMatmulOptions{};
       decomposeOptions.enableWeightPrepack = enableOmniFetchWeightPrepack;
       decomposeOptions.enablePersistentVtcm = enableHexKLPersistentVtcm;
+      decomposeOptions.enableVtcmLifetimeColoring =
+          enableOmniFetchVtcmColoring;
+      decomposeOptions.enableDmaToVtcm = enableOmniFetchDmaToVtcm;
       pm.addNestedPass<func::FuncOp>(
           createDecomposeHexKLMatmulPass(decomposeOptions));
     }
@@ -427,6 +435,11 @@ public:
           enableOmniFetchInterLayerPrefetch;
       prefetchOptions.enablePersistentWhCache =
           enableOmniFetchPersistentWhCache;
+      prefetchOptions.enableTwoDimPipeline =
+          enableOmniFetchTwoDimPipeline;
+      prefetchOptions.enableKvCachePrefetch =
+          enableOmniFetchKvCachePrefetch;
+      prefetchOptions.kvCachePageTokens = omniFetchKvCachePageTokens;
       pm.addNestedPass<func::FuncOp>(
           hexagon::createPrefetchInsertPass(prefetchOptions));
       pm.addPass(createCanonicalizerPass());

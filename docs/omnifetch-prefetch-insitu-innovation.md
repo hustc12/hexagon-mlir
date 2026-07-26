@@ -197,9 +197,9 @@ regression gates.
 | 2 | transform-aware profitability model | per-site choice among no transform, sync, async, and persistent layout | initial static model implemented; repeated model-level gate pending |
 | 3 | layout-carrying producer/consumer fusion | propagate requested AH/WH layout through view/reshape chains | conservative activation-view fusion implemented; repeated model-level gate pending |
 | 4 | cross-token persistent WH cache | model-context cache with generation-safe invalidation | implemented end to end; Falcon model/device correctness, warm-hit, and invalidation gates passed |
-| 5 | two-dimensional load/reshape/compute pipeline | independently scheduled load and transform readiness | pending |
-| 6 | VTCM lifetime coloring | interference-based VTCM offset assignment | pending |
-| 7 | KV-cache-aware prefetch and layout | page-aware K/V staging and attention-consumer layout | pending |
+| 5 | two-dimensional load/reshape/compute pipeline | independently scheduled load and transform readiness | implemented; compiler/runtime tests and Falcon model/device gate passed; repeated performance gate pending |
+| 6 | VTCM lifetime coloring | interference-based VTCM offset assignment | implemented; compiler/runtime tests and Falcon model/device gate passed; repeated performance gate pending |
+| 7 | KV-cache-aware prefetch and layout | page-aware K/V staging and attention-consumer layout | compiler path implemented; Falcon prefill/device gate passed; true cross-token decode and repeated performance gates pending |
 | 8 | prefetch plus dequantization/reshape | fused compressed load, dequantization, and WH production | pending |
 
 Thermal/token-phase control and critical-path scheduling are cross-cutting
@@ -501,6 +501,295 @@ The item-4 cumulative row is 0.99% faster than this adjacent HexKL sample and
 85.73% faster than HVX. This is a valid mechanism result, but the approximately
 1% HexKL delta remains too small for a publication claim without interleaved
 repetitions, thermal control, and confidence intervals.
+
+## Item 5 implementation and validation
+
+Item 5 implements a real load/reshape/compute pipeline for profitable HexKL
+weight sites. It is controlled by `enableOmniFetchTwoDimPipeline` /
+`--enable-omnifetch-two-dim-pipeline` and remains off by default.
+
+The previous async prototype synchronously transformed the current weight tile
+on every K iteration and also launched the next tile. That was correct, but the
+repeated current-tile transform serialized the path and prevented it from being
+a true pipeline. The item-5 compiler transformation now:
+
+1. synchronously bootstraps only the first K tile;
+2. starts the two-dimensional DDR load for tile `t+1` while HMX consumes tile
+   `t`;
+3. completes WH reshape into the idle ping-pong slot after tile `t` compute;
+4. publishes transform readiness through the existing V-DAE semaphore; and
+5. lets the following iteration consume the ready slot without repeating the
+   synchronous WH transform.
+
+The runtime descriptor has explicit `LOAD_PENDING`, `LOAD_READY`, and
+`TRANSFORM_READY` phases. The compiler passes six tile parameters for the
+hybrid item-4/item-5 path: tile row, tile column, source width, destination
+offset, staging offset, and stable layout-site ID.
+
+Item 5 composes with the cross-invocation cache rather than replacing it. A
+warm cache hit copies an already transformed WH tile into the idle slot. A miss
+enters the asynchronous load/reshape pipeline and inserts the completed WH tile
+into the same context- and generation-safe cache. The first tile also uses the
+persistent cache. Thus `async=5, persistent=5` means five sites use both
+mechanisms, rather than two disjoint sets of sites.
+
+The new
+`qcom_hexagon_backend/test/Conversion/LinalgToLLVM/omnifetch_two_dim_pipeline.mlir`
+test verifies the first-tile guard, persistent bootstrap, next-tile lookahead,
+six-parameter identity, and removal of the original per-iteration
+`micro_hmx_rm_to_wh` operation. Together with the item-4 and cost-model tests,
+three targeted compiler tests pass.
+
+On the sequence-length-128 two-layer Falcon model runner, five weight sites
+selected the item-5 pipeline and five activation sites remained synchronous.
+The final fixed-order three-way run was:
+
+| Configuration | Device time | Numerical result |
+|---|---:|---|
+| HVX / unmodified Hexagon-MLIR | 11197.351 ms | top-5 matched, max abs 0.0237 |
+| HexKL | 1622.670 ms | top-1 match, max abs 0.0239 |
+| HexKL + OmniFetch items 1–5 | 1586.580 ms warm average | top-1 match, max abs 0.0239 |
+
+The cumulative row is 2.22% faster than the adjacent HexKL run and 85.83%
+faster than HVX (1.023x and 7.058x respectively). Its cold time was 1715.577
+ms; the three warm invocations produced 4296 total hits and 312 total misses,
+and the invalidation probe took 1611.002 ms. This is a positive model-level
+mechanism result, not yet a publication-quality speedup: the experiment still
+needs interleaved repetitions, temperature/power logging, and confidence
+intervals.
+
+The debug runner has hidden size 64 and only two K tiles at several sites. The
+explicit item-5 gate therefore permits loops with at least two tiles so that
+repository model tests actually exercise the pipeline. With the flag off, the
+original conservative profitability threshold remains unchanged.
+
+## Item 6 implementation and validation
+
+Item 6 adds opt-in VTCM lifetime coloring to the decomposed HexKL matmul path.
+It is controlled by `enableOmniFetchVtcmColoring` /
+`--enable-omnifetch-vtcm-coloring`, is disabled by default, and is enabled only
+in the cumulative items-1-through-6 model row.
+
+The implementation represents activation tiles, weight ping-pong tiles,
+prefetch staging, flattened output, and accumulator storage as half-open live
+intervals with a size and alignment. A deterministic first-fit interval
+colorer assigns offsets to contiguous tile ranges. Regions may share an offset
+only when their live intervals do not overlap; simultaneously live regions
+retain distinct colors. Both the normal M-outer schedule and the weight-prepack
+schedule have explicit lifetime models.
+
+For the sequence-length-128 Falcon debug module, all five decomposed HexKL
+sites were colored. The reported per-function maximum changed from 45056 bytes
+in the legacy append-only layout to 16384 bytes in the colored layout, saving
+28672 bytes, or 63.64%. The compiler records
+`omni_fetch.vtcm_legacy_peak_bytes`,
+`omni_fetch.vtcm_colored_peak_bytes`,
+`omni_fetch.vtcm_saved_peak_bytes`, and
+`omni_fetch.vtcm_colored_sites` attributes so that the allocation result is
+visible in IR and benchmark logs.
+
+Model-level validation caught an important error in the first lifetime model:
+it treated an activation tile as dead after one N-column computation, although
+the default M-outer schedule reuses that activation across all N columns. This
+allowed output storage to overwrite a live activation and produced a maximum
+absolute logit difference of 0.7319. The corrected model keeps activation
+storage live across the N loop and reuses the dead WH ping-pong slots for
+flattened output and accumulator storage. In the weight-prepack schedule,
+prepacked WH remains live across M rows and output storage instead reuses dead
+activation colors. After this correction, top-1 matching and the established
+0.0239 maximum absolute difference were restored.
+
+The focused compiler checks are:
+
+```bash
+source /home/huzq85/2-working/hexagon_npu/mlir-env/bin/activate
+lit -sv \
+  triton/build/cmake.linux-x86_64-cpython-3.11/third_party/qcom_hexagon_backend/test/Transforms/omnifetch-vtcm-lifetime-coloring.mlir \
+  triton/build/cmake.linux-x86_64-cpython-3.11/third_party/qcom_hexagon_backend/test/Transforms/decompose-hexkl-matmul.mlir \
+  triton/build/cmake.linux-x86_64-cpython-3.11/third_party/qcom_hexagon_backend/test/Conversion/LinalgToLLVM/omnifetch_two_dim_pipeline.mlir \
+  triton/build/cmake.linux-x86_64-cpython-3.11/third_party/qcom_hexagon_backend/test/Conversion/LinalgToLLVM/omnifetch_persistent_wh_cache.mlir
+```
+
+All four tests pass. The new coloring test checks the 45056-to-16384-byte peak
+reduction and verifies the intended offset sharing between non-overlapping
+scratch/weight/output regions. The incremental library build, Python syntax
+checks, shell syntax check, and `git diff --check` also pass.
+
+The model-level three-way command is:
+
+```bash
+ANDROID_SERIAL=49d1c7b2 \
+  bash scripts/run_omnifetch_model_ablation.sh \
+    --model falcon-debug --seq-len 128 --timeout 240
+```
+
+The final fixed-order run produced:
+
+| Configuration | Device time | Numerical result |
+|---|---:|---|
+| HVX / unmodified Hexagon-MLIR | 11321.344 ms | top-5 matched, max abs 0.0237 |
+| HexKL | 1619.855 ms | top-1 match, max abs 0.0239 |
+| HexKL + OmniFetch items 1–6 | 1598.756 ms warm average | top-1 match, max abs 0.0239 |
+
+The cumulative row is 1.30% faster than the adjacent HexKL sample and 85.88%
+faster than HVX (1.013x and 7.081x respectively). Its cold invocation took
+1707.232 ms. Before the explicit invalidation probe, the cache counters reached
+4296 hits and 312 misses; the post-invalidation invocation took 1590.593 ms and
+increased the totals to 5160 hits and 600 misses.
+
+This run proves that the colored allocation composes correctly with prefetch,
+in-situ reshape, the persistent WH cache, and the two-dimensional pipeline
+while materially reducing the statically reserved VTCM peak. It does not yet
+show an isolated item-6 latency improvement: the items-1-through-5 result from
+the preceding run was 1586.580 ms, and cross-run thermal/noise effects are
+larger than this difference. Publication-quality performance evaluation still
+requires interleaved items-1-through-5 versus items-1-through-6 repetitions,
+device temperature/power logging, and confidence intervals.
+
+## Item 7 implementation and validation
+
+Item 7 adds compiler-visible K/V stream identity, page accounting, coalesced
+L2 prefetch, and a KV-aware fusion boundary. It is controlled by
+`enableOmniFetchKvCachePrefetch` /
+`--enable-omnifetch-kv-cache-prefetch`; the logical page size is controlled by
+`omniFetchKvCachePageTokens` /
+`--omnifetch-kv-cache-page-tokens` and defaults to 32 tokens. Both are opt-in,
+and item 7 is enabled only in the cumulative Falcon row.
+
+The implementation has four stages:
+
+1. `tm_tensor.attention` lowering marks the QK contraction's K operand and the
+   AV contraction's V operand with semantic roles. Metadata emission itself is
+   gated, so HVX and plain HexKL retain the original IR and fusion behavior.
+2. The transpose-aware matmul scheduler and named-to-generic conversion
+   preserve only these semantic attributes. The QK path consumes K directly
+   in `[batch-or-head, sequence, head_dim]` layout through transpose-aware
+   indexing instead of materializing a cache-wide transpose.
+3. Tensor fusion preserves the marked attention boundary until after
+   bufferization. This prevents a replacement generic op from silently losing
+   K/V identity and prevents unrelated producer fusion from obscuring the
+   cache-consumer layout.
+4. `PrefetchInsert` splits a static K/V memref into contiguous leading
+   streams, accounts for logical 32-token pages, coalesces adjacent pages into
+   one hardware hint per stream, and emits `L2Hint` `prefetch_in_situ` ops.
+   The runtime lowers these to the existing asynchronous Hexagon `l2fetch`
+   implementation; no copy or VTCM allocation is performed.
+
+The compiler reports:
+
+- `omni_fetch.kv_prefetch_sites`;
+- `omni_fetch.kv_prefetch_hints`;
+- `omni_fetch.kv_prefetch_pages`;
+- `omni_fetch.kv_prefetch_bytes`; and
+- `omni_fetch.kv_direct_layout_sites`.
+
+The Falcon debug graph contains two attention layers. At sequence length 128
+and two heads, item 7 finds four consumers (K and V per layer), accounts for
+32 logical pages, coalesces them into eight contiguous hardware hints, and
+prefetches 65536 bytes per invocation.
+
+Two implementation failures were caught before accepting the result. Copying
+the complete attribute dictionary while creating a transpose-aware matmul
+overwrote structural op properties and caused a 64-versus-192 shape inference
+failure. Copying only the two OmniFetch semantic attributes fixed the baseline.
+Next, the generic tensor fusion pass replaced marked contractions and the
+model reported zero KV sites. Metadata is now emitted only under the item-7
+gate, and the gated path preserves the attention boundary until page hints are
+inserted. A direct full-pipeline check then reports:
+
+```text
+[HexagonFusion] function=FalconForCausalLM skipped=1 reason=preserve_kv_cache_boundary
+[KVCachePrefetch] function=FalconForCausalLM sites=4 hints=8 pages=32 bytes=65536 page_tokens=32
+```
+
+The focused regression command is:
+
+```bash
+source /home/huzq85/2-working/hexagon_npu/mlir-env/bin/activate
+lit -sv \
+  triton/build/cmake.linux-x86_64-cpython-3.11/third_party/qcom_hexagon_backend/test/Conversion/TmTensorToLinalg/SDPA.mlir \
+  triton/build/cmake.linux-x86_64-cpython-3.11/third_party/qcom_hexagon_backend/test/Transforms/omnifetch-kv-cache-prefetch.mlir \
+  triton/build/cmake.linux-x86_64-cpython-3.11/third_party/qcom_hexagon_backend/test/Transforms/omnifetch-vtcm-lifetime-coloring.mlir \
+  triton/build/cmake.linux-x86_64-cpython-3.11/third_party/qcom_hexagon_backend/test/Conversion/LinalgToLLVM/omnifetch_two_dim_pipeline.mlir \
+  triton/build/cmake.linux-x86_64-cpython-3.11/third_party/qcom_hexagon_backend/test/Conversion/LinalgToLLVM/omnifetch_persistent_wh_cache.mlir
+```
+
+All five tests pass. The new test checks two K/V consumers, four coalesced
+hints, 16 logical pages, 32768 bytes, per-stream subviews, and L2Hint emission.
+The user-guide-based incremental build, Python syntax checks, shell syntax
+check, and `git diff --check` also pass.
+
+The model command remains:
+
+```bash
+ANDROID_SERIAL=49d1c7b2 \
+  bash scripts/run_omnifetch_model_ablation.sh \
+    --model falcon-debug --seq-len 128 --timeout 240
+```
+
+The final fixed-order device run produced:
+
+| Configuration | Device time | Numerical result |
+|---|---:|---|
+| HVX / unmodified Hexagon-MLIR | 11742.816 ms | top-5 matched, max abs 0.0237 |
+| HexKL | 1614.896 ms | top-1 match, max abs 0.0239 |
+| HexKL + OmniFetch items 1–7 | 599.969 ms warm average | top-1 match, max abs 0.0231 |
+
+The cumulative row is 62.85% faster than the adjacent HexKL sample and 94.89%
+faster than HVX (2.692x and 19.572x respectively). It is 62.47% faster than
+the preceding item-6 run, but that cross-run comparison is not an isolated
+item-7 measurement. The cold invocation took 701.875 ms; the explicit
+invalidation probe took 599.153 ms. Before invalidation, the WH cache counters
+reached 3775 hits and 833 misses.
+
+This large delta must be attributed to the combined
+`KV-aware fusion boundary + direct K layout + page prefetch` policy, not to
+eight `l2fetch` instructions alone. Preserving the attention boundary changes
+the compiler schedule and reduced runtime substantially in this debug graph;
+it also increased compilation time to approximately 212 seconds in the
+measured cumulative build. An isolated four-way ablation—items 1–6,
+boundary-only, hints-only, and boundary+hints—is required before assigning
+causality or making a performance claim.
+
+Most importantly, the current Falcon, GPT-2, Qwen, and TinyLlama runners set
+`use_cache=False`. This experiment exercises K/V streams in a full-sequence
+prefill graph, not a persistent `past_key_values` decode loop. Item 7's
+compiler mechanism and model/device gate are implemented, but a true
+cross-token result still requires a fixed-shape decode-step ABI with K/V cache
+inputs/outputs, cache-position or page-table inputs, multiple sequential
+device invocations, GQA/MQA coverage, and sliding-window/page selection.
+
+## Triton and triton-shared dependency boundary
+
+The current repository is build-dependent on both submodules, even though the
+OmniFetch algorithm and the torch-mlir model input are not intrinsically
+Triton-dependent.
+
+- `triton` is a hard dependency of the current canonical host build. The
+  Hexagon backend is registered with `add_triton_plugin`, its Python launcher
+  imports `triton._C.libtriton`, and model runners import the backend through
+  the Triton Python package. The generated `libtriton.so` contains the active
+  Hexagon plugin used to lower torch-mlir/Linalg modules.
+- `triton_shared` is required by the canonical combined build and by the
+  Triton-kernel frontend path (`Triton IR -> Linalg`). It is included in
+  `TRITON_PLUGIN_DIRS`, and the build/test layout places its tools beside the
+  Hexagon plugin.
+- The current Falcon `.mlirbc`/torch-mlir path does not semantically invoke
+  Triton IR or require `triton-shared-opt` to convert the model. After the
+  compiler plugin and DSP shared objects have been built, device inference
+  does not load either submodule's source tree.
+- Therefore the local source edits in `triton/python/src/main.cc` and the two
+  `triton_shared` conversion files are not OmniFetch item-5 changes. They are
+  compatibility/lowering fixes for the Triton frontend path and remain outside
+  the OmniFetch commit scope.
+
+A future standalone `hexagon-mlir-model` build can remove the model path's
+source-level dependency by replacing `add_triton_plugin` with a standalone
+MLIR library/tool target, moving the torch launcher out of
+`triton.backends.*`, and linking only the required MLIR/LLVM and Hexagon
+libraries. Until that refactor is done, deleting or deinitializing either
+submodule will break the documented build even though the core optimization
+passes themselves contain no Triton IR.
 
 ## Model-level experiment matrix
 

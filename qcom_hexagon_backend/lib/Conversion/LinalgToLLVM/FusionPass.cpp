@@ -222,11 +222,28 @@ static FailureOr<unsigned> multiUseFusion(MLIRContext *context,
 
 void HexagonFusionPass::runOnOperation() {
   auto funcOp = getOperation();
+  bool preserveKvBoundary = false;
+  funcOp.walk([&](linalg::LinalgOp op) {
+    if (op->hasAttr("omni_fetch.kv_cache_role"))
+      preserveKvBoundary = true;
+  });
+  if (preserveKvBoundary) {
+    llvm::errs() << "[HexagonFusion] function=" << funcOp.getName()
+                 << " skipped=1 reason=preserve_kv_cache_boundary\n";
+    return;
+  }
   auto context = &getContext();
   RewritePatternSet fusionPatterns(context);
 
   auto controlElemwiseFn = [&](OpOperand *operand) {
     Operation *producer = operand->get().getDefiningOp();
+    // Item 7 attaches K/V stream identity to the attention contraction.
+    // Generic elementwise fusion creates a replacement op and currently does
+    // not preserve arbitrary semantic attributes, so keep this small boundary
+    // intact until KV page hints have been inserted after bufferization.
+    if (operand->getOwner()->hasAttr("omni_fetch.kv_cache_role") ||
+        (producer && producer->hasAttr("omni_fetch.kv_cache_role")))
+      return false;
     return linalg::areElementwiseOpsFusable(operand) &&
            (producer->hasOneUse() || fusionAllowRecompute);
   };

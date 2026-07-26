@@ -71,6 +71,14 @@ def main():
     parser.add_argument("--enable-omnifetch-weight-prepack", action="store_true")
     parser.add_argument("--enable-omnifetch-persistent-wh-cache",
                         action="store_true")
+    parser.add_argument("--enable-omnifetch-two-dim-pipeline",
+                        action="store_true")
+    parser.add_argument("--enable-omnifetch-vtcm-coloring",
+                        action="store_true")
+    parser.add_argument("--enable-omnifetch-kv-cache-prefetch",
+                        action="store_true")
+    parser.add_argument("--omnifetch-kv-cache-page-tokens", type=int,
+                        default=32)
     parser.add_argument("--device-iterations", type=int, default=1)
     parser.add_argument("--enable-hexkl-persistent-vtcm", action="store_true")
     parser.add_argument("--seq-len", type=int, default=None)
@@ -85,6 +93,18 @@ def main():
         enable_omnifetch_weight_prepack=args.enable_omnifetch_weight_prepack,
         enable_omnifetch_persistent_wh_cache=(
             args.enable_omnifetch_persistent_wh_cache
+        ),
+        enable_omnifetch_two_dim_pipeline=(
+            args.enable_omnifetch_two_dim_pipeline
+        ),
+        enable_omnifetch_vtcm_coloring=(
+            args.enable_omnifetch_vtcm_coloring
+        ),
+        enable_omnifetch_kv_cache_prefetch=(
+            args.enable_omnifetch_kv_cache_prefetch
+        ),
+        omnifetch_kv_cache_page_tokens=(
+            args.omnifetch_kv_cache_page_tokens
         ),
         device_iterations=args.device_iterations,
         enable_hexkl_persistent_vtcm=args.enable_hexkl_persistent_vtcm,

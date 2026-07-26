@@ -54,6 +54,10 @@ namespace {
 
 struct HexagonLowerTmTensorPass
     : public ::impl::HexagonLowerTmTensorBase<HexagonLowerTmTensorPass> {
+  explicit HexagonLowerTmTensorPass(
+      const HexagonLowerTmTensorOptions &options)
+      : HexagonLowerTmTensorBase(options) {}
+
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<tm_tensor::TmTensorDialect>();
     registry.insert<linalg::LinalgDialect>();
@@ -68,7 +72,11 @@ struct HexagonLowerTmTensorPass
 
 // Pattern to lower tm_tensor.attention to linalg operations
 struct LowerAttentionOp : public OpRewritePattern<AttentionOp> {
-  using OpRewritePattern::OpRewritePattern;
+  LowerAttentionOp(MLIRContext *context, bool emitKvCacheMetadata)
+      : OpRewritePattern(context),
+        emitKvCacheMetadata(emitKvCacheMetadata) {}
+
+  bool emitKvCacheMetadata;
 
   LogicalResult matchAndRewrite(AttentionOp op,
                                 PatternRewriter &rewriter) const final {
@@ -133,11 +141,18 @@ struct LowerAttentionOp : public OpRewritePattern<AttentionOp> {
     Value qkTinit =
         rewriter.create<linalg::FillOp>(loc, zero, qkTempty).getResult(0);
     auto qkTtype = RankedTensorType::get(qkTshape, elType);
-    Value qkT = rewriter
-                    .create<linalg::BatchMatmulOp>(loc, qkTtype,
-                                                   ValueRange{query, keyT},
-                                                   ValueRange{qkTinit})
-                    .getResult(0);
+    auto qkOp = rewriter.create<linalg::BatchMatmulOp>(
+        loc, qkTtype, ValueRange{query, keyT}, ValueRange{qkTinit});
+    // Preserve the semantic identity of the K stream after lowering. Item 7
+    // consumes this marker after bufferization to insert page-coalesced cache
+    // hints without guessing from generic contraction indexing maps.
+    if (emitKvCacheMetadata) {
+      qkOp->setAttr("omni_fetch.kv_cache_role",
+                    rewriter.getStringAttr("key"));
+      qkOp->setAttr("omni_fetch.kv_cache_operand",
+                    rewriter.getI64IntegerAttr(1));
+    }
+    Value qkT = qkOp.getResult(0);
     DBG(" batch-matmul: " << qkT);
 
     // Scale QK^T by 1/sqrt(head_dim)
@@ -230,11 +245,15 @@ struct LowerAttentionOp : public OpRewritePattern<AttentionOp> {
 
     // Lastly, `softmax(QK^T)*V`
     auto outType = RankedTensorType::get(outShape, elType);
-    Value result = rewriter
-                       .create<linalg::BatchMatmulOp>(
-                           loc, outType, ValueRange{softmaxResult, value},
-                           ValueRange{opsInit})
-                       .getResult(0);
+    auto avOp = rewriter.create<linalg::BatchMatmulOp>(
+        loc, outType, ValueRange{softmaxResult, value}, ValueRange{opsInit});
+    if (emitKvCacheMetadata) {
+      avOp->setAttr("omni_fetch.kv_cache_role",
+                    rewriter.getStringAttr("value"));
+      avOp->setAttr("omni_fetch.kv_cache_operand",
+                    rewriter.getI64IntegerAttr(1));
+    }
+    Value result = avOp.getResult(0);
 
     rewriter.replaceOp(op, result);
     return success();
@@ -243,7 +262,7 @@ struct LowerAttentionOp : public OpRewritePattern<AttentionOp> {
 
 void HexagonLowerTmTensorPass::runOnOperation() {
   RewritePatternSet patterns(&getContext());
-  patterns.add<LowerAttentionOp>(patterns.getContext());
+  patterns.add<LowerAttentionOp>(patterns.getContext(), emitKvCacheMetadata);
 
   if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))
     signalPassFailure();
@@ -252,6 +271,7 @@ void HexagonLowerTmTensorPass::runOnOperation() {
 } // namespace
 
 std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
-hexagon::createHexagonLowerTmTensorPass() {
-  return std::make_unique<HexagonLowerTmTensorPass>();
+hexagon::createHexagonLowerTmTensorPass(
+    const HexagonLowerTmTensorOptions &options) {
+  return std::make_unique<HexagonLowerTmTensorPass>(options);
 }

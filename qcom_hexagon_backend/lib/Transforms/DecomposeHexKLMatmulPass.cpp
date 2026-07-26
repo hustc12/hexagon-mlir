@@ -43,11 +43,16 @@ namespace {
 
 struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
   DecomposeHexKLMatmul(MLIRContext *ctx, bool enableWeightPrepack,
-                       Value sharedVtcm)
+                       bool enableVtcmLifetimeColoring,
+                       bool enableDmaToVtcm, Value sharedVtcm)
       : OpRewritePattern(ctx), enableWeightPrepack(enableWeightPrepack),
+        enableVtcmLifetimeColoring(enableVtcmLifetimeColoring),
+        enableDmaToVtcm(enableDmaToVtcm),
         sharedVtcm(sharedVtcm) {}
 
   bool enableWeightPrepack;
+  bool enableVtcmLifetimeColoring;
+  bool enableDmaToVtcm;
   /// Non-null when the pass allocated a function-scoped VTCM arena.
   Value sharedVtcm;
 
@@ -186,7 +191,18 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
     Value twoKTiles = rewriter.create<arith::MulIOp>(
         loc, kTiles, rewriter.create<arith::ConstantIndexOp>(loc, 2));
     Value vtcmTiles;
-    if (enableWeightPrepack) {
+    if (enableVtcmLifetimeColoring && enableWeightPrepack) {
+      // [0,K): AH, [K,2K): persistent WH. One scratch tile at 2K is
+      // sufficient because CopySubmatrix -> RmToAh consumes it immediately.
+      vtcmTiles = rewriter.create<arith::AddIOp>(
+          loc, twoKTiles, rewriter.create<arith::ConstantIndexOp>(loc, 1));
+    } else if (enableVtcmLifetimeColoring) {
+      // [0,K): AH. Scratch, w0 and w1 share the post-AH phase colors K/K+1.
+      // Output flat/acc reuse colors 0/1 after the final HMX consume.
+      Value extraTiles = rewriter.create<arith::ConstantIndexOp>(
+          loc, enableDmaToVtcm ? 3 : 2);
+      vtcmTiles = rewriter.create<arith::AddIOp>(loc, kTiles, extraTiles);
+    } else if (enableWeightPrepack) {
       Value threeK = rewriter.create<arith::AddIOp>(loc, twoKTiles, kTiles);
       vtcmTiles = rewriter.create<arith::AddIOp>(
           loc, threeK, rewriter.create<arith::ConstantIndexOp>(loc, 5));
@@ -221,7 +237,7 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
     // full scratch bank (2*kTiles*4096) so act reload does not clobber WH.
     Value wOff0 = rewriter.create<arith::MulIOp>(loc, kTilesI32, i32_4096);
     Value wOff1 = rewriter.create<arith::AddIOp>(loc, wOff0, i32_4096);
-    Value wRegionBase = enableWeightPrepack
+    Value wRegionBase = enableWeightPrepack && !enableVtcmLifetimeColoring
                             ? rewriter.create<arith::MulIOp>(
                                   loc,
                                   rewriter.create<arith::AddIOp>(loc, kTilesI32,
@@ -230,7 +246,14 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
                             : wOff0;
     Value flatOff;
     Value accOff;
-    if (enableWeightPrepack) {
+    if (enableVtcmLifetimeColoring) {
+      // In the default M-outer schedule AH remains live across every N tile,
+      // while each column's WH ping-pong slots die before its readback. Reuse
+      // WH colors there. In the prepack N-outer schedule WH remains live
+      // across M rows, while AH dies before each row's readback; reuse AH.
+      flatOff = enableWeightPrepack ? i32_0 : wOff0;
+      accOff = enableWeightPrepack ? i32_4096 : wOff1;
+    } else if (enableWeightPrepack) {
       Value threeKI32 = rewriter.create<arith::AddIOp>(
           loc, rewriter.create<arith::AddIOp>(loc, kTilesI32, kTilesI32),
           kTilesI32);
@@ -281,8 +304,11 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
                           ValueRange) {
                         Value kt =
                             bbb.create<arith::IndexCastOp>(loc, i32Ty, ktIdx);
-                        Value scrIdx =
-                            bbb.create<arith::AddIOp>(loc, kTilesI32, kt);
+                        Value scrIdx = enableVtcmLifetimeColoring
+                            ? bbb.create<arith::AddIOp>(
+                                  loc, kTilesI32, kTilesI32)
+                            : bbb.create<arith::AddIOp>(
+                                  loc, kTilesI32, kt);
                         Value scrOff =
                             bbb.create<arith::MulIOp>(loc, scrIdx, i32_4096);
                         bbb.create<hexkl::MicroHMXCopySubmatrixToF16Op>(
@@ -333,7 +359,9 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
                 loc, idx0, kTiles, idx1, ValueRange{},
                 [&](OpBuilder &bb, Location loc, Value ktIdx, ValueRange) {
                   Value kt = bb.create<arith::IndexCastOp>(loc, i32Ty, ktIdx);
-                  Value scrIdx = bb.create<arith::AddIOp>(loc, kTilesI32, kt);
+                  Value scrIdx = enableVtcmLifetimeColoring
+                      ? kTilesI32
+                      : bb.create<arith::AddIOp>(loc, kTilesI32, kt);
                   Value scrOff =
                       bb.create<arith::MulIOp>(loc, scrIdx, i32_4096);
                   bb.create<hexkl::MicroHMXCopySubmatrixToF16Op>(
@@ -406,10 +434,68 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
   }
 };
 
-/// VTCM bytes for a HexKL matmul with static K.
-/// Default layout: (ceil(K/32)*2+7)*4096; prepack needs (3*kTiles+5)*4096.
-/// Persistent arena uses the max so either mode fits.
-static std::optional<int64_t> estimateVtcmBytes(hexkl::MatmulOp op) {
+struct VtcmLiveRegion {
+  int64_t tiles;
+  int beginPhase;
+  int endPhase;
+  int64_t color = -1;
+};
+
+/// First-fit interval coloring with contiguous tile ranges. Two regions
+/// interfere only when both their phase intervals and assigned tile ranges
+/// overlap. Phases are: 0=activation/prepack, 1=HMX compute preparation,
+/// 2=HMX consume, 3=accumulator readback, 4=result copy.
+static int64_t computeColoredVtcmTiles(int64_t kTiles, bool weightPrepack,
+                                       bool dmaToVtcm) {
+  SmallVector<VtcmLiveRegion> regions;
+  if (weightPrepack) {
+    regions.push_back({kTiles, 0, 5}); // WH retained across all M rows
+    regions.push_back({kTiles, 1, 3}); // AH bank
+    regions.push_back({1, 1, 2});      // one reusable RM scratch tile
+  } else {
+    regions.push_back({kTiles, 0, 5}); // AH retained across all N columns
+    regions.push_back({1, 0, 1});      // RM scratch, dead before WH
+    regions.push_back({2, 1, 3});      // WH ping-pong slots
+    if (dmaToVtcm)
+      regions.push_back({1, 1, 2});    // non-aliasing async DMA stage
+  }
+  regions.push_back({1, 3, 4}); // accumulator read tile
+  regions.push_back({1, 3, 5}); // flat result tile; overlaps accumulator
+
+  int64_t peak = 0;
+  for (VtcmLiveRegion &region : regions) {
+    for (int64_t candidate = 0;; ++candidate) {
+      bool conflicts = false;
+      for (const VtcmLiveRegion &placed : regions) {
+        if (placed.color < 0)
+          continue;
+        bool lifetimeOverlap =
+            region.beginPhase < placed.endPhase &&
+            placed.beginPhase < region.endPhase;
+        bool addressOverlap =
+            candidate < placed.color + placed.tiles &&
+            placed.color < candidate + region.tiles;
+        if (lifetimeOverlap && addressOverlap) {
+          conflicts = true;
+          break;
+        }
+      }
+      if (!conflicts) {
+        region.color = candidate;
+        peak = std::max(peak, candidate + region.tiles);
+        break;
+      }
+    }
+  }
+  return peak;
+}
+
+/// VTCM bytes for a HexKL matmul with static K. The legacy layout reserves
+/// (2*kTiles+7) tiles by default or (3*kTiles+5) for prepack. Item 6 uses the
+/// interference graph above to compute the compact peak.
+static std::optional<int64_t>
+estimateVtcmBytes(hexkl::MatmulOp op, bool enableWeightPrepack,
+                  bool enableVtcmLifetimeColoring, bool enableDmaToVtcm) {
   auto lhsType = dyn_cast<MemRefType>(op.getLhs().getType());
   if (!lhsType || !lhsType.hasStaticShape() || lhsType.getRank() != 2)
     return std::nullopt;
@@ -417,16 +503,23 @@ static std::optional<int64_t> estimateVtcmBytes(hexkl::MatmulOp op) {
   if (K <= 0)
     return std::nullopt;
   int64_t kTiles = (K + 31) / 32;
+  if (enableVtcmLifetimeColoring)
+    return computeColoredVtcmTiles(kTiles, enableWeightPrepack,
+                                   enableDmaToVtcm) *
+           4096;
   int64_t defBytes = (kTiles * 2 + 4 + 3) * 4096;
   int64_t prepackBytes = (kTiles * 3 + 5) * 4096;
-  return std::max(defBytes, prepackBytes);
+  return enableWeightPrepack ? prepackBytes : defBytes;
 }
 
 void populateDecomposeHexKLMatmulPatterns(RewritePatternSet &patterns,
                                           bool enableWeightPrepack,
+                                          bool enableVtcmLifetimeColoring,
+                                          bool enableDmaToVtcm,
                                           Value sharedVtcm) {
-  patterns.add<DecomposeHexKLMatmul>(patterns.getContext(), enableWeightPrepack,
-                                     sharedVtcm);
+  patterns.add<DecomposeHexKLMatmul>(
+      patterns.getContext(), enableWeightPrepack,
+      enableVtcmLifetimeColoring, enableDmaToVtcm, sharedVtcm);
 }
 
 struct DecomposeHexKLMatmulPass
@@ -453,7 +546,9 @@ struct DecomposeHexKLMatmulPass
       std::optional<int64_t> maxBytes;
       bool allStatic = !matmuls.empty();
       for (hexkl::MatmulOp op : matmuls) {
-        auto bytes = estimateVtcmBytes(op);
+        auto bytes = estimateVtcmBytes(
+            op, enableWeightPrepack, enableVtcmLifetimeColoring,
+            enableDmaToVtcm);
         if (!bytes) {
           allStatic = false;
           break;
@@ -479,8 +574,44 @@ struct DecomposeHexKLMatmulPass
     }
 
     RewritePatternSet patterns(&getContext());
-    populateDecomposeHexKLMatmulPatterns(patterns, enableWeightPrepack,
-                                         sharedVtcm);
+    // Report the peak static arena reduction before rewriting the matmuls.
+    int64_t legacyPeak = 0;
+    int64_t coloredPeak = 0;
+    int64_t staticSites = 0;
+    func.walk([&](hexkl::MatmulOp op) {
+      auto legacy = estimateVtcmBytes(op, enableWeightPrepack,
+                                      /*coloring=*/false,
+                                      enableDmaToVtcm);
+      auto colored = estimateVtcmBytes(op, enableWeightPrepack,
+                                       /*coloring=*/true,
+                                       enableDmaToVtcm);
+      if (!legacy || !colored)
+        return;
+      legacyPeak = std::max(legacyPeak, *legacy);
+      coloredPeak = std::max(coloredPeak, *colored);
+      ++staticSites;
+    });
+    if (enableVtcmLifetimeColoring && staticSites > 0) {
+      Builder b(func.getContext());
+      func->setAttr("omni_fetch.vtcm_coloring_enabled", b.getUnitAttr());
+      func->setAttr("omni_fetch.vtcm_legacy_peak_bytes",
+                    b.getI64IntegerAttr(legacyPeak));
+      func->setAttr("omni_fetch.vtcm_colored_peak_bytes",
+                    b.getI64IntegerAttr(coloredPeak));
+      func->setAttr("omni_fetch.vtcm_saved_peak_bytes",
+                    b.getI64IntegerAttr(legacyPeak - coloredPeak));
+      func->setAttr("omni_fetch.vtcm_colored_sites",
+                    b.getI64IntegerAttr(staticSites));
+      llvm::errs() << "[VTCMLifetimeColoring] function=" << func.getName()
+                   << " sites=" << staticSites
+                   << " legacy_peak=" << legacyPeak
+                   << " colored_peak=" << coloredPeak
+                   << " saved_peak=" << (legacyPeak - coloredPeak) << "\n";
+    }
+
+    populateDecomposeHexKLMatmulPatterns(
+        patterns, enableWeightPrepack, enableVtcmLifetimeColoring,
+        enableDmaToVtcm, sharedVtcm);
     if (failed(applyPatternsGreedily(func, std::move(patterns)))) {
       return signalPassFailure();
     }

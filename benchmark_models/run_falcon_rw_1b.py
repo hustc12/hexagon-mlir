@@ -560,6 +560,10 @@ def falcon_rw_1b(
     enable_omnifetch_adaptive: bool = True,
     enable_omnifetch_weight_prepack: bool = False,
     enable_omnifetch_persistent_wh_cache: bool = False,
+    enable_omnifetch_two_dim_pipeline: bool = False,
+    enable_omnifetch_vtcm_coloring: bool = False,
+    enable_omnifetch_kv_cache_prefetch: bool = False,
+    omnifetch_kv_cache_page_tokens: int = 32,
     device_iterations: int = 1,
     enable_hexkl_persistent_vtcm: bool = False,
     seq_len: Optional[int] = None,
@@ -642,6 +646,18 @@ def falcon_rw_1b(
     options["enableOmniFetchPersistentWhCache"] = bool(
         enable_omnifetch_persistent_wh_cache
     )
+    options["enableOmniFetchTwoDimPipeline"] = bool(
+        enable_omnifetch_two_dim_pipeline
+    )
+    options["enableOmniFetchVtcmColoring"] = bool(
+        enable_omnifetch_vtcm_coloring
+    )
+    options["enableOmniFetchKvCachePrefetch"] = bool(
+        enable_omnifetch_kv_cache_prefetch
+    )
+    options["omniFetchKvCachePageTokens"] = int(
+        omnifetch_kv_cache_page_tokens
+    )
     options["enableHexKLPersistentVtcm"] = bool(enable_hexkl_persistent_vtcm)
 
     # torch-mlir may lift unused ALiBi slopes buffer as arg0; keep a matching dummy.
@@ -694,6 +710,14 @@ if __name__ == "__main__":
     )
     parser.add_argument("--enable-omnifetch-persistent-wh-cache",
                         action="store_true")
+    parser.add_argument("--enable-omnifetch-two-dim-pipeline",
+                        action="store_true")
+    parser.add_argument("--enable-omnifetch-vtcm-coloring",
+                        action="store_true")
+    parser.add_argument("--enable-omnifetch-kv-cache-prefetch",
+                        action="store_true")
+    parser.add_argument("--omnifetch-kv-cache-page-tokens", type=int,
+                        default=32)
     parser.add_argument("--device-iterations", type=int, default=1)
     parser.add_argument(
         "--seq-len",
@@ -712,6 +736,18 @@ if __name__ == "__main__":
         enable_omnifetch_weight_prepack=args.enable_omnifetch_weight_prepack,
         enable_omnifetch_persistent_wh_cache=(
             args.enable_omnifetch_persistent_wh_cache
+        ),
+        enable_omnifetch_two_dim_pipeline=(
+            args.enable_omnifetch_two_dim_pipeline
+        ),
+        enable_omnifetch_vtcm_coloring=(
+            args.enable_omnifetch_vtcm_coloring
+        ),
+        enable_omnifetch_kv_cache_prefetch=(
+            args.enable_omnifetch_kv_cache_prefetch
+        ),
+        omnifetch_kv_cache_page_tokens=(
+            args.omnifetch_kv_cache_page_tokens
         ),
         device_iterations=args.device_iterations,
         enable_hexkl_persistent_vtcm=args.enable_hexkl_persistent_vtcm,

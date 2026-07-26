@@ -55,9 +55,17 @@ struct LinalgGeneralizePass
 FailureOr<linalg::GenericOp>
 LinalgGeneralizePass::GeneralizeOp(IRRewriter &rewriter,
                                    linalg::LinalgOp linalgOp) {
+  Attribute kvRole = linalgOp->getAttr("omni_fetch.kv_cache_role");
+  Attribute kvOperand = linalgOp->getAttr("omni_fetch.kv_cache_operand");
   rewriter.setInsertionPoint(linalgOp);
   FailureOr<linalg::GenericOp> generalizedOp =
       linalg::generalizeNamedOp(rewriter, linalgOp);
+  if (succeeded(generalizedOp)) {
+    if (kvRole)
+      (*generalizedOp)->setAttr("omni_fetch.kv_cache_role", kvRole);
+    if (kvOperand)
+      (*generalizedOp)->setAttr("omni_fetch.kv_cache_operand", kvOperand);
+  }
   return generalizedOp;
 }
 

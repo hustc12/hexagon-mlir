@@ -45,6 +45,13 @@ using namespace hexagon;
 
 namespace {
 
+static void copyOmniFetchKvAttrs(Operation *from, Operation *to) {
+  for (StringRef name : {"omni_fetch.kv_cache_role",
+                         "omni_fetch.kv_cache_operand"})
+    if (Attribute attr = from->getAttr(name))
+      to->setAttr(name, attr);
+}
+
 struct ScheduleMatmulForHVXPass
     : public ::impl::ScheduleMatmulForHVXBase<ScheduleMatmulForHVXPass> {
   void runOnOperation() override;
@@ -55,6 +62,8 @@ struct ScheduleMatmulForHVXPass
 FailureOr<linalg::GenericOp>
 ScheduleMatmulForHVXPass::GeneralizeOp(IRRewriter &rewriter,
                                        linalg::LinalgOp linalgOp) {
+  Attribute kvRole = linalgOp->getAttr("omni_fetch.kv_cache_role");
+  Attribute kvOperand = linalgOp->getAttr("omni_fetch.kv_cache_operand");
   rewriter.setInsertionPoint(linalgOp);
   FailureOr<linalg::GenericOp> generalizedOp =
       linalg::generalizeNamedOp(rewriter, linalgOp);
@@ -63,6 +72,10 @@ ScheduleMatmulForHVXPass::GeneralizeOp(IRRewriter &rewriter,
     signalPassFailure();
     return failure(); // Return a failure result
   }
+  if (kvRole)
+    (*generalizedOp)->setAttr("omni_fetch.kv_cache_role", kvRole);
+  if (kvOperand)
+    (*generalizedOp)->setAttr("omni_fetch.kv_cache_operand", kvOperand);
   return generalizedOp;
 }
 
@@ -89,6 +102,7 @@ void ScheduleMatmulForHVXPass::runOnOperation() {
             linalgOp.getLoc(), linalgOp.getOperation()->getResultTypes(),
             ValueRange{linalgOp.getDpsInputs()[0], transposeOp.getOperand(0)},
             linalgOp.getDpsInits());
+        copyOmniFetchKvAttrs(linalgOp, matmulTransposeBOp);
         rewriter.replaceOp(linalgOp, matmulTransposeBOp);
         rewriter.eraseOp(transposeOp);
       } else if (firstOperandDef && isa<linalg::TransposeOp>(firstOperandDef)) {
@@ -99,6 +113,7 @@ void ScheduleMatmulForHVXPass::runOnOperation() {
             linalgOp.getLoc(), linalgOp.getOperation()->getResultTypes(),
             ValueRange{transposeOp.getOperand(0), linalgOp.getDpsInputs()[1]},
             linalgOp.getDpsInits());
+        copyOmniFetchKvAttrs(linalgOp, matmulTransposeAOp);
         rewriter.replaceOp(linalgOp, matmulTransposeAOp);
         rewriter.eraseOp(transposeOp);
       }
@@ -119,6 +134,7 @@ void ScheduleMatmulForHVXPass::runOnOperation() {
                 ValueRange{linalgOp.getDpsInputs()[0],
                            transposeOp.getOperand(0)},
                 linalgOp.getDpsInits());
+        copyOmniFetchKvAttrs(linalgOp, matmulTransposeBOp);
         rewriter.replaceOp(linalgOp, matmulTransposeBOp);
         rewriter.eraseOp(transposeOp);
       } else if (firstOperandDef && isa<linalg::TransposeOp>(firstOperandDef)) {
@@ -132,6 +148,7 @@ void ScheduleMatmulForHVXPass::runOnOperation() {
                 ValueRange{transposeOp.getOperand(0),
                            linalgOp.getDpsInputs()[1]},
                 linalgOp.getDpsInits());
+        copyOmniFetchKvAttrs(linalgOp, matmulTransposeAOp);
         rewriter.replaceOp(linalgOp, matmulTransposeAOp);
         rewriter.eraseOp(transposeOp);
       }

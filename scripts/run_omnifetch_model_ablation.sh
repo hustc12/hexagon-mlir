@@ -95,6 +95,9 @@ run_case hexkl --enable-hexkl
 CUMULATIVE_ARGS=(--enable-hexkl --enable-omnifetch-vdae)
 if [[ "${MODEL}" == "falcon-debug" ]]; then
   CUMULATIVE_ARGS+=(--enable-omnifetch-persistent-wh-cache)
+  CUMULATIVE_ARGS+=(--enable-omnifetch-two-dim-pipeline)
+  CUMULATIVE_ARGS+=(--enable-omnifetch-vtcm-coloring)
+  CUMULATIVE_ARGS+=(--enable-omnifetch-kv-cache-prefetch)
 fi
 run_case hexkl_omnifetch_cumulative "${CUMULATIVE_ARGS[@]}"
 

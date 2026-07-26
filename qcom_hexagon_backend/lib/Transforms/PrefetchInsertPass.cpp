@@ -92,6 +92,14 @@ struct TransformStats {
   int64_t persistent = 0;
 };
 
+struct KvCachePrefetchStats {
+  int64_t sites = 0;
+  int64_t hints = 0;
+  int64_t pages = 0;
+  int64_t bytes = 0;
+  int64_t directLayoutSites = 0;
+};
+
 static StringRef stringifyTransformMode(TransformMode mode) {
   switch (mode) {
   case TransformMode::Native:
@@ -728,6 +736,125 @@ static Value createDdrTileSubview(OpBuilder &b, Location loc, Value src,
       .getResult();
 }
 
+/// Insert one contiguous L2 hint per leading K/V stream. Attention tensors use
+/// [..., sequence, head_dim]; keeping every leading stream separate avoids
+/// fetching through padding while coalescing all logically adjacent cache
+/// pages into one hardware request. `kvCachePageTokens` remains visible in the
+/// page count even when adjacent pages are coalesced into one hint.
+static KvCachePrefetchStats
+insertKvCachePrefetchHints(func::FuncOp func, int64_t kvCachePageTokens) {
+  KvCachePrefetchStats stats;
+  if (kvCachePageTokens <= 0) {
+    func.emitWarning() << "invalid KV cache page size " << kvCachePageTokens
+                       << "; item 7 disabled for this function";
+    return stats;
+  }
+
+  SmallVector<linalg::LinalgOp> consumers;
+  func.walk([&](linalg::LinalgOp op) {
+    if (op->hasAttr("omni_fetch.kv_cache_role"))
+      consumers.push_back(op);
+  });
+
+  for (linalg::LinalgOp consumer : consumers) {
+    auto operandAttr =
+        consumer->getAttrOfType<IntegerAttr>("omni_fetch.kv_cache_operand");
+    auto role =
+        consumer->getAttrOfType<StringAttr>("omni_fetch.kv_cache_role");
+    if (!operandAttr || !role)
+      continue;
+    int64_t operandIndex = operandAttr.getInt();
+    SmallVector<Value> inputs(consumer.getDpsInputs());
+    if (operandIndex < 0 ||
+        operandIndex >= static_cast<int64_t>(inputs.size()))
+      continue;
+
+    Value src = inputs[operandIndex];
+    auto srcType = dyn_cast<MemRefType>(src.getType());
+    if (!srcType || !srcType.hasStaticShape() || srcType.getRank() < 2 ||
+        srcType.getMemorySpaceAsInt() != 0 ||
+        !isa<FloatType>(srcType.getElementType()))
+      continue;
+
+    ArrayRef<int64_t> shape = srcType.getShape();
+    int64_t rank = srcType.getRank();
+    int64_t seqTokens = shape[rank - 2];
+    int64_t headDim = shape[rank - 1];
+    if (seqTokens <= 0 || headDim <= 0)
+      continue;
+
+    int64_t streams = 1;
+    bool reasonable = true;
+    for (int64_t dim = 0; dim < rank - 2; ++dim) {
+      if (shape[dim] <= 0 || streams > 128 / shape[dim]) {
+        reasonable = false;
+        break;
+      }
+      streams *= shape[dim];
+    }
+    if (!reasonable)
+      continue;
+
+    int64_t elemBytes =
+        srcType.getElementType().getIntOrFloatBitWidth() / 8;
+    int64_t pagesPerStream =
+        (seqTokens + kvCachePageTokens - 1) / kvCachePageTokens;
+    OpBuilder b(consumer);
+    Location loc = consumer.getLoc();
+
+    for (int64_t linearStream = 0; linearStream < streams; ++linearStream) {
+      SmallVector<OpFoldResult> offsets(rank, b.getIndexAttr(0));
+      SmallVector<OpFoldResult> sizes;
+      SmallVector<OpFoldResult> strides(rank, b.getIndexAttr(1));
+      sizes.reserve(rank);
+      int64_t remaining = linearStream;
+      for (int64_t dim = rank - 3; dim >= 0; --dim) {
+        offsets[dim] = b.getIndexAttr(remaining % shape[dim]);
+        remaining /= shape[dim];
+      }
+      for (int64_t dim = 0; dim < rank - 2; ++dim)
+        sizes.push_back(b.getIndexAttr(1));
+      sizes.push_back(b.getIndexAttr(seqTokens));
+      sizes.push_back(b.getIndexAttr(headDim));
+
+      Value stream = b.create<memref::SubViewOp>(
+          loc, src, offsets, sizes, strides);
+      b.create<PrefetchInSituOp>(
+          loc, stream, stream, LayoutTransform::L2Hint, /*lookahead=*/1,
+          DenseI32ArrayAttr{}, ValueRange{});
+      ++stats.hints;
+    }
+
+    consumer->setAttr("omni_fetch.kv_page_tokens",
+                      b.getI64IntegerAttr(kvCachePageTokens));
+    consumer->setAttr("omni_fetch.kv_pages",
+                      b.getI64IntegerAttr(streams * pagesPerStream));
+    consumer->setAttr("omni_fetch.kv_layout",
+                      b.getStringAttr("direct_sequence_head_dim"));
+    ++stats.sites;
+    ++stats.directLayoutSites;
+    stats.pages += streams * pagesPerStream;
+    stats.bytes += streams * seqTokens * headDim * elemBytes;
+  }
+
+  Builder b(func.getContext());
+  func->setAttr("omni_fetch.kv_prefetch_sites",
+                b.getI64IntegerAttr(stats.sites));
+  func->setAttr("omni_fetch.kv_prefetch_hints",
+                b.getI64IntegerAttr(stats.hints));
+  func->setAttr("omni_fetch.kv_prefetch_pages",
+                b.getI64IntegerAttr(stats.pages));
+  func->setAttr("omni_fetch.kv_prefetch_bytes",
+                b.getI64IntegerAttr(stats.bytes));
+  func->setAttr("omni_fetch.kv_direct_layout_sites",
+                b.getI64IntegerAttr(stats.directLayoutSites));
+  llvm::errs() << "[KVCachePrefetch] function=" << func.getName()
+               << " sites=" << stats.sites << " hints=" << stats.hints
+               << " pages=" << stats.pages << " bytes=" << stats.bytes
+               << " page_tokens=" << kvCachePageTokens << "\n";
+  return stats;
+}
+
 /// HexKL OmniFetch insertion.
 /// - layoutAware=false: L2Hint warmup (Phase 1; no HexKL op removal)
 /// - layoutAware=true:  replace RmToWh / (Copy+RmToAh) with in-situ HMX layout
@@ -739,6 +866,7 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
                                          bool enableLayoutAware,
                                          int lookahead, bool enableDmaToVtcm,
                                          bool enablePersistentWhCache,
+                                         bool enableTwoDimPipeline,
                                          TransformStats &stats) {
   if (!enableLayoutAware) {
     // ----- Phase 1 path: L2 hints only -----
@@ -832,6 +960,18 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
     TransformDecision decision =
         decideWeightTransform(loop, wtTy, lookahead,
                               enablePersistentWhCache);
+    // Item 5 composes with item 4: profitable sites use the load/reshape/
+    // compute pipeline, while the runtime cache services or populates each
+    // pipelined tile using the compiler-assigned site identity.
+    // The explicit item-5 gate also enables short model-debug loops (two or
+    // more K tiles). This is essential for correctness/performance gating on
+    // the repository's model runners, whose reduced hidden size would
+    // otherwise exercise no pipeline at all. The default cost model remains
+    // unchanged when the item-5 gate is off.
+    if (enableTwoDimPipeline && mmOp && wtTy && wtTy.hasStaticShape() &&
+        getStaticTripCount(loop).value_or(0) >= 2 &&
+        decision.usefulTiles >= 2)
+      decision.mode = TransformMode::AsyncInSitu;
     if (decision.mode == TransformMode::AsyncInSitu && !mmOp)
       decision.mode = TransformMode::SyncInSitu;
     annotateTransformDecision(wh, decision);
@@ -864,17 +1004,49 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
       // Optional VTCM DMA stage at flatOff=(kTiles+2)*4096.  When disabled,
       // runtime packs into DDR omni_stage instead (tile_params size 4).
       SmallVector<Value, 5> syncParams = {ktVal, colVal, wtCols, curOff};
+      Value stageOff;
       if (enableDmaToVtcm) {
         Value kTilesPlus2 = b.create<arith::AddIOp>(
             loc, ubI32, b.create<arith::ConstantIntOp>(loc, i32Ty, 2));
-        Value stageOff = b.create<arith::MulIOp>(loc, kTilesPlus2, c4096);
+        stageOff = b.create<arith::MulIOp>(loc, kTilesPlus2, c4096);
         syncParams.push_back(stageOff);
       }
 
-      auto syncPrefetch = b.create<PrefetchInSituOp>(
-          loc, srcMem, vtcmMem, LayoutTransform::HMXWeight,
-          /*lookahead=*/0, DenseI32ArrayAttr{}, syncParams);
-      annotateTransformDecision(syncPrefetch, decision);
+      Value hybridSiteId;
+      if (enableTwoDimPipeline && enablePersistentWhCache &&
+          decision.persistentCandidate) {
+        if (!enableDmaToVtcm)
+          syncParams.push_back(
+              b.create<arith::ConstantIntOp>(loc, i32Ty, -1));
+        hybridSiteId = b.create<arith::ConstantIntOp>(
+            loc, i32Ty, stats.persistent++);
+        syncParams.push_back(hybridSiteId);
+      }
+
+      auto emitSyncCurrent = [&](OpBuilder &syncBuilder, Location syncLoc) {
+        auto syncPrefetch = syncBuilder.create<PrefetchInSituOp>(
+            syncLoc, srcMem, vtcmMem, LayoutTransform::HMXWeight,
+            hybridSiteId ? /*persistent cache*/ -1 : 0,
+            DenseI32ArrayAttr{}, syncParams);
+        annotateTransformDecision(syncPrefetch, decision);
+      };
+
+      if (enableTwoDimPipeline) {
+        // Bootstrap only tile 0. Later current tiles were loaded and reshaped
+        // by the previous iteration; repeating the synchronous WH transform
+        // here would serialize and nullify the pipeline.
+        Value lbI32 =
+            b.create<arith::IndexCastOp>(loc, i32Ty, loop.getLowerBound());
+        Value isFirst = b.create<arith::CmpIOp>(
+            loc, arith::CmpIPredicate::eq, ktVal, lbI32);
+        b.create<scf::IfOp>(
+            loc, isFirst, [&](OpBuilder &thenBuilder, Location thenLoc) {
+              emitSyncCurrent(thenBuilder, thenLoc);
+              thenBuilder.create<scf::YieldOp>(thenLoc);
+            });
+      } else {
+        emitSyncCurrent(b, loc);
+      }
       ++inserted;
 
       Value nextKtRaw = b.create<arith::AddIOp>(loc, ktVal, c1);
@@ -895,7 +1067,13 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
             SmallVector<Value, 5> asyncParams = {nextKtRaw, colVal, wtCols,
                                                  nextOff};
             if (enableDmaToVtcm)
-              asyncParams.push_back(syncParams.back()); // same stageOff
+              asyncParams.push_back(stageOff);
+            if (hybridSiteId) {
+              if (!enableDmaToVtcm)
+                asyncParams.push_back(thenBuilder.create<arith::ConstantIntOp>(
+                    thenLoc, i32Ty, -1));
+              asyncParams.push_back(hybridSiteId);
+            }
             auto asyncPrefetch = thenBuilder.create<PrefetchInSituOp>(
                 thenLoc, srcMem, vtcmMem, LayoutTransform::HMXWeight,
                 /*lookahead=*/1, DenseI32ArrayAttr{}, asyncParams);
@@ -987,6 +1165,7 @@ static void insertPrefetchForLoop(scf::ForOp loop, int lookahead,
                                   bool enableLayoutAware,
                                   bool enableDmaToVtcm,
                                   bool enablePersistentWhCache,
+                                  bool enableTwoDimPipeline,
                                   TransformStats &stats) {
   OpBuilder builder(loop);
   Location loc = loop.getLoc();
@@ -998,7 +1177,8 @@ static void insertPrefetchForLoop(scf::ForOp loop, int lookahead,
   if (containsHexKLCompute(loop)) {
     int n = insertHexKLMicroPrefetchHints(builder, loop, enableLayoutAware,
                                           lookahead, enableDmaToVtcm,
-                                          enablePersistentWhCache, stats);
+                                          enablePersistentWhCache,
+                                          enableTwoDimPipeline, stats);
     llvm::errs() << "[PrefetchInsert] Total prefetch sites: " << n
                  << " shadow_kb=0\n";
     return;
@@ -1186,8 +1366,14 @@ struct PrefetchInsertPass
                  << ", enableDmaToVtcm=" << enableDmaToVtcm
                  << ", enablePersistentWhCache="
                  << enablePersistentWhCache
+                 << ", enableTwoDimPipeline=" << enableTwoDimPipeline
                  << ", enableInterLayerPrefetch=" << enableInterLayerPrefetch
+                 << ", enableKvCachePrefetch=" << enableKvCachePrefetch
+                 << ", kvCachePageTokens=" << kvCachePageTokens
                  << " (forced off in HVX insert for safety)\n";
+
+    if (enableKvCachePrefetch)
+      insertKvCachePrefetchHints(func, kvCachePageTokens);
 
     const bool funcHasHexKL = containsHexKLCompute(func);
 
@@ -1222,7 +1408,8 @@ struct PrefetchInsertPass
       llvm::dbgs() << "\n[PrefetchInsert] --- Processing loop " << loopIdx++
                    << " at " << loop.getLoc() << " ---\n";
       insertPrefetchForLoop(loop, lookahead, enableLayoutAware,
-                            enableDmaToVtcm, enablePersistentWhCache, stats);
+                            enableDmaToVtcm, enablePersistentWhCache,
+                            enableTwoDimPipeline, stats);
     }
 
     Builder builder(func.getContext());

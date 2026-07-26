@@ -40,6 +40,7 @@
 #include <dlfcn.h>
 #include <filesystem>
 #include <iterator>
+#include <string>
 
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h"
@@ -127,6 +128,26 @@ void setLinalgToLLVMOptions(
     auto it = arch_kwargs.find("enableOmniFetchPersistentWhCache");
     options.enableOmniFetchPersistentWhCache =
         (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableOmniFetchTwoDimPipeline");
+    options.enableOmniFetchTwoDimPipeline =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableOmniFetchVtcmColoring");
+    options.enableOmniFetchVtcmColoring =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableOmniFetchKvCachePrefetch");
+    options.enableOmniFetchKvCachePrefetch =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("omniFetchKvCachePageTokens");
+    if (it != arch_kwargs.end())
+      options.omniFetchKvCachePageTokens = std::stoi(it->second);
   }
   {
     auto it = arch_kwargs.find("enableOmniFetchDualThreadDae");

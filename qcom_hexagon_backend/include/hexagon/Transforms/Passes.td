@@ -162,6 +162,11 @@ def HexagonDoubleBufferGenericS2 :
 def HexagonLowerTmTensor :
     InterfacePass<"hexagon-lower-tm-tensor", "mlir::FunctionOpInterface"> {
   let summary = "Lower lower tm-tensor ops to mlir dialect ops";
+  let options = [
+    Option<"emitKvCacheMetadata", "emit-kv-cache-metadata", "bool",
+           /*default=*/"false",
+           "Attach semantic K/V stream metadata for item-7 page-aware prefetch.">,
+  ];
   let constructor = "hexagon::createHexagonLowerTmTensorPass()";
 }
 
@@ -265,6 +270,13 @@ def DecomposeHexKLMatmul :
            "alloc/dealloc churn). Falls back to per-matmul alloc when any K is "
            "dynamic. Default off: measured gain is noise-level and OmniFetch "
            "interaction needs more validation.">,
+    Option<"enableVtcmLifetimeColoring", "enable-vtcm-lifetime-coloring", "bool",
+           /*default=*/"false",
+           "Assign VTCM offsets from phase lifetimes so scratch, weight, "
+           "activation, flat-output, and accumulator regions reuse storage.">,
+    Option<"enableDmaToVtcm", "enable-dma-to-vtcm", "bool",
+           /*default=*/"false",
+           "Reserve a non-aliasing VTCM staging tile for OmniFetch DMA.">,
   ];
 
   let constructor = "hexagon::createDecomposeHexKLMatmulPass()";
@@ -401,6 +413,16 @@ def PrefetchInsert :
     Option<"enablePersistentWhCache", "enable-persistent-wh-cache", "bool",
            /*default=*/"false",
            "Use the generation-safe runtime WH cache for profitable weight sites.">,
+    Option<"enableTwoDimPipeline", "enable-two-dim-pipeline", "bool",
+           /*default=*/"false",
+           "Pipeline DDR load for tile t+1, WH transform for tile t+1, and "
+           "HMX compute for tile t without redundantly transforming current tiles.">,
+    Option<"enableKvCachePrefetch", "enable-kv-cache-prefetch", "bool",
+           /*default=*/"false",
+           "Insert page-coalesced L2 hints for compiler-identified attention K/V streams.">,
+    Option<"kvCachePageTokens", "kv-cache-page-tokens", "int",
+           /*default=*/"32",
+           "Logical K/V cache page size in sequence tokens used for accounting and coalescing.">,
   ];
 
   let constructor = "hexagon::createPrefetchInsertPass()";

@@ -363,6 +363,7 @@ static uint16_t omni_stage[OMNI_STAGE_SLOTS][OMNI_STAGE_ELEMS];
 
 typedef struct {
   int active;
+  int phase;
   uint32_t token;
   void *dest; /* full HexKL VTCM i8 slab when hexkl_deferred */
   const void *src; /* full DDR matrix when hexkl_deferred */
@@ -377,7 +378,15 @@ typedef struct {
   int32_t src_cols;
   int32_t weight_off; /* absolute byte offset into dest VTCM slab */
   int32_t vtcm_stage_off; /* >=0: packed tile lives at dest+off (DMA→VTCM) */
+  int32_t site_id; /* >=0: item-4 cache identity for item-5 hybrid mode */
 } OmniAsyncJob;
+
+enum {
+  OMNI_JOB_IDLE = 0,
+  OMNI_JOB_LOAD_PENDING = 1,
+  OMNI_JOB_LOAD_READY = 2,
+  OMNI_JOB_TRANSFORM_READY = 3
+};
 
 /* Single-producer/single-consumer descriptor ring. The compiler emits at most
  * one async weight request per loop iteration; signal() consumes the oldest
@@ -437,6 +446,7 @@ static void omni_async_complete(void) {
   if (job->token != 0)
     hexagon_runtime_dma_wait(job->token);
 #endif
+  __atomic_store_n(&job->phase, OMNI_JOB_LOAD_READY, __ATOMIC_RELEASE);
   void *dest = job->dest;
   int32_t eb = job->elem_bytes;
   int32_t ne = job->num_elems;
@@ -461,12 +471,24 @@ static void omni_async_complete(void) {
             (const _Float16 *)job->src, (uint32_t)job->tile_row,
             (uint32_t)job->tile_col, (uint32_t)job->src_cols);
       }
+      if (job->site_id >= 0) {
+        OmniWhCacheEntry *entry = omni_wh_cache_reserve(
+            job->src, job->tile_row, job->tile_col, job->src_cols,
+            job->site_id);
+        memcpy(entry->data, (char *)dest + job->weight_off,
+               OMNI_WH_TILE_BYTES);
+        if (entry->epoch ==
+            __atomic_load_n(&omni_wh_epoch, __ATOMIC_ACQUIRE))
+          __atomic_store_n(&entry->valid, 1, __ATOMIC_RELEASE);
+      }
     }
 #else
     (void)dest;
     (void)eb;
     (void)ne;
 #endif
+    __atomic_store_n(&job->phase, OMNI_JOB_TRANSFORM_READY,
+                     __ATOMIC_RELEASE);
     __atomic_store_n(&job->active, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&omni_async_head,
                      (job_idx + 1) % OMNI_STAGE_SLOTS, __ATOMIC_RELAXED);
@@ -517,7 +539,7 @@ static void omni_l2fetch_weight_tile(const _Float16 *src, int32_t tile_row,
 static int omni_async_kick_hexkl_weight(const void *src, void *dest,
                                         int32_t tile_row, int32_t tile_col,
                                         int32_t src_cols, int32_t weight_off,
-                                        int32_t stage_off) {
+                                        int32_t stage_off, int32_t site_id) {
   if (!src || !dest || src_cols <= 0 || tile_row < 0 || tile_col < 0 ||
       weight_off < 0)
     return 0;
@@ -609,6 +631,8 @@ static int omni_async_kick_hexkl_weight(const void *src, void *dest,
   job->src_cols = src_cols;
   job->weight_off = weight_off;
   job->vtcm_stage_off = vtcmStage;
+  job->site_id = site_id;
+  __atomic_store_n(&job->phase, OMNI_JOB_LOAD_PENDING, __ATOMIC_RELEASE);
   __atomic_store_n(&job->active, 1, __ATOMIC_RELEASE);
   __atomic_store_n(&omni_async_tail, (job_idx + 1) % OMNI_STAGE_SLOTS,
                    __ATOMIC_RELAXED);
@@ -655,6 +679,8 @@ static int omni_async_kick(const void *src, void *dest, int32_t elem_bytes,
   job->hexkl_deferred = 0;
   job->weight_off = -1;
   job->vtcm_stage_off = -1;
+  job->site_id = -1;
+  __atomic_store_n(&job->phase, OMNI_JOB_LOAD_PENDING, __ATOMIC_RELEASE);
   __atomic_store_n(&job->active, 1, __ATOMIC_RELEASE);
   __atomic_store_n(&omni_async_tail, (job_idx + 1) % OMNI_STAGE_SLOTS,
                    __ATOMIC_RELAXED);
@@ -876,10 +902,25 @@ void __omni_fetch_prefetch_insitu(const void *src, void *dest,
       }
       __atomic_fetch_add(&omni_wh_misses, 1, __ATOMIC_RELAXED);
     }
-    if (lookahead > 0 && weight_off >= 0 &&
-        omni_async_kick_hexkl_weight(src, dest, tile_row, tile_col, src_cols,
-                                     weight_off, stage_off))
-      return;
+    if (lookahead > 0 && weight_off >= 0) {
+      /* Item 5 + item 4 hybrid: a warm persistent tile is already WH-ready,
+       * so publish it directly into the idle ping-pong slot. A miss enters
+       * the explicit LOAD_PENDING -> LOAD_READY -> TRANSFORM_READY pipeline
+       * and is inserted into the same generation-safe cache on completion. */
+      if (src_rows >= 0) {
+        OmniWhCacheEntry *cached =
+            omni_wh_cache_lookup(src, tile_row, tile_col, src_cols, src_rows);
+        if (cached) {
+          memcpy(wh_dest, cached->data, OMNI_WH_TILE_BYTES);
+          __atomic_fetch_add(&omni_wh_hits, 1, __ATOMIC_RELAXED);
+          return;
+        }
+        __atomic_fetch_add(&omni_wh_misses, 1, __ATOMIC_RELAXED);
+      }
+      if (omni_async_kick_hexkl_weight(src, dest, tile_row, tile_col, src_cols,
+                                       weight_off, stage_off, src_rows))
+        return;
+    }
 #ifdef __hexagon__
     (void)elem_bytes;
     (void)num_elems;

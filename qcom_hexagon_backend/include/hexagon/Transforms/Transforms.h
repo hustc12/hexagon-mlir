@@ -54,7 +54,9 @@ std::unique_ptr<OperationPass<ModuleOp>>
 createHexagonLLVMEnableHexagonRoutinesPass();
 
 std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
-createHexagonLowerTmTensorPass();
+createHexagonLowerTmTensorPass(
+    const HexagonLowerTmTensorOptions &options =
+        HexagonLowerTmTensorOptions());
 
 std::unique_ptr<OperationPass<func::FuncOp>> createHexagonLWPPass(
     const HexagonLWPPassOptions &options = HexagonLWPPassOptions());
