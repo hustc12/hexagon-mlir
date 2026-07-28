@@ -1870,3 +1870,124 @@ already reports 33 prefetch sites, 11 async choices, 11 persistent choices,
 produced inside 480 seconds.  It must remain a compile-timeout result until a
 longer run or pass-complexity fix completes; mechanism counters alone are not a
 performance result.
+
+## Third new-candidate screening (2026-07-28)
+
+The third group deliberately uses structural controls: an OPT MHA decoder, a
+global-attention DeiT, and a long-sequence Wav2Vec2 encoder.  All are offline
+random-weight FP16 Debug proxies.  OPT and Wav2Vec2 required semantic-preserving
+export adaptations: eager attention, explicit OPT `position_ids` to avoid
+`tm_tensor.scan`, and materializing Wav2Vec2's inference-time weight-normalized
+position-convolution weight.
+
+```bash
+ANDROID_SERIAL=49d1c7b2 scripts/run_debug_matrix.sh \
+  --runtime-root /tmp/omnifetch-2x-improvement \
+  --seq-len 32 --timeout 180 \
+  --output-dir /tmp/omnifetch-new-candidates-group3 \
+  opt-125m deit-small wav2vec2-base
+```
+
+OPT was rerun after the explicit-position fix with a 120-second bound.
+
+| Debug candidate | HVX (ms) | HexKL (ms) | HexKL + items 1-7 (ms) | HexKL/combo | Correctness/outcome |
+|---|---:|---:|---:|---:|---|
+| OPT-125M proxy | 1680.180 | 164.211 | 106.451 | **1.5426x** | pass, max error 0.0012 |
+| DeiT-Small proxy | 1472.615 | 1487.593 | 656.140 | nominal 2.2672x | **invalid: NaN output, top-1 mismatch in all configurations** |
+| Wav2Vec2-base proxy | 489.284 | 488.338 | N/A | N/A | baselines pass; combo compile timeout at 180 s |
+
+OPT is a valid positive but sub-1.8x result.  It triggers 39 prefetch and 39
+in-situ sites, 13 async and 13 persistent choices, and saves 53,248 bytes of
+VTCM peak, but has no KV-aware sites.  Compared with GQA models, this suggests
+classic MHA benefits from projection/weight movement yet lacks the extra
+KV-state opportunity that produced Whisper's larger gain.
+
+DeiT's raw latency ratio must not be used in the paper's successful-model
+count.  The identical NaN/top-1 failure in HVX, HexKL, and the combination
+points to a pre-existing device numerical/lowering problem rather than an
+OmniFetch-only regression, but no backend is correct.  It is retained as a
+failed boundary case.
+
+Wav2Vec2's HVX and HexKL baselines are effectively equal and numerically valid
+(maximum error 0.0009, top-1 match).  The combination pass exceeded the
+180-second compile limit, so this experiment currently establishes neither
+speedup nor slowdown.  A longer compile run is lower priority than fixing the
+systemic combination-pass compile complexity.
+
+## Current >=1.8x census and domain balance (2026-07-28)
+
+For architecture screening, use the relaxed rule requested for the current
+stage: three runtime numbers exist and `HexKL / combination >= 1.8`; DeiT is
+temporarily counted despite its NaN correctness failure.  Under that rule
+there are **9** models:
+
+| Domain | Count | Models |
+|---|---:|---|
+| Language/Text | 5 | Falcon, GPT-2, Qwen2.5-0.5B, TinyLlama, SD/CLIP text encoder |
+| Computer Vision | 3 | Swin, SegFormer MiT-B0, DeiT-Small (correctness waived) |
+| Speech/Audio | 1 | Whisper-tiny |
+| **Total** | **9** | target is approximately 15 |
+
+This is a screening count, not yet the final paper-qualified count.  Qwen's
+warm result falls below 1.8x, GPT-2 has an abnormal FP32 HexKL baseline,
+SD/CLIP is sub-millisecond, and DeiT is numerically invalid.  A strict,
+robustness-aware paper count is therefore only five today: Falcon, TinyLlama,
+Swin, SegFormer, and Whisper.
+
+To reach 15 while balancing three domains, the target should be **5/5/5**.
+Language/Text already has five screening candidates, so the next search should
+add two vision and four speech/audio successes:
+
+- Vision: DETR (CNN + encoder/decoder + cross-attention) and BEiT (global ViT
+  with relative position embeddings);
+- Speech/Audio: Speech2Text (encoder/decoder cross-attention), HuBERT,
+  WavLM, and Data2Vec-Audio (long-sequence speech encoders);
+- additionally rerun Wav2Vec2 combination with a longer compile bound, but
+  retain it as an explicit timeout if it still fails.
+
+All six new model families have native classes in the installed Transformers
+4.52.4.  They must all remain in the reported matrix; unsuccessful candidates
+must not be silently replaced.  Full, non-reduced checkpoint work should start
+only after the Debug screening set reaches the desired count, except that full
+runner feasibility work may begin early for the already robust five models.
+
+## Fourth six-candidate Debug screening (2026-07-28)
+
+The planned two vision plus four audio candidates were all retained in one
+matrix, with a 90-second per-configuration screening bound:
+
+```bash
+ANDROID_SERIAL=49d1c7b2 scripts/run_debug_matrix.sh \
+  --runtime-root /tmp/omnifetch-2x-improvement \
+  --seq-len 32 --timeout 90 \
+  --output-dir /tmp/omnifetch-new-candidates-group4 \
+  detr-resnet-50 beit-base speech2text-small \
+  hubert-base wavlm-base-plus data2vec-audio-base
+```
+
+| Candidate | HVX (ms) | HexKL (ms) | Combination (ms) | HexKL/combo | Screening result |
+|---|---:|---:|---:|---:|---|
+| DETR | N/A | N/A | N/A | N/A | `tm_tensor.scan` parser failure |
+| BEiT | 688.260 | 694.660 | 318.362 | **2.1820x** | nominal pass; all outputs NaN |
+| Speech2Text | N/A | N/A | N/A | N/A | `tm_tensor.scan` parser failure |
+| HuBERT | 503.813 | 491.712 | N/A | N/A | baselines correct; combo compile timeout |
+| WavLM | N/A | N/A | N/A | N/A | torch-mlir heterogeneous-list importer failure |
+| Data2Vec-Audio | N/A | N/A | N/A | N/A | baseline device exit 13; combo timeout |
+
+BEiT uses an absolute-position Debug variant because its dynamic relative
+position index cannot currently be legalized by torch-mlir.  Its nominal
+2.182x is driven by four KV-aware sites covering 16 pages / 33,280 bytes, but
+it has the same NaN correctness problem as DeiT.  Under the current
+accuracy-waived screening rule it can be counted; it is not paper-qualified.
+
+The relaxed `>=1.8x` census therefore rises from 9 to **10**:
+Language/Text 5, Computer Vision 4, Speech/Audio 1.  The target of 15 is still
+not reached and domain balance remains poor.  The failures identify concrete
+infrastructure work rather than evidence that the optimization is slow:
+
+1. register/lower `tm_tensor.scan`, or eliminate scan through explicit
+   position/mask metadata, for DETR and Speech2Text;
+2. bound the combination-pass compile complexity for HuBERT/Wav2Vec2-family
+   graphs;
+3. legalize WavLM relative-position bucket construction;
+4. diagnose the shared DeiT/BEiT FP16 device NaN before final paper runs.

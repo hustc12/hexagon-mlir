@@ -36,6 +36,15 @@ all_models=(
   vit
   ast-audioset
   whisper-tiny
+  opt-125m
+  deit-small
+  wav2vec2-base
+  detr-resnet-50
+  beit-base
+  speech2text-small
+  hubert-base
+  wavlm-base-plus
+  data2vec-audio-base
 )
 models=()
 
@@ -188,7 +197,7 @@ base_args_for() {
     falcon_rw_1b)
       printf '%s\n' '--seq-len' "${SEQ_LEN}" '--device-iterations' '3'
       ;;
-    gpt2lmheadmodel|graphsage|mamba-130m|qwen2.5-0.5b|qwen2.5-coder-0.5b|smollm2-135m|tinyllama|whisper-tiny)
+    gpt2lmheadmodel|graphsage|mamba-130m|opt-125m|qwen2.5-0.5b|qwen2.5-coder-0.5b|smollm2-135m|tinyllama|whisper-tiny)
       printf '%s\n' '--seq-len' "${SEQ_LEN}"
       ;;
     real-esrgan)
@@ -276,7 +285,7 @@ run_one() {
     arg_text=""
   fi
   case "${model}" in
-    falcon_rw_1b|gpt2lmheadmodel|graphsage|mamba-130m|qwen2.5-0.5b|qwen2.5-coder-0.5b|smollm2-135m|tinyllama|whisper-tiny)
+    falcon_rw_1b|gpt2lmheadmodel|graphsage|mamba-130m|opt-125m|qwen2.5-0.5b|qwen2.5-coder-0.5b|smollm2-135m|tinyllama|whisper-tiny)
       recorded_seq_len=${SEQ_LEN}
       ;;
     *)

@@ -39,3 +39,13 @@ The second candidate group adds `qwen2.5-coder-0.5b`,
 `segformer-mit-b0`, and `whisper-tiny`.  Whisper includes a process-local tanh
 GELU replacement for its hard-coded convolutional `F.gelu`, because exact GELU
 otherwise leaves unsupported `math.erf` in the Hexagon lowering path.
+
+The third structural-control group adds `opt-125m`, `deit-small`, and
+`wav2vec2-base`.  OPT supplies explicit position IDs for export, while
+Wav2Vec2 materializes its weight-normalized positional-convolution weight
+before torch-mlir export.
+
+The fourth candidate group adds DETR, BEiT, Speech2Text, HuBERT, WavLM, and
+Data2Vec-Audio Debug runners.  Their first matrix intentionally retains
+torch-mlir/parser/device failures as screening results rather than silently
+dropping unsupported models.
