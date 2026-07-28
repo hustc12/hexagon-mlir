@@ -47,6 +47,11 @@ all_models=(
   data2vec-audio-base
   speecht5-asr
   clap-htsat
+  unispeech-base
+  sew-base
+  sd_unet_crossattn
+  unispeech-sat-base
+  dinov2-small
 )
 models=()
 

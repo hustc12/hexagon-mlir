@@ -2139,3 +2139,103 @@ Speech/Audio 3.  BEiT and DeiT remain in the relaxed count only because the
 current screening rule explicitly waives accuracy; their NaN outputs must
 remain visible in any paper table.  The runtime-valid subset gains two
 additional correct audio results from this run.
+
+## Balanced 15-model completion and SD-UNet feasibility (2026-07-28)
+
+The remaining search targeted two audio models and one vision model so the
+relaxed 15-model set would be balanced 5/5/5.  Every device run remained
+strictly serial.
+
+```bash
+ANDROID_SERIAL=49d1c7b2 scripts/run_debug_matrix.sh \
+  --runtime-root "$PWD" \
+  --timeout 300 \
+  --output-dir /tmp/omnifetch-fill-15-group1 \
+  unispeech-base sew-base sd_unet_crossattn
+
+ANDROID_SERIAL=49d1c7b2 scripts/run_debug_matrix.sh \
+  --runtime-root "$PWD" \
+  --timeout 300 \
+  --output-dir /tmp/omnifetch-fill-15-group2 \
+  unispeech-sat-base dinov2-small
+```
+
+| Candidate | HVX (ms) | HexKL (ms) | Combination (ms) | HexKL/combo | Result |
+|---|---:|---:|---:|---:|---|
+| UniSpeech-base 1L | 293.102 | 293.799 | 150.528 | **1.9518x** | max error 0.0009, top-1 match |
+| UniSpeech-SAT-base 1L | 296.251 | 306.903 | 150.127 | **2.0443x** | max error 0.0009, top-1 match |
+| DINOv2-small proxy | 173.867 | 174.867 | 60.337 | **2.8982x** | max error 0.0002, top-1 match |
+| SEW-base 1L | 222.662 | 212.712 | N/A | N/A | combination codegen timeout at 300 s |
+| SD-UNet CrossAttn proxy | N/A | N/A | N/A | N/A | HVX codegen timeout at 300 s |
+
+The three successful candidates each expose two compiler-identified attention
+K/V sites.  UniSpeech and UniSpeech-SAT prefetch eight logical pages / 12,800
+bytes; DINOv2 prefetches four pages / 4,352 bytes.  This repeats the same
+mechanism with correct outputs in two domains.
+
+The relaxed `>=1.8x` set now reaches **15 models** with the intended balance:
+
+| Domain | Count | Models |
+|---|---:|---|
+| Language/Text | 5 | Falcon, GPT-2, Qwen2.5-0.5B, TinyLlama, SD/CLIP text encoder |
+| Computer Vision | 5 | Swin, SegFormer, DeiT-Small, BEiT, DINOv2 |
+| Speech/Audio | 5 | Whisper, HuBERT, Wav2Vec2, UniSpeech, UniSpeech-SAT |
+| **Total** | **15** | balanced 5/5/5 |
+
+DeiT and BEiT remain accuracy-waived NaN entries and must be labelled as such.
+The other three additions in this section are numerically valid.
+
+### Can SD-UNet be deployed?
+
+There are two distinct answers:
+
+1. The existing `run_sd_unet_debug.py` is deployable at about 105 ms, but it
+   explicitly replaces every CrossAttn block with a plain Down/UpBlock2D.
+   It is a convolution/ResNet smoke test, not a representative diffusion
+   denoiser, and has no OmniFetch attention opportunity.
+2. The first `run_sd_unet_crossattn_debug.py` configuration retained CrossAttn
+   down, mid, and up blocks while shrinking to `[32,64]` channels, an 8x8
+   latent, an 8x32 text context, and about 0.79M parameters.  Even this proxy
+   exceeded 300 seconds in HVX host codegen before reaching the phone.
+3. A bounded repair attempt reduced the same structurally complete graph to
+   one `[32]` stage, a 4x4 latent, and a 4x16 text context.  It still exceeded
+   180 seconds in HVX host codegen.  The exported 1.3 MB MLIR graph contains
+   4,392 lines and 85 convolution/matmul/batch-matmul operations.  This rules
+   out tensor width and spatial size as the primary blocker: graph-wide
+   lowering and code generation for the monolithic down/mid/up CrossAttention
+   dataflow dominate before device execution begins.
+
+The bounded rerun was:
+
+```bash
+ANDROID_SERIAL=49d1c7b2 scripts/run_debug_matrix.sh \
+  --runtime-root "$PWD" \
+  --timeout 180 \
+  --output-dir /tmp/omnifetch-sd-unet-bounded-fix \
+  sd_unet_crossattn
+```
+
+Only HVX was allowed to consume the 180-second budget.  HexKL and the
+combination were deliberately not launched after the common compilation
+blocker reproduced, so this experiment consumed at most one compile timeout
+rather than three.
+
+Therefore a structurally correct SD-UNet is **not yet deployable end to end**
+through the current monolithic lowering path.  The blocker is host compilation
+complexity, not phone memory or an unsupported model API.  The next sensible
+implementation is block-level AOT partitioning: compile ResNet, self-attention,
+and cross-attention blocks as separate shared objects, retain intermediates in
+a reusable arena, and apply attention K/V prefetch across block boundaries.
+The partition boundary should be the Diffusers down/mid/up block interface so
+that skip tensors and encoder context remain explicit.  Compile each unique
+block shape once, reuse the resulting shared object across repeated blocks and
+diffusion timesteps, and schedule DMA/prefetch for the next block while the
+current block executes.  This is preferable to claiming the no-CrossAttn proxy
+as SD-UNet.
+
+Given the bounded-effort requirement, block-level AOT is deferred rather than
+adding a large new execution path during model screening.  The one-stage
+CrossAttn runner remains in the matrix as a regression target: a future
+partitioned implementation is successful only when all three HVX, HexKL, and
+HexKL+OmniFetch configurations reach device execution and pass the numerical
+comparison.
