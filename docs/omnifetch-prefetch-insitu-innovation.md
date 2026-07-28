@@ -1822,3 +1822,51 @@ Screening decision: advance SmolLM2 to a full-checkpoint symmetric repeated
 experiment; do not count AST without a new audio-specific movement policy such
 as spectrogram patch-stream DMA; and first bound/fix SwinV2 compile complexity
 before claiming a device performance result.
+
+## Second new-candidate screening (2026-07-28)
+
+The second group adds three offline deterministic FP16 structural proxies:
+Qwen2.5-Coder-0.5B with its exact 7:1 GQA grouping ratio, a two-stage SegFormer
+MiT-B0, and a one-layer encoder/one-layer decoder Whisper-tiny.  The matrix was:
+
+```bash
+ANDROID_SERIAL=49d1c7b2 scripts/run_debug_matrix.sh \
+  --runtime-root /tmp/omnifetch-2x-improvement \
+  --seq-len 32 --timeout 480 \
+  --output-dir /tmp/omnifetch-new-candidates-group2 \
+  qwen2.5-coder-0.5b segformer-mit-b0 whisper-tiny
+```
+
+Whisper initially exposed two integration defects.  Its convolutional frontend
+hard-codes exact GELU and left unsupported `math.erf`; the Debug harness now
+uses the standard tanh GELU approximation.  Re-parsing unchanged textual IR
+also lost `tm_tensor.attention`; when no HexKL rewrite fires, the harness now
+retains original bytecode.  Reducing only Debug width/vocabulary to fit the DSP
+then produced a complete three-way result.
+
+| Debug candidate | HVX (ms) | HexKL (ms) | HexKL + items 1-7 (ms) | HexKL/combo | Outcome |
+|---|---:|---:|---:|---:|---|
+| Qwen2.5-Coder-0.5B proxy | 8486.568 | 424.451 | N/A | N/A | combo compile timeout at 480 s |
+| SegFormer MiT-B0 proxy | 324.340 | 275.134 | 112.937 | **2.4362x** | all pass |
+| Whisper-tiny proxy | 331.746 | 340.427 | 97.619 | **3.4873x** | all pass after lowering fixes |
+
+SegFormer has five prefetch sites, nine in-situ sites, one persistent choice,
+36,864 bytes of VTCM peak saving, and two KV-aware sites.  Its maximum absolute
+error is 0.0002 and top-1 matches.  This is the first strong result on
+hierarchical spatial-reduction attention and supports generalization beyond
+LLM projection graphs.
+
+Whisper's generic prefetch/cost-model counters are zero, while KV metadata
+inference finds seven sites and KV-aware prefetch inserts nine sites covering
+41 pages / 81,920 bytes.  Maximum absolute error is 0.0005 and top-1 matches.
+Therefore its 3.4873x gain is specifically evidence for attention-state-aware
+early movement across encoder self-attention, decoder self-attention, and
+cross-attention, rather than layout elimination.
+
+Qwen2.5-Coder confirms that its aligned projection/FFN structure strongly
+benefits from HexKL (`HVX/HexKL = 19.9942x`).  Its combination compilation
+already reports 33 prefetch sites, 11 async choices, 11 persistent choices,
+69,632 bytes VTCM saving, and four KV-prefetch sites, but no runtime number was
+produced inside 480 seconds.  It must remain a compile-timeout result until a
+longer run or pass-complexity fix completes; mechanism counters alone are not a
+performance result.

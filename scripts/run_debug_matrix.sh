@@ -23,16 +23,19 @@ all_models=(
   graphsage
   mamba-130m
   qwen2.5-0.5b
+  qwen2.5-coder-0.5b
   real-esrgan
   sd_text_encoder
   sd_unet
   sd_vae_decoder
+  segformer-mit-b0
   smollm2-135m
   swin_transformer
   swinv2-tiny
   tinyllama
   vit
   ast-audioset
+  whisper-tiny
 )
 models=()
 
@@ -185,7 +188,7 @@ base_args_for() {
     falcon_rw_1b)
       printf '%s\n' '--seq-len' "${SEQ_LEN}" '--device-iterations' '3'
       ;;
-    gpt2lmheadmodel|graphsage|mamba-130m|qwen2.5-0.5b|smollm2-135m|tinyllama)
+    gpt2lmheadmodel|graphsage|mamba-130m|qwen2.5-0.5b|qwen2.5-coder-0.5b|smollm2-135m|tinyllama|whisper-tiny)
       printf '%s\n' '--seq-len' "${SEQ_LEN}"
       ;;
     real-esrgan)
@@ -273,7 +276,7 @@ run_one() {
     arg_text=""
   fi
   case "${model}" in
-    falcon_rw_1b|gpt2lmheadmodel|graphsage|mamba-130m|qwen2.5-0.5b|smollm2-135m|tinyllama)
+    falcon_rw_1b|gpt2lmheadmodel|graphsage|mamba-130m|qwen2.5-0.5b|qwen2.5-coder-0.5b|smollm2-135m|tinyllama|whisper-tiny)
       recorded_seq_len=${SEQ_LEN}
       ;;
     *)

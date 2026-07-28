@@ -34,3 +34,8 @@ The matrix also includes offline, deterministic cross-domain candidate screens:
 attention), and `ast-audioset` (spectrogram Transformer).  They use random FP16
 weights and reduced topology, so they screen compiler/runtime structure rather
 than pretrained-model accuracy.
+
+The second candidate group adds `qwen2.5-coder-0.5b`,
+`segformer-mit-b0`, and `whisper-tiny`.  Whisper includes a process-local tanh
+GELU replacement for its hard-coded convolutional `F.gelu`, because exact GELU
+otherwise leaves unsupported `math.erf` in the Hexagon lowering path.
