@@ -52,6 +52,20 @@ def customize_input_size(default: int = 64) -> int:
     return default
 
 
+def load_real_esrgan_model(device):
+    """Load the published full RRDBNet model.
+
+    Kept as a hook so the Debug runner can use a genuinely small topology.
+    The normal/full benchmark always executes this implementation.
+    """
+    model_wrapper = RealESRGAN(device, scale=4)
+    weights_path = huggingface_hub.hf_hub_download(
+        "ai-forever/Real-ESRGAN", "RealESRGAN_x4.pth"
+    )
+    model_wrapper.load_weights(weights_path, download=False)
+    return model_wrapper.model.eval()
+
+
 def real_esrgan(
     enable_hexkl: bool = False,
     enable_omnifetch_vdae: bool = False,
@@ -64,12 +78,7 @@ def real_esrgan(
 ):
     patch_dsp_heap_256mb()
     device = torch.device("cpu")
-    model_wrapper = RealESRGAN(device, scale=4)
-    weights_path = huggingface_hub.hf_hub_download(
-        "ai-forever/Real-ESRGAN", "RealESRGAN_x4.pth"
-    )
-    model_wrapper.load_weights(weights_path, download=False)
-    model = model_wrapper.model.eval()
+    model = load_real_esrgan_model(device)
     func_name = model.__class__.__name__
 
     size = input_size if input_size is not None else customize_input_size(64)
@@ -99,6 +108,17 @@ def real_esrgan(
         enable_omnifetch_items_1_7,
         lower_constants_separate=True,
     )
+    if enable_omnifetch_items_1_7 and not (
+        "linalg.matmul" in ir or "linalg.batch_matmul" in ir
+    ):
+        # Persistent-WH benchmarking executes cold/warm/invalidated kernels.
+        # A conv-only graph has no WH cache site, so those extra executions
+        # only consume DSP heap and can prevent the output from being emitted.
+        options["enableOmniFetchPersistentWhCache"] = False
+        print(
+            "[OmniFetchAdaptiveNoop] no matmul/WH-cache site; "
+            "disabled persistent-WH replay"
+        )
     hex_outputs = hex_execution(
         module, func_name, [input_tensor], options, mlir_text=mlir_text
     )

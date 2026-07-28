@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Debug Real-ESRGAN with smaller spatial input (DSP VA).
+"""Debug Real-ESRGAN with a reduced RRDBNet topology and spatial input.
 
-Main harness keeps full RRDBNet; --input-size is the capacity knob.
+This is a compiler/runtime smoke and three-way A/B runner. Use the parent
+``run_real-esrgan.py`` for full-model measurements.
 """
 from __future__ import annotations
 
@@ -21,8 +22,22 @@ assert _SPEC.loader is not None
 _SPEC.loader.exec_module(_MOD)
 
 
+def _load_tiny_model(device):
+    from RealESRGAN.rrdbnet_arch import RRDBNet
+
+    print("[Debug] Real-ESRGAN reduced RRDBNet: feat=16 blocks=2 grow=8")
+    return RRDBNet(
+        num_in_ch=3,
+        num_out_ch=3,
+        scale=4,
+        num_feat=16,
+        num_block=2,
+        num_grow_ch=8,
+    ).to(device).eval()
+
+
 def _tiny_size(_default=16):
-    print("[Debug] Real-ESRGAN input 8x8 (full harness default 64x64; topology=full RRDBNet)")
+    print("[Debug] Real-ESRGAN input 8x8 (full harness default 64x64)")
     return 8
 
 
@@ -34,6 +49,7 @@ def main():
         return _orig(*a, **k)
 
     _MOD.customize_input_size = _tiny_size
+    _MOD.load_real_esrgan_model = _load_tiny_model
     _MOD.compare = _loose
 
     from hexkl_utils import add_phase4_args

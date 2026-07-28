@@ -53,6 +53,11 @@ def load_unet(config):
     return UNet2DConditionModel.from_config(config)
 
 
+def customize_phase4_options(options: dict, _module) -> dict:
+    """Identity hook for Debug topology-specific option gating."""
+    return options
+
+
 def test_unet(
     enablelwp: bool = False,
     enable_hexkl: bool = False,
@@ -95,6 +100,18 @@ def test_unet(
     args.disable_omnifetch_adaptive = not enable_omnifetch_adaptive
     args.enable_omnifetch_items_1_7 = enable_omnifetch_items_1_7
     options = options_from_args(args)
+    module_text = str(module)
+    if enable_omnifetch_items_1_7 and not (
+        "linalg.matmul" in module_text or "linalg.batch_matmul" in module_text
+    ):
+        # Persistent-WH replay is meaningful only when a WH cache site exists.
+        # Avoid three redundant executions of a conv-only graph on DSP heap.
+        options["enableOmniFetchPersistentWhCache"] = False
+        print(
+            "[OmniFetchAdaptiveNoop] no matmul/WH-cache site; "
+            "disabled persistent-WH replay"
+        )
+    options = customize_phase4_options(options, module)
 
     print("Running UNet on Hexagon NPU …")
     hex_out = hex_execution(module, "UNet2DConditionModel", list(inputs), options)

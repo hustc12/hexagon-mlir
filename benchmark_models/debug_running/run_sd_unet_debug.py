@@ -53,6 +53,19 @@ def _tiny_inputs(config: dict):
     return latent, timestep, encoder
 
 
+def _disable_persistent_wh_replay(options: dict, _module) -> dict:
+    # This Debug topology deliberately removes every CrossAttn block. Its
+    # residual scalar matmuls are not HexKL WH-cache candidates, so replaying
+    # the whole UNet cold/warm/invalidated only exhausts DSP heap.
+    if options.get("enableOmniFetchPersistentWhCache", False):
+        options["enableOmniFetchPersistentWhCache"] = False
+        print(
+            "[OmniFetchAdaptiveNoop] Debug UNet has no HexKL WH-cache site; "
+            "disabled persistent-WH replay"
+        )
+    return options
+
+
 def main():
     _orig = _MOD.compare
 
@@ -62,6 +75,7 @@ def main():
 
     _MOD.customize_unet_config = _tiny_config
     _MOD.customize_unet_inputs = _tiny_inputs
+    _MOD.customize_phase4_options = _disable_persistent_wh_replay
     _MOD.compare = _loose
 
     from sd_utils import add_phase4_cli

@@ -1493,9 +1493,332 @@ SD UNet also had zero cumulative sites in this debug configuration.
   is resolved.
 - Device status-13 failures and timeouts are not performance measurements.
 
-The reproducible cumulative runner is
-`scripts/run_debug_matrix_full_1_7.sh`. It records performance and
-per-mechanism hit counts in
-`benchmark_models/results/debug_matrix_full_1_7/results.csv`; the build tree,
-MLIR bytecode, generated shared objects, raw tensors, and result logs are
-generated artifacts and must not be committed.
+The canonical three-way runner is now `scripts/run_debug_matrix.sh`.  One
+invocation runs HVX, HexKL, and HexKL + cumulative items 1–7, records
+per-mechanism hit counts, retries failed rows while skipping successful rows,
+and writes both the attempt history (`results.csv`) and latest-result speedup
+table (`summary.csv`).  The older cumulative-only script is not required.
+
+### Completed Debug matrix for the previously blocked models
+
+The blocked models were rerun on 2026-07-28 with one command, a clean device
+state, and the same sequence length in all three configurations:
+
+```bash
+ANDROID_SERIAL=49d1c7b2 scripts/run_debug_matrix.sh \
+  --runtime-root /tmp/omnifetch-2x-improvement \
+  --seq-len 32 \
+  --timeout 600 \
+  --output-dir /tmp/omnifetch-unfinished-debug-seq32 \
+  qwen2.5-0.5b graphsage mamba-130m sd_unet real-esrgan gpt2lmheadmodel
+```
+
+`--runtime-root` selected the isolated build made from the
+`omnifetch-2x-improvement` tag while the runner sources came from this
+worktree.  Omit that option after building the current worktree itself.
+
+| Debug model | HVX (ms) | HexKL (ms) | HexKL + items 1–7 (ms) | HexKL / combo | HVX / combo | Applicable item hits |
+|---|---:|---:|---:|---:|---:|---|
+| Qwen2.5-0.5B, 2L, seq=32 | 1897.422 | 153.888 | 79.475 | 1.936x | 23.875x | prefetch=45, in-situ=49, async=15, persistent=5, KV=4 |
+| GraphSAGE/BERT debug, seq=32 | 296.833 | 122.142 | 81.037 | 1.507x | 3.663x | prefetch=36, in-situ=36, async=12, persistent=2 |
+| Mamba debug, 1L, seq=32 | 1165.356 | 127.751 | 110.213 | 1.159x | 10.574x | prefetch=9, in-situ=9, async=3, persistent=2 |
+| SD UNet debug, no cross-attn | 105.085 | 105.505 | 106.154 | 0.994x | 0.990x | none |
+| Real-ESRGAN reduced RRDBNet | 71.064 | 71.041 | 70.614 | 1.006x | 1.006x | none |
+| GPT-2, 2L, full LM head, seq=32 | 22496.585 | 109539.127 | 31937.477 | 3.430x | 0.704x | prefetch=24, in-situ=72, async=8, persistent=8, KV=4 |
+
+The former Qwen, GraphSAGE, and Mamba device-status-13 failures did not
+reproduce with the clean, parameter-consistent run.  Qwen and Mamba matched
+top-1; GraphSAGE matched the CPU tolerance.  All three GPT-2 numerical gates
+passed.  GPT-2 demonstrates a narrower claim: items 1–7 recover 3.43x over its
+poor HexKL result, but the combination remains 1.42x slower than HVX.  Its
+two-layer Debug model still retains the full 50,257-token LM head, which
+dominates this configuration.
+
+SD UNet and Real-ESRGAN are negative controls.  They have zero eligible
+prefetch/HexKL sites, so no speedup should be claimed.  Their original
+cumulative runs replayed a cold/warm/invalidated persistent-WH experiment even
+with no WH-cache candidate, exhausting device heap before output emission.
+The Debug runners now adaptively disable only that inapplicable replay.  The
+normal full-model hooks remain unchanged.  SD UNet remains numerically
+unqualified (maximum differences 0.7682–1.4204), and the reduced Real-ESRGAN
+combination run also exceeded its 0.05 tolerance (0.0651); their timings are
+smoke/negative-control data only.
+
+Build trees, MLIR bytecode, generated shared objects, raw tensors, CSV files,
+and logs are generated artifacts and must not be committed.
+
+## Precision diagnosis, corrected speedup attribution, and three-domain plan
+
+### Why the current GPT-2 HexKL baseline is slower than HVX
+
+The current GPT-2 result is not directly comparable with the other FP16 model
+runners.  The main GPT-2 harness exports the complete model in FP32.  In
+HexKL mode, `rewrite_matmul_inputs_to_f16` inserts runtime `f32 -> f16`
+conversions for both operands of every eligible matmul while keeping
+LayerNorm, softmax, residuals, and the surrounding graph in FP32.  In
+contrast, Qwen, Falcon, TinyLlama, Swin, Mamba, GraphSAGE, and ViT are exported
+as FP16 models, so their HexKL rewrite normally bypasses an existing
+`f16 -> f32` extension instead of converting full FP32 tensors at inference
+time.
+
+This difference is especially expensive in the current two-layer GPT-2 Debug
+runner:
+
+- only `n_layer` is reduced from 12 to 2;
+- hidden width remains 768;
+- vocabulary remains 50,257;
+- the wrapper returns full-sequence logits.
+
+The LM-head weight alone contains `50,257 * 768 = 38.6M` elements, or
+approximately 154 MB in FP32.  Repeatedly converting this and the intermediate
+activations before HMX matmuls can cost more than the HMX compute saves.  This
+is consistent with the measured 22,496.585 ms HVX and 109,539.127 ms HexKL
+times.
+
+There is also direct historical evidence.  At `b6f5548`, GPT-2 was exported
+entirely in FP16 and the recorded full-model result was approximately 24.0 s
+HVX versus 12.0 s HexKL.  It was later changed to FP32 because the full
+12-layer FP16 path produced NaNs after roughly four layers.  Therefore the
+current 3.43x `HexKL / combination` result partly recovers a pathological
+conversion-heavy HexKL baseline; it must not yet be presented as an intrinsic
+3.43x GPT-2 structural benefit.
+
+The next GPT-2 experiment must respect the decision not to introduce mixed
+precision or quantization:
+
+1. use an all-FP16 two-layer Debug GPT-2;
+2. normalize its Debug width, heads, FFN, and vocabulary to the same scale as
+   the Qwen/Falcon/TinyLlama Debug runners, or make every LLM runner compute
+   last-token logits only;
+3. run all three backends with byte-identical FP16 weights and inputs;
+4. keep full 12-layer GPT-2 out of the qualified result set until the all-FP16
+   numerical failure is fixed.
+
+### Corrected cold-versus-warm view of the apparent high-speedup models
+
+The cumulative runner enables persistent-WH mode.  Its reported `Perf` is the
+second, warm execution, whereas the ordinary HexKL runner historically
+reports one execution.  The combination logs also contain `cold_us`, which
+allows a more conservative comparison:
+
+| Model | Reported HexKL / warm combination | HexKL / cold combination | Principal mechanism | Interpretation |
+|---|---:|---:|---|---|
+| Falcon debug | 2.741x | 2.326x | persistent WH + KV prefetch + VTCM coloring + async pipeline | robust multi-mechanism gain |
+| Swin debug | 3.239x | 3.237x | window-attention KV prefetch | strongest clean structure-driven result |
+| TinyLlama debug | 1.950x | 2.037x | KV prefetch, with one persistent/VTCM site | robust; warm replay is not the source |
+| GPT-2 debug | 3.430x | 3.459x | VTCM coloring + KV prefetch + in-situ/pipeline | robust against warm bias, but the FP32 HexKL baseline is abnormal |
+| SD text encoder debug | 5.044x | 3.336x | two KV-prefetch sites | sub-millisecond result; repeated statistical validation required |
+| Qwen debug | 1.936x | 1.423x | 15 async sites + persistent WH + eager-attention KV prefetch | structurally suitable, but the current >=1.8x claim depends on warm cache |
+| ViT debug | 1.677x | 1.624x | KV-aware prefetch | moderate and relatively stable |
+| GraphSAGE debug | 1.507x | 0.986x | no effective persistent hits | apparent gain is warm/device-state dominated |
+
+The mechanism counters explain the differences:
+
+- Falcon has five async/persistent candidates, eight KV-prefetch sites, about
+  28 KB of colored VTCM peak reduction, and an approximately 84% incremental
+  warm WH-cache hit rate.
+- Qwen has 15 async sites, four KV sites, about 36 KB of VTCM peak reduction,
+  and an approximately 89% incremental warm WH-cache hit rate.  It is a strong
+  cross-invocation-cache target, but its cold gain is currently only 1.42x.
+- TinyLlama has 18 KV sites and about 360 KB of KV-prefetch traffic.  Its warm
+  execution is slightly slower than cold, so its approximately 2x gain is not
+  a warm-cache artifact.
+- Swin has no ordinary async/persistent candidate in this run.  Its six
+  window-attention KV sites issue about 527 KB of page-coalesced prefetch, and
+  cold and warm times are effectively identical.
+- GPT-2 reduces colored VTCM peak by about 404 KB and issues about 384 KB of KV
+  prefetch.  Its persistent cache has almost no useful hits, so the gain comes
+  from data staging/layout mechanisms and from compensating for the poor FP32
+  HexKL path.
+- SD text encoder and GraphSAGE are too short or too warm-state-sensitive to
+  support a strong paper claim without repeated measurements.
+
+### Structural commonality of suitable models
+
+The promising models share a memory-system structure rather than one model
+name or application:
+
+1. static sequence/window shapes expose compile-time tile, page, and lookahead
+   decisions;
+2. attention creates repeated Q/K/V head split, transpose, reshape, and merge
+   operations that can be carried in situ instead of materialized;
+3. GQA/MQA or window attention creates strong K/V reuse;
+4. batch-one mobile inference is frequently memory-bound, so moving weights
+   and KV data early can overlap otherwise exposed stalls;
+5. matrix dimensions are 32-aligned or can be tiled into HexKL/HMX shapes;
+6. the exported graph exposes ordinary matmul/batch-matmul operations rather
+   than opaque fused custom operators;
+7. immutable projection and FFN weights are reused across tokens or
+   invocations, making a generation-safe persistent cache useful.
+
+This predicts good results for GQA decoder models, hierarchical/window vision
+transformers, and long-sequence speech transformers.  It predicts little
+benefit for convolution-only models, models whose eligible operations are too
+small, or graphs whose attention is hidden behind unsupported custom ops.
+
+The current reduced LLM results do not yet prove the GQA/MQA part of this
+hypothesis.  The Qwen Debug configuration uses one query and one KV head, and
+Falcon/TinyLlama Debug use two query and two KV heads.  Their measured graphs
+therefore have MHA-style head counts even though the published full
+architectures use GQA/MQA variants.  The present speedups demonstrate
+attention-KV movement and persistent-weight opportunities; explicit
+query-head sharing must be validated with the new full-ratio candidates.
+
+### Final target set: 15 models in three domains
+
+The final set should not consist only of decoder-only LLM variants.  The
+planned set has eight Language/LLM models, four Computer Vision models, and
+three Speech/Audio models.  The list preserves the current high-gain vehicles
+and adds architectures that exercise the same memory abstractions in different
+domains.
+
+#### Domain A: Language and LLM inference (8)
+
+| # | Model | Status | Structural reason |
+|---:|---|---|---|
+| 1 | Falcon-RW-1B Debug | existing | fused attention/QKV movement, persistent WH, async pipeline |
+| 2 | Qwen2.5-0.5B Debug | existing | RoPE/eager attention and many aligned projection/FFN sites |
+| 3 | TinyLlama-1.1B Debug | existing | Llama-style attention and large KV-prefetch opportunity |
+| 4 | GPT-2 Debug | existing; FP16 baseline must be repaired | classic MHA plus large layout/VTCM opportunity |
+| 5 | SD/CLIP text encoder Debug | existing; statistical qualification pending | encoder self-attention and short-sequence KV prefetch |
+| 6 | Qwen2.5-Coder-0.5B | new | 0.49B, 24 layers, 14 query heads / 2 KV heads; direct Qwen-family replication |
+| 7 | SmolLM2-135M | new | Llama decoder, 30 layers, width 576, 9 query / 3 KV heads |
+| 8 | MobileLLM-125M | new | on-device deep-thin decoder with GQA, SwiGLU, and shared embeddings |
+
+Primary model references:
+
+- <https://huggingface.co/Qwen/Qwen2.5-Coder-0.5B>
+- <https://huggingface.co/HuggingFaceTB/SmolLM2-135M>
+- <https://huggingface.co/facebook/MobileLLM-125M>
+
+Qwen2.5-Coder is useful as a replication, not independent architecture
+evidence.  SmolLM2 provides a natively supported Llama/GQA family.  MobileLLM
+is particularly relevant to the paper's phone-inference motivation, but its
+Hugging Face path uses custom model code, so export feasibility must be
+screened before device work.
+
+#### Domain B: Computer Vision (4)
+
+| # | Model | Status | Structural reason |
+|---:|---|---|---|
+| 9 | Swin-Tiny Debug | existing | hierarchical window attention; current clean 3.24x result |
+| 10 | SwinV2-Tiny | new | same window-attention family with changed attention/layout details |
+| 11 | SegFormer MiT-B0 | new | hierarchical spatial-reduction attention and heavy feature-layout transitions |
+| 12 | DeiT-Small | new | 22M-parameter global ViT attention at 224x224; architecture-diverse control |
+
+Primary model references:
+
+- <https://huggingface.co/microsoft/swinv2-tiny-patch4-window8-256>
+- <https://huggingface.co/nvidia/mit-b0>
+- <https://huggingface.co/facebook/deit-small-patch16-224>
+
+SwinV2 is the highest-confidence extension because the existing Swin gain is
+cold/warm invariant and attributable to window-attention KV prefetch.
+SegFormer tests whether the abstraction transfers to hierarchical
+spatial-reduction attention.  DeiT is a global-attention boundary case: it is
+less likely than Swin to exceed 1.8x, but is necessary to avoid selecting only
+models already known to match the mechanism.
+
+#### Domain C: Speech and Audio (3)
+
+| # | Model | Status | Structural reason |
+|---:|---|---|---|
+| 13 | Whisper-tiny | new | 39M encoder-decoder Transformer; self- and cross-attention |
+| 14 | Wav2Vec2-base-960h | new | 94.4M long-sequence speech encoder with repeated self-attention |
+| 15 | AST AudioSet | new | audio spectrogram converted to a ViT token sequence; direct cross-domain layout test |
+
+Primary model references:
+
+- <https://huggingface.co/openai/whisper-tiny>
+- <https://huggingface.co/facebook/wav2vec2-base-960h>
+- <https://huggingface.co/MIT/ast-finetuned-audioset-10-10-0.4593>
+
+Whisper covers encoder-decoder and cross-attention, Wav2Vec2 stresses
+long-sequence encoder memory traffic, and AST deliberately applies a ViT to
+spectrogram patches.  Together they test whether the OmniFetch abstraction
+generalizes across data modalities rather than merely across model names.
+The installed Transformers 4.52.4 exposes native Whisper, Wav2Vec2, AST,
+DeiT, SwinV2, and SegFormer classes.
+
+### Evaluation rules for the 15-model set
+
+Cross-domain runtimes must not be pooled into one average.  Comparisons are
+within each model and workload:
+
+- LLM/Text: batch 1, fixed prefill lengths 32 and 128, FP16 throughout, and a
+  consistent last-token-logit policy;
+- Vision: batch 1 at the checkpoint's native 224/256 resolution;
+- Speech/Audio: batch 1 with fixed-duration audio or fixed feature-frame
+  length, reported explicitly.
+
+Every backend must execute the same timing protocol:
+
+1. one cold execution after a fresh model/device context;
+2. the same number of warm-up executions for HVX, HexKL, and the combination;
+3. at least five measured executions, reporting median and p90;
+4. cold latency reported separately from steady-state latency;
+5. compiler mechanism counts, KV bytes, VTCM peak reduction, persistent
+   hit/miss counters, numerical correctness, and thermal/device state retained
+   with the result.
+
+A model is a qualified `>=1.8x` result only when:
+
+- `HexKL / (HexKL + items 1-7) >= 1.8` under a symmetric timing protocol;
+- correctness passes;
+- at least one intended mechanism has a nonzero runtime/compiler counter;
+- the result is not explained only by warm-up, DVFS, or an artificially poor
+  precision-conversion baseline.
+
+All 15 models, including failures and sub-threshold results, must remain in the
+reported matrix.  The scientific claim should be that the system was evaluated
+on 15 models from three domains and that the high-gain subset shares the
+predicted memory-access structure, not that unsuccessful models were removed
+until 15 winners remained.
+
+## First new-candidate implementation and device screening (2026-07-28)
+
+Three deterministic, random-weight FP16 Debug runners were added to screen one
+representative per domain before full-checkpoint experiments:
+
+- `run_smollm2-135m_debug.py`: two-layer Llama decoder, hidden 96, FFN 256,
+  preserving SmolLM2's 3:1 GQA ratio as 3 query heads / 1 KV head;
+- `run_swinv2-tiny_debug.py`: hierarchical shifted-window SwinV2 proxy;
+- `run_ast-audioset_debug.py`: two-layer AST over a 64x32 spectrogram, using
+  16x16 patches, stride 8, and the original 527-label output space.
+
+These are architecture/performance-screening proxies, not accuracy substitutes
+for pretrained checkpoints.  Config and weights are constructed locally in
+FP16, so the tests require neither network access nor a model cache.
+
+```bash
+ANDROID_SERIAL=49d1c7b2 scripts/run_debug_matrix.sh \
+  --runtime-root /tmp/omnifetch-2x-improvement \
+  --seq-len 32 --timeout 600 \
+  --output-dir /tmp/omnifetch-new-candidates-debug \
+  smollm2-135m swinv2-tiny ast-audioset
+```
+
+| Debug candidate | HVX (ms) | HexKL (ms) | HexKL + items 1-7 (ms) | HexKL/combo | Outcome |
+|---|---:|---:|---:|---:|---|
+| SmolLM2-135M proxy | 3145.272 | 204.110 | 120.371 | **1.6957x** | all three pass |
+| SwinV2-Tiny proxy, 64x64/4-stage | N/A | N/A | N/A | N/A | device launcher exit 13 |
+| AST AudioSet proxy | 235.001 | 236.875 | N/A | N/A | combo compile timeout at 600 s |
+
+SmolLM2 is positive but currently below the 1.8x target.  Its combination run
+has direct mechanism evidence: 33 prefetch sites, 37 in-situ operations, 11
+async and 5 persistent choices, 53,248 bytes of VTCM peak saved, four
+KV-prefetch sites, and four eagerly inferred KV sites.  Maximum absolute logit
+error was 0.0006, so this is not an enabled-but-dead option.
+
+The negative results are informative.  AST HexKL is 0.8% slower than HVX; its
+combination log has zero prefetch sites, zero async/persistent choices, zero
+VTCM saving, and layout elimination reports `no work`.  Four-stage SwinV2
+remains expensive to lower after reducing it to 32x32/embed 32: HVX compilation
+still exceeded 600 seconds.  This implicates window/control graph complexity
+rather than tensor volume alone.  The retry was terminated and its generated
+artifacts were not added to Git.
+
+Screening decision: advance SmolLM2 to a full-checkpoint symmetric repeated
+experiment; do not count AST without a new audio-specific movement policy such
+as spectrogram patch-stream DMA; and first bound/fix SwinV2 compile complexity
+before claiming a device performance result.
