@@ -45,6 +45,8 @@ all_models=(
   hubert-base
   wavlm-base-plus
   data2vec-audio-base
+  speecht5-asr
+  clap-htsat
 )
 models=()
 

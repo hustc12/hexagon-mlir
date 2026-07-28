@@ -9,13 +9,25 @@ from hexkl_utils import *
 class DetrDebugWrapper(torch.nn.Module):
     def __init__(self,m):super().__init__();self.m=m
     def forward(self,x):return self.m(pixel_values=x).logits
+class StaticDetrPosition(torch.nn.Module):
+    def __init__(self,pos):super().__init__();self.register_buffer("pos",pos)
+    def forward(self,pixel_values,pixel_mask):
+        del pixel_mask
+        return self.pos.to(pixel_values.dtype).expand(pixel_values.shape[0],-1,-1,-1)
 def run(a):
     patch_dsp_heap_256mb();torch.manual_seed(50)
     b=ResNetConfig(num_channels=3,embedding_size=16,hidden_sizes=[16,32,64,128],depths=[1,1,1,1],layer_type="basic")
     c=DetrConfig(backbone_config=b,use_pretrained_backbone=False,use_timm_backbone=False,d_model=64,
         encoder_layers=1,decoder_layers=1,encoder_attention_heads=2,decoder_attention_heads=2,
         encoder_ffn_dim=128,decoder_ffn_dim=128,num_queries=32,num_labels=91);c._attn_implementation="eager"
-    w=DetrDebugWrapper(DetrForObjectDetection(c).half().eval()).eval();ins=[torch.rand(1,3,64,64,dtype=torch.float16)]
+    model=DetrForObjectDetection(c).half().eval();ins=[torch.rand(1,3,64,64,dtype=torch.float16)]
+    mask=torch.ones(1,64,64,dtype=torch.long)
+    with torch.no_grad():
+        features=model.model.backbone.conv_encoder(ins[0],mask)
+        feature,feature_mask=features[-1]
+        pos=model.model.backbone.position_embedding(feature,feature_mask).detach()
+    model.model.backbone.position_embedding=StaticDetrPosition(pos)
+    w=DetrDebugWrapper(model).eval()
     m=compile_to_linalg(w,tuple(ins),decomp_pow=False);ir=str(m);p=None;print(f"[DebugCandidate] DETR proxy [IR] batch_matmul={ir.count('linalg.batch_matmul')}")
     if a.enable_hexkl:
         q,nb,nf=apply_hexkl_ir_rewrites(ir);p=q if nb or nf else None;print(f"[HexKL] rewrites={nb+nf}")

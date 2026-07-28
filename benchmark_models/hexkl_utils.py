@@ -256,12 +256,16 @@ def hexagon_options_phase4(
     options["enableOmniFetchPersistentWhCache"] = cumulative
     options["enableOmniFetchTwoDimPipeline"] = cumulative
     options["enableOmniFetchVtcmColoring"] = cumulative
+    # Item 7 covers page-aware prefetch of compiler-identified attention K/V
+    # streams.  For autoregressive decoders those streams may be persistent
+    # K/V cache pages; for encoders they are the current invocation's ordinary
+    # attention K/V tensors.  Both are valid early-data-movement opportunities.
     options["enableOmniFetchKvCachePrefetch"] = cumulative
     if cumulative:
         print(
             "[OmniFetchItems1To7] enabled: layout/cost/fusion + "
             "persistent-WH + two-dimensional-pipeline + "
-            "VTCM-coloring + KV-aware-prefetch"
+            "VTCM-coloring + attention-K/V-stream-prefetch"
         )
     return options
 

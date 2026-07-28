@@ -183,17 +183,29 @@ if (w8_cache_report) {{
         code_headers = self.common_strings.code_headers
         if self.options.get("enableOmniFetchPersistentWhCache", False):
             code_headers += """
-extern "C" void __omni_fetch_wh_cache_set_context(uint64_t, uint32_t);
-extern "C" void __omni_fetch_wh_cache_invalidate(uint64_t, uint32_t);
-extern "C" uint64_t __omni_fetch_wh_cache_stats(void);
-extern "C" uint64_t __omni_fetch_w8_cache_stats(void);
+// If the cost model selects no persistent site, no OmniFetch op pulls the
+// device runtime bitcode into the kernel object.  Keep reporting calls
+// loadable in that legitimate no-op case.  Strong runtime definitions replace
+// these weak fallbacks whenever a transformed site actually exists.
+extern "C" __attribute__((weak)) void
+__omni_fetch_wh_cache_set_context(uint64_t, uint32_t) {}
+extern "C" __attribute__((weak)) void
+__omni_fetch_wh_cache_invalidate(uint64_t, uint32_t) {}
+extern "C" __attribute__((weak)) uint64_t
+__omni_fetch_wh_cache_stats(void) { return 0; }
+extern "C" __attribute__((weak)) uint64_t
+__omni_fetch_w8_cache_stats(void) { return 0; }
 """
         if self.options.get("enableOmniFetchVDAE", False):
             code_headers += """
-extern "C" uint64_t __omni_fetch_l2_scheduler_counts(void);
-extern "C" uint64_t __omni_fetch_l2_scheduler_limits(void);
-extern "C" uint64_t __omni_fetch_l2_requested_bytes(void);
-extern "C" uint64_t __omni_fetch_l2_issued_bytes(void);
+extern "C" __attribute__((weak)) uint64_t
+__omni_fetch_l2_scheduler_counts(void) { return 0; }
+extern "C" __attribute__((weak)) uint64_t
+__omni_fetch_l2_scheduler_limits(void) { return 0; }
+extern "C" __attribute__((weak)) uint64_t
+__omni_fetch_l2_requested_bytes(void) { return 0; }
+extern "C" __attribute__((weak)) uint64_t
+__omni_fetch_l2_issued_bytes(void) { return 0; }
 """
 
         code_define = self.common_strings.code_define.format(

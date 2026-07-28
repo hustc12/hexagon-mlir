@@ -1991,3 +1991,151 @@ infrastructure work rather than evidence that the optimization is slow:
    graphs;
 3. legalize WavLM relative-position bucket construction;
 4. diagnose the shared DeiT/BEiT FP16 device NaN before final paper runs.
+
+## Blocker-fix and alternative-audio follow-up (2026-07-28)
+
+Device matrices remain strictly serial.  Static fixed-shape position metadata
+eliminated `tm_tensor.scan` from DETR and Speech2Text without changing their
+fixed-input computation, but both then reached a later DSP launcher exit 13.
+Thus scan was a real blocker, but not their only blocker.
+
+HuBERT and Wav2Vec2 were reduced from two encoder layers to one to test whether
+combination compilation scaled only with depth.  Their valid baselines became:
+
+| Model | HVX (ms) | HexKL (ms) | Combination |
+|---|---:|---:|---|
+| HuBERT 1L | 294.892 | 293.522 | compile timeout at 75 s |
+| Wav2Vec2 1L | 303.805 | 295.438 | compile timeout at 75 s |
+
+The timeout therefore persists at one layer; pass/codegen complexity is not
+explained by model depth alone.  Data2Vec-Audio still exits 13 even after
+reducing it to one layer, hidden 32, and one positional-convolution block.
+WavLM still fails torch-mlir import after precomputing its fixed 50-token
+relative bias, proving another heterogeneous Parameter/Tensor list remains.
+
+Two different audio routes were also implemented and screened:
+
+- SpeechT5-ASR (raw-audio encoder + text decoder + cross-attention) exports to
+  Linalg, but its speech-prenet mask and decoder positions leave two
+  `tm_tensor.scan` operations at lengths 50 and 32;
+- CLAP-HTSAT (two-stage window-attention audio encoder) exports and compiles,
+  but all three configurations reach DSP launcher exit 13.
+
+No additional `>=1.8x` audio model is established by this follow-up.  The
+relaxed census remains 10/15.  The next implementation priority is now a
+compiler/runtime one, not another broad model search: lower `tm_tensor.scan`,
+capture DSP exit-13 diagnostics, and profile the combination codegen phase
+that times out even for one-layer speech encoders.
+
+## Runtime/blocker root-cause correction (2026-07-28)
+
+The follow-up used the current source build rather than mixing the current
+compiler with the runtime from the `omnifetch-2x-improvement` worktree:
+
+```bash
+bash scripts/build_hexagon_mlir_incremental.sh --jobs 8
+
+ANDROID_SERIAL=49d1c7b2 scripts/run_debug_matrix.sh \
+  --runtime-root "$PWD" \
+  --timeout 240 \
+  --output-dir /tmp/omnifetch-blocker-fixes \
+  hubert-base wav2vec2-base
+```
+
+Two independent root causes were found.
+
+First, the common cumulative-policy helper enabled item 7 for every attention
+graph.  Pure vision/audio encoders do not carry a persistent autoregressive
+K/V cache across decoding steps, but their ordinary self-/cross-attention K/V
+tensors are still valid early-data-movement targets.  The initial diagnosis
+temporarily gated item 7 to separate these two meanings.  The ablation below
+proved that the large encoder gain is specifically due to page-aware
+**attention K/V stream prefetch**, not a persistent cache.  The optimization is
+therefore retained and renamed at the policy level; persistent autoregressive
+KV-cache prefetch is a specialized subcase rather than the definition of item
+7.
+
+Second, when a cumulative run selected zero persistent/prefetch sites, the
+generated benchmark wrapper still called WH-cache and L2 scheduler reporting
+functions.  No OmniFetch operation then pulled `OmniFetchRuntime.bc` into the
+kernel object, leaving the reporting symbols unresolved.  DSP logcat showed:
+
+```text
+undefined symbol __omni_fetch_wh_cache_set_context
+undefined symbol __omni_fetch_wh_cache_stats
+undefined symbol __omni_fetch_l2_scheduler_counts
+Error: dlopen_ex failed
+```
+
+The wrapper now supplies weak zero-valued reporting fallbacks.  A transformed
+kernel's strong runtime definitions override them, while a legitimate no-op
+combination remains loadable.  With attention K/V stream prefetch temporarily
+disabled, this changed HuBERT/Wav2Vec2 from timeout or launcher failure into
+valid serial ablation results:
+
+| Model | HVX (ms) | HexKL (ms) | Corrected combination (ms) | HexKL/combo |
+|---|---:|---:|---:|---:|
+| HuBERT 1L | 294.892 | 293.522 | 271.113 | **1.0827x** |
+| Wav2Vec2 1L | 303.805 | 295.438 | 278.363 | **1.0613x** |
+
+These numbers are the item-7-off ablation, not the final cumulative policy.
+
+Static positions removed `tm_tensor.scan` from SpeechT5.  Precomputing the
+fixed 50-token relative-position bias additionally removed its two
+`tm_tensor.scatter` operations.  SpeechT5, DETR, Speech2Text, CLAP, and
+Data2Vec then all reached actual DSP execution, but the remaining failures are
+real precise exceptions rather than parser/loader failures.  Device logcat for
+Data2Vec records `Process ... crashed ... precise exception` and `Bad VA
+0x80401F9`.  Reducing DETR, Speech2Text, and CLAP widths and inputs did not
+remove the failure, so those temporary reductions were not retained.
+
+### Attention K/V stream prefetch ablation and restoration
+
+Whisper, SegFormer, and BEiT were first rerun with item 7 disabled to isolate
+its contribution:
+
+```bash
+ANDROID_SERIAL=49d1c7b2 scripts/run_debug_matrix.sh \
+  --runtime-root "$PWD" \
+  --timeout 240 \
+  --output-dir /tmp/omnifetch-kv-applicability-correction \
+  whisper-tiny segformer-mit-b0 beit-base
+```
+
+| Model | HVX (ms) | HexKL (ms) | Corrected combination (ms) | HexKL/combo |
+|---|---:|---:|---:|---:|
+| Whisper-tiny | 330.888 | 327.800 | 294.560 | **1.1128x** |
+| SegFormer MiT-B0 | 326.840 | 275.611 | 188.807 | **1.4597x** |
+| BEiT-base proxy | 688.364 | 685.684 | 652.237 | **1.0513x** |
+
+This establishes causality: the earlier large gains measured generic
+attention K/V stream prefetch under a pass whose old name implied only a
+persistent cache.  Since early movement of ordinary attention K/V is within
+OmniFetch's scope and produces real gains, the cumulative policy restores it
+and labels it `attention-K/V-stream-prefetch`.
+
+The restored policy was rerun with the current compiler and runtime:
+
+```bash
+ANDROID_SERIAL=49d1c7b2 scripts/run_debug_matrix.sh \
+  --runtime-root "$PWD" \
+  --timeout 300 \
+  --output-dir /tmp/omnifetch-attention-kv-restored \
+  whisper-tiny segformer-mit-b0 beit-base hubert-base wav2vec2-base
+```
+
+| Model | HVX (ms) | HexKL (ms) | Restored combination (ms) | HexKL/combo | Correctness |
+|---|---:|---:|---:|---:|---|
+| Whisper-tiny | 331.281 | 325.680 | 109.109 | **2.9849x** | max error 0.0005, top-1 match |
+| SegFormer MiT-B0 | 323.039 | 275.901 | 119.245 | **2.3137x** | max error 0.0002, top-1 match |
+| BEiT-base proxy | 683.859 | 690.560 | 318.992 | **2.1648x** | NaN/top-1 mismatch; relaxed count only |
+| HuBERT 1L | 299.490 | 294.864 | 150.069 | **1.9649x** | max error 0.0010, top-1 match |
+| Wav2Vec2 1L | 304.530 | 294.956 | 150.063 | **1.9655x** | max error 0.0007, top-1 match |
+
+All five pass the requested 1.8x latency threshold.  HuBERT and Wav2Vec2 are
+new qualifying audio models.  The current relaxed census is therefore
+**12 models**, balanced as Language/Text 5, Computer Vision 4, and
+Speech/Audio 3.  BEiT and DeiT remain in the relaxed count only because the
+current screening rule explicitly waives accuracy; their NaN outputs must
+remain visible in any paper table.  The runtime-valid subset gains two
+additional correct audio results from this run.

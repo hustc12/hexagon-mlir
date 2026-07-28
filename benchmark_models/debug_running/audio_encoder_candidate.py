@@ -1,6 +1,6 @@
 """Shared offline speech-encoder Debug harness."""
 from __future__ import annotations
-import argparse, sys
+import argparse, sys, types
 from pathlib import Path
 import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -18,6 +18,14 @@ def run_candidate(args, name, config, model_cls, root_name, seed):
     conv=getattr(pos,"conv",None)
     if conv is not None and hasattr(conv,"parametrizations") and "weight" in conv.parametrizations:
         torch.nn.utils.parametrize.remove_parametrizations(conv,"weight",leave_parametrized=True)
+    if root_name == "wavlm":
+        for layer in root.encoder.layers:
+            attention=layer.attention
+            bias=attention.compute_bias(50,50).detach().to(torch.float16)
+            def constant_bias(self,query_length,key_length,_bias=bias):
+                del self,query_length,key_length
+                return _bias
+            attention.compute_bias=types.MethodType(constant_bias,attention)
     wrapped=AudioEncoderWrapper(model).eval(); inputs=[torch.rand(1,512,dtype=torch.float16)*2-1]
     print(f"[DebugCandidate] {name}: samples=512 layers={config.num_hidden_layers} hidden={config.hidden_size}")
     module=compile_to_linalg(wrapped,tuple(inputs),decomp_pow=False); ir=str(module)
