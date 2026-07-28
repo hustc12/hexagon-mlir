@@ -80,6 +80,7 @@ def mamba_130m(
     enable_omnifetch_layout_aware: bool = True,
     omnifetch_lookahead: int = 2,
     enable_omnifetch_adaptive: bool = True,
+    enable_omnifetch_items_1_7: bool = False,
     seq_len: Optional[int] = None,
 ):
     patch_dsp_heap_256mb()
@@ -151,6 +152,7 @@ def mamba_130m(
         enable_omnifetch_layout_aware,
         omnifetch_lookahead,
         enable_omnifetch_adaptive,
+        enable_omnifetch_items_1_7,
     )
     hex_outputs = hex_execution(
         module, func_name, [input_ids], options, mlir_text=mlir_text

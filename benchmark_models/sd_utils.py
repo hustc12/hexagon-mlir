@@ -128,6 +128,7 @@ def default_options(
     enable_omnifetch_layout_aware: bool = True,
     omnifetch_lookahead: int = 2,
     enable_omnifetch_adaptive: bool = True,
+    enable_omnifetch_items_1_7: bool = False,
 ) -> dict:
     """Phase-4 options. HexKL off by default for fair HVX baseline."""
     opts = HexagonOptions().__dict__
@@ -136,11 +137,22 @@ def default_options(
     opts["enableVectorization"] = False
     opts["enableHexKL"] = bool(enable_hexkl)
     opts["enableConvertToHexagonmem"] = bool(enable_hexkl)
-    opts["enablePrefetch"] = bool(enable_omnifetch_vdae)
+    cumulative = bool(enable_omnifetch_items_1_7)
+    opts["enablePrefetch"] = bool(enable_omnifetch_vdae or cumulative)
     opts["enableOmniFetchLayoutAware"] = bool(enable_omnifetch_layout_aware)
     opts["omniFetchLookahead"] = int(omnifetch_lookahead)
-    opts["enableOmniFetchVDAE"] = bool(enable_omnifetch_vdae)
+    opts["enableOmniFetchVDAE"] = bool(enable_omnifetch_vdae or cumulative)
     opts["enableOmniFetchAdaptive"] = bool(enable_omnifetch_adaptive)
+    opts["enableOmniFetchPersistentWhCache"] = cumulative
+    opts["enableOmniFetchTwoDimPipeline"] = cumulative
+    opts["enableOmniFetchVtcmColoring"] = cumulative
+    opts["enableOmniFetchKvCachePrefetch"] = cumulative
+    if cumulative:
+        print(
+            "[OmniFetchItems1To7] enabled: layout/cost/fusion + "
+            "persistent-WH + two-dimensional-pipeline + "
+            "VTCM-coloring + KV-aware-prefetch"
+        )
     if enablelwp:
         opts["enableLWP"] = True
     return opts
@@ -153,6 +165,11 @@ def add_phase4_cli(parser):
     parser.add_argument("--disable-layout-aware", action="store_true")
     parser.add_argument("--omnifetch-lookahead", type=int, default=2)
     parser.add_argument("--disable-omnifetch-adaptive", action="store_true")
+    parser.add_argument(
+        "--enable-omnifetch-items-1-7",
+        action="store_true",
+        help="Enable the cumulative innovation items 1 through 7.",
+    )
     return parser
 
 
@@ -164,6 +181,9 @@ def options_from_args(args, enablelwp: bool = None):
         enable_omnifetch_layout_aware=not getattr(args, "disable_layout_aware", False),
         omnifetch_lookahead=getattr(args, "omnifetch_lookahead", 2),
         enable_omnifetch_adaptive=not getattr(args, "disable_omnifetch_adaptive", False),
+        enable_omnifetch_items_1_7=getattr(
+            args, "enable_omnifetch_items_1_7", False
+        ),
     )
 
 

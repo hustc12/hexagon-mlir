@@ -36,6 +36,7 @@ def main():
     parser.add_argument("--disable-layout-aware", action="store_true")
     parser.add_argument("--omnifetch-lookahead", type=int, default=2)
     parser.add_argument("--disable-omnifetch-adaptive", action="store_true")
+    parser.add_argument("--enable-omnifetch-items-1-7", action="store_true")
     parser.add_argument("--enable-omnifetch-dma-to-vtcm", action="store_true")
     parser.add_argument("--enable-omnifetch-weight-prepack", action="store_true")
     parser.add_argument("--enable-omnifetch-dual-thread-dae", action="store_true")
@@ -53,6 +54,7 @@ def main():
         enable_omnifetch_layout_aware=not args.disable_layout_aware,
         omnifetch_lookahead=args.omnifetch_lookahead,
         enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
+        enable_omnifetch_items_1_7=args.enable_omnifetch_items_1_7,
         enable_omnifetch_dma_to_vtcm=args.enable_omnifetch_dma_to_vtcm,
         enable_omnifetch_weight_prepack=args.enable_omnifetch_weight_prepack,
         enable_omnifetch_dual_thread_dae=args.enable_omnifetch_dual_thread_dae,

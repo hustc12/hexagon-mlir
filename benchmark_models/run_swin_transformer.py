@@ -86,6 +86,7 @@ def swin_transformer(
     enable_omnifetch_layout_aware: bool = True,
     omnifetch_lookahead: int = 2,
     enable_omnifetch_adaptive: bool = True,
+    enable_omnifetch_items_1_7: bool = False,
     seq_len: Optional[int] = None,
 ):
     patch_dsp_heap_256mb()
@@ -132,6 +133,7 @@ def swin_transformer(
         enable_omnifetch_layout_aware,
         omnifetch_lookahead,
         enable_omnifetch_adaptive,
+        enable_omnifetch_items_1_7,
         lower_constants_separate=LOWER_CONSTANTS_SEPARATE,
     )
     inputs = rel_pos_indices + [pixel_values]
@@ -163,5 +165,6 @@ if __name__ == "__main__":
         enable_omnifetch_layout_aware=not args.disable_layout_aware,
         omnifetch_lookahead=args.omnifetch_lookahead,
         enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
+        enable_omnifetch_items_1_7=args.enable_omnifetch_items_1_7,
         seq_len=args.seq_len,
     )

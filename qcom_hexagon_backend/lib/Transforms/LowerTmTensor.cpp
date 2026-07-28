@@ -260,12 +260,68 @@ struct LowerAttentionOp : public OpRewritePattern<AttentionOp> {
   }
 };
 
+/// Preserve item-7 applicability for models exported with eager attention.
+///
+/// Those graphs no longer contain tm_tensor.attention, but their two rank-3
+/// contractions still have distinctive static shapes:
+///   QK^T: [B, S, H] x [B, H, S] -> [B, S, S]
+///   AV:   [B, S, S] x [B, S, H] -> [B, S, H]
+///
+/// Require S != H so a square, non-attention batch matmul is never guessed.
+/// The explicit metadata emitted by LowerAttentionOp always takes precedence.
+static int64_t annotateEagerAttentionKvStreams(FunctionOpInterface func) {
+  int64_t inferred = 0;
+  func.walk([&](linalg::BatchMatmulOp op) {
+    if (op->hasAttr("omni_fetch.kv_cache_role") ||
+        op->getNumOperands() < 3)
+      return;
+
+    auto lhs = dyn_cast<ShapedType>(op->getOperand(0).getType());
+    auto rhs = dyn_cast<ShapedType>(op->getOperand(1).getType());
+    auto out = dyn_cast<ShapedType>(op->getOperand(2).getType());
+    if (!lhs || !rhs || !out || !lhs.hasStaticShape() ||
+        !rhs.hasStaticShape() || !out.hasStaticShape() ||
+        lhs.getRank() != 3 || rhs.getRank() != 3 || out.getRank() != 3)
+      return;
+
+    ArrayRef<int64_t> a = lhs.getShape();
+    ArrayRef<int64_t> b = rhs.getShape();
+    ArrayRef<int64_t> c = out.getShape();
+    if (a[0] != b[0] || a[0] != c[0] || a[1] != c[1] ||
+        a[2] != b[1] || b[2] != c[2])
+      return;
+
+    StringRef role;
+    if (c[1] == c[2] && a[1] != a[2])
+      role = "key";
+    else if (a[1] == a[2] && c[1] != c[2])
+      role = "value";
+    else
+      return;
+
+    Builder bld(op.getContext());
+    op->setAttr("omni_fetch.kv_cache_role", bld.getStringAttr(role));
+    op->setAttr("omni_fetch.kv_cache_operand", bld.getI64IntegerAttr(1));
+    ++inferred;
+  });
+  return inferred;
+}
+
 void HexagonLowerTmTensorPass::runOnOperation() {
   RewritePatternSet patterns(&getContext());
   patterns.add<LowerAttentionOp>(patterns.getContext(), emitKvCacheMetadata);
 
-  if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))
+  if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
     signalPassFailure();
+    return;
+  }
+
+  if (emitKvCacheMetadata) {
+    int64_t inferred = annotateEagerAttentionKvStreams(getOperation());
+    llvm::errs() << "[KVCacheMetadata] function="
+                 << getOperation()->getName() << " eager_inferred="
+                 << inferred << "\n";
+  }
 }
 
 } // namespace

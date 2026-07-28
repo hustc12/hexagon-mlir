@@ -67,6 +67,7 @@ def main():
         enable_omnifetch_layout_aware=not args.disable_layout_aware,
         omnifetch_lookahead=args.omnifetch_lookahead,
         enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
+        enable_omnifetch_items_1_7=args.enable_omnifetch_items_1_7,
         seq_len=args.seq_len,
         image_size=args.image_size,
     )

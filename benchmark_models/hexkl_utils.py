@@ -236,6 +236,7 @@ def hexagon_options_phase4(
     enable_omnifetch_layout_aware: bool = True,
     omnifetch_lookahead: int = 2,
     enable_omnifetch_adaptive: bool = True,
+    enable_omnifetch_items_1_7: bool = False,
     lower_constants_separate: bool = True,
 ):
     from triton.backends.qcom_hexagon_backend.compiler import HexagonOptions
@@ -246,11 +247,22 @@ def hexagon_options_phase4(
     options["enableVectorization"] = False
     options["enableHexKL"] = bool(enable_hexkl)
     options["enableConvertToHexagonmem"] = bool(enable_hexkl)
-    options["enablePrefetch"] = bool(enable_omnifetch_vdae)
+    cumulative = bool(enable_omnifetch_items_1_7)
+    options["enablePrefetch"] = bool(enable_omnifetch_vdae or cumulative)
     options["enableOmniFetchLayoutAware"] = bool(enable_omnifetch_layout_aware)
     options["omniFetchLookahead"] = int(omnifetch_lookahead)
-    options["enableOmniFetchVDAE"] = bool(enable_omnifetch_vdae)
+    options["enableOmniFetchVDAE"] = bool(enable_omnifetch_vdae or cumulative)
     options["enableOmniFetchAdaptive"] = bool(enable_omnifetch_adaptive)
+    options["enableOmniFetchPersistentWhCache"] = cumulative
+    options["enableOmniFetchTwoDimPipeline"] = cumulative
+    options["enableOmniFetchVtcmColoring"] = cumulative
+    options["enableOmniFetchKvCachePrefetch"] = cumulative
+    if cumulative:
+        print(
+            "[OmniFetchItems1To7] enabled: layout/cost/fusion + "
+            "persistent-WH + two-dimensional-pipeline + "
+            "VTCM-coloring + KV-aware-prefetch"
+        )
     return options
 
 
@@ -260,6 +272,11 @@ def add_phase4_args(parser):
     parser.add_argument("--disable-layout-aware", action="store_true")
     parser.add_argument("--omnifetch-lookahead", type=int, default=2)
     parser.add_argument("--disable-omnifetch-adaptive", action="store_true")
+    parser.add_argument(
+        "--enable-omnifetch-items-1-7",
+        action="store_true",
+        help="Enable the cumulative innovation items 1 through 7.",
+    )
     parser.add_argument("--seq-len", type=int, default=None)
     return parser
 
@@ -271,5 +288,6 @@ def phase4_kwargs_from_args(args):
         enable_omnifetch_layout_aware=not args.disable_layout_aware,
         omnifetch_lookahead=args.omnifetch_lookahead,
         enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
+        enable_omnifetch_items_1_7=args.enable_omnifetch_items_1_7,
         seq_len=getattr(args, "seq_len", None),
     )

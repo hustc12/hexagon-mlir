@@ -60,6 +60,7 @@ def test_unet(
     enable_omnifetch_layout_aware: bool = True,
     omnifetch_lookahead: int = 2,
     enable_omnifetch_adaptive: bool = True,
+    enable_omnifetch_items_1_7: bool = False,
 ):
     print("\n=== Stable Diffusion — UNet ===")
     config = UNet2DConditionModel.load_config(SD_MODEL_ID, subfolder="unet")
@@ -92,6 +93,7 @@ def test_unet(
     args.disable_layout_aware = not enable_omnifetch_layout_aware
     args.omnifetch_lookahead = omnifetch_lookahead
     args.disable_omnifetch_adaptive = not enable_omnifetch_adaptive
+    args.enable_omnifetch_items_1_7 = enable_omnifetch_items_1_7
     options = options_from_args(args)
 
     print("Running UNet on Hexagon NPU …")
@@ -115,4 +117,5 @@ if __name__ == "__main__":
         enable_omnifetch_layout_aware=not args.disable_layout_aware,
         omnifetch_lookahead=args.omnifetch_lookahead,
         enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
+        enable_omnifetch_items_1_7=args.enable_omnifetch_items_1_7,
     )

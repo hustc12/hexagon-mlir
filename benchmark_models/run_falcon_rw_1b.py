@@ -586,6 +586,7 @@ def falcon_rw_1b(
     enable_omnifetch_layout_aware: bool = True,
     omnifetch_lookahead: int = 2,
     enable_omnifetch_adaptive: bool = True,
+    enable_omnifetch_items_1_7: bool = False,
     enable_omnifetch_weight_prepack: bool = False,
     enable_omnifetch_persistent_wh_cache: bool = False,
     enable_omnifetch_two_dim_pipeline: bool = False,
@@ -666,25 +667,26 @@ def falcon_rw_1b(
     options["enableVectorization"] = False
     options["enableHexKL"] = bool(enable_hexkl)
     options["enableConvertToHexagonmem"] = bool(enable_hexkl)
-    options["enablePrefetch"] = bool(enable_omnifetch_vdae)
+    cumulative = bool(enable_omnifetch_items_1_7)
+    options["enablePrefetch"] = bool(enable_omnifetch_vdae or cumulative)
     options["enableOmniFetchLayoutAware"] = bool(enable_omnifetch_layout_aware)
     options["omniFetchLookahead"] = int(omnifetch_lookahead)
-    options["enableOmniFetchVDAE"] = bool(enable_omnifetch_vdae)
+    options["enableOmniFetchVDAE"] = bool(enable_omnifetch_vdae or cumulative)
     options["enableOmniFetchAdaptive"] = bool(enable_omnifetch_adaptive)
     options["enableOmniFetchWeightPrepack"] = bool(
         enable_omnifetch_weight_prepack
     )
     options["enableOmniFetchPersistentWhCache"] = bool(
-        enable_omnifetch_persistent_wh_cache
+        enable_omnifetch_persistent_wh_cache or cumulative
     )
     options["enableOmniFetchTwoDimPipeline"] = bool(
-        enable_omnifetch_two_dim_pipeline
+        enable_omnifetch_two_dim_pipeline or cumulative
     )
     options["enableOmniFetchVtcmColoring"] = bool(
-        enable_omnifetch_vtcm_coloring
+        enable_omnifetch_vtcm_coloring or cumulative
     )
     options["enableOmniFetchKvCachePrefetch"] = bool(
-        enable_omnifetch_kv_cache_prefetch
+        enable_omnifetch_kv_cache_prefetch or cumulative
     )
     options["enableOmniFetchDequantReshape"] = bool(
         enable_omnifetch_dequant_reshape
@@ -731,6 +733,7 @@ if __name__ == "__main__":
     parser.add_argument("--disable-layout-aware", action="store_true")
     parser.add_argument("--omnifetch-lookahead", type=int, default=2)
     parser.add_argument("--disable-omnifetch-adaptive", action="store_true")
+    parser.add_argument("--enable-omnifetch-items-1-7", action="store_true")
     parser.add_argument(
         "--enable-omnifetch-weight-prepack",
         action="store_true",
@@ -769,6 +772,7 @@ if __name__ == "__main__":
         enable_omnifetch_layout_aware=not args.disable_layout_aware,
         omnifetch_lookahead=args.omnifetch_lookahead,
         enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
+        enable_omnifetch_items_1_7=args.enable_omnifetch_items_1_7,
         enable_omnifetch_weight_prepack=args.enable_omnifetch_weight_prepack,
         enable_omnifetch_persistent_wh_cache=(
             args.enable_omnifetch_persistent_wh_cache

@@ -387,6 +387,7 @@ def gpt2lmheadmodel(
     enable_omnifetch_layout_aware: bool = True,
     omnifetch_lookahead: int = 2,
     enable_omnifetch_adaptive: bool = True,
+    enable_omnifetch_items_1_7: bool = False,
     enable_omnifetch_dma_to_vtcm: bool = False,
     enable_omnifetch_weight_prepack: bool = False,
     enable_omnifetch_dual_thread_dae: bool = False,
@@ -471,6 +472,7 @@ def gpt2lmheadmodel(
     module = compile_to_linalg(wrapped, encoding["input_ids"])
 
     mlir_text = None
+    cumulative = bool(enable_omnifetch_items_1_7)
     if enable_hexkl:
         raw = module.operation.get_asm(binary=False)
         mlir_text, n = rewrite_matmul_inputs_to_f16(raw)
@@ -482,11 +484,15 @@ def gpt2lmheadmodel(
             enableVectorization=False,
             enableVTCMTiling=enable_vtcm_tiling,
             enableConvertToHexagonmem=True,
-            enablePrefetch=enable_omnifetch_vdae,
+            enablePrefetch=enable_omnifetch_vdae or cumulative,
             enableOmniFetchLayoutAware=enable_omnifetch_layout_aware,
             omniFetchLookahead=omnifetch_lookahead,
-            enableOmniFetchVDAE=enable_omnifetch_vdae,
+            enableOmniFetchVDAE=enable_omnifetch_vdae or cumulative,
             enableOmniFetchAdaptive=enable_omnifetch_adaptive,
+            enableOmniFetchPersistentWhCache=cumulative,
+            enableOmniFetchTwoDimPipeline=cumulative,
+            enableOmniFetchVtcmColoring=cumulative,
+            enableOmniFetchKvCachePrefetch=cumulative,
             enableOmniFetchDmaToVtcm=enable_omnifetch_dma_to_vtcm,
             enableOmniFetchWeightPrepack=enable_omnifetch_weight_prepack,
             enableOmniFetchDualThreadDae=enable_omnifetch_dual_thread_dae,
@@ -499,11 +505,15 @@ def gpt2lmheadmodel(
         options["enableHexKL"] = False
         options["enableVTCMTiling"] = enable_vtcm_tiling
         options["enableConvertToHexagonmem"] = enable_convert_to_hexagonmem
-        options["enablePrefetch"] = enable_omnifetch_vdae
+        options["enablePrefetch"] = enable_omnifetch_vdae or cumulative
         options["enableOmniFetchLayoutAware"] = enable_omnifetch_layout_aware
         options["omniFetchLookahead"] = omnifetch_lookahead
-        options["enableOmniFetchVDAE"] = enable_omnifetch_vdae
+        options["enableOmniFetchVDAE"] = enable_omnifetch_vdae or cumulative
         options["enableOmniFetchAdaptive"] = enable_omnifetch_adaptive
+        options["enableOmniFetchPersistentWhCache"] = cumulative
+        options["enableOmniFetchTwoDimPipeline"] = cumulative
+        options["enableOmniFetchVtcmColoring"] = cumulative
+        options["enableOmniFetchKvCachePrefetch"] = cumulative
         options["enableOmniFetchDmaToVtcm"] = enable_omnifetch_dma_to_vtcm
         options["enableOmniFetchWeightPrepack"] = enable_omnifetch_weight_prepack
         options["enableOmniFetchDualThreadDae"] = enable_omnifetch_dual_thread_dae
@@ -556,6 +566,11 @@ if __name__ == "__main__":
     parser.add_argument("--disable-omnifetch-adaptive", action="store_true",
                         help="Disable PMU-driven adaptive prefetch distance.")
     parser.add_argument(
+        "--enable-omnifetch-items-1-7",
+        action="store_true",
+        help="Enable the cumulative innovation items 1 through 7.",
+    )
+    parser.add_argument(
         "--enable-omnifetch-dma-to-vtcm",
         action="store_true",
         help="DMA-pack OmniFetch weight tiles into VTCM staging "
@@ -607,6 +622,7 @@ if __name__ == "__main__":
         enable_omnifetch_layout_aware=not args.disable_layout_aware,
         omnifetch_lookahead=args.omnifetch_lookahead,
         enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
+        enable_omnifetch_items_1_7=args.enable_omnifetch_items_1_7,
         enable_omnifetch_dma_to_vtcm=args.enable_omnifetch_dma_to_vtcm,
         enable_omnifetch_weight_prepack=args.enable_omnifetch_weight_prepack,
         enable_omnifetch_dual_thread_dae=args.enable_omnifetch_dual_thread_dae,

@@ -1413,3 +1413,89 @@ GPT-2 debug at sequence lengths 128 and 32 did not return from the device call
 within the manual observation window and was interrupted. These runs are
 failures, not performance data. The explicit timeout in
 `scripts/run_omnifetch_model_ablation.sh` prevents future unbounded waits.
+
+## Cross-model integration of cumulative items 1–7
+
+### Why runner flags alone were insufficient
+
+The original cumulative experiment was fully wired only in the Falcon runner.
+Other runners enabled generic VDAE/layout-aware prefetch, but did not enable
+items 4–7 together.  More importantly, item 7 originally relied on semantic
+metadata emitted while lowering `tm_tensor.attention`.  Models exported with
+eager attention contain ordinary `linalg.batch_matmul` operations, so their
+K/V streams remained invisible even when the item-7 option was true.
+
+The cross-model integration adds one common runner option:
+
+```text
+--enable-omnifetch-items-1-7
+```
+
+It enables the same cumulative configuration in every non-quantized debug
+runner:
+
+1. layout-value analysis and reshape memoization;
+2. transform-aware profitability;
+3. layout-carrying fusion;
+4. persistent WH cache;
+5. two-dimensional load/reshape/compute pipeline;
+6. VTCM lifetime coloring;
+7. K/V-aware page-coalesced prefetch.
+
+Item 7 now also has a conservative compiler-side eager-attention recognizer.
+It identifies only static rank-3 contractions with the unambiguous shapes
+`[B,S,H] x [B,H,S] -> [B,S,S]` (K) and
+`[B,S,S] x [B,S,H] -> [B,S,H]` (V), and requires `S != H`.  Explicit metadata
+from `tm_tensor.attention` takes precedence.  Ambiguous square batch matmuls
+are not annotated.
+
+### Debug-model result on `omnifetch-2x-improvement`
+
+The following measurements were made on 2026-07-28 on the connected v75
+device.  The HVX and HexKL columns are the earlier measurements from the same
+tag and identical debug model configurations.  The cumulative column was
+rebuilt and rerun after the cross-model integration.
+
+| Model | HVX (ms) | HexKL (ms) | HexKL + items 1–7 (ms) | vs HexKL | Actual cumulative hits |
+|---|---:|---:|---:|---:|---|
+| Falcon debug, seq=128 | 11238.419 | 1619.671 | 590.880 | 2.741x | KV=8, VTCM=5, async=5, persistent=5 |
+| SD text encoder | 1.450 | 1.478 | 0.293 | 5.044x | KV=2 |
+| SD VAE decoder | 8615.044 | 502.577 | 385.453 | 1.304x | VTCM=12, async=7, persistent=12 |
+| Swin debug | 67575.498 | 66860.712 | 20642.078 | 3.239x | KV=6 |
+| TinyLlama debug, seq=128 | 8879.842 | 2533.438 | 1299.005 | 1.950x | KV=18, VTCM=1, async=1, persistent=1 |
+| ViT debug | 1201.766 | 1204.605 | 718.449 | 1.677x | KV=4 |
+
+Qwen debug also completed once in a clean device state at 600.726 ms with
+KV=10, VTCM=9, async=9, persistent=9 and a maximum logit difference of
+0.0007.  Its earlier HexKL baseline returned device status 13, so no valid
+HexKL speedup is reported.  A later matrix rerun after the GPT-2 device hang
+also returned status 13 and is treated as contaminated rather than replacing
+the successful clean run.
+
+GPT-2 hit KV=4, VTCM=8, async=8 and persistent=8 at compile time, but its
+device execution hung, matching the existing HexKL baseline problem.
+GraphSAGE and Mamba likewise hit applicable compiler mechanisms but retained
+their existing HexKL device status-13 failure.  Real-ESRGAN is a convolutional
+graph with zero HexKL/attention sites, so items 4–7 are not applicable.
+SD UNet also had zero cumulative sites in this debug configuration.
+
+### Correctness caveats
+
+- Falcon and TinyLlama matched top-1 and had maximum logit differences of
+  0.0231 and 0.0005 respectively.
+- SD text encoder matched the CPU reference exactly within the configured
+  tolerance.
+- Swin and ViT matched the reference top-1 class.
+- The SD VAE device run passed, but its debug harness reported a maximum
+  elementwise difference of 1.2686 and then continued because debug comparison
+  is non-fatal.  Its timing is useful for performance exploration but must not
+  be promoted to a correctness-qualified result until the numerical mismatch
+  is resolved.
+- Device status-13 failures and timeouts are not performance measurements.
+
+The reproducible cumulative runner is
+`scripts/run_debug_matrix_full_1_7.sh`. It records performance and
+per-mechanism hit counts in
+`benchmark_models/results/debug_matrix_full_1_7/results.csv`; the build tree,
+MLIR bytecode, generated shared objects, raw tensors, and result logs are
+generated artifacts and must not be committed.

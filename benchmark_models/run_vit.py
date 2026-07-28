@@ -75,6 +75,7 @@ def vit(
     enable_omnifetch_layout_aware: bool = True,
     omnifetch_lookahead: int = 2,
     enable_omnifetch_adaptive: bool = True,
+    enable_omnifetch_items_1_7: bool = False,
     seq_len: Optional[int] = None,  # unused; kept for CLI parity
     image_size: Optional[int] = None,
 ):
@@ -126,6 +127,7 @@ def vit(
         enable_omnifetch_layout_aware,
         omnifetch_lookahead,
         enable_omnifetch_adaptive,
+        enable_omnifetch_items_1_7,
     )
     hex_outputs = hex_execution(
         module, func_name, [pixel_values], options, mlir_text=mlir_text
@@ -156,6 +158,7 @@ if __name__ == "__main__":
         enable_omnifetch_layout_aware=not args.disable_layout_aware,
         omnifetch_lookahead=args.omnifetch_lookahead,
         enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
+        enable_omnifetch_items_1_7=args.enable_omnifetch_items_1_7,
         seq_len=args.seq_len,
         image_size=args.image_size,
     )

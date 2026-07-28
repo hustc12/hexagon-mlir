@@ -58,6 +58,7 @@ def real_esrgan(
     enable_omnifetch_layout_aware: bool = True,
     omnifetch_lookahead: int = 2,
     enable_omnifetch_adaptive: bool = True,
+    enable_omnifetch_items_1_7: bool = False,
     seq_len: Optional[int] = None,
     input_size: Optional[int] = None,
 ):
@@ -95,6 +96,7 @@ def real_esrgan(
         enable_omnifetch_layout_aware,
         omnifetch_lookahead,
         enable_omnifetch_adaptive,
+        enable_omnifetch_items_1_7,
         lower_constants_separate=True,
     )
     hex_outputs = hex_execution(
@@ -120,6 +122,7 @@ if __name__ == "__main__":
         enable_omnifetch_layout_aware=not args.disable_layout_aware,
         omnifetch_lookahead=args.omnifetch_lookahead,
         enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
+        enable_omnifetch_items_1_7=args.enable_omnifetch_items_1_7,
         seq_len=args.seq_len,
         input_size=args.input_size,
     )
