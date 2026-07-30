@@ -11,6 +11,7 @@ usage() {
   echo "          [--device-iterations N] [--timeout SEC] [--serial SERIAL]"
   echo "          [--output-dir DIR]"
   echo "          [--m1-only]"
+  echo "          [--cumulative-only|--hvx-item7-only] [--enable-hvx-vector]"
   echo "          [--include-experimental]"
 }
 
@@ -22,6 +23,9 @@ DEVICE_SERIAL="${ANDROID_SERIAL:-49d1c7b2}"
 OUTPUT_DIR=""
 INCLUDE_EXPERIMENTAL=0
 M1_ONLY=0
+CUMULATIVE_ONLY=0
+ENABLE_HVX_VECTOR=0
+HVX_ITEM7_ONLY=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -32,11 +36,19 @@ while [[ $# -gt 0 ]]; do
     --serial) DEVICE_SERIAL="$2"; shift 2 ;;
     --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
     --m1-only) M1_ONLY=1; shift ;;
+    --cumulative-only) CUMULATIVE_ONLY=1; shift ;;
+    --hvx-item7-only) HVX_ITEM7_ONLY=1; shift ;;
+    --enable-hvx-vector) ENABLE_HVX_VECTOR=1; shift ;;
     --include-experimental) INCLUDE_EXPERIMENTAL=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage; exit 2 ;;
   esac
 done
+
+if [[ "${CUMULATIVE_ONLY}" -eq 1 && "${HVX_ITEM7_ONLY}" -eq 1 ]]; then
+  echo "--cumulative-only and --hvx-item7-only are mutually exclusive" >&2
+  exit 2
+fi
 
 case "${MODEL}" in
   falcon-full)
@@ -100,16 +112,40 @@ run_case() {
   fi
 }
 
-# Mandatory primary rows. Keep this order stable in logs and reports.
-run_case hvx
-run_case hexkl --enable-hexkl
+if [[ "${HVX_ITEM7_ONLY}" -eq 1 ]]; then
+  if [[ "${MODEL}" != "falcon-debug" && "${MODEL}" != "falcon-full" ]]; then
+    echo "--hvx-item7-only currently requires a Falcon runner" >&2
+    exit 2
+  fi
+  run_case hvx_vector_item7 \
+    --enable-hvx-vector \
+    --enable-omnifetch-kv-cache-prefetch
+  exit 0
+fi
+
 CUMULATIVE_ARGS=(--enable-hexkl --enable-omnifetch-vdae)
+if [[ "${ENABLE_HVX_VECTOR}" -eq 1 ]]; then
+  CUMULATIVE_ARGS+=(--enable-hvx-vector)
+fi
 if [[ "${M1_ONLY}" -eq 0 ]] &&
    [[ "${MODEL}" == "falcon-debug" || "${MODEL}" == "falcon-full" ]]; then
   CUMULATIVE_ARGS+=(--enable-omnifetch-persistent-wh-cache)
   CUMULATIVE_ARGS+=(--enable-omnifetch-two-dim-pipeline)
   CUMULATIVE_ARGS+=(--enable-omnifetch-vtcm-coloring)
   CUMULATIVE_ARGS+=(--enable-omnifetch-kv-cache-prefetch)
+fi
+
+# Mandatory primary rows. Keep this order stable in logs and reports.  The
+# cumulative-only mode is useful when matched baselines already exist.
+if [[ "${CUMULATIVE_ONLY}" -eq 0 ]]; then
+  HVX_ARGS=()
+  HEXKL_ARGS=(--enable-hexkl)
+  if [[ "${ENABLE_HVX_VECTOR}" -eq 1 ]]; then
+    HVX_ARGS+=(--enable-hvx-vector)
+    HEXKL_ARGS+=(--enable-hvx-vector)
+  fi
+  run_case hvx "${HVX_ARGS[@]}"
+  run_case hexkl "${HEXKL_ARGS[@]}"
 fi
 run_case hexkl_omnifetch_cumulative "${CUMULATIVE_ARGS[@]}"
 

@@ -582,6 +582,7 @@ def _install_alibi_patch():
 def falcon_rw_1b(
     enablelwp: bool = False,
     enable_hexkl: bool = False,
+    enable_hvx_vector: bool = False,
     enable_omnifetch_vdae: bool = False,
     enable_omnifetch_layout_aware: bool = True,
     omnifetch_lookahead: int = 2,
@@ -662,13 +663,18 @@ def falcon_rw_1b(
     options = HexagonOptions().__dict__
     options["enableLWP"] = bool(enablelwp)
     options["lowerConstantsInSeparateSharedObjects"] = True
-    # Same as Qwen: MicroHMX does not need HVX vectorization; vec crashed Falcon
-    # on device (exit 13). MatmulToHexKL already skips attention-like shapes.
-    options["enableVectorization"] = False
+    # Historically this was forced off after an invalid Hexagon vector prologue
+    # caused a device exit.  Keep the legacy default for reproducibility, but
+    # expose a controlled true-HVX path now that the LLVM prologue is repaired.
+    options["enableVectorization"] = bool(enable_hvx_vector)
     options["enableHexKL"] = bool(enable_hexkl)
     options["enableConvertToHexagonmem"] = bool(enable_hexkl)
     cumulative = bool(enable_omnifetch_items_1_7)
-    options["enablePrefetch"] = bool(enable_omnifetch_vdae or cumulative)
+    options["enablePrefetch"] = bool(
+        enable_omnifetch_vdae
+        or enable_omnifetch_kv_cache_prefetch
+        or cumulative
+    )
     options["enableOmniFetchLayoutAware"] = bool(enable_omnifetch_layout_aware)
     options["omniFetchLookahead"] = int(omnifetch_lookahead)
     options["enableOmniFetchVDAE"] = bool(enable_omnifetch_vdae or cumulative)
@@ -729,6 +735,11 @@ if __name__ == "__main__":
     )
     parser.add_argument("--enable-lwp", action="store_true")
     parser.add_argument("--enable-hexkl", action="store_true")
+    parser.add_argument(
+        "--enable-hvx-vector",
+        action="store_true",
+        help="Enable the repaired HVX vector codegen path.",
+    )
     parser.add_argument("--enable-omnifetch-vdae", action="store_true")
     parser.add_argument("--disable-layout-aware", action="store_true")
     parser.add_argument("--omnifetch-lookahead", type=int, default=2)
@@ -768,6 +779,7 @@ if __name__ == "__main__":
     falcon_rw_1b(
         enablelwp=args.enable_lwp,
         enable_hexkl=args.enable_hexkl,
+        enable_hvx_vector=args.enable_hvx_vector,
         enable_omnifetch_vdae=args.enable_omnifetch_vdae,
         enable_omnifetch_layout_aware=not args.disable_layout_aware,
         omnifetch_lookahead=args.omnifetch_lookahead,

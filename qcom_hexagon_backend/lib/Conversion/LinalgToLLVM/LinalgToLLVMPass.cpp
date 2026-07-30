@@ -208,7 +208,10 @@ public:
     pm.addPass(createLowerLibdevicePass());
     pm.addNestedPass<func::FuncOp>(createLowerTPtrPass());
     HexagonLowerTmTensorOptions lowerTmOpts{};
-    lowerTmOpts.emitKvCacheMetadata = enableOmniFetchKvCachePrefetch;
+    // Lower attention first, but infer item-7 K/V streams only after fusion.
+    // Attaching semantic attributes here forces fusion either to preserve
+    // every rewrite manually or to disable useful optimization globally.
+    lowerTmOpts.emitKvCacheMetadata = false;
     pm.addNestedPass<func::FuncOp>(
         createHexagonLowerTmTensorPass(lowerTmOpts));
     pm.addNestedPass<func::FuncOp>(createReduceContractionRankPass());
@@ -262,6 +265,16 @@ public:
 
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
+
+    // Recover K/V identity from the final, fused contraction shapes.  This
+    // keeps the normal HVX fusion pipeline intact while providing stable
+    // metadata to the later bufferized prefetch insertion pass.
+    if (enableOmniFetchKvCachePrefetch) {
+      HexagonLowerTmTensorOptions kvMetadataOpts{};
+      kvMetadataOpts.emitKvCacheMetadata = true;
+      pm.addNestedPass<func::FuncOp>(
+          createHexagonLowerTmTensorPass(kvMetadataOpts));
+    }
 
     if (enableSlicing)
       pm.addPass(createHexagonSlicingPass(
@@ -426,6 +439,16 @@ public:
 
     // --- Component 1: Prefetch Insertion ---
     if (enablePrefetch) {
+      // Tiling, vectorization, and one-shot bufferization may replace the
+      // contraction operation after the earlier post-fusion annotation.
+      // Re-infer item-7 metadata on the final bufferized Linalg operations so
+      // the prefetch pass never depends on attributes surviving rewrites.
+      if (enableOmniFetchKvCachePrefetch) {
+        HexagonLowerTmTensorOptions kvMetadataOpts{};
+        kvMetadataOpts.emitKvCacheMetadata = true;
+        pm.addNestedPass<func::FuncOp>(
+            createHexagonLowerTmTensorPass(kvMetadataOpts));
+      }
       auto prefetchOptions = PrefetchInsertOptions{};
       prefetchOptions.lookahead = omniFetchLookahead;
       // Layout-aware flag controls in-situ reshape during prefetch.
@@ -526,6 +549,11 @@ public:
     pm.addPass(createFinalizeMemRefToLLVMConversionPass());
     pm.addPass(createArithToLLVMConversionPass());
     pm.addPass(createConvertControlFlowToLLVMPass());
+    // Some late conversion patterns legitimately materialize ub.poison after
+    // the zero-substitution cleanup.  Convert any residual UB ops to their
+    // LLVM dialect equivalents so translateModuleToLLVMIR never sees an
+    // untranslated UB dialect operation.
+    pm.addPass(createUBToLLVMConversionPass());
 
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());

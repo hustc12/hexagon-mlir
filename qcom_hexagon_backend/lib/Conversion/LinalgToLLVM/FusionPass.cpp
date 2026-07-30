@@ -222,16 +222,6 @@ static FailureOr<unsigned> multiUseFusion(MLIRContext *context,
 
 void HexagonFusionPass::runOnOperation() {
   auto funcOp = getOperation();
-  bool preserveKvBoundary = false;
-  funcOp.walk([&](linalg::LinalgOp op) {
-    if (op->hasAttr("omni_fetch.kv_cache_role"))
-      preserveKvBoundary = true;
-  });
-  if (preserveKvBoundary) {
-    llvm::errs() << "[HexagonFusion] function=" << funcOp.getName()
-                 << " skipped=1 reason=preserve_kv_cache_boundary\n";
-    return;
-  }
   auto context = &getContext();
   RewritePatternSet fusionPatterns(context);
 

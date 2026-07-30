@@ -115,6 +115,17 @@ getOrInsertPrefetchInSitu(ModuleOp module,
                                 argTys, voidTy);
 }
 
+/// Get or insert `void __omni_fetch_l2_hint_2d(ptr, i32, i32, i32)`.
+static FailureOr<LLVM::LLVMFuncOp>
+getOrInsertL2Hint2D(ModuleOp module, ConversionPatternRewriter &rewriter) {
+  MLIRContext *ctx = module.getContext();
+  auto ptrTy = LLVM::LLVMPointerType::get(ctx);
+  auto i32Ty = IntegerType::get(ctx, 32);
+  auto voidTy = LLVM::LLVMVoidType::get(ctx);
+  return LLVM::lookupOrCreateFn(rewriter, module, getL2Hint2DFnName(),
+                                {ptrTy, i32Ty, i32Ty, i32Ty}, voidTy);
+}
+
 /// Get or insert `void __omni_fetch_copy2d(...)`.
 static FailureOr<LLVM::LLVMFuncOp>
 getOrInsertCopy2D(ModuleOp module, ConversionPatternRewriter &rewriter) {
@@ -415,6 +426,68 @@ struct LowerPrefetchInSitu
 };
 
 //===----------------------------------------------------------------------===//
+// L2HintOp → read-only __omni_fetch_l2_hint_2d(...)
+//===----------------------------------------------------------------------===//
+struct LowerL2Hint : public ConvertOpToLLVMPattern<L2HintOp> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(L2HintOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    ModuleOp module = op->getParentOfType<ModuleOp>();
+    MLIRContext *ctx = rewriter.getContext();
+    auto i32Ty = IntegerType::get(ctx, 32);
+    auto ptrTy = LLVM::LLVMPointerType::get(ctx);
+    auto srcType = cast<MemRefType>(op.getSrc().getType());
+    if (!srcType.hasStaticShape())
+      return rewriter.notifyMatchFailure(op, "expected static source shape");
+
+    Value srcPtr = alignedPtrWithOffset(rewriter, loc, adaptor.getSrc(),
+                                        srcType.getElementType());
+    if (srcPtr.getType() != ptrTy)
+      srcPtr = LLVM::AddrSpaceCastOp::create(rewriter, loc, ptrTy, srcPtr);
+
+    auto cI32 = [&](int32_t value) {
+      return rewriter.create<LLVM::ConstantOp>(
+          loc, i32Ty, rewriter.getI32IntegerAttr(value));
+    };
+    int64_t elemBytes =
+        srcType.getElementType().getIntOrFloatBitWidth() / 8;
+    SmallVector<int64_t> sourceStrides;
+    int64_t sourceOffset = 0;
+    if (failed(srcType.getStridesAndOffset(sourceStrides, sourceOffset)) ||
+        sourceStrides.empty() || sourceStrides.back() != 1)
+      return rewriter.notifyMatchFailure(
+          op, "expected a statically strided source with contiguous inner dim");
+
+    int64_t widthBytes = srcType.getShape().back() * elemBytes;
+    int64_t height = 1;
+    int64_t strideBytes = widthBytes;
+    // A stream subview is [1,...,S,...,1,D]. Select the closest non-unit
+    // dimension outside D as the hardware 2-D height and preserve its physical
+    // stride. This covers [B,H,S,D] and fused [B,S,H,D] layouts.
+    for (int64_t dim = srcType.getRank() - 2; dim >= 0; --dim) {
+      if (srcType.getDimSize(dim) > 1) {
+        height = srcType.getDimSize(dim);
+        strideBytes = sourceStrides[dim] * elemBytes;
+        break;
+      }
+    }
+
+    auto fnOrErr = getOrInsertL2Hint2D(module, rewriter);
+    if (failed(fnOrErr))
+      return failure();
+    rewriter.replaceOpWithNewOp<LLVM::CallOp>(
+        op, *fnOrErr,
+        ValueRange{srcPtr, cI32(static_cast<int32_t>(widthBytes)),
+                   cI32(static_cast<int32_t>(height)),
+                   cI32(static_cast<int32_t>(strideBytes))});
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // AdaptiveControlOp  →  i32 __omni_fetch_update_distance(i32)
 //===----------------------------------------------------------------------===//
 struct LowerAdaptiveControl
@@ -454,7 +527,7 @@ struct OmniFetchToLLVMPass
     RewritePatternSet patterns(ctx);
 
     patterns.add<LowerCreateSem, LowerSignal, LowerWait, LowerPrefetchInSitu,
-                 LowerAdaptiveControl>(typeConverter);
+                 LowerL2Hint, LowerAdaptiveControl>(typeConverter);
 
     LLVMConversionTarget target(*ctx);
     target.addIllegalDialect<OmniFetchDialect>();

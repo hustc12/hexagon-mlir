@@ -1,0 +1,32 @@
+diff --git a/llvm/lib/Target/Hexagon/HexagonFrameLowering.cpp b/llvm/lib/Target/Hexagon/HexagonFrameLowering.cpp
+index 1b665c1996c2..62630a92f927 100644
+--- a/llvm/lib/Target/Hexagon/HexagonFrameLowering.cpp
++++ b/llvm/lib/Target/Hexagon/HexagonFrameLowering.cpp
+@@ -747,6 +747,18 @@ void HexagonFrameLowering::insertPrologueInBlock(MachineBasicBlock &MBB,
+     assert(alignTo(NumBytes, 8) == NumBytes);
+     BuildMI(MBB, InsertPt, dl, HII.get(Hexagon::A2_addi), SP)
+       .addReg(SP)
+       .addImm(-int(NumBytes));
+   }
++
++  // PS_aligna is selected before prologue/epilogue insertion. Scheduling can
++  // otherwise leave an aligned-frame access before the pseudo, while this
++  // routine subsequently inserts allocframe at the start of the block. Move
++  // the pseudo back to the prologue boundary so the final order is:
++  // allocframe, stack alignment, AP definition, AP uses.
++  if (MachineInstr *AI =
++          const_cast<MachineInstr *>(getAlignaInstr(MF))) {
++    MachineBasicBlock *AlignB = AI->getParent();
++    MBB.splice(InsertPt, AlignB, AI->getIterator());
++    AI->setFlag(MachineInstr::FrameSetup);
++  }
+ }
+diff --git a/llvm/lib/Target/Hexagon/HexagonPseudo.td b/llvm/lib/Target/Hexagon/HexagonPseudo.td
+index 957bf7313a63..37c02ff0f662 100644
+--- a/llvm/lib/Target/Hexagon/HexagonPseudo.td
++++ b/llvm/lib/Target/Hexagon/HexagonPseudo.td
+@@ -270,2 +270,3 @@
+-let isCodeGenOnly = 1, isPseudo = 1, Uses = [R30], hasSideEffects = 0 in
++let isCodeGenOnly = 1, isPseudo = 1, Uses = [R30], hasSideEffects = 1,
++    isBarrier = 1, isSolo = 1 in
+ def PS_aligna : Pseudo<(outs IntRegs:$Rd), (ins u32_0Imm:$A), "", []>;

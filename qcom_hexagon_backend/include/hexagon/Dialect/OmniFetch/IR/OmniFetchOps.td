@@ -113,6 +113,26 @@ def OmniFetch_WaitOp : OmniFetch_Op<"wait",
 // Prefetch op
 // ---------------------------------------------------------------------------
 
+def OmniFetch_L2HintOp : OmniFetch_Op<"l2_hint",
+    [MemoryEffects<[MemRead, MemWrite]>]> {
+  let summary = "Read-only L2 prefetch hint for one memref region";
+  let description = [{
+    Requests an L2 prefetch for the complete static source region.  Unlike
+    `prefetch_in_situ`, this operation has no destination operand, so the live
+    K/V source does not become a destination-style buffer.  The conservative
+    global write effect deliberately makes this performance-affecting hardware
+    request non-DCE-able; it does not describe a write to the source memref.
+  }];
+
+  let arguments = (ins
+    AnyMemRef:$src,
+    DefaultValuedAttr<I32Attr, "1">:$lookahead
+  );
+
+  let assemblyFormat =
+      "$src attr-dict `:` qualified(type($src))";
+}
+
 def OmniFetch_PrefetchInSituOp : OmniFetch_Op<"prefetch_in_situ",
     [MemoryEffects<[MemRead, MemWrite]>]> {
   let summary = "Layout-aware in-situ prefetch from DDR to VTCM";

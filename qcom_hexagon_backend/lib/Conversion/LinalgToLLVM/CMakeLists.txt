@@ -30,6 +30,7 @@ add_mlir_conversion_library(LinalgToLLVM
   MLIRPass
   MLIRTensorDialect
   MLIRTransforms
+  MLIRUBToLLVM
   MLIRMathTransforms
   MLIRSupport
   MLIRRegisterAllExtensions

@@ -99,7 +99,28 @@ struct KvCachePrefetchStats {
   int64_t pages = 0;
   int64_t bytes = 0;
   int64_t directLayoutSites = 0;
+  int64_t vtcmStages = 0;
+  int64_t asyncStages = 0;
 };
+
+static Operation *findLastDpsWriterBefore(Value buffer,
+                                          Operation *consumer) {
+  Operation *last = nullptr;
+  for (Operation *user : buffer.getUsers()) {
+    if (user->getBlock() != consumer->getBlock() ||
+        !user->isBeforeInBlock(consumer))
+      continue;
+    auto dps = dyn_cast<DestinationStyleOpInterface>(user);
+    if (!dps)
+      continue;
+    bool writesBuffer = llvm::any_of(
+        dps.getDpsInitsMutable(),
+        [&](OpOperand &init) { return init.get() == buffer; });
+    if (writesBuffer && (!last || last->isBeforeInBlock(user)))
+      last = user;
+  }
+  return last;
+}
 
 static StringRef stringifyTransformMode(TransformMode mode) {
   switch (mode) {
@@ -743,8 +764,10 @@ static Value createDdrTileSubview(OpBuilder &b, Location loc, Value src,
 /// pages into one hardware request. `kvCachePageTokens` remains visible in the
 /// page count even when adjacent pages are coalesced into one hint.
 static KvCachePrefetchStats
-insertKvCachePrefetchHints(func::FuncOp func, int64_t kvCachePageTokens) {
+insertKvCachePrefetchHints(func::FuncOp func, int64_t kvCachePageTokens,
+                           bool stageInVtcm, bool enableAsyncOverlap) {
   KvCachePrefetchStats stats;
+  DenseMap<Value, Value> stagedBuffers;
   if (kvCachePageTokens <= 0) {
     func.emitWarning() << "invalid KV cache page size " << kvCachePageTokens
                        << "; item 7 disabled for this function";
@@ -762,6 +785,8 @@ insertKvCachePrefetchHints(func::FuncOp func, int64_t kvCachePageTokens) {
         consumer->getAttrOfType<IntegerAttr>("omni_fetch.kv_cache_operand");
     auto role =
         consumer->getAttrOfType<StringAttr>("omni_fetch.kv_cache_role");
+    auto layout =
+        consumer->getAttrOfType<StringAttr>("omni_fetch.kv_cache_layout");
     if (!operandAttr || !role)
       continue;
     int64_t operandIndex = operandAttr.getInt();
@@ -779,19 +804,35 @@ insertKvCachePrefetchHints(func::FuncOp func, int64_t kvCachePageTokens) {
 
     ArrayRef<int64_t> shape = srcType.getShape();
     int64_t rank = srcType.getRank();
-    int64_t seqTokens = shape[rank - 2];
+    bool isBshd = layout && layout.getValue() == "bshd" && rank == 4;
+    bool isShd = layout && layout.getValue() == "shd" && rank == 3;
+    int64_t seqTokens = (isBshd || isShd) ? shape[isBshd ? 1 : 0]
+                                          : shape[rank - 2];
     int64_t headDim = shape[rank - 1];
     if (seqTokens <= 0 || headDim <= 0)
       continue;
 
     int64_t streams = 1;
     bool reasonable = true;
-    for (int64_t dim = 0; dim < rank - 2; ++dim) {
-      if (shape[dim] <= 0 || streams > 128 / shape[dim]) {
+    if (isBshd) {
+      if (shape[0] <= 0 || shape[2] <= 0 ||
+          shape[0] > 128 / shape[2])
         reasonable = false;
-        break;
+      else
+        streams = shape[0] * shape[2];
+    } else if (isShd) {
+      if (shape[1] <= 0 || shape[1] > 128)
+        reasonable = false;
+      else
+        streams = shape[1];
+    } else {
+      for (int64_t dim = 0; dim < rank - 2; ++dim) {
+        if (shape[dim] <= 0 || streams > 128 / shape[dim]) {
+          reasonable = false;
+          break;
+        }
+        streams *= shape[dim];
       }
-      streams *= shape[dim];
     }
     if (!reasonable)
       continue;
@@ -803,26 +844,85 @@ insertKvCachePrefetchHints(func::FuncOp func, int64_t kvCachePageTokens) {
     OpBuilder b(consumer);
     Location loc = consumer.getLoc();
 
+    if (stageInVtcm) {
+      Value shadow = stagedBuffers.lookup(src);
+      if (!shadow) {
+        auto shadowTy = MemRefType::get(
+            srcType.getShape(), srcType.getElementType(),
+            /*layout=*/MemRefLayoutAttrInterface{},
+            /*memorySpace=*/IntegerAttr::get(
+                IntegerType::get(b.getContext(), 64), /*VTCM=*/1));
+
+        Operation *producer = findLastDpsWriterBefore(src, consumer);
+        if (producer)
+          b.setInsertionPointAfter(producer);
+        else
+          b.setInsertionPoint(consumer);
+        shadow = b.create<memref::AllocOp>(loc, shadowTy);
+
+        if (enableAsyncOverlap) {
+          auto tagTy = MemRefType::get({1}, b.getI32Type());
+          Value tag = b.create<memref::AllocOp>(loc, tagTy);
+          Value zero = b.create<arith::ConstantIndexOp>(loc, 0);
+          Value numElements = b.create<arith::ConstantIndexOp>(
+              loc, srcType.getNumElements());
+          SmallVector<Value> zeroIndices(srcType.getRank(), zero);
+          SmallVector<Value> tagIndex{zero};
+          b.create<memref::DmaStartOp>(
+              loc, src, zeroIndices, shadow, zeroIndices, numElements, tag,
+              tagIndex);
+          b.setInsertionPoint(consumer);
+          b.create<memref::DmaWaitOp>(loc, tag, tagIndex, numElements);
+          ++stats.asyncStages;
+        } else {
+          b.create<memref::CopyOp>(loc, src, shadow);
+        }
+
+        stagedBuffers[src] = shadow;
+        ++stats.vtcmStages;
+        stats.bytes += streams * seqTokens * headDim * elemBytes;
+      }
+      consumer.getDpsInputOperand(operandIndex)->set(shadow);
+      consumer->setAttr("omni_fetch.kv_layout",
+                        b.getStringAttr(enableAsyncOverlap
+                                            ? "vtcm_dma_overlapped"
+                                            : "vtcm_staged"));
+      ++stats.sites;
+      continue;
+    }
+
     for (int64_t linearStream = 0; linearStream < streams; ++linearStream) {
       SmallVector<OpFoldResult> offsets(rank, b.getIndexAttr(0));
       SmallVector<OpFoldResult> sizes;
       SmallVector<OpFoldResult> strides(rank, b.getIndexAttr(1));
       sizes.reserve(rank);
-      int64_t remaining = linearStream;
-      for (int64_t dim = rank - 3; dim >= 0; --dim) {
-        offsets[dim] = b.getIndexAttr(remaining % shape[dim]);
-        remaining /= shape[dim];
-      }
-      for (int64_t dim = 0; dim < rank - 2; ++dim)
+      if (isBshd) {
+        offsets[0] = b.getIndexAttr(linearStream / shape[2]);
+        offsets[2] = b.getIndexAttr(linearStream % shape[2]);
         sizes.push_back(b.getIndexAttr(1));
-      sizes.push_back(b.getIndexAttr(seqTokens));
-      sizes.push_back(b.getIndexAttr(headDim));
+        sizes.push_back(b.getIndexAttr(seqTokens));
+        sizes.push_back(b.getIndexAttr(1));
+        sizes.push_back(b.getIndexAttr(headDim));
+      } else if (isShd) {
+        offsets[1] = b.getIndexAttr(linearStream);
+        sizes.push_back(b.getIndexAttr(seqTokens));
+        sizes.push_back(b.getIndexAttr(1));
+        sizes.push_back(b.getIndexAttr(headDim));
+      } else {
+        int64_t remaining = linearStream;
+        for (int64_t dim = rank - 3; dim >= 0; --dim) {
+          offsets[dim] = b.getIndexAttr(remaining % shape[dim]);
+          remaining /= shape[dim];
+        }
+        for (int64_t dim = 0; dim < rank - 2; ++dim)
+          sizes.push_back(b.getIndexAttr(1));
+        sizes.push_back(b.getIndexAttr(seqTokens));
+        sizes.push_back(b.getIndexAttr(headDim));
+      }
 
       Value stream = b.create<memref::SubViewOp>(
           loc, src, offsets, sizes, strides);
-      b.create<PrefetchInSituOp>(
-          loc, stream, stream, LayoutTransform::L2Hint, /*lookahead=*/1,
-          DenseI32ArrayAttr{}, ValueRange{});
+      b.create<L2HintOp>(loc, stream, /*lookahead=*/1);
       ++stats.hints;
     }
 
@@ -831,7 +931,9 @@ insertKvCachePrefetchHints(func::FuncOp func, int64_t kvCachePageTokens) {
     consumer->setAttr("omni_fetch.kv_pages",
                       b.getI64IntegerAttr(streams * pagesPerStream));
     consumer->setAttr("omni_fetch.kv_layout",
-                      b.getStringAttr("direct_sequence_head_dim"));
+                      b.getStringAttr((isBshd || isShd)
+                                          ? "direct_shd_strided_2d"
+                                          : "direct_sequence_head_dim"));
     ++stats.sites;
     ++stats.directLayoutSites;
     stats.pages += streams * pagesPerStream;
@@ -849,9 +951,15 @@ insertKvCachePrefetchHints(func::FuncOp func, int64_t kvCachePageTokens) {
                 b.getI64IntegerAttr(stats.bytes));
   func->setAttr("omni_fetch.kv_direct_layout_sites",
                 b.getI64IntegerAttr(stats.directLayoutSites));
+  func->setAttr("omni_fetch.kv_vtcm_stages",
+                b.getI64IntegerAttr(stats.vtcmStages));
+  func->setAttr("omni_fetch.kv_async_stages",
+                b.getI64IntegerAttr(stats.asyncStages));
   llvm::errs() << "[KVCachePrefetch] function=" << func.getName()
                << " sites=" << stats.sites << " hints=" << stats.hints
                << " pages=" << stats.pages << " bytes=" << stats.bytes
+               << " vtcm_stages=" << stats.vtcmStages
+               << " async_stages=" << stats.asyncStages
                << " page_tokens=" << kvCachePageTokens << "\n";
   return stats;
 }
@@ -1398,7 +1506,8 @@ struct PrefetchInsertPass
                  << " (forced off in HVX insert for safety)\n";
 
     if (enableKvCachePrefetch)
-      insertKvCachePrefetchHints(func, kvCachePageTokens);
+      insertKvCachePrefetchHints(func, kvCachePageTokens, enableDmaToVtcm,
+                                 enableTwoDimPipeline);
 
     const bool funcHasHexKL = containsHexKLCompute(func);
 

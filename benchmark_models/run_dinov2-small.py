@@ -28,6 +28,13 @@ def run(args: argparse.Namespace) -> None:
     wrapped, pixels = create_dinov2_small_full_model_and_input()
     print_dinov2_small_full_identity(wrapped, pixels)
     inputs = [pixels]
+    # torch-mlir lifts the non-persistent fixed position-embedding buffer to
+    # the first public function argument.  Keep it explicit for the Hexagon
+    # ABI; the Python model still exposes only pixel_values to callers.
+    device_inputs = [
+        wrapped.model.dinov2.embeddings.omnifetch_fixed_position_embeddings,
+        pixels,
+    ]
 
     module = compile_to_linalg(wrapped, tuple(inputs), decomp_pow=False)
     ir = str(module)
@@ -51,11 +58,16 @@ def run(args: argparse.Namespace) -> None:
         not args.disable_omnifetch_adaptive,
         args.enable_omnifetch_items_1_7,
         lower_constants_separate=True,
+        backend_profile=args.backend_profile,
+        enable_lwp=args.enable_lwp,
+        lwp_loop_depth=args.lwp_loop_depth,
+        disable_lwp_loop=args.disable_lwp_loop,
+        omnifetch_items_through=args.omnifetch_items_through,
     )
     output = hex_execution(
         module,
         wrapped.__class__.__name__,
-        inputs,
+        device_inputs,
         options,
         mlir_text=patched,
         iterations=args.device_iterations,

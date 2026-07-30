@@ -1057,6 +1057,21 @@ static void omni_l2fetch(const void *ptr, uint32_t total_bytes) {
 }
 #endif
 
+void __omni_fetch_l2_hint_2d(const void *src, int32_t width_bytes,
+                             int32_t height, int32_t stride_bytes) {
+  if (!src || width_bytes <= 0 || height <= 0 || stride_bytes <= 0)
+    return;
+#ifdef __hexagon__
+  omni_l2fetch_2d(src, (uint32_t)width_bytes, (uint32_t)height,
+                  (uint32_t)stride_bytes);
+#else
+  (void)src;
+  (void)width_bytes;
+  (void)height;
+  (void)stride_bytes;
+#endif
+}
+
 /* -------------------------------------------------------------------------
  * __omni_fetch_prefetch_insitu
  *

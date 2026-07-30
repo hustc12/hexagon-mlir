@@ -271,37 +271,113 @@ struct LowerAttentionOp : public OpRewritePattern<AttentionOp> {
 /// The explicit metadata emitted by LowerAttentionOp always takes precedence.
 static int64_t annotateEagerAttentionKvStreams(FunctionOpInterface func) {
   int64_t inferred = 0;
-  func.walk([&](linalg::BatchMatmulOp op) {
+  func.walk([&](linalg::LinalgOp op) {
     if (op->hasAttr("omni_fetch.kv_cache_role") ||
-        op->getNumOperands() < 3)
+        op.getNumReductionLoops() == 0 || op.getDpsInputs().size() < 2 ||
+        op.getDpsInits().empty())
       return;
 
-    auto lhs = dyn_cast<ShapedType>(op->getOperand(0).getType());
-    auto rhs = dyn_cast<ShapedType>(op->getOperand(1).getType());
-    auto out = dyn_cast<ShapedType>(op->getOperand(2).getType());
-    if (!lhs || !rhs || !out || !lhs.hasStaticShape() ||
-        !rhs.hasStaticShape() || !out.hasStaticShape() ||
-        lhs.getRank() != 3 || rhs.getRank() != 3 || out.getRank() != 3)
+    auto out = dyn_cast<ShapedType>(op.getDpsInits()[0].getType());
+    if (!out || !out.hasStaticShape())
       return;
 
-    ArrayRef<int64_t> a = lhs.getShape();
-    ArrayRef<int64_t> b = rhs.getShape();
     ArrayRef<int64_t> c = out.getShape();
-    if (a[0] != b[0] || a[0] != c[0] || a[1] != c[1] ||
-        a[2] != b[1] || b[2] != c[2])
-      return;
-
     StringRef role;
-    if (c[1] == c[2] && a[1] != a[2])
-      role = "key";
-    else if (a[1] == a[2] && c[1] != c[2])
-      role = "value";
-    else
+    int64_t operandIndex = -1;
+    StringRef layout = "sequence_head";
+
+    // Fusion can inline Q/K/V projection epilogues into attention.  The
+    // physical stream then remains [B,S,H,D], while the contraction output is
+    // [B,H,S,S] (QK) or [B,H,S,D] (AV).  Select the K/V activation operand
+    // directly instead of forcing materialization merely to recover [B,H,S,D].
+    if (out.getRank() == 4 && c[0] > 0 && c[1] > 0 && c[2] > 0) {
+      SmallVector<int64_t> bshdOperands;
+      bool hasAttentionProb = false;
+      for (auto [index, input] : llvm::enumerate(op.getDpsInputs())) {
+        auto type = dyn_cast<ShapedType>(input.getType());
+        if (!type || !type.hasStaticShape() || type.getRank() != 4)
+          continue;
+        ArrayRef<int64_t> shape = type.getShape();
+        if (shape[0] == c[0] && shape[1] == c[2] &&
+            shape[2] == c[1] && shape[3] > 0)
+          bshdOperands.push_back(index);
+        if (shape[0] == c[0] && shape[1] == c[1] &&
+            shape[2] == c[2] && shape[3] == c[2])
+          hasAttentionProb = true;
+      }
+      if (c[2] == c[3] && bshdOperands.size() >= 2) {
+        role = "key";
+        operandIndex = bshdOperands.back();
+        layout = "bshd";
+      } else if (c[2] != c[3] && hasAttentionProb &&
+                 !bshdOperands.empty()) {
+        role = "value";
+        operandIndex = bshdOperands.back();
+        layout = "bshd";
+      }
+    }
+
+    // One-shot bufferization can fold the unit batch dimension, yielding
+    // physical [S,H,D] streams and [H,S,S]/[H,S,D] contractions.
+    if (operandIndex < 0 && out.getRank() == 3) {
+      SmallVector<int64_t> shdOperands;
+      bool hasAttentionProb = false;
+      for (auto [index, input] : llvm::enumerate(op.getDpsInputs())) {
+        auto type = dyn_cast<ShapedType>(input.getType());
+        if (!type || !type.hasStaticShape() || type.getRank() != 3)
+          continue;
+        ArrayRef<int64_t> shape = type.getShape();
+        if (shape[0] == c[1] && shape[1] == c[0] && shape[2] > 0)
+          shdOperands.push_back(index);
+        if (shape[0] == c[0] && shape[1] == c[1] &&
+            shape[2] == c[1])
+          hasAttentionProb = true;
+      }
+      if (c[1] == c[2] && shdOperands.size() >= 2) {
+        role = "key";
+        operandIndex = shdOperands.back();
+        layout = "shd";
+      } else if (c[1] != c[2] && hasAttentionProb &&
+                 !shdOperands.empty()) {
+        role = "value";
+        operandIndex = shdOperands.back();
+        layout = "shd";
+      }
+    }
+
+    if (operandIndex < 0 && out.getRank() == 3) {
+      auto lhs = dyn_cast<ShapedType>(op.getDpsInputs()[0].getType());
+      auto rhs = dyn_cast<ShapedType>(op.getDpsInputs()[1].getType());
+      if (!lhs || !rhs || !lhs.hasStaticShape() || !rhs.hasStaticShape() ||
+          lhs.getRank() != 3 || rhs.getRank() != 3)
+        return;
+      ArrayRef<int64_t> a = lhs.getShape();
+      ArrayRef<int64_t> b = rhs.getShape();
+      if (a[0] != b[0] || a[0] != c[0])
+        return;
+
+      // QK^T may carry explicit [B,H,S] K^T, or scheduling may have folded
+      // the transpose into the indexing map and restored physical [B,S,H].
+      bool rhsIsExplicitKt = b[1] == a[2] && b[2] == a[1];
+      bool rhsIsFoldedK = b[1] == a[1] && b[2] == a[2];
+      if (c[1] == c[2] && c[1] == a[1] && a[1] != a[2] &&
+          (rhsIsExplicitKt || rhsIsFoldedK))
+        role = "key";
+      else if (a[1] == a[2] && a[1] == b[1] && b[1] == c[1] &&
+               b[2] == c[2] && c[1] != c[2])
+        role = "value";
+      if (!role.empty())
+        operandIndex = 1;
+    }
+
+    if (operandIndex < 0 || role.empty())
       return;
 
     Builder bld(op.getContext());
     op->setAttr("omni_fetch.kv_cache_role", bld.getStringAttr(role));
-    op->setAttr("omni_fetch.kv_cache_operand", bld.getI64IntegerAttr(1));
+    op->setAttr("omni_fetch.kv_cache_operand",
+                bld.getI64IntegerAttr(operandIndex));
+    op->setAttr("omni_fetch.kv_cache_layout", bld.getStringAttr(layout));
     ++inferred;
   });
   return inferred;

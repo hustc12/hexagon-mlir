@@ -46,6 +46,12 @@ def run(args):
         not args.disable_omnifetch_adaptive,
         args.enable_omnifetch_items_1_7,
         lower_constants_separate=False,
+        backend_profile=args.backend_profile,
+        enable_lwp=args.enable_lwp,
+        lwp_loop_depth=args.lwp_loop_depth,
+        disable_lwp_loop=args.disable_lwp_loop,
+        omnifetch_items_through=args.omnifetch_items_through,
+        enable_omnifetch_kv_vtcm=args.enable_omnifetch_kv_vtcm,
     )
     output = hex_execution(
         module,
@@ -57,11 +63,15 @@ def run(args):
     )
     with torch.no_grad():
         reference = wrapped(*inputs)
+    finite = bool(torch.isfinite(output[0]).all())
     diff = (output[0].float() - reference.float()).abs().max().item()
+    top1_match = output[0].argmax().item() == reference.argmax().item()
     print(
-        f"[Compare] max_abs_diff={diff:.4f} "
-        f"top1_match={output[0].argmax().item() == reference.argmax().item()}"
+        f"[Compare] finite={finite} max_abs_diff={diff:.4f} "
+        f"top1_match={top1_match}"
     )
+    if not finite or not top1_match:
+        raise AssertionError("DINOv2 Debug Hexagon result failed correctness gate")
 
 
 if __name__ == "__main__":

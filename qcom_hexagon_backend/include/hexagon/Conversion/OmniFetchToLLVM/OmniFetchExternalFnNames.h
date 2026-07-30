@@ -44,6 +44,15 @@ inline llvm::StringRef getPrefetchInSituFnName() {
   return "__omni_fetch_prefetch_insitu";
 }
 
+/// Issues one page-safe, strided 2-D L2 prefetch request.
+/// Signature (C):
+///   void __omni_fetch_l2_hint_2d(
+///       const void *src, int32_t width_bytes, int32_t height,
+///       int32_t stride_bytes);
+inline llvm::StringRef getL2Hint2DFnName() {
+  return "__omni_fetch_l2_hint_2d";
+}
+
 /// Rank-2 (possibly strided) tile copy used for LAYOUT_NONE prefetches.
 /// Signature (C):
 ///   void __omni_fetch_copy2d(

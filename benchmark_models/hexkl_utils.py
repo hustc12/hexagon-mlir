@@ -234,9 +234,6 @@ def hex_execution(
         f.write(bytecode)
 
     options = options or {}
-    options["enableVTCMTiling"] = False
-    if not options.get("enableHexKL"):
-        options["enableConvertToHexagonmem"] = False
     return TorchMLIRHexagonLauncher().run_torch_mlir(
         launch_path, inputs, func_name, iterations=iterations, options=options
     )
@@ -256,35 +253,90 @@ def hexagon_options_phase4(
     enable_omnifetch_adaptive: bool = True,
     enable_omnifetch_items_1_7: bool = False,
     lower_constants_separate: bool = True,
+    backend_profile: Optional[str] = None,
+    enable_lwp: bool = False,
+    lwp_loop_depth: int = 1,
+    disable_lwp_loop: bool = False,
+    omnifetch_items_through: int = 0,
+    enable_omnifetch_kv_vtcm: bool = False,
 ):
     from triton.backends.qcom_hexagon_backend.compiler import HexagonOptions
 
     options = HexagonOptions().__dict__
-    options["enableLWP"] = False
+    profile = backend_profile or os.environ.get(
+        "OMNIFETCH_BACKEND_PROFILE", "legacy-scalar"
+    )
+    valid_profiles = {
+        "legacy-scalar",
+        "hvx-vector",
+        "hvx-vector-vtcm",
+    }
+    if profile not in valid_profiles:
+        raise ValueError(
+            f"unknown backend profile {profile!r}; "
+            f"expected one of {sorted(valid_profiles)}"
+        )
+    if lwp_loop_depth < 0:
+        raise ValueError("LWP loop depth must be non-negative")
+    if not 0 <= omnifetch_items_through <= 7:
+        raise ValueError("OmniFetch cumulative item level must be in [0, 7]")
+
+    options["enableLWP"] = bool(enable_lwp)
+    options["disableLWPLoop"] = bool(disable_lwp_loop)
+    options["LWPloopDepth"] = int(lwp_loop_depth)
     options["lowerConstantsInSeparateSharedObjects"] = bool(lower_constants_separate)
-    options["enableVectorization"] = False
     options["enableHexKL"] = bool(enable_hexkl)
-    options["enableConvertToHexagonmem"] = bool(enable_hexkl)
-    cumulative = bool(enable_omnifetch_items_1_7)
-    options["enablePrefetch"] = bool(enable_omnifetch_vdae or cumulative)
+    if profile == "legacy-scalar":
+        options["enableVectorization"] = False
+        options["enableVTCMTiling"] = False
+        options["enableConvertToHexagonmem"] = bool(enable_hexkl)
+    elif profile == "hvx-vector":
+        options["enableVectorization"] = True
+        options["enableVTCMTiling"] = False
+        options["enableConvertToHexagonmem"] = True
+    else:
+        options["enableVectorization"] = True
+        options["enableVTCMTiling"] = True
+        options["enableConvertToHexagonmem"] = True
+    cumulative_level = 7 if enable_omnifetch_items_1_7 else omnifetch_items_through
+    options["enablePrefetch"] = bool(
+        enable_omnifetch_vdae or cumulative_level >= 1
+    )
     options["enableOmniFetchLayoutAware"] = bool(enable_omnifetch_layout_aware)
     options["omniFetchLookahead"] = int(omnifetch_lookahead)
-    options["enableOmniFetchVDAE"] = bool(enable_omnifetch_vdae or cumulative)
+    options["enableOmniFetchVDAE"] = bool(
+        enable_omnifetch_vdae or cumulative_level >= 3
+    )
     options["enableOmniFetchAdaptive"] = bool(enable_omnifetch_adaptive)
-    options["enableOmniFetchPersistentWhCache"] = cumulative
-    options["enableOmniFetchTwoDimPipeline"] = cumulative
-    options["enableOmniFetchVtcmColoring"] = cumulative
+    options["enableOmniFetchPersistentWhCache"] = cumulative_level >= 4
+    options["enableOmniFetchTwoDimPipeline"] = cumulative_level >= 5
+    options["enableOmniFetchVtcmColoring"] = cumulative_level >= 6
     # Item 7 covers page-aware prefetch of compiler-identified attention K/V
     # streams.  For autoregressive decoders those streams may be persistent
     # K/V cache pages; for encoders they are the current invocation's ordinary
     # attention K/V tensors.  Both are valid early-data-movement opportunities.
-    options["enableOmniFetchKvCachePrefetch"] = cumulative
-    if cumulative:
+    options["enableOmniFetchKvCachePrefetch"] = cumulative_level >= 7
+    options["enableOmniFetchDmaToVtcm"] = bool(enable_omnifetch_kv_vtcm)
+    options["enableHexagonmemCopyToDMA"] = bool(enable_omnifetch_kv_vtcm)
+    if cumulative_level:
         print(
-            "[OmniFetchItems1To7] enabled: layout/cost/fusion + "
-            "persistent-WH + two-dimensional-pipeline + "
-            "VTCM-coloring + attention-K/V-stream-prefetch"
+            f"[OmniFetchCumulative] items_through={cumulative_level}: "
+            "prefetch/layout/V-DAE + persistent-WH + "
+            "two-dimensional-pipeline + VTCM-coloring + "
+            "attention-K/V-stream-prefetch (features gated by level)"
+            + (" + K/V DMA-to-VTCM staging" if enable_omnifetch_kv_vtcm else "")
         )
+    print(
+        "[BackendConfig] "
+        f"profile={profile} "
+        f"vectorization={int(options['enableVectorization'])} "
+        f"vtcm_tiling={int(options['enableVTCMTiling'])} "
+        f"hexagonmem={int(options['enableConvertToHexagonmem'])} "
+        f"hexkl={int(options['enableHexKL'])} "
+        f"lwp={int(options['enableLWP'])} "
+        f"lwp_loop_depth={options['LWPloopDepth']} "
+        f"lwp_loops_disabled={int(options['disableLWPLoop'])}"
+    )
     return options
 
 
@@ -298,6 +350,48 @@ def add_phase4_args(parser):
         "--enable-omnifetch-items-1-7",
         action="store_true",
         help="Enable the cumulative innovation items 1 through 7.",
+    )
+    parser.add_argument(
+        "--omnifetch-items-through",
+        type=int,
+        choices=range(0, 8),
+        default=0,
+        metavar="N",
+        help="Ablation: enable cumulative OmniFetch items through N (0-7).",
+    )
+    parser.add_argument(
+        "--enable-omnifetch-kv-vtcm",
+        action="store_true",
+        help=(
+            "Stage item-7 K/V streams into VTCM through synchronous DMA "
+            "instead of issuing L2-only hints."
+        ),
+    )
+    parser.add_argument(
+        "--backend-profile",
+        choices=("legacy-scalar", "hvx-vector", "hvx-vector-vtcm"),
+        default=os.environ.get("OMNIFETCH_BACKEND_PROFILE", "legacy-scalar"),
+        help=(
+            "Backend codegen profile. legacy-scalar reproduces historical "
+            "results; hvx-vector enables vectorization; hvx-vector-vtcm also "
+            "enables VTCM tiling."
+        ),
+    )
+    parser.add_argument(
+        "--enable-lwp",
+        action="store_true",
+        help="Enable function/loop Lightweight Profiling instrumentation.",
+    )
+    parser.add_argument(
+        "--lwp-loop-depth",
+        type=int,
+        default=1,
+        help="Maximum sibling loop depth instrumented by LWP (default: 1).",
+    )
+    parser.add_argument(
+        "--disable-lwp-loop",
+        action="store_true",
+        help="Instrument only the function body, not individual loops.",
     )
     parser.add_argument("--seq-len", type=int, default=None)
     return parser
