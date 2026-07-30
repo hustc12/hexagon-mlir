@@ -686,3 +686,332 @@ VTCM across multiple sequence positions, prefetch the next tile while the
 current tile computes, and fold transpose/reshape formation into producer
 stores.  This stays within OmniFetch's unified objective of moving data
 earlier or avoiding the movement entirely.
+
+## 14. New design space after the vector item-7 result
+
+### 14.1 Why another list of independent prefetch mechanisms is insufficient
+
+The earlier M1--M10 roadmap already covers page-safe `L2FETCH`, L2-versus-DMA
+selection, physical-layout equivalence, VRF forwarding, aligned/page-aware
+placement, VTCM bank coloring, nontemporal last use, store-to-load distance,
+tiered residency, and PMU feedback.  Renaming those mechanisms would not
+create a new contribution.
+
+The vector experiments instead reveal a missing compiler abstraction.  The
+compiler currently optimizes one movement site or one consumer at a time.  It
+does not first ask whether several consumers can share the same physical read,
+resident tile, or producer result.  Consequently it can prefetch a value that
+is already hot, copy a whole stream into VTCM for one immediate consumer, or
+materialize an intermediate that could have served several operations while
+still in the vector register file.
+
+The next design should be based on a **movement-amortization region (MAR)**:
+
+```text
+source tile / producer result
+          |
+          | one admitted movement or direct producer handoff
+          v
+  VRF or VTCM resident tile
+     /          |          \
+ consumer A  consumer B  consumer C
+     \          |          /
+      final-use store or eviction
+```
+
+An MAR groups compatible consumers of the same source version.  It decides:
+
+- which loop order maximizes reuse before the tile is evicted;
+- whether the tile should enter through L2 prefetch, DMA, or direct production;
+- which consumer layouts can be formed during that movement;
+- whether one vector load can be multicast to multiple computations;
+- whether an intermediate should be forwarded, recomputed, or materialized;
+- whether VRF pressure permits fusion without spills; and
+- where the last use permits an nontemporal store/load.
+
+This creates one coherent story:
+
+> OmniFetch schedules a tile before its first unavoidable use, forms its
+> required physical layout during that movement, and amortizes the tile across
+> all compatible consumers before releasing its hierarchy residency.
+
+The story remains precision-preserving and does not require quantization.
+
+### 14.2 Manual-derived constraints used by the new design
+
+The two V73 manuals place hard constraints on an MAR:
+
+1. HVX VMEM accesses L2 directly and bypasses L1.  Scalar `dcfetch` is therefore
+   not an HVX tensor optimization.
+2. VRF access is substantially cheaper than VMEM.  Avoiding a store/load is
+   preferable to replacing DDR traffic with two VTCM accesses.
+3. VTCM has deterministic, non-evictable service and continuous packet-level
+   access, but an explicit copy must be amortized and external DMA is
+   noncoherent until completion/ownership is established.
+4. `L2FETCH` is best below 8 KiB and several hundred cycles ahead of use.  It is
+   low priority, page constrained, and a competing command can truncate useful
+   work.
+5. V73 vectors are 128 bytes.  VMEMU can touch multiple cache lines, so base
+   and row-stride alignment should be a scheduling property, not a late fix.
+6. A load shortly after a store to the same address can stall until the store
+   reaches L2; roughly 15 independent packets are recommended.
+7. Contiguous access reduces bank conflicts, cache-set aliases, and micro-TLB
+   misses.  Page working set and lower address bits are part of scheduling.
+8. Scatter/gather is VTCM-only and page-contained; producer-side direct
+   placement is generally preferable to storing row-major and gathering later.
+9. The `:nt` attribute describes final use and can protect future prefetched or
+   reused data from one-pass traffic.
+
+These facts favor reuse regions and loop/dataflow transformation over issuing
+more independent hints.
+
+### 14.3 New mechanism N1: phase-specialized stationary scheduling
+
+Use different stationary dataflows for prefill and decode:
+
+- **prefill:** weights are reused across many sequence/image positions, so
+  make a weight/output-channel tile stationary in VRF or VTCM and process a
+  strip of positions before advancing the weight tile;
+- **decode:** one token reuses a large historical K/V state, so make the
+  active K/V page or head tile stationary while queries stream through it;
+- **convolution/vision:** choose output-channel-, input-channel-, or
+  patch-stationary scheduling from reuse and VTCM/VRF pressure.
+
+This directly targets the Falcon prefill result: prefetching fresh K/V cannot
+help a run dominated by projection and vocabulary weights.  Reordering
+`[sequence, output-channel, reduction]` so a weight vector serves several
+sequence positions can reduce repeated VMEM reads even when the complete
+weight tensor already fits in L2.
+
+Admission test:
+
+```text
+saved VMEM bytes =
+  weight_tile_bytes * (old_position_reloads - new_position_reloads)
+
+admit only if:
+  saved VMEM bytes >
+  added output traffic + padding + spill bytes
+```
+
+The first implementation target should be a single static FP16 projection in
+Falcon Debug, followed by GPT-2/Qwen and the QKV/MLP projections of ViT/Swin.
+
+### 14.4 New mechanism N2: activation multicast across sibling projections
+
+Transformer blocks contain natural sibling consumers:
+
+- normalized activation feeding Q, K, and V projections;
+- MLP activation feeding gate and up projections;
+- encoder output feeding multiple cross-attention projections; and
+- a feature tile feeding several convolution branches.
+
+Current operator-by-operator lowering may reload the same activation for every
+sibling.  An activation-multicast MAR loads one 128-byte-aligned activation
+vector once into VRF and applies all compatible projection tiles before the
+value is discarded.  If HMX is used, the activation is staged once into AH and
+referenced by multiple HMX calls when the public HexKL ABI permits it.
+
+This is stronger than ordinary fusion: the principal metric is eliminated
+source reads, not merely fewer dispatches.  It composes naturally with
+prefetch because the shared activation receives one lease instead of three
+competing leases.
+
+### 14.5 New mechanism N3: online reduction and consumer fusion
+
+Large reduction intermediates should not be written and reread when a bounded
+tile state suffices:
+
+- LayerNorm/RMSNorm: retain partial sum/square-sum in vector registers and
+  feed normalized tiles directly to projection staging;
+- softmax: maintain online max and normalization sum by score tile, then
+  consume V tiles without materializing the full score/probability matrix;
+- pooling/statistics: combine reduction epilogue with the following transform
+  or projection.
+
+For attention this is an OmniFetch-compatible, hierarchy-specific online
+attention path:
+
+```text
+prefetch K/V tile t+1 (<8 KiB, page-contained)
+  while
+Q tile + K/V tile t -> online max/sum/output accumulator in VRF/VTCM
+```
+
+It reduces score-matrix writes, softmax rereads, and V rereads, while providing
+enough compute between prefetch and consumption.  This is a better prefill
+target than hinting newly produced whole K/V streams immediately before use.
+
+The implementation should begin on HVX attention; HMX matmul substitution is
+an independent extension and is not required to validate reduced movement.
+
+### 14.6 New mechanism N4: residual rendezvous
+
+A residual tensor is produced early and consumed after several expensive
+operators.  Ordinary lowering can write it to DDR/L2 and read it again at the
+add.  A residual-rendezvous MAR chooses among:
+
+- retaining a small tile in VRF across a fused local region;
+- retaining a longer-live tile in a colored VTCM slot;
+- processing a sequence/image strip through the block so residual production
+  and addition are closer; or
+- assigning an L2 lease when VTCM pressure makes explicit retention worse.
+
+The final producer can write directly into the residual-add layout, and the
+add can be fused with the last consumer store.  This removes one materialized
+boundary without assuming that an entire model activation fits in VTCM.
+
+### 14.7 New mechanism N5: recompute-versus-reload
+
+Some values are cheaper to regenerate in VRF than to load:
+
+- causal/window masks;
+- position indices and simple affine address-derived values;
+- broadcast constants and scale factors;
+- cheap elementwise epilogues; and
+- view/transpose address expressions.
+
+Introduce a costed choice:
+
+```text
+recompute_cost(vector packets)
+    versus
+reload_cost(VMEM bytes + expected L2/TLB stalls)
+```
+
+This complements movement-equivalence analysis.  A value need not be
+prefetched or retained if deterministic vector recomputation is cheaper.
+Recomputation must be bit-compatible with the baseline where exact numerical
+equivalence is required.
+
+### 14.8 New mechanism N6: VRF-pressure-aware fusion and tile sizing
+
+Fusion is beneficial only while live vector values remain in VRF.  Excessive
+fusion causes spills, which silently converts “zero-copy forwarding” into more
+VMEM traffic.
+
+Add a vector-register liveness estimator to each proposed MAR:
+
+- live Q/K/V, accumulator, normalization state, masks, and address vectors;
+- vector-pair requirements of individual HVX operations;
+- expected spill bytes;
+- packet distance required by store/load or scatter/gather hazards; and
+- remaining independent work available for L2FETCH latency hiding.
+
+Select tile shape, number of fused consumers, and pipeline depth jointly.
+Object auditing must verify that the selected region reduces VMEM
+instructions and does not merely move spills to a different stack slot.
+
+### 14.9 New mechanism N7: overwrite-aware allocation and zero suppression
+
+Buffers that are fully overwritten should not trigger an initial read or a
+separate DDR zero-fill:
+
+- initialize reductions in VRF/HMX accumulators;
+- construct full output tiles in registers and perform one aligned store;
+- use VTCM scratch for partial results rather than zeroing a DDR tensor;
+- avoid copy-on-initialization for destination-style ops whose entire output
+  is proven overwritten; and
+- mark final one-pass stores nontemporal when legal.
+
+The scalar manual's `dczeroa` demonstrates the architectural value of
+allocating a write-only cache line without fetching old contents.  HVX tensor
+code should realize the same principle through full-tile vector stores,
+destination ownership analysis, VTCM scratch, and cache-allocation policy
+rather than routing tensors through scalar L1.
+
+### 14.10 New mechanism N8: page-working-set supertiles
+
+M5 proposed page-aware placement.  The stronger scheduling transformation is
+to execute all compatible work for one page-contained supertile before moving
+to the next page:
+
+1. issue one page-safe 2-D L2 lease or DMA;
+2. consume the resident tile across sibling operators/positions;
+3. perform in-situ layout placement and local reductions;
+4. release it at the final use; and
+5. advance to the next page/supertile.
+
+This reduces active-page count and micro-TLB churn while amortizing one
+prefetch command.  It also prevents a burst of per-row hints from overwriting
+the single-flight L2 prefetch engine.
+
+### 14.11 New mechanism N9: HMX/HVX boundary residency
+
+HMX and HVX should not be treated as unrelated kernels joined through DDR:
+
+```text
+HMX output in VTCM
+  -> HVX bias/activation/norm/residual in the same tile
+  -> in-situ AH staging for the next HMX operation
+```
+
+The MAR owns the public VTCM tile across the boundary.  HVX epilogues consume
+and update it in place when aliasing is legal; the final HVX store forms the
+next AH layout.  This removes HMX-output DDR materialization and the next
+activation reload without relying on private HMX registers.
+
+This direction connects cleanly to the current paper story.  General
+non-aligned/batched MatMul-to-HMX lowering remains a separate “Next Paper
+Idea”; boundary residency improves data supply for HMX operations that are
+already legal.
+
+### 14.12 New mechanism N10: multi-layer circular activation arena
+
+For activation-dominated regions, process a bounded sequence/image strip
+through several adjacent operators or layers using a circular colored VTCM
+arena.  The strip remains resident while weights stream past it.  For
+weight-dominated regions, retain the existing layer-major schedule instead.
+
+This is not unconditionally profitable: crossing layers can increase weight
+reloads.  A dynamic-programming partitioner should select region boundaries
+from:
+
+- activation bytes saved;
+- additional weight bytes;
+- VTCM/VRF capacity;
+- residual lifetime;
+- layout compatibility; and
+- available prefetch overlap.
+
+It generalizes residual rendezvous and stationary scheduling to graph regions
+without requiring whole-model VTCM residency.
+
+### 14.13 Priority and experimental gates
+
+The new mechanisms should not be implemented in arbitrary order:
+
+| Priority | Mechanism | Why first | Initial complete-model gate |
+|---:|---|---|---|
+| 1 | N1 phase-specialized stationary scheduling | directly targets the measured Falcon prefill bottleneck and repeated weight reads | Falcon/GPT-2 HVX vector |
+| 2 | N2 activation multicast | common to LLM, ViT/Swin, and encoder-decoder models | Falcon plus Swin/Whisper |
+| 3 | N6 VRF-pressure model | prevents N1/N2 fusion from winning only in source IR while spilling in the object | all N1/N2 models |
+| 4 | N3 online reduction/attention | largest materialization reduction, but more complex correctness | GPT-2/Falcon and one vision/audio Transformer |
+| 5 | N4 residual rendezvous | broad model coverage and composes with N3 | Transformer and ResNet-like model |
+| 6 | N9 HMX/HVX boundary residency | connects the same movement abstraction to HMX | one already-HMX-eligible model |
+| 7 | N5/N7 read suppression | smaller independent wins and useful cleanup | three domains |
+| 8 | N8/N10 supertile/region partitioning | global scheduling after local cost models are trustworthy | selected full models |
+
+Before changing code, each candidate site should emit a movement ledger:
+
+```text
+baseline physical reads/writes
+predicted eliminated bytes
+new prefetch/DMA bytes
+expected reuse count
+VRF and VTCM footprint
+active pages and alignment padding
+predicted spills
+first-use distance
+```
+
+A mechanism enters the cumulative row only when:
+
+1. the final object shows fewer VMEM operations or fewer physical bytes;
+2. no new spill, alignment, page, or ownership problem invalidates the model;
+3. identical complete-model inputs pass the correctness gate;
+4. HVX vector improves over HVX vector, or the HMX-enabled path improves over
+   its matched HexKL baseline; and
+5. repeated serial measurements show a stable improvement beyond noise.
+
+This replaces blind feature trials with falsifiable, byte-level predictions.
