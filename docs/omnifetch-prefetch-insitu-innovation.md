@@ -2244,7 +2244,7 @@ before device compilation:
 | SegFormer MiT-B0 | 224x224; stages `[2,2,2,2]`, widths `[32,64,160,256]` | 3,576,392 | deterministic random |
 | DeiT-Small | 224x224 patch16; 12L, H384, 6 heads | 22,051,432 | deterministic random |
 | BEiT-base | 224x224 patch16; 12L, H768, per-layer relative-position bias retained | 86,530,984 | deterministic random |
-| DINOv2-small | stored 518 position table, 224 input crop; 12L, H384, 6 heads | 22,825,576 | deterministic random |
+| DINOv2-small | stored 518 position table, 224 input crop; 12L, H384, 6 heads | 22,825,192 | deterministic random |
 | Whisper-tiny | 80x3000 mel input (30 seconds); encoder/decoder 4/4, H384 | 37,760,640 | deterministic random |
 | HuBERT-base | 20,560 samples (1.285 s), 64 post-convolution frames; 12L, H768 | 94,396,320 | deterministic random |
 | Wav2Vec2-base | same fixed audio workload; 12L, H768 | 94,396,320 | deterministic random |
@@ -2470,6 +2470,101 @@ demonstrates that HMX mapping alone was not sufficient to make the full graph
 execute: it required the cumulative prefetch, decoupling, persistence, and
 VTCM-lifetime plan.  Because the baseline latencies are absent, Whisper belongs
 in the feasibility/capacity table rather than the numerical speedup table.
+
+#### Direct-QNN CPU/HTP full-model checkpoint
+
+The first direct-QNN full-model experiment deliberately reused DINOv2-small,
+because it is the only full global-attention vision model above for which HVX,
+HexKL, and the combination all produced correctness-valid timing.  A shared
+factory now constructs both the Hexagon-MLIR and ONNX graphs with exactly:
+
+- seed 142 and 22,825,192 deterministic random parameters;
+- the published 12-layer, hidden-384, six-head DINOv2-small structure;
+- the stored 518-position table and exact fixed 518-to-224 interpolation;
+- one logical `1x3x224x224` image and 257 tokens; and
+- one 1000-logit output.
+
+The earlier parameter table incorrectly wrote 22,825,576; the original
+Hexagon-MLIR run log and the shared factory both report 22,825,192, and the
+table is corrected above.
+
+The locally downloaded `QAIRT_v2.47.0.260601.zip` is not a complete QAIRT SDK:
+it contains only a Windows Genie DLL/import library.  The accompanying
+`qai-appbuilder-2.47.0.zip` is application-builder source and also lacks QNN
+converter, model generator, Android CPU/HTP backends, and V73 skel.  This run
+therefore uses the complete and previously validated QAIRT/QNN
+2.26.2.240911 installation rather than calling the partial archive “QNN 2.47.”
+
+QNN CPU rejected the initial FP16 model at the first Conv2d during graph
+prepare.  The final protocol consequently uses two representations of the same
+parameter values:
+
+- QNN HTP: the original FP16 model and FP16 input interface;
+- QNN CPU: those already-rounded FP16 parameter/input values expanded exactly
+  to FP32, because the 2.26 CPU backend does not accept this FP16 graph.
+
+The CPU and HTP PyTorch references differ by at most 0.001492 and have the same
+top-1.  This is a backend-legality conversion, not a separately initialized
+model, but the precision difference must remain visible in every table.
+
+Both QNN rows run synchronously for 20 serial inferences on the same SM8550
+phone.  HTP is explicitly configured for one HVX thread and the `default`
+performance profile.  `qnn-net-run` exposes no CPU-backend thread-count
+control; CPU therefore uses QNN's default scheduler and reported affinity
+fallbacks to cpuset `f8`.  It must not be described as a single-thread CPU
+result.
+
+| Backend/configuration | Precision | Mean | Min | Max | Correctness |
+|---|---|---:|---:|---:|---|
+| QNN CPU default scheduler | FP32 | **472.936 ms** | 338.292 ms | 618.730 ms | finite; max error 0.000002; top-1 302 |
+| QNN HTP, one HVX thread | FP16 | **99.520 ms** | 99.028 ms | 102.124 ms | finite; max error 0.003906; top-1 302 |
+
+QNN metadata confirms physical NHWC input `[1,224,224,3]` and output
+`[1,1000]`; the exporter serializes the same logical NCHW tensor in that
+reported physical layout.  QNN CPU is 4.7522x slower than QNN HTP.
+
+For context, the full-model execution-only means are:
+
+| Path | Time | Relative to QNN HTP |
+|---|---:|---:|
+| Hexagon-MLIR HVX | 1,281,514.120 ms | 12,876.95x slower |
+| Hexagon-MLIR HexKL | 1,284,233.665 ms | 12,904.28x slower |
+| Hexagon-MLIR HexKL + items 1-7 | 300,484.161 ms | 3,019.33x slower |
+| QNN CPU FP32 | 472.936 ms | 4.7522x slower |
+| QNN HTP FP16 | 99.520 ms | 1.0x |
+
+These enormous ratios do not mean that one prefetch primitive is thousands of
+times worse.  The DINOv2 HexKL log reports zero legal HMX rewrites, so its
+matrix work remains in generic Hexagon-MLIR loops; the combination accelerates
+that same weak compute mapping but does not replace it with a production
+full-graph kernel plan.  QNN HTP performs proprietary whole-graph fusion,
+layout selection, tiling, HMX/HVX mapping, constant packing, memory planning,
+and runtime scheduling.  QNN CPU similarly uses optimized backend kernels and
+default multithreaded scheduling instead of the generated DSP loops.
+
+The comparison therefore establishes two points:
+
+1. OmniFetch's full DINOv2 4.2739x gain is real and correctness-valid relative
+   to the current open Hexagon-MLIR baseline.
+2. Compute-kernel quality and HMX coverage, not only data movement, remain the
+   dominant gap to a production vendor stack.  QNN should be reported as a
+   closed-source upper-bound reference, while expanded HMX lowering remains
+   separate baseline infrastructure/Next Paper Idea rather than being
+   misattributed to OmniFetch.
+
+Reproduction is split so conversion can survive device or session failures:
+
+```bash
+# Build ONNX plus the FP32-CPU and FP16-HTP Android model libraries.
+scripts/run_dinov2_full_qnn_cpu_htp.sh --prepare-only
+
+# Reuse the prepared libraries; run CPU first and HTP second, strictly serial.
+scripts/run_dinov2_full_qnn_cpu_htp.sh --run-only
+```
+
+All ONNX, generated C++, weight binaries, shared libraries, raw tensors,
+profiles, and metadata stay under
+`/tmp/omnifetch-baselines/dinov2-small-full-qnn` and are not committed.
 
 ### Can SD-UNet be deployed?
 
