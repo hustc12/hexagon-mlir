@@ -160,7 +160,14 @@ def get_encodings(tokenizer, *inputs):
     return tokenizer(*inputs, return_tensors="pt")
 
 
-def hex_execution(module, func_name, inputs, options: dict = None, mlir_text: Optional[str] = None):
+def hex_execution(
+    module,
+    func_name,
+    inputs,
+    options: dict = None,
+    mlir_text: Optional[str] = None,
+    iterations: int = 1,
+):
     linalg_filename = Path(__file__).parent / (str(func_name) + ".mlirbc")
 
     # Strip cf.assert (embedding bounds checks → ub.poison on Hexagon LLVM).
@@ -189,7 +196,7 @@ def hex_execution(module, func_name, inputs, options: dict = None, mlir_text: Op
     if not options.get("enableHexKL"):
         options["enableConvertToHexagonmem"] = False
     return TorchMLIRHexagonLauncher().run_torch_mlir(
-        launch_path, inputs, func_name, options=options
+        launch_path, inputs, func_name, iterations=iterations, options=options
     )
 
 
@@ -337,6 +344,7 @@ def qwen2_5_0_5b(
     enable_omnifetch_adaptive: bool = True,
     enable_omnifetch_items_1_7: bool = False,
     seq_len: Optional[int] = None,
+    device_iterations: int = 1,
 ):
     # User-PD: 1GB heap reservation can fault; GPT-2 HexKL uses 256MB.
     _patch_dsp_heap_256mb()
@@ -467,7 +475,12 @@ def qwen2_5_0_5b(
     inputs = [input_ids, attention_mask, position_ids]
 
     hex_outputs = hex_execution(
-        module, func_name, inputs, options, mlir_text=mlir_text
+        module,
+        func_name,
+        inputs,
+        options,
+        mlir_text=mlir_text,
+        iterations=device_iterations,
     )
     print("Successfully ran full Qwen model on Hexagon DSP!")
 
@@ -508,6 +521,7 @@ if __name__ == "__main__":
     parser.add_argument("--omnifetch-lookahead", type=int, default=2)
     parser.add_argument("--disable-omnifetch-adaptive", action="store_true")
     parser.add_argument("--enable-omnifetch-items-1-7", action="store_true")
+    parser.add_argument("--device-iterations", type=int, default=1)
     parser.add_argument(
         "--seq-len",
         type=int,
@@ -523,4 +537,5 @@ if __name__ == "__main__":
         enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
         enable_omnifetch_items_1_7=args.enable_omnifetch_items_1_7,
         seq_len=args.seq_len,
+        device_iterations=args.device_iterations,
     )

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from typing import Optional
+import os
 import re
 from pathlib import Path
 
@@ -14,17 +15,33 @@ from triton.backends.qcom_hexagon_backend.torch_mlir_hexagon_launcher import (
 from triton.backends.qcom_hexagon_backend import hexagon_launcher_base as _hlb
 
 _QURT_HEAP_1GB = "unsigned int _QURT_MAX_HEAP_SIZE = 1073741824; // 1 GB Max Heap Size"
-_QURT_HEAP_256MB = "unsigned int _QURT_MAX_HEAP_SIZE = 268435456;  // 256 MB Max Heap Size"
 
 
-def patch_dsp_heap_256mb():
+def patch_dsp_heap_mb(heap_size_mb: int):
+    if heap_size_mb <= 0 or heap_size_mb >= 1024:
+        raise ValueError("DSP heap must be between 1 and 1023 MiB")
     orig_init = _hlb.WrapperGeneratorStrings.__init__
+    replacement = (
+        "unsigned int _QURT_MAX_HEAP_SIZE = "
+        f"{heap_size_mb * 1024 * 1024};  // {heap_size_mb} MB Max Heap Size"
+    )
 
     def _patched_init(self):
         orig_init(self)
-        self.code_string = self.code_string.replace(_QURT_HEAP_1GB, _QURT_HEAP_256MB)
+        self.code_string = self.code_string.replace(_QURT_HEAP_1GB, replacement)
 
     _hlb.WrapperGeneratorStrings.__init__ = _patched_init
+
+
+def patch_dsp_heap_256mb():
+    patch_dsp_heap_mb(256)
+
+
+def patch_full_model_dsp_heap(default_mb: int = 512):
+    """Patch the full-model DSP heap, with an auditable environment override."""
+    heap_mb = int(os.environ.get("OMNIFETCH_DSP_HEAP_MB", str(default_mb)))
+    print(f"[DSPHeap] full_model_heap_mb={heap_mb}")
+    patch_dsp_heap_mb(heap_mb)
 
 
 def rewrite_matmul_inputs_to_f16(ir: str) -> tuple[str, int]:
@@ -187,6 +204,7 @@ def hex_execution(
     options: dict = None,
     mlir_text: Optional[str] = None,
     out_dir: Optional[Path] = None,
+    iterations: int = 1,
 ):
     out_dir = out_dir or Path(__file__).parent
     linalg_filename = out_dir / (str(func_name) + ".mlirbc")
@@ -220,7 +238,7 @@ def hex_execution(
     if not options.get("enableHexKL"):
         options["enableConvertToHexagonmem"] = False
     return TorchMLIRHexagonLauncher().run_torch_mlir(
-        launch_path, inputs, func_name, options=options
+        launch_path, inputs, func_name, iterations=iterations, options=options
     )
 
 

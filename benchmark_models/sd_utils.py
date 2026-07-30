@@ -51,7 +51,7 @@ def compile_to_linalg(model, *inputs, dump_to_file=None, debug=False):
 # ---------------------------------------------------------------------------
 
 def hex_execution(module, func_name, inputs, options: dict = None,
-                  heap_size_mb: int = 8):
+                  heap_size_mb: int = 8, iterations: int = 1):
     linalg_filename = Path(__file__).parent / (func_name + ".mlirbc")
     bytecode = module.operation.get_asm(binary=True)
     with open(linalg_filename, "wb") as f:
@@ -73,7 +73,11 @@ def hex_execution(module, func_name, inputs, options: dict = None,
     _hlb.WrapperGeneratorStrings.__init__ = _patched_base_init
     try:
         hex_outputs = TorchMLIRHexagonLauncher().run_torch_mlir(
-            str(linalg_filename), inputs, func_name, options=options
+            str(linalg_filename),
+            inputs,
+            func_name,
+            iterations=iterations,
+            options=options,
         )
     finally:
         _hlb.WrapperGeneratorStrings.__init__ = _orig_base_init
@@ -170,6 +174,7 @@ def add_phase4_cli(parser):
         action="store_true",
         help="Enable the cumulative innovation items 1 through 7.",
     )
+    parser.add_argument("--device-iterations", type=int, default=1)
     return parser
 
 

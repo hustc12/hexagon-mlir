@@ -70,6 +70,7 @@ def test_text_encoder(
     omnifetch_lookahead: int = 2,
     enable_omnifetch_adaptive: bool = True,
     enable_omnifetch_items_1_7: bool = False,
+    device_iterations: int = 1,
 ):
     print("\n=== Stable Diffusion — Text Encoder ===")
 
@@ -131,7 +132,12 @@ def test_text_encoder(
 
     print("Running Text Encoder on Hexagon NPU …")
     hex_out = hex_execution(
-        module, "CLIPWrapper", [position_ids, input_ids, attention_mask], options
+        module,
+        "CLIPWrapper",
+        [position_ids, input_ids, attention_mask],
+        options,
+        heap_size_mb=512,
+        iterations=device_iterations,
     )
     print("Running reference on x86 …")
     x86_out = x86_execution(model, input_ids, attention_mask)
@@ -153,4 +159,5 @@ if __name__ == "__main__":
         omnifetch_lookahead=args.omnifetch_lookahead,
         enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
         enable_omnifetch_items_1_7=args.enable_omnifetch_items_1_7,
+        device_iterations=args.device_iterations,
     )

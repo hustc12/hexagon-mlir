@@ -6,9 +6,12 @@ import sys
 from pathlib import Path
 
 import torch
-from transformers import Dinov2Config, Dinov2ForImageClassification
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from dinov2_debug_common import (
+    create_dinov2_debug_model_and_input,
+    print_dinov2_debug_identity,
+)
 from hexkl_utils import (
     add_phase4_args,
     apply_hexkl_ir_rewrites,
@@ -19,34 +22,11 @@ from hexkl_utils import (
 )
 
 
-class Dinov2DebugWrapper(torch.nn.Module):
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-
-    def forward(self, pixels):
-        return self.model(pixel_values=pixels).logits
-
-
 def run(args):
     patch_dsp_heap_256mb()
-    torch.manual_seed(142)
-    config = Dinov2Config(
-        image_size=32,
-        patch_size=8,
-        num_channels=3,
-        hidden_size=64,
-        num_hidden_layers=1,
-        num_attention_heads=2,
-        intermediate_size=128,
-        hidden_act="gelu_new",
-        num_labels=10,
-        use_mask_token=False,
-    )
-    wrapped = Dinov2DebugWrapper(
-        Dinov2ForImageClassification(config).half().eval()
-    ).eval()
-    inputs = [torch.rand(1, 3, 32, 32, dtype=torch.float16)]
+    wrapped, pixels = create_dinov2_debug_model_and_input()
+    print_dinov2_debug_identity(wrapped, pixels)
+    inputs = [pixels]
     module = compile_to_linalg(wrapped, tuple(inputs), decomp_pow=False)
     ir = str(module)
     print(
@@ -68,7 +48,12 @@ def run(args):
         lower_constants_separate=False,
     )
     output = hex_execution(
-        module, wrapped.__class__.__name__, inputs, options, mlir_text=patched
+        module,
+        wrapped.__class__.__name__,
+        inputs,
+        options,
+        mlir_text=patched,
+        iterations=args.device_iterations,
     )
     with torch.no_grad():
         reference = wrapped(*inputs)
@@ -82,4 +67,10 @@ def run(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     add_phase4_args(parser)
+    parser.add_argument(
+        "--device-iterations",
+        type=int,
+        default=1,
+        help="Number of serial in-process executions averaged on the DSP.",
+    )
     run(parser.parse_args())

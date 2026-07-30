@@ -172,7 +172,14 @@ def x86_execution(model, encoding):
     return model(encoding)
 
 
-def hex_execution(module, func_name, inputs, options: dict = None, mlir_text: Optional[str] = None):
+def hex_execution(
+    module,
+    func_name,
+    inputs,
+    options: dict = None,
+    mlir_text: Optional[str] = None,
+    iterations: int = 1,
+):
     linalg_filename = Path(__file__).parent / (str(func_name) + ".mlirbc")
     bytecode = module.operation.get_asm(binary=True)
     with open(linalg_filename, "wb") as f:
@@ -185,7 +192,7 @@ def hex_execution(module, func_name, inputs, options: dict = None, mlir_text: Op
         launch_path = str(patched)
 
     hex_outputs = TorchMLIRHexagonLauncher().run_torch_mlir(
-        launch_path, inputs, func_name, options=options
+        launch_path, inputs, func_name, iterations=iterations, options=options
     )
     return hex_outputs
 
@@ -397,6 +404,7 @@ def gpt2lmheadmodel(
     # Fixed sequence length for fair ablations (HexKL vs HVX vs OmniFetch).
     # None → legacy behaviour (short prompt; HexKL uses a hand-tuned 32-token string).
     seq_len: Optional[int] = None,
+    device_iterations: int = 1,
 ):
 
     model_name = "openai-community/gpt2"
@@ -527,7 +535,12 @@ def gpt2lmheadmodel(
         options["enableLWP"] = True
     inputs = [encoding["input_ids"]]
     hex_outputs = hex_execution(
-        module, func_name, inputs, options, mlir_text=mlir_text
+        module,
+        func_name,
+        inputs,
+        options,
+        mlir_text=mlir_text,
+        iterations=device_iterations,
     )
     x86_outputs = x86_execution(wrapped, encoding["input_ids"])
 
@@ -611,6 +624,7 @@ if __name__ == "__main__":
              "pad_token). Use the same value with/without --enable-hexkl. "
              "Must be a multiple of 32 when HexKL is enabled.",
     )
+    parser.add_argument("--device-iterations", type=int, default=1)
     args = parser.parse_args()
 
     gpt2lmheadmodel(
@@ -630,4 +644,5 @@ if __name__ == "__main__":
         enable_omnifetch_attention_hmx=args.enable_omnifetch_attention_hmx,
         enable_hexkl_persistent_vtcm=args.enable_hexkl_persistent_vtcm,
         seq_len=args.seq_len,
+        device_iterations=args.device_iterations,
     )

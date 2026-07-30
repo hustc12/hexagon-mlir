@@ -2185,6 +2185,292 @@ The relaxed `>=1.8x` set now reaches **15 models** with the intended balance:
 DeiT and BEiT remain accuracy-waived NaN entries and must be labelled as such.
 The other three additions in this section are numerically valid.
 
+### Full-model execution plan (2026-07-29)
+
+The Debug screening set is now frozen.  Full-model work uses the same balanced
+5/5/5 list, but a model is called "full" only if no layer count, hidden width,
+head count, vocabulary size, or native input resolution/duration is reduced.
+Published checkpoint weights and a published full-size configuration with
+random weights are tracked separately; the latter is useful for compiler and
+memory-schedule screening but is not represented as a checkpoint result.
+
+The strict serial order is:
+
+| Order | Domain | Model | Initial full-runner state | Initial weight state |
+|---:|---|---|---|---|
+| 1 | Language/Text | Falcon-RW-1B | present | checkpoint missing locally |
+| 2 | Language/Text | GPT-2 | present | checkpoint cached |
+| 3 | Language/Text | Qwen2.5-0.5B | present | checkpoint cached |
+| 4 | Language/Text | TinyLlama-1.1B | present | checkpoint missing locally |
+| 5 | Language/Text | SD/CLIP text encoder | present | full structure, random weights |
+| 6 | Vision | Swin-Tiny | present | full structure, random weights |
+| 7 | Vision | SegFormer MiT-B0 | pending | pending |
+| 8 | Vision | DeiT-Small | pending | pending |
+| 9 | Vision | BEiT-base | pending | pending |
+| 10 | Vision | DINOv2-small | pending | pending |
+| 11 | Speech/Audio | Whisper-tiny | pending | pending |
+| 12 | Speech/Audio | HuBERT-base | pending | pending |
+| 13 | Speech/Audio | Wav2Vec2-base | pending | pending |
+| 14 | Speech/Audio | UniSpeech-base | pending | pending |
+| 15 | Speech/Audio | UniSpeech-SAT-base | pending | pending |
+
+Within each row, execution order is always `HVX -> HexKL -> HexKL + cumulative
+items 1-7`; models are never run concurrently.  A failed export, host codegen,
+device load, execution, or correctness check is retained as a result rather
+than replaced by a smaller graph.  Initial screening uses one process-level
+device timing to expose feasibility.  A model that completes all three rows is
+then promoted to the formal protocol above (cold separated from at least five
+warm measured invocations, with median/p90 and mechanism counters).
+
+The single entry point is:
+
+```bash
+scripts/run_full_model_matrix.sh --list
+
+ANDROID_SERIAL=49d1c7b2 scripts/run_full_model_matrix.sh \
+  --seq-len 32 --timeout 3600 --dsp-heap-mb 512 \
+  --output-dir benchmark_models/results/full_matrix_items_1_7
+```
+
+Generated MLIR, shared objects, logs, and result CSV files remain experiment
+artifacts and must not be committed.
+
+The preparation pass then completed all nine previously missing full-structure
+runners.  Static construction verifies the following exact parameter counts
+before device compilation:
+
+| Model | Full workload/structure | Parameters | Weight state |
+|---|---|---:|---|
+| SegFormer MiT-B0 | 224x224; stages `[2,2,2,2]`, widths `[32,64,160,256]` | 3,576,392 | deterministic random |
+| DeiT-Small | 224x224 patch16; 12L, H384, 6 heads | 22,051,432 | deterministic random |
+| BEiT-base | 224x224 patch16; 12L, H768, per-layer relative-position bias retained | 86,530,984 | deterministic random |
+| DINOv2-small | stored 518 position table, 224 input crop; 12L, H384, 6 heads | 22,825,576 | deterministic random |
+| Whisper-tiny | 80x3000 mel input (30 seconds); encoder/decoder 4/4, H384 | 37,760,640 | deterministic random |
+| HuBERT-base | 20,560 samples (1.285 s), 64 post-convolution frames; 12L, H768 | 94,396,320 | deterministic random |
+| Wav2Vec2-base | same fixed audio workload; 12L, H768 | 94,396,320 | deterministic random |
+| UniSpeech-base | same fixed audio workload; 12L, H768 | 94,396,320 | deterministic random |
+| UniSpeech-SAT-base | same fixed audio workload; 12L, H768 | 94,396,320 | deterministic random |
+
+DINOv2 does not shrink its published 518x518 positional parameter to the
+224x224 evaluation crop.  The exact 518-to-224 interpolation is precomputed on
+the host and captured as a constant because it is input-shape invariant.  BEiT
+does not reuse the Debug workaround that disabled relative-position bias.
+These details are necessary for the runners to be called full structure.
+
+The full runners use a 512 MiB QuRT heap by default, rather than the 256 MiB
+Debug heap.  The exact value is recorded in every CSV row and can be changed
+with `--dsp-heap-mb`; a value at or above 1 GiB remains forbidden because that
+reservation is known to fault in the phone's User-PD.  Screening defaults to
+one device invocation.  After all three rows pass, the formal repeat is:
+
+```bash
+ANDROID_SERIAL=49d1c7b2 scripts/run_full_model_matrix.sh \
+  --device-iterations 5 --dsp-heap-mb 512 \
+  --seq-len 32 --timeout 3600 MODEL_NAME
+```
+
+The launcher reports the in-process mean.  Median and p90 still require
+multiple process-level formal repetitions; a five-iteration mean must not be
+mislabelled as either statistic.
+
+#### First full-structure screening: Swin-Tiny
+
+The first serial screening used the existing full `[2,2,6,2]` Swin-Tiny
+runner, random FP16 full-structure weights, a 224x224 input, and the original
+256 MiB Debug heap:
+
+| Configuration | Host codegen | Device result |
+|---|---:|---|
+| HVX | 265.2125 s | failed immediately, exit 13; no `perf.txt` |
+| HexKL | 204.7267 s | failed immediately, exit 13; no `perf.txt` |
+| HexKL + items 1-7 | 704.9473 s | **PASS, 206,326.114 ms**, max error 0.0039, top-1/top-5 match |
+
+The combination is slow in absolute terms but it is the only configuration
+that completed.  Its persistent-WH wrapper executes a cold call, one measured
+warm call, and a post-invalidation call.  The ADB command therefore took
+617.6415 seconds even though the reported warm call was 206.326 seconds:
+cold 206.225 s, warm 206.326 s, invalidated 203.955 s.  The long FastRPC wait
+was real computation, not a deadlock.
+
+The full graph exercised the intended mechanisms:
+
+- 12 compiler prefetch sites;
+- four async and four persistent cost-model choices;
+- 20 attention K/V sites, 1,584 pages, and 3,311,616 prefetched bytes;
+- VTCM peak reduced from 126,976 to 57,344 bytes (69,632 bytes saved);
+- 13,968 cold WH hits / 144 misses and 27,936 total hits / 288 misses; and
+- 12,330 issued runtime L2 requests, with 11,515 page-clipped requests.
+
+No speedup can be computed until the two baselines complete.  Because both
+baseline failures could be caused by the inherited 256 MiB heap, the next
+bounded check reruns HVX only with the now-recorded 512 MiB full-model heap.
+This is a capacity diagnosis, not a performance cherry-pick.
+
+The 512 MiB Swin HVX retry still completed host codegen (199.6202 seconds) and
+then failed immediately with device exit 13.  Heap reservation alone therefore
+does not explain the baseline failure.  The combination's successful execution
+is provisionally classified as a data-lifetime/layout feasibility improvement,
+not a latency speedup.
+
+#### Full-structure SegFormer MiT-B0 screening
+
+The next strictly serial model was the full four-stage, 224x224 MiT-B0 graph:
+
+| Configuration | Host codegen | Device result |
+|---|---:|---|
+| HVX | 133.8480 s | exit 13; no `perf.txt` |
+| HexKL | 132.5319 s | 8 batch-matmul rewrites; exit 13; no `perf.txt` |
+| HexKL + items 1-7 | 419.8110 s | **PASS, 19,785.205 ms**, finite output, max error 0.0012, top-1 match |
+
+The combination again converted an otherwise non-executable full graph into a
+valid device execution.  It selected eight persistent sites (zero async
+sites), inserted 16 total prefetch sites, identified four attention K/V sites,
+and reduced VTCM peak from 61,440 to 24,576 bytes.  Runtime counters reported
+1,940 cold WH hits / 20 misses, 4,212 issued L2 requests, and 6,030,720 issued
+bytes.  Cold, warm, and post-invalidation calls were 19.971 s, 19.785 s, and
+19.704 s, respectively, so the ADB execution lasted about 60 seconds.
+
+This repeats the Swin capacity result in a different hierarchical vision
+architecture and at only 3.58M parameters.  It weakens a simple
+"parameter-count too large" explanation: native spatial activation layout and
+lifetime are more plausible limits.  It still does not provide a numerical
+speedup because neither baseline produced a valid latency.
+
+#### Full-structure DeiT-Small screening
+
+The third full vision run used the published DeiT-Small structure (224x224
+patch-16 input, 12 layers, hidden size 384, six attention heads, and 22.05M
+parameters) with deterministic random FP16 weights.  All three configurations
+completed device execution and produced timing data, but all three outputs
+contained NaNs and failed the finite/top-1 correctness gate:
+
+| Configuration | Host codegen | Warm device time | Correctness |
+|---|---:|---:|---|
+| HVX | 67.6258 s | 913,419.276 ms | **FAIL:** NaN, top-1 mismatch |
+| HexKL | 71.0438 s | 912,734.553 ms | **FAIL:** NaN, top-1 mismatch |
+| HexKL + items 1-7 | 176.2994 s | 266,291.591 ms | **FAIL:** NaN, top-1 mismatch |
+
+If accuracy is temporarily waived for candidate screening, the combination is
+`912734.553 / 266291.591 = 3.4276x` faster than HexKL.  This ratio is a strong
+performance signal but is **not a paper-valid speedup** until the common NaN
+failure is fixed.  The aggregate CSV intentionally reports the speedup as
+`NA`, because a failed correctness gate must not silently enter the successful
+model count.
+
+HexKL reported zero batch-matmul and FP16 HMX rewrites, so its 0.075% difference
+from HVX is noise-level and both rows use effectively the same generic compute
+path.  The combination selected no native, async, or persistent transform-cost
+sites and found no eliminable layout transform.  Its active mechanism was
+attention K/V stream prefetch: 24 sites, 144 hints, 648 pages, and 3,649,536
+hinted bytes.  Runtime issued 432 page-clipped L2 requests and 972,928 bytes.
+This isolates the provisional gain more narrowly than Swin or SegFormer:
+attention-stream lookahead changed execution time even without HMX coverage,
+persistent-WH reuse, or in-situ layout elimination.
+
+The combination wrapper measured cold, warm, and post-invalidation calls at
+269.032 s, 266.292 s, and 272.667 s.  Their close agreement argues against a
+one-time cache warm-up artifact.  The immediate next correctness task is to
+locate the earliest layer producing non-finite values under all three
+configurations; until then DeiT remains an accuracy-waived candidate only.
+
+#### Full-structure BEiT-base screening
+
+The original full runner retained BEiT's per-layer relative-position bias, but
+Transformers dynamically regenerated its meshgrid/index/interpolation graph.
+Torch-MLIR rejected the resulting `aten.unsqueeze` before backend selection.
+For fixed native 224x224 inference, the runner now evaluates each layer's
+14x14 relative-position bias once and captures the exact result as a buffer.
+The original learned table remains a parameter, and a two-layer equivalence
+test measured zero difference before and after freezing.  This is a
+fixed-resolution export repair, not removal of relative-position bias.
+
+After that repair, the 86.53M-parameter graph exported 72 batch matmuls and one
+matmul.  The valid infrastructure run produced:
+
+| Configuration | Host codegen | Device/host result |
+|---|---:|---|
+| HVX | 159.6166 s | constants pushed; immediate device exit 13; no timing |
+| HexKL | 162.7533 s | zero HexKL rewrites; immediate device exit 13; no timing |
+| HexKL + items 1-7 | not completed | host process killed with exit 137 after IR passes; no library/timing |
+
+The combination IR contained 24 K/V prefetch sites and 288
+`prefetch_in_situ` operations, but no HMX layout transform was eliminable.
+The process was killed after the VDAE pass and before the object/shared-library
+messages, which identifies host peak-memory/codegen capacity as the immediate
+blocker.  It must not be interpreted as a device latency regression.
+
+BEiT therefore remains unsupported as a monolithic full graph under the
+current host/device capacity.  The bounded next repair is module-wise
+compilation with constants shared across layer modules; reducing layer count
+or disabling relative-position bias would no longer be a full-model test and
+is not used as a substitute result.
+
+#### Full-structure DINOv2-small screening
+
+DINOv2-small is the first full-size vision transformer in this series for
+which all three rows passed the correctness gate.  The runner retained the
+published 518-position parameter table, precomputed its exact fixed 224-crop
+interpolation, and executed the full 12-layer, hidden-384 graph:
+
+| Configuration | Host codegen | Warm device time | Correctness |
+|---|---:|---:|---|
+| HVX | 65.5256 s | 1,281,514.120 ms | PASS |
+| HexKL | 63.1069 s | 1,284,233.665 ms | PASS |
+| HexKL + items 1-7 | 162.2270 s | **300,484.161 ms** | PASS; max error 0.0059, top-1 match |
+
+The correctness-valid HexKL-to-combination speedup is **4.2739x**.  HexKL
+performed zero batch-matmul or FP16 HMX rewrites and was 0.21% slower than
+HVX, so those two rows are effectively the same generic compute path.  The
+combination selected no native, async, or persistent transform-cost sites and
+found no HMX layout transform to eliminate.  It activated 24 attention K/V
+sites, 144 hints, 792 pages, and 4,737,024 hinted bytes.  Runtime issued 432
+page-clipped L2 requests and 1,248,768 bytes.
+
+The combination's cold, warm, and post-invalidation calls were 301.727 s,
+300.484 s, and 299.525 s; the full ADB command was 902.399 s.  Their tight
+spread rejects a one-time warm-cache explanation.  Together with the
+correctness-valid result, this is strong evidence that attention K/V stream
+prefetch alone can change the generated execution schedule substantially for
+the full global-attention graph, even before the separate Next Paper Idea
+expands HMX coverage.
+
+#### Full-structure Whisper-tiny screening
+
+Whisper-tiny used the complete 30-second `80x3000` log-mel input, four encoder
+layers, four decoder layers, hidden size 384, a 32-token decoder input, and
+37.76M deterministic random FP16 parameters.  No layer, width, or audio
+duration was reduced:
+
+| Configuration | Host codegen | Device result |
+|---|---:|---|
+| HVX | 65.5410 s | ran for about 57 minutes, then device exit 13; no `perf.txt` |
+| HexKL | 78.1039 s | 32 batch-matmul rewrites; immediate device exit 13; no timing |
+| HexKL + items 1-7 | 178.0254 s | **PASS, 1,093,076.414 ms**, finite output, max error 0.0049, last-token top-1 match |
+
+No numerical speedup is reported because neither baseline returned a valid
+latency.  The result is instead a full-model feasibility improvement: the
+combination completed a correctness-valid native-duration Whisper inference
+where both baselines failed.  The combination wrapper's cold, warm, and
+post-invalidation calls were 1,099.970 s, 1,093.076 s, and 1,086.868 s; the
+three-call ADB command took 3,285.043 s.  The close per-call values again rule
+out a one-time warm-cache effect.
+
+Unlike DINOv2, this model exercised several parts of the cumulative design:
+
+- 32 HexKL batch-matmul rewrites;
+- 96 compiler prefetch sites and 192 in-situ operations;
+- 32 synchronous, 32 asynchronous, and 32 persistent cost-model choices;
+- VTCM peak reduced from 421,888 to 204,800 bytes (217,088 bytes saved);
+- 16 K/V stream sites, 96 hints, 1,248 pages, and 9,412,608 hinted bytes; and
+- 24,397 runtime L2 requests with 6,154,752 issued bytes.
+
+This distinction matters for attribution.  DINOv2's valid 4.2739x result
+isolated attention-stream prefetch with zero HMX rewrite, whereas Whisper
+demonstrates that HMX mapping alone was not sufficient to make the full graph
+execute: it required the cumulative prefetch, decoupling, persistence, and
+VTCM-lifetime plan.  Because the baseline latencies are absent, Whisper belongs
+in the feasibility/capacity table rather than the numerical speedup table.
+
 ### Can SD-UNet be deployed?
 
 There are two distinct answers:
@@ -2239,3 +2525,720 @@ CrossAttn runner remains in the matrix as a regression target: a future
 partitioned implementation is successful only when all three HVX, HexKL, and
 HexKL+OmniFetch configurations reach device execution and pass the numerical
 comparison.
+
+## External baseline bring-up: QNN and LiteRT (2026-07-28)
+
+### Baseline model
+
+DINOv2-small Debug was selected for the first external deployment because it
+has one Transformer layer, a fixed `1x3x32x32` input, one ten-element output,
+and no token cache or dynamic shape.  It still contains attention, and its
+existing three-way measurements are numerically correct:
+
+| Existing path | Latency |
+|---|---:|
+| HVX | 173.867 ms |
+| HexKL | 174.867 ms |
+| HexKL + OmniFetch items 1-7 | 60.337 ms |
+
+The external exporter uses the identical seed (`142`), configuration, FP16
+weights, and input values as `run_dinov2-small_debug.py`.  DINOv2's upstream
+export path deliberately inserts bicubic position interpolation whenever
+TorchScript tracing is active, even when the input already matches the
+configured image size.  The baseline exporter replaces that tracing-only
+Resize/Cast chain with the already-sized position tensor.  This is equivalent
+to eager execution for the fixed 32x32 Debug input and is required by the QNN
+2.26 ONNX frontend.
+
+### Direct QNN 2.26 V73 HTP result
+
+The complete export, conversion, Android library build, V73 deployment,
+20-iteration serial run, correctness check, and profile extraction are now one
+command:
+
+```bash
+scripts/run_dinov2_qnn_baseline.sh
+```
+
+Generated files are written to
+`/tmp/omnifetch-baselines/dinov2-debug-qnn` by default.  The script uses:
+
+- QAIRT/QNN `2.26.2.240911`;
+- ONNX opset 17 and QNN `--float_bitwidth 16`;
+- `libQnnHtp.so`, V73 stub, and V73 skel on the phone;
+- FP32 host raw I/O in NHWC physical layout, which is the standard
+  `qnn-net-run` file interface, with an FP16 graph input/output on HTP;
+- 20 repeated input-list entries, executed serially;
+- QNN `burst` performance profile (exploratory run; superseded by the
+  controlled run below for cross-backend comparison).
+
+The QNN graph reports FP16 `[1,32,32,3]` input, FP16 `[1,10]` output, four HVX
+threads, and 20 completed inferences.  Correctness is:
+
+```text
+max_abs_diff=0.000244
+top1_ref=8
+top1_qnn=8
+```
+
+The basic QNN profile reports the following 20-run averages:
+
+| QNN profile scope | Average |
+|---|---:|
+| NetRun end-to-end execute, including I/O/misc | **1.017 ms** |
+| QNN execute | 1.002 ms |
+| RPC execute | 0.955 ms |
+| QNN accelerator execute | 0.472 ms |
+| Accelerator execute | 0.418 ms |
+| Accelerator execute excluding wait | 0.304 ms |
+
+This proves that the direct QNN baseline is deployable and materially stronger
+than the current hexagon-mlir paths for this Debug graph.  However, the QNN
+profile exposes several nested timing scopes while the current
+hexagon-mlir runner prints one model latency.  The first defensible comparison
+should use QNN `NetRun` execute time and add an equivalent warmed, repeated
+host-to-DSP execution measurement to the hexagon-mlir runner.  The
+accelerator-only 0.418 ms number must not be compared directly with the current
+60.337 ms number.
+
+### Controlled DINOv2 comparison and configuration audit
+
+The first QNN result was not a controlled cross-backend comparison.  Online
+QNN prepare selected four HVX threads because no graph thread limit was
+provided, and the script requested `burst`, QNN's highest sustained
+performance vote.  In contrast, the current hexagon-mlir model harness sets
+both `enableMultiThreading=false` and `enableSCFThreading=false`, and does not
+make an equivalent QNN-style `burst` vote.
+
+The benchmark has now been made reproducible as follows:
+
+- `dinov2_debug_common.py` is the single model factory used by the
+  hexagon-mlir runner and the external ONNX exporter;
+- both paths report the same model SHA-256
+  `b1369edc7559bf68bb11108bd91a0b2e5e2adc8c95e8eb24b6bb6180aa2afe28`;
+- both paths report the same input SHA-256
+  `352b527f0be5256826d717e85b672a410f0332941951f1e1c7336683bba8976c`;
+- all paths use FP16 model parameters and the identical FP16 logical input;
+- all executions are synchronous and serial, with one graph invocation in
+  flight and 20 in-process/input-list iterations;
+- QNN is constrained to one HVX thread and the `default` performance profile.
+
+The complete four-way comparison is intentionally serialized by one command:
+
+```bash
+scripts/run_dinov2_fair_external_comparison.sh
+```
+
+It writes generated artifacts outside the repository under
+`/tmp/omnifetch-baselines/dinov2-debug-fair` by default.  `OUTPUT_DIR`,
+`ITERATIONS`, and `ANDROID_SERIAL` may be overridden.
+
+Run the controlled hexagon-mlir cases serially:
+
+```bash
+source /home/huzq85/2-working/hexagon_npu/mlir-env/bin/activate
+export ANDROID_SERIAL=49d1c7b2
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+python benchmark_models/debug_running/run_dinov2-small_debug.py \
+  --device-iterations 20
+python benchmark_models/debug_running/run_dinov2-small_debug.py \
+  --enable-hexkl --device-iterations 20
+python benchmark_models/debug_running/run_dinov2-small_debug.py \
+  --enable-hexkl --enable-omnifetch-items-1-7 --device-iterations 20
+```
+
+Run controlled direct QNN:
+
+```bash
+QNN_ITERATIONS=20 \
+QNN_HVX_THREADS=1 \
+QNN_PERF_PROFILE=default \
+OUTPUT_DIR=/tmp/omnifetch-baselines/dinov2-debug-qnn-fair \
+scripts/run_dinov2_qnn_baseline.sh
+```
+
+The 2026-07-28 controlled results on the SM8550/V73 phone are:
+
+| Path / timing scope | Threads | Mode | 20-run average |
+|---|---:|---|---:|
+| hexagon-mlir HVX model body | 1 | no explicit high vote | 148.022 ms |
+| hexagon-mlir HexKL model body | 1 | no explicit high vote | 148.568 ms |
+| HexKL + OmniFetch items 1-7 warm model body | 1 + DAE scout | no explicit high vote | **51.712 ms** |
+| QNN NetRun execute, including I/O/misc | 1 HVX | default | **0.867 ms** |
+| QNN execute | 1 HVX | default | 0.854 ms |
+| QNN accelerator execute | 1 HVX | default | 0.341 ms |
+| Accelerator execute | 1 HVX | default | 0.306 ms |
+| Accelerator execute excluding wait | 1 HVX | default | 0.250 ms |
+
+All four paths pass numerical validation.  The QNN output has
+`max_abs_diff=0.000244` and the same top-1 class 8.  The controlled QNN NetRun
+scope is still 170.7x faster than HVX and 59.6x faster than the OmniFetch
+combination, so thread count and `burst` voting were real confounders but are
+not the principal explanation.
+
+The main causes visible in the current implementation are:
+
+1. `hexagon_options_phase4()` explicitly sets `enableVectorization=false`.
+   The linker uses `-mhvx`, but this does not mean the full Transformer graph
+   has been tiled and vectorized for HVX.
+2. `hex_execution()` explicitly sets `enableVTCMTiling=false`; the generic
+   path therefore does not get the compiler's ordinary VTCM tiling pass.
+3. Both hexagon-mlir graph threading options are disabled.  This controlled
+   comparison intentionally also limits QNN to one HVX thread, but QNN still
+   benefits from an internally scheduled HTP graph.
+4. The DINOv2 trace contains eight `linalg.batch_matmul` operations, yet the
+   HexKL run reports `rewrites=0`.  Thus the path labelled HexKL does not lower
+   any of those attention matmuls through the current HexKL rewrite; its
+   148.568 ms result is expected to match HVX closely.
+5. QNN performs vendor graph preparation: fixed physical layouts, graph-wide
+   canonicalization/fusion, kernel selection, VTCM planning, and asynchronous
+   background scheduling.  Its HTP implementation can schedule both HVX and
+   HMX-class resources.  The exact proprietary kernel mapping is not exposed
+   by basic profiling, so attributing a specific percentage to HMX would be
+   speculation; the measured result establishes the aggregate compiler and
+   runtime advantage.
+6. OmniFetch's 51.712 ms result is real, but its logs show zero HexKL rewrites
+   and zero persistent-W/H cache hits.  Its active benefit in this graph comes
+   primarily from the attention K/V stream prefetch path: 88 L2 requests and
+   73,216 issued bytes.  It does not repair the missing compute vectorization
+   or replace generic attention kernels.
+
+Accordingly, QNN should be treated as a highly optimized vendor upper
+baseline, not as evidence that the DINOv2 model differs.  The next fair
+performance work is to close compute-lowering gaps (especially supported
+batch-matmul/attention shapes, vectorization and VTCM scheduling) while
+retaining OmniFetch as the data-movement layer.
+
+### LiteRT Qualcomm status and version constraint
+
+The official repository was cloned to:
+
+```text
+/home/huzq85/2-working/hexagon_npu/baselines/LiteRT
+```
+
+The inspected revision is `b65d712754df26e52ed6334479c06510ee5d34f1`.
+This revision's official `third_party/qairt/workspace.bzl` pins QAIRT
+`2.47.0.260601`.  The directory supplied as `QAIRT_v2.47` was inspected.  Its
+`QAIRT_v2.47.0.260601.zip` does carry that version in its name, but contains
+only five entries: one directory hierarchy plus the Windows ARM64X
+`Genie.dll` and `Genie.lib`.  The accompanying `qai-appbuilder-2.47.0.zip` is
+AppBuilder source and samples.  Neither archive contains `include/QNN`,
+`lib/x86_64-linux-clang`, `lib/aarch64-android`, or the V73 skeleton expected
+by LiteRT's `third_party/qairt/qairt.BUILD`.  It is therefore a 2.47-labelled
+component download, not the complete QAIRT 2.47 Community SDK, and cannot be
+used through `LITERT_QAIRT_SDK`.
+
+LiteRT commit `f9083236c67091169da132b5d40c4505d6859ce4` pins the prior complete
+SDK `2.46.0.260424`, so using that LiteRT revision with the matching SDK is a
+valid fallback.  However, no 2.46 SDK or archive exists under the current
+baseline directories.  A direct request to LiteRT's official pinned download
+URL redirects to Qualcomm Software Center and returns HTTP 403 without an
+authenticated download.  LiteRT 2.46 testing is therefore blocked only on the
+complete `v2.46.0.260424.zip` (or its extracted SDK directory); it must not be
+faked with 2.26 libraries.
+
+The currently available complete closed SDK is `2.26.2.240911`, and LiteRT's
+open-source Qualcomm compiler/dispatch integration was introduced after that
+SDK generation.  Consequently, the current LiteRT Qualcomm plugin cannot be
+honestly built against the provided QNN 2.26 headers and runtime.  A LiteRT CPU
+or GPU run would not be an NPU baseline and is therefore not substituted.
+
+The correct next action is to provide either the complete QAIRT 2.47 Community
+SDK pinned by the cloned LiteRT revision or the complete 2.46 SDK pinned by
+LiteRT commit `f9083236c`.  Then run both:
+
+1. LiteRT Compiled Model API + Qualcomm compiler/dispatch plugin + QNN HTP;
+2. direct QNN 2.47;
+
+with the same DINOv2 graph, FP16 policy, one-HVX-thread/default-mode setting,
+20 serial iterations, and timing boundary.  Direct QNN 2.26 should remain as a
+separately labelled vendor-SDK result rather than silently mixing 2.26 runtime
+libraries into a LiteRT 2.47 plugin.
+
+### LiteRT + QAIRT 2.26 historical compatibility result
+
+The final paragraph above remains true for the **current** LiteRT revision, but
+the conclusion that LiteRT cannot be tested with the installed QAIRT 2.26 is
+superseded by a version-matched historical route.  LiteRT commit
+`e879503271481c476d2be41668e75dfc9d432e90` predates the mandatory QNN IR
+backend.  With its TensorFlow dependency pinned to the contemporary
+`f291a2e7b91ae11648d30cb2c1965c30f772af71` revision, the open-source
+Qualcomm compiler and dispatch plugin can be built against QAIRT
+`2.26.2.240911`.
+
+The compatibility work is deliberately explicit and reproducible:
+
+- `litert_qnn226_compat.patch` pins the TensorFlow archive, updates renamed
+  `rules_ml_toolchain` labels, limits System Context parsing to the V1/V2 ABI
+  present in QAIRT 2.26, and adds Android runner measurements;
+- the Qualcomm graph configuration fixes
+  `QNN_HTP_GRAPH_CONFIG_OPTION_NUM_HVX_THREADS=1`;
+- the Android runner fixes the HTP performance vote to `default`, disables QNN
+  per-execution logging, and reports first-run, steady mean, median, and p90;
+- `export_dinov2_debug_tflite.py` reconstructs the exact fixed-shape graph from
+  the exported ONNX initializers.  FP16-rounded parameters are retained in
+  FP32 containers; this is not quantization or a different random model.
+  LiteRT's QNN graph configuration requests FP16 precision;
+- the entire export, host numerical validation, plugin build, offline context
+  creation, Android build, deployment, and serial measurement is one command:
+
+```bash
+scripts/run_dinov2_litert_baseline.sh
+```
+
+The complete five-way sequence (HVX, HexKL, HexKL+items 1-7, direct QNN, and
+LiteRT-QNN) is also serialized by:
+
+```bash
+scripts/run_dinov2_fair_external_comparison.sh
+```
+
+Both scripts write generated files to `/tmp` by default.  No TFLite model,
+QNN context, Bazel cache, Android binary, virtualenv, or benchmark log belongs
+in Git.
+
+Host validation against the original FP16 ONNX model gives:
+
+```text
+max_abs_diff_onnx_tflite=0.000113010406
+top1_onnx=8
+top1_tflite=8
+```
+
+On the phone, LiteRT reports one dispatch custom op replacing the complete
+50-op graph (`1/1` NPU partition).  QNN restores the offline context binary,
+registers the input and output RPC buffers, and completes every graph
+execution on SM8550 HTP V73.  For the deterministic runner input, the LiteRT
+CPU and HTP outputs retain top-1 class 8; their maximum absolute difference is
+approximately `0.00149`, consistent with FP16 HTP execution.
+
+The controlled result uses one HVX thread, the `default` HTP performance mode,
+100 synchronous calls per process, three processes run one after another, and
+excludes the first call from the steady-state average:
+
+| LiteRT path | Trial | First | Steady mean | Median | p90 |
+|---|---:|---:|---:|---:|---:|
+| Qualcomm HTP, 1 HVX, default | 1 | 4.965 ms | 1.004 ms | 0.907 ms | 1.222 ms |
+| Qualcomm HTP, 1 HVX, default | 2 | 4.687 ms | 0.969 ms | 0.901 ms | 1.250 ms |
+| Qualcomm HTP, 1 HVX, default | 3 | 6.363 ms | 0.964 ms | 0.893 ms | 1.223 ms |
+| XNNPACK CPU | 1 | 1.171 ms | 0.355 ms | 0.304 ms | 0.416 ms |
+| XNNPACK CPU | 2 | 1.047 ms | 0.366 ms | 0.316 ms | 0.438 ms |
+| XNNPACK CPU | 3 | 0.845 ms | 0.330 ms | 0.312 ms | 0.429 ms |
+
+The three-trial HTP steady mean is **0.979 ms** and the mean of the three
+medians is **0.900 ms**.  Direct QNN's controlled NetRun average is 0.867 ms,
+so LiteRT adds about 0.112 ms, or 12.9%, at this very small graph size.  The
+LiteRT HTP result is still 151.2x faster than hexagon-mlir HVX, 151.8x faster
+than the current HexKL path, and 52.8x faster than HexKL+OmniFetch items 1-7
+when compared with their earlier controlled model-body numbers.  These ratios
+cross somewhat different runtime timing boundaries and therefore describe the
+current end-to-end implementation gap, not kernel-only speedups.
+
+The CPU result being faster than default-mode HTP is credible for this tiny
+one-layer Debug graph: HTP RPC/dispatch synchronization dominates roughly one
+million MACs.  An exploratory `burst` run produced three HTP steady means of
+0.130, 0.132, and 0.130 ms, but it is not the primary baseline because the
+hexagon-mlir and controlled direct-QNN cases do not make the same high-power
+vote.  This 7.5x default-to-burst difference is also evidence that performance
+mode must always be recorded in future comparisons.
+
+This result does not make the incomplete `QAIRT_v2.47` download usable, nor
+does it relabel a 2.26 binary as 2.47.  It is specifically:
+
+```text
+historical LiteRT e879503 + compatibility patch + QAIRT/QNN 2.26.2
+```
+
+The modern LiteRT + complete QAIRT 2.47 experiment remains a separate future
+baseline when the complete SDK becomes available.
+
+## Post-LiteRT audit: backend identity, fair baselines, and HMX scope
+
+This section records the conclusions reached after the first working
+LiteRT-QNN deployment.  It supersedes any earlier wording that treats LiteRT
+and direct QNN as independent NPU backends or claims that every measured path
+already uses bit-identical runtime input values.
+
+### LiteRT is not an independent Qualcomm NPU backend in this experiment
+
+The working Qualcomm path is:
+
+```text
+LiteRT model/runtime
+  -> open-source Qualcomm compiler and dispatch plugin
+  -> QNN SDK
+  -> QNN HTP backend
+  -> HTP scheduling over HVX, HMX, DMA, and VTCM
+```
+
+LiteRT supplies the model container, compilation-plugin interface, dispatch
+integration, and runtime API.  The component that compiles and executes the
+graph on the Qualcomm NPU is QNN HTP.  This interpretation is also consistent
+with the measured results:
+
+```text
+direct QNN NetRun average:       0.867 ms
+LiteRT plus QNN steady average:  0.979 ms
+observed LiteRT-layer delta:     0.112 ms (12.9% of direct QNN)
+```
+
+Consequently, LiteRT-QNN and direct QNN should not be presented as two
+independent NPU compiler baselines in the primary result table.  Keeping the
+LiteRT experiment remains useful for deployment validation and for measuring
+framework overhead, but direct QNN is the more direct vendor-backend reference.
+
+### Exact DINOv2 Debug model audit
+
+`dinov2_debug_common.py` is the single model factory used by the
+hexagon-mlir runner and ONNX exporter.  The logical model is:
+
+| Property | Value |
+|---|---:|
+| input | batch 1, 3x32x32 image |
+| patch size | 8x8 |
+| patch sequence | 16 patch tokens plus one CLS token = 17 |
+| hidden size | 64 |
+| attention heads | 2 |
+| encoder layers | 1 |
+| actual MLP hidden size | 256 |
+| output classes | 10 |
+| trainable parameters | 65,034 |
+| approximate work | 1.07 million MACs |
+
+The configuration passes `intermediate_size=128`, but the Hugging Face DINOv2
+implementation constructs a 64-to-256-to-64 MLP from its default
+`mlp_ratio=4`.  Both the Torch/MLIR and reconstructed TFLite graphs execute the
+actual 256-wide MLP, so this does not create a cross-backend mismatch.
+Nevertheless, the factory should eventually express `mlp_ratio=4` explicitly
+and remove the misleading unused setting.
+
+The common factory produces:
+
+```text
+model_sha256=b1369edc7559bf68bb11108bd91a0b2e5e2adc8c95e8eb24b6bb6180aa2afe28
+input_sha256=352b527f0be5256826d717e85b672a410f0332941951f1e1c7336683bba8976c
+```
+
+The apparent model-file sizes are not comparable measures of model structure:
+
+- the PyTorch FP16 parameter payload is 130,068 bytes;
+- the ONNX file is about 153 KiB and deduplicates identical zero/one
+  initializers;
+- the TFLite model is about 259 KiB because it retains FP16-rounded parameter
+  values in FP32 containers; and
+- the offline LiteRT/QNN compiled model is about 193 KiB and includes a QNN
+  context rather than a source parameter representation.
+
+Ten additional random images were evaluated through the exported FP16 ONNX
+and the reconstructed FP32-container TFLite graph.  All ten top-1 results
+matched and the worst maximum absolute output difference was
+`0.0001963079`.  This establishes fixed-shape functional equivalence beyond a
+single test vector.
+
+There are, however, three remaining fairness qualifications:
+
+1. Direct QNN consumes the common factory's tensor values, but the current
+   LiteRT `run_model` fills its buffer with the repeated pattern
+   `0.0, 0.1, ..., 0.9`.  Shape and work are unchanged, but runtime input
+   values are not bit-identical.
+2. The LiteRT CPU graph uses FP32 containers; hexagon-mlir and the QNN HTP
+   graph execute FP16.  FP32 does not explain why the CPU is faster, but the
+   precision policy must be labelled.
+3. The LiteRT interpreter defaults to one thread, while the XNNPACK delegate
+   receives its default `num_threads=0` because the runner does not add an
+   explicit CPU-options object.  The current 0.350 ms number must therefore be
+   labelled **XNNPACK default thread policy**, not a proven one-thread result.
+
+Before publication, LiteRT should read the exact common raw input, report its
+hash, explicitly configure one XNNPACK thread, and record CPU affinity and
+performance mode.
+
+### Why QNN HTP and XNNPACK are much faster than the current MLIR path
+
+The DINOv2 source Linalg graph contains:
+
+```text
+linalg.batch_matmul: 8
+linalg.matmul:       1
+linalg.generic:      84
+HexKL rewrites:      0
+```
+
+The current model harness explicitly disables both Hexagon vectorization and
+ordinary VTCM tiling.  Linking with `-mhvx` permits HVX instructions but does
+not transform the 84 generic operations into profitable vector kernels.
+LayerNorm, Softmax, GELU, reductions, view/layout work, and every unmatched
+matrix multiplication therefore remain on the generic compiler path.
+
+QNN HTP is a full graph compiler and runtime rather than one kernel library.
+It performs vendor kernel selection, layout propagation, graph
+canonicalization/fusion, constant and weight preparation, VTCM planning,
+buffer reuse, and internal scheduling.  The complete 50-operation TFLite graph
+is represented by one LiteRT dispatch operation after QNN compilation.  Basic
+profiling does not expose the proprietary kernel mapping, so the QNN result
+must not be attributed entirely to HMX without optrace evidence.
+
+The XNNPACK result is credible for this particular Debug proxy.  It has one
+Transformer layer, only 17 tokens, about 1.07 million MACs, and roughly 256
+KiB of FP32 constant data.  Warm weights and activations fit readily in CPU
+caches; XNNPACK provides NEON kernels and weight packing, and CPU execution
+does not pay HTP RPC/dispatch synchronization.  The approximately
+0.25--0.31 ms QNN accelerator time versus 0.979 ms LiteRT-QNN time also shows
+that fixed dispatch and synchronization cost is significant at this graph
+size.  This observation must not be generalized to full DINOv2, GPT-2, or
+Falcon.
+
+### Recommended baseline hierarchy
+
+The final baseline selection remains a later experimental decision.  The
+recommended hierarchy is:
+
+| ID | Configuration | Role |
+|---|---|---|
+| B0 | hexagon-mlir generic HVX | original open compiler path |
+| B1 | hexagon-mlir optimized HVX | vectorization and legal VTCM tiling enabled |
+| B2 | hexagon-mlir plus HexKL/HMX | HMX compute without OmniFetch |
+| B3 | hexagon-mlir plus HexKL/HMX plus OmniFetch | proposed movement system |
+| external | direct QNN HTP | closed-source vendor upper-bound reference |
+| optional | XNNPACK CPU | end-device CPU context, preferably in an appendix |
+| optional | Hexagon NN library | legacy vendor graph baseline if its package and conversion path are available |
+
+LiteRT-QNN may remain as a deployment/framework-overhead result but is
+redundant with direct QNN as a primary NPU backend baseline.  Direct QNN should
+not be removed merely because it is closed: it is valuable as an explicitly
+labelled product-level upper bound, while B0--B3 provide the controlled,
+attributable compiler comparison.
+
+B1 is essential.  Comparing only against a harness that deliberately disables
+HVX vectorization and VTCM tiling risks creating a weak baseline.  The main
+paper comparison should therefore emphasize:
+
+```text
+optimized HVX
+vs. HexKL/HMX
+vs. HexKL/HMX plus OmniFetch
+```
+
+with direct QNN HTP reported separately.  No directly usable Hexagon NN/nnlib
+artifact was found in the currently installed `HEXAGON_SDK`, so that optional
+baseline may require a separately distributed legacy package and must not
+block the principal study.
+
+### HexKL, HMX, and HTP are different abstraction levels
+
+The most accurate relationship is:
+
+```text
+HTP execution subsystem
+  |- scalar/control execution
+  |- HVX vector resources
+  |- HMX matrix resources
+  |- DMA and VTCM
+  `- graph/runtime scheduling
+
+HexKL
+  `- callable optimized kernels and micro-operations, including HMX matmul
+```
+
+HexKL is a mechanism through which hexagon-mlir can use HMX.  It is not itself
+the complete HTP graph backend.  The current FP16 micro interface consumes
+32x32 activation and weight tiles in HMX-specific AH and WH layouts, uses
+VTCM, and accumulates through HMX.  Everything not matched by the HexKL
+conversion continues through ordinary hexagon-mlir lowering.
+
+Likewise, it is unsafe to assume that QNN sends every operation named MatMul
+to HMX.  A product compiler may prefer HVX for small, skinny, dynamic, badly
+aligned, or layout-expensive matrices.  It can choose based on padding,
+packing, reuse, VTCM pressure, and scheduling cost.  QNN's public basic profile
+does not reveal that decision for this graph.
+
+## **Next Paper Idea**: profitable non-aligned and batched MatMul lowering to HMX
+
+> **Scope marker:** this is deliberately labelled **Next Paper Idea**.  It is
+> not part of the current OmniFetch items 1--7 contribution unless a later
+> paper explicitly introduces a unified compute-and-movement planner.
+
+### Current HMX coverage failure
+
+The DINOv2 Debug graph contains the following matrix operations:
+
+```text
+Q:          batch_matmul 1x17x64  * 1x64x64
+K:          batch_matmul 1x17x64  * 1x64x64
+V:          batch_matmul 1x17x64  * 1x64x64
+QK^T:       batch_matmul 2x17x32  * 2x32x17
+AttentionV: batch_matmul 2x17x17  * 2x17x32
+Out proj:   batch_matmul 1x17x64  * 1x64x64
+MLP up:     batch_matmul 1x17x64  * 1x64x256
+MLP down:   batch_matmul 1x17x256 * 1x256x64
+Classifier: matmul       1x128    * 128x10
+```
+
+The current `MatmulToHexKLPass` accepts only static rank-two
+`linalg.matmul` whose M, K, and N dimensions are all divisible by the
+32-element HMX tile.  Its attention-like shapes are rejected by default as
+well.  The auxiliary Python batch-collapse rewrite is also limited to
+batch-one, already aligned shapes.  DINOv2 therefore records zero rewrites,
+and its row labelled HexKL is effectively still the generic HVX path.
+
+The restrictions cannot simply be deleted: the underlying FP16 HexKL micro
+operation is a 32x32-by-32x32 HMX operation with strict AH/WH layout and
+alignment requirements.  The compiler must add padding, tail handling,
+batch/head iteration, output slicing, and a profitability decision.
+
+### Proposed lowering stages
+
+The first stage should target batch-one projection and MLP operations:
+
+```text
+tensor<1xMxK> * tensor<1xKxN>
+  -> collapse the unit batch
+  -> zero-pad M, K, and N to legal HMX tiles
+  -> convert activation/weight to AH/WH as required
+  -> execute HexKL/HMX
+  -> slice the valid MxN result
+  -> restore the unit batch
+```
+
+For DINOv2 this converts:
+
+```text
+17x64x64   -> 32x64x64
+17x64x256  -> 32x64x256
+17x256x64  -> 32x256x64
+```
+
+It can cover Q, K, V, output projection, MLP up, and MLP down: six of the nine
+matrix operations and approximately 78% of the graph's matrix MACs.  Padding
+M from 17 to 32 creates about 1.88x arithmetic expansion, but HMX may still be
+much faster than the current generic loops.
+
+The second stage can lower true batch/head attention by iterating over the
+leading dimension, creating rank-two subviews, and invoking padded HMX per
+head.  This path needs a stricter cost gate:
+
+```text
+17x32x17 original work:  9,248 MAC/head
+32x32x32 padded work:   32,768 MAC/head
+padding expansion:       3.54x
+```
+
+Layout preparation can make it even less profitable.  Item 7's direct K/V
+layout mechanism could reduce that movement cost, but HMX must still be
+selected only when total latency wins.
+
+The classifier should remain on optimized HVX:
+
+```text
+1x128x10 original
+32x128x32 padded
+arithmetic expansion: 102.4x
+```
+
+This example demonstrates why the desired transformation is not “all MatMul
+to HMX.”  It is a joint legality and profitability problem.
+
+The implementation should be a real C++ compiler transformation rather than
+another textual Python rewrite.  A proposed `BatchMatmulToHexKLPass` would:
+
+1. classify batch-one projection/MLP and batch/head attention;
+2. compute padded M/K/N and layout requirements;
+3. estimate useful MACs, padded MACs, packing bytes, reuse, and VTCM demand;
+4. select optimized HVX, direct HMX, or padded HMX per site;
+5. emit pad, batch subview, `hexkl.matmul`, and output slice operations; and
+6. report every accepted and rejected site.
+
+A minimum diagnostic contract is:
+
+```text
+[HMXCoverage]
+total_matmuls=9
+hmx_direct=...
+hmx_padded=...
+hmx_batched=...
+hvx_unprofitable=...
+original_macs=...
+padded_macs=...
+layout_bytes=...
+```
+
+The evaluation must first separate compute coverage:
+
+```text
+optimized HVX
+direct-aligned HMX only
+direct plus padded projection/MLP HMX
+direct plus padded plus batched-attention HMX
+```
+
+Only then should it compare:
+
+```text
+coverage-expanded HMX
+vs. coverage-expanded HMX plus OmniFetch
+```
+
+This ordering prevents raw HMX compute gains from being incorrectly attributed
+to prefetch or data-movement optimization.
+
+### Story-line assessment
+
+The concern that this work may not connect seamlessly to the current paper is
+well founded.
+
+The current OmniFetch story is:
+
+```text
+given a selected compute path and required physical layouts,
+plan when and where data moves across DDR/L2/VTCM/VRF,
+combine prefetch with in-situ layout production,
+and eliminate movements that are physically unnecessary.
+```
+
+Non-aligned/batched HMX lowering asks a different first-order question:
+
+```text
+which compute engine and kernel should execute this operation,
+and is padding plus HMX cheaper than HVX?
+```
+
+Implementing the latter solely because it improves latency would mix an
+orthogonal compute-mapping contribution into a movement paper.  It would also
+make the measured speedup hard to attribute: a result might improve because of
+HMX throughput rather than OmniFetch's prefetch, DMA, in-situ reshape, or
+movement elimination.
+
+There are two logically sound boundaries:
+
+1. **Current-paper boundary.** Treat improved HMX coverage only as baseline
+   infrastructure.  Measure and report its independent gain, freeze that
+   compute mapping for both B2 and B3, and attribute only the B3-minus-B2 delta
+   to OmniFetch.  Do not claim padded/batched HMX lowering as an OmniFetch
+   contribution.
+2. **Next-paper boundary.** Introduce a unified
+   **compute-layout-movement planner**.  It jointly selects HVX versus HMX,
+   padding/tail strategy, AH/WH residency, producer layout, DMA/prefetch path,
+   and VTCM lifetime from one end-to-end cost model.  In that abstraction,
+   compute choice changes the required movement plan, and movement cost changes
+   whether HMX is profitable.  The two mechanisms then form one causal story
+   rather than an assortment of speedups.
+
+The second boundary is a natural and potentially strong follow-on paper:
+
+```text
+operator shape and reuse
+  -> choose HVX or direct/padded/batched HMX
+  -> choose physical layout and residency
+  -> synthesize prefetch/DMA/in-situ movement schedule
+  -> adapt using measured stalls and resource pressure
+```
+
+It is also materially broader than the current contribution and carries
+additional correctness, cost-model, tail-handling, and evaluation obligations.
+For that reason, the recommended decision is to retain this section as
+**Next Paper Idea**.  If a minimal HMX coverage fix is later needed to create a
+credible B2 baseline, it must be isolated, separately ablated, and described
+as experimental infrastructure rather than silently folded into OmniFetch.

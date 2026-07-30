@@ -12,7 +12,7 @@ from transformers.models.swin.modeling_swin import SwinForImageClassification
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hexkl_utils import (  # noqa: E402
-    patch_dsp_heap_256mb,
+    patch_full_model_dsp_heap,
     compile_to_linalg,
     hex_execution,
     apply_hexkl_ir_rewrites,
@@ -88,8 +88,10 @@ def swin_transformer(
     enable_omnifetch_adaptive: bool = True,
     enable_omnifetch_items_1_7: bool = False,
     seq_len: Optional[int] = None,
+    device_iterations: int = 1,
 ):
-    patch_dsp_heap_256mb()
+    # Full 28M-parameter graph exceeds the Debug runner's 256 MiB heap.
+    patch_full_model_dsp_heap()
     model_name = "microsoft/swin-tiny-patch4-window7-224"
 
     config = SwinConfig.from_pretrained(model_name)
@@ -138,7 +140,12 @@ def swin_transformer(
     )
     inputs = rel_pos_indices + [pixel_values]
     hex_outputs = hex_execution(
-        module, func_name, inputs, options, mlir_text=mlir_text
+        module,
+        func_name,
+        inputs,
+        options,
+        mlir_text=mlir_text,
+        iterations=device_iterations,
     )
     print("Successfully ran Swin on Hexagon DSP!")
 
@@ -158,6 +165,7 @@ if __name__ == "__main__":
         description="Swin-Tiny Hexagon smoke (optional HexKL/OmniFetch)."
     )
     add_phase4_args(parser)
+    parser.add_argument("--device-iterations", type=int, default=1)
     args = parser.parse_args()
     swin_transformer(
         enable_hexkl=args.enable_hexkl,
@@ -167,4 +175,5 @@ if __name__ == "__main__":
         enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
         enable_omnifetch_items_1_7=args.enable_omnifetch_items_1_7,
         seq_len=args.seq_len,
+        device_iterations=args.device_iterations,
     )
