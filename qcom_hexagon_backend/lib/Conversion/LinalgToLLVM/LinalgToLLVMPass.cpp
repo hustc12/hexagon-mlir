@@ -491,6 +491,9 @@ public:
       kernelOptions.baselineKind =
           enableAPTGetHX ? "apt-get-hx" : "prefetch-kernel-hx";
       kernelOptions.requireManualSafe = enableAPTGetHX;
+      kernelOptions.manualCandidateIds =
+          enableAPTGetHX ? aptGetHxManualCandidateIds.getValue()
+                         : std::string();
       pm.addNestedPass<func::FuncOp>(
           hexagon::createPrefetchKernelHXPass(kernelOptions));
     }

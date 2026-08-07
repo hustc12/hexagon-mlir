@@ -105,6 +105,9 @@ def LinalgToLLVM : Pass<"linalg-to-llvm", "mlir::ModuleOp"> {
     Option<"aptGetHxDistance", "apt-get-hx-distance", "int",
           /*default=*/"1",
           "Distance selected offline by scripts/apt_get_hx_select.py">,
+    Option<"aptGetHxManualCandidateIds", "apt-get-hx-manual-candidate-ids", "std::string",
+          /*default=*/"\"\"",
+          "Comma-separated candidate IDs manually qualified for APT-GET-HX">,
     // Omni-Fetch: Plan-A three independent components -----------------------
     // Component 1: Prefetch insertion (base component; required by 2 & 3)
     Option<"enablePrefetch", "enable-prefetch", "bool",

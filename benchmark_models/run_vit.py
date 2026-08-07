@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import sys
 from pathlib import Path
 
@@ -36,6 +37,7 @@ def customize_model_config(config):
 
 def run(args: argparse.Namespace) -> None:
     patch_full_model_dsp_heap()
+    torch.manual_seed(871)
     model_name = "google/vit-base-patch16-224"
 
     config = AutoConfig.from_pretrained(model_name)
@@ -69,9 +71,20 @@ def run(args: argparse.Namespace) -> None:
     # lifted position-embedding buffer explicitly before the pixel input.
     device_inputs = [fixed_position_embeddings, pixel_values]
     params = sum(parameter.numel() for parameter in model.parameters())
+    model_hash = hashlib.sha256()
+    for name, tensor in sorted(model.state_dict().items()):
+        model_hash.update(name.encode("utf-8"))
+        model_hash.update(tensor.detach().cpu().contiguous().numpy().tobytes())
+    input_hash = hashlib.sha256(
+        pixel_values.detach().cpu().contiguous().numpy().tobytes()
+    ).hexdigest()
     print(
         f"[Input] pixel_values={tuple(pixel_values.shape)} params={params} "
         f"HexKL={args.enable_hexkl}"
+    )
+    print(
+        f"[ViT Identity] model_sha256={model_hash.hexdigest()} "
+        f"input_sha256={input_hash}"
     )
 
     module = compile_to_linalg(wrapped, tuple(inputs), decomp_pow=False)
@@ -100,6 +113,9 @@ def run(args: argparse.Namespace) -> None:
         backend_profile=args.backend_profile,
         enable_omnifetch_m_pad_hmx=args.enable_omnifetch_m_pad_hmx,
         enable_out_params=args.enable_out_params,
+        prefetch_baseline=args.prefetch_baseline,
+        prefetch_baseline_distance=args.prefetch_baseline_distance,
+        apt_get_hx_manual_candidate_ids=args.apt_get_hx_manual_candidate_ids,
     )
     output = hex_execution(
         module,

@@ -600,6 +600,9 @@ def falcon_rw_1b(
     device_iterations: int = 1,
     enable_hexkl_persistent_vtcm: bool = False,
     seq_len: Optional[int] = None,
+    prefetch_baseline: str = "none",
+    prefetch_baseline_distance: int = 1,
+    apt_get_hx_manual_candidate_ids: str = "",
 ):
     _patch_dsp_heap_256mb()
 
@@ -678,6 +681,20 @@ def falcon_rw_1b(
         enable_omnifetch_activation_multicast
     )
     cumulative = bool(enable_omnifetch_items_1_7)
+    if prefetch_baseline not in ("none", "prefetch-kernel-hx", "apt-get-hx"):
+        raise ValueError(f"unknown prefetch baseline {prefetch_baseline!r}")
+    if prefetch_baseline != "none" and (enable_omnifetch_vdae or cumulative):
+        raise ValueError("external prefetch baselines cannot be combined with OmniFetch")
+    options["enablePrefetchKernelHX"] = prefetch_baseline == "prefetch-kernel-hx"
+    options["prefetchKernelHxDistance"] = int(prefetch_baseline_distance)
+    options["enableAPTGetHX"] = prefetch_baseline == "apt-get-hx"
+    options["aptGetHxDistance"] = int(prefetch_baseline_distance)
+    options["aptGetHxManualCandidateIds"] = apt_get_hx_manual_candidate_ids
+    print(
+        f"[PrefetchBaseline] kind={prefetch_baseline} "
+        f"distance={prefetch_baseline_distance} "
+        f"manual_ids={apt_get_hx_manual_candidate_ids or 'none'}"
+    )
     options["enablePrefetch"] = bool(
         enable_omnifetch_vdae
         or enable_omnifetch_kv_cache_prefetch
@@ -764,6 +781,13 @@ if __name__ == "__main__":
     parser.add_argument("--disable-omnifetch-adaptive", action="store_true")
     parser.add_argument("--enable-omnifetch-items-1-7", action="store_true")
     parser.add_argument(
+        "--prefetch-baseline",
+        choices=("none", "prefetch-kernel-hx", "apt-get-hx"),
+        default="none",
+    )
+    parser.add_argument("--prefetch-baseline-distance", type=int, default=1)
+    parser.add_argument("--apt-get-hx-manual-candidate-ids", default="")
+    parser.add_argument(
         "--enable-omnifetch-weight-prepack",
         action="store_true",
         help="Reshape each RM weight tile to WH once per column and reuse it "
@@ -831,4 +855,7 @@ if __name__ == "__main__":
         device_iterations=args.device_iterations,
         enable_hexkl_persistent_vtcm=args.enable_hexkl_persistent_vtcm,
         seq_len=args.seq_len,
+        prefetch_baseline=args.prefetch_baseline,
+        prefetch_baseline_distance=args.prefetch_baseline_distance,
+        apt_get_hx_manual_candidate_ids=args.apt_get_hx_manual_candidate_ids,
     )

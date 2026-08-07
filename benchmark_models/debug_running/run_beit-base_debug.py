@@ -20,8 +20,17 @@ def run(a):
     print(f"[DebugCandidate] BEiT-base proxy [IR] batch_matmul={ir.count('linalg.batch_matmul')}")
     if a.enable_hexkl:
         q,nb,nf=apply_hexkl_ir_rewrites(ir);p=q if nb or nf else None;print(f"[HexKL] rewrites={nb+nf}")
-    o=hex_execution(m,w.__class__.__name__,ins,hexagon_options_phase4(a.enable_hexkl,a.enable_omnifetch_vdae,not a.disable_layout_aware,a.omnifetch_lookahead,not a.disable_omnifetch_adaptive,a.enable_omnifetch_items_1_7,False),mlir_text=p)
+    options=hexagon_options_phase4(
+        a.enable_hexkl,a.enable_omnifetch_vdae,not a.disable_layout_aware,
+        a.omnifetch_lookahead,not a.disable_omnifetch_adaptive,
+        a.enable_omnifetch_items_1_7,False,
+        backend_profile=a.backend_profile,
+        prefetch_baseline=a.prefetch_baseline,
+        prefetch_baseline_distance=a.prefetch_baseline_distance,
+        apt_get_hx_manual_candidate_ids=a.apt_get_hx_manual_candidate_ids,
+    )
+    o=hex_execution(m,w.__class__.__name__,ins,options,mlir_text=p,iterations=a.device_iterations)
     with torch.no_grad():r=w(*ins)
     print(f"[Compare] max_abs_diff={(o[0].float()-r.float()).abs().max().item():.4f} top1_match={o[0].argmax().item()==r.argmax().item()}")
 if __name__=="__main__":
-    x=argparse.ArgumentParser();add_phase4_args(x);run(x.parse_args())
+    x=argparse.ArgumentParser();add_phase4_args(x);x.add_argument("--device-iterations",type=int,default=1);run(x.parse_args())

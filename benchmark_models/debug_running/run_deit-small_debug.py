@@ -34,12 +34,17 @@ def run(args):
     options=hexagon_options_phase4(args.enable_hexkl,args.enable_omnifetch_vdae,
         not args.disable_layout_aware,args.omnifetch_lookahead,
         not args.disable_omnifetch_adaptive,args.enable_omnifetch_items_1_7,
-        lower_constants_separate=False)
-    out=hex_execution(module,wrapped.__class__.__name__,inputs,options,mlir_text=patched)
+        lower_constants_separate=False,backend_profile=args.backend_profile,
+        prefetch_baseline=args.prefetch_baseline,
+        prefetch_baseline_distance=args.prefetch_baseline_distance,
+        apt_get_hx_manual_candidate_ids=args.apt_get_hx_manual_candidate_ids)
+    out=hex_execution(module,wrapped.__class__.__name__,inputs,options,
+        mlir_text=patched,iterations=args.device_iterations)
     with torch.no_grad(): ref=wrapped(*inputs)
     diff=(out[0].float()-ref.float()).abs().max().item()
     print(f"[Compare] max_abs_diff={diff:.4f} top1_match={out[0].argmax().item()==ref.argmax().item()}")
 
 
 if __name__=="__main__":
-    p=argparse.ArgumentParser(description=__doc__); add_phase4_args(p); run(p.parse_args())
+    p=argparse.ArgumentParser(description=__doc__); add_phase4_args(p)
+    p.add_argument("--device-iterations",type=int,default=1); run(p.parse_args())

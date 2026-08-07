@@ -220,3 +220,103 @@ one selected global distance per APT-GET-HX model build.
    burst that is silently busy-suppressed.
 3. Verify the complete path in final Hexagon assembly/object, then add the
    strictly serial model comparison script and run one existing full model.
+
+## Two-model HVX Debug comparison (2026-08-06)
+
+### Scope and controls
+
+The first end-to-end comparison uses DINOv2 Debug and ViT Debug.  Both are
+complete reduced model graphs from `benchmark_models/debug_running`, not GEMM
+microbenchmarks.  Every row uses the same Hexagon-MLIR build, HexKL overlay,
+`hvx-vector-vtcm` backend profile, FP16 graph, one host-launched DSP kernel,
+and seven serial in-process device executions.  No configurations run in
+parallel.
+
+The exact graph/input identities are stable across all three rows:
+
+- DINOv2 Debug model SHA-256
+  `b1369edc7559bf68bb11108bd91a0b2e5e2adc8c95e8eb24b6bb6180aa2afe28`,
+  input SHA-256
+  `352b527f0be5256826d717e85b672a410f0332941951f1e1c7336683bba8976c`;
+- ViT Debug model SHA-256
+  `b4b8db84104a253e1905626a827997d086ccead17910fa317dff0dfee6bf180c`,
+  input SHA-256
+  `b8551e108c4f0fe57fcff10658f58f03572bea3f238808ef07a8ab5062e12edf`.
+
+ViT Debug was repaired to call the current full-runner entry point, uses two
+encoder layers, hidden size 64, 64x64 input, patch size 32, and externalizes
+its position embedding through the same safe ABI strategy used by DINOv2.
+Its model and input RNG are explicitly seeded before every configuration.
+
+APT-GET-HX uses an explicit stable candidate-ID allowlist.  Two serial DINOv2
+LWP samples selected the conservative global distance one.  The same distance
+is used for the shape-similar ViT proxy.  This is an engineering MVP: the
+current compiler consumes one model-global distance, so it does not yet
+reproduce per-candidate inner/outer placement.  On these two shapes the APT
+plan admits every manually qualified safe candidate and therefore converges
+to the same generated request set as Prefetch-Kernel-HX.  Their latency
+difference should be treated as run-order/noise, not an algorithmic win.
+
+### Reproduction command
+
+```bash
+OUTPUT_DIR=/tmp/omnifetch-prefetch-baseline5-final2 \
+DEVICE_ITERATIONS=7 MODEL_TIMEOUT=600 \
+scripts/run_prefetch_baseline_two_models.sh
+```
+
+The script executes only the following three independent rows, stops on a
+device/correctness failure, and rejects a baseline with zero compile-time
+hints or zero runtime-issued requests:
+
+1. HexKL + OmniFetch items 1--7;
+2. HexKL + APT-GET-HX;
+3. HexKL + Prefetch-Kernel-HX.
+
+Logs and CSV files remain under `/tmp` and are not committed.
+
+### Device results
+
+| Model | Scheme | Mean (us) | P50 (us) | P90 (us) | Min (us) | Static hints | Runtime issued | Requested / issued bytes | Correctness |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| DINOv2 Debug | OmniFetch items 1--7 | **18,084** | 18,130 | 19,195 | 16,926 | 4 | 36 | 78,336 / 34,432 | finite, max diff 0.0006, top-1 match |
+| DINOv2 Debug | APT-GET-HX | 21,052 | 20,498 | 23,096 | 18,681 | 24 | 122,843 | 18,677,120 / 18,355,264 | finite, max diff 0.0006, top-1 match |
+| DINOv2 Debug | Prefetch-Kernel-HX | 20,159 | 19,996 | 22,257 | 18,627 | 24 | 122,843 | 18,677,120 / 18,355,264 | finite, max diff 0.0006, top-1 match |
+| ViT Debug | OmniFetch items 1--7 | **48,511** | 47,443 | 51,415 | 46,816 | 8 | 72 | 46,080 / 41,408 | finite, max diff 0.0007, top-1 match |
+| ViT Debug | APT-GET-HX | 50,073 | 46,772 | 56,425 | 46,566 | 42 | 36,274 | 5,243,392 / 5,175,552 | finite, max diff 0.0007, top-1 match |
+| ViT Debug | Prefetch-Kernel-HX | 51,184 | 47,995 | 57,733 | 47,209 | 42 | 36,274 | 5,243,392 / 5,175,552 | finite, max diff 0.0007, top-1 match |
+
+Relative to APT-GET-HX and Prefetch-Kernel-HX respectively, the OmniFetch
+mean is 1.164x and 1.115x faster on DINOv2 Debug, and 1.032x and 1.055x faster
+on ViT Debug.  This is a positive Debug-screen result, not yet a full-model or
+statistical paper claim.
+
+The causal result is more informative than the small ViT timing gap.
+OmniFetch issues orders of magnitude fewer requests: 36 rather than 122,843
+on DINOv2 and 72 rather than 36,274 on ViT.  Busy suppression is zero in all
+rows, so the difference is not hidden by the single-flight guard.  The broad
+baseline classifier prefetches every legal future subview in dynamically hot
+loops, whereas OmniFetch's semantic/layout-aware policy selects four or eight
+sites and controls their footprint.  These measurements support the design
+hypothesis that timeliness must be coupled with traffic selectivity and data
+movement ownership; indiscriminately issuing every safe request consumes
+bandwidth and adds address/guard overhead.
+
+The runtime report generator was extended to activate for either external
+baseline, rather than only for OmniFetch V-DAE.  This closed a measurement bug
+found in the first run and makes nonzero issued coverage an enforced script
+gate.
+
+### Model-screen exclusions
+
+The screening stage deliberately rejected invalid comparisons:
+
+- GPT-2 and Mamba scalar paths produced zero eligible hints;
+- Real-ESRGAN produced zero admitted hints and its HVX/VTCM path exited 13;
+- Falcon, Whisper, SegFormer, Swin, DeiT, and BEiT vector attempts produced
+  candidates but hit the existing device exit-13 backend failure (DeiT's
+  matching no-prefetch control failed as well).
+
+These failures are not recorded as performance results.  ViT was admitted
+only after nonzero hints, nonzero runtime-issued requests, successful device
+execution, finite output, and top-1 agreement were all observed.

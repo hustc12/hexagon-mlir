@@ -317,6 +317,9 @@ def hexagon_options_phase4(
     enable_omnifetch_activation_multicast: bool = False,
     enable_omnifetch_m_pad_hmx: bool = False,
     enable_out_params: bool = False,
+    prefetch_baseline: str = "none",
+    prefetch_baseline_distance: int = 1,
+    apt_get_hx_manual_candidate_ids: str = "",
 ):
     from triton.backends.qcom_hexagon_backend.compiler import HexagonOptions
 
@@ -338,6 +341,10 @@ def hexagon_options_phase4(
         raise ValueError("LWP loop depth must be non-negative")
     if not 0 <= omnifetch_items_through <= 7:
         raise ValueError("OmniFetch cumulative item level must be in [0, 7]")
+    if prefetch_baseline not in ("none", "prefetch-kernel-hx", "apt-get-hx"):
+        raise ValueError(f"unknown prefetch baseline {prefetch_baseline!r}")
+    if prefetch_baseline_distance <= 0:
+        raise ValueError("prefetch baseline distance must be positive")
 
     options["enableLWP"] = bool(enable_lwp)
     options["disableLWPLoop"] = bool(disable_lwp_loop)
@@ -357,6 +364,15 @@ def hexagon_options_phase4(
         options["enableVTCMTiling"] = True
         options["enableConvertToHexagonmem"] = True
     cumulative_level = 7 if enable_omnifetch_items_1_7 else omnifetch_items_through
+    if prefetch_baseline != "none" and (
+        enable_omnifetch_vdae or cumulative_level > 0
+    ):
+        raise ValueError("external prefetch baselines cannot be combined with OmniFetch")
+    options["enablePrefetchKernelHX"] = prefetch_baseline == "prefetch-kernel-hx"
+    options["prefetchKernelHxDistance"] = int(prefetch_baseline_distance)
+    options["enableAPTGetHX"] = prefetch_baseline == "apt-get-hx"
+    options["aptGetHxDistance"] = int(prefetch_baseline_distance)
+    options["aptGetHxManualCandidateIds"] = apt_get_hx_manual_candidate_ids
     options["enablePrefetch"] = bool(
         enable_omnifetch_vdae or cumulative_level >= 1
     )
@@ -396,6 +412,8 @@ def hexagon_options_phase4(
         f"vtcm_tiling={int(options['enableVTCMTiling'])} "
         f"hexagonmem={int(options['enableConvertToHexagonmem'])} "
         f"hexkl={int(options['enableHexKL'])} "
+        f"prefetch_baseline={prefetch_baseline} "
+        f"prefetch_distance={prefetch_baseline_distance} "
         f"lwp={int(options['enableLWP'])} "
         f"lwp_loop_depth={options['LWPloopDepth']} "
         f"lwp_loops_disabled={int(options['disableLWPLoop'])}"
@@ -406,6 +424,23 @@ def hexagon_options_phase4(
 def add_phase4_args(parser):
     parser.add_argument("--enable-hexkl", action="store_true")
     parser.add_argument("--enable-omnifetch-vdae", action="store_true")
+    parser.add_argument(
+        "--prefetch-baseline",
+        choices=("none", "prefetch-kernel-hx", "apt-get-hx"),
+        default="none",
+        help="Run one isolated external prefetch baseline.",
+    )
+    parser.add_argument(
+        "--prefetch-baseline-distance",
+        type=int,
+        default=1,
+        help="Static or APT-profile-selected future iteration distance.",
+    )
+    parser.add_argument(
+        "--apt-get-hx-manual-candidate-ids",
+        default="",
+        help="Comma-separated manually qualified stable candidate IDs.",
+    )
     parser.add_argument("--disable-layout-aware", action="store_true")
     parser.add_argument("--omnifetch-lookahead", type=int, default=2)
     parser.add_argument("--disable-omnifetch-adaptive", action="store_true")

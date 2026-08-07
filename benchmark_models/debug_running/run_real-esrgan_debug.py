@@ -10,6 +10,7 @@ import argparse
 import importlib.util
 from pathlib import Path
 import sys
+import types
 
 _BENCH = Path(__file__).resolve().parent.parent
 if str(_BENCH) not in sys.path:
@@ -23,7 +24,24 @@ _SPEC.loader.exec_module(_MOD)
 
 
 def _load_tiny_model(device):
-    from RealESRGAN.rrdbnet_arch import RRDBNet
+    # Import the pure-PyTorch architecture without executing RealESRGAN's
+    # package __init__, which imports the optional cv2 inference wrapper.
+    package_name = "_omnifetch_realesrgan_arch"
+    package_spec = importlib.util.find_spec("RealESRGAN")
+    assert package_spec is not None and package_spec.origin is not None
+    package_root = Path(package_spec.origin).parent
+    package = types.ModuleType(package_name)
+    package.__path__ = [str(package_root)]
+    sys.modules.setdefault(package_name, package)
+    arch_name = f"{package_name}.rrdbnet_arch"
+    arch_spec = importlib.util.spec_from_file_location(
+        arch_name, package_root / "rrdbnet_arch.py"
+    )
+    arch_module = importlib.util.module_from_spec(arch_spec)
+    assert arch_spec.loader is not None
+    sys.modules[arch_name] = arch_module
+    arch_spec.loader.exec_module(arch_module)
+    RRDBNet = arch_module.RRDBNet
 
     print("[Debug] Real-ESRGAN reduced RRDBNet: feat=16 blocks=2 grow=8")
     return RRDBNet(
@@ -57,6 +75,7 @@ def main():
     parser = argparse.ArgumentParser(description="DEBUG tiny Real-ESRGAN")
     add_phase4_args(parser)
     parser.add_argument("--input-size", type=int, default=None)
+    parser.add_argument("--device-iterations", type=int, default=1)
     args = parser.parse_args()
     _MOD.real_esrgan(
         enable_hexkl=args.enable_hexkl,
@@ -67,6 +86,11 @@ def main():
         enable_omnifetch_items_1_7=args.enable_omnifetch_items_1_7,
         seq_len=args.seq_len,
         input_size=args.input_size,
+        backend_profile=args.backend_profile,
+        prefetch_baseline=args.prefetch_baseline,
+        prefetch_baseline_distance=args.prefetch_baseline_distance,
+        apt_get_hx_manual_candidate_ids=args.apt_get_hx_manual_candidate_ids,
+        device_iterations=args.device_iterations,
     )
 
 

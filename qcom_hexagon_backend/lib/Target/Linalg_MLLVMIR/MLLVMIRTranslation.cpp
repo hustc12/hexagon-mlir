@@ -135,6 +135,11 @@ void setLinalgToLLVMOptions(
     if (it != arch_kwargs.end())
       options.aptGetHxDistance = std::stoi(it->second);
   }
+  {
+    auto it = arch_kwargs.find("aptGetHxManualCandidateIds");
+    if (it != arch_kwargs.end())
+      options.aptGetHxManualCandidateIds = it->second;
+  }
   options.enablePrefetch =
       !arch_kwargs.at("enablePrefetch").compare(TRUE);
   options.enableOmniFetchLayoutAware =

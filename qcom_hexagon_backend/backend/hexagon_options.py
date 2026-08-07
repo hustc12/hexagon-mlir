@@ -70,6 +70,7 @@ class HexagonOptions:
     # independently from Prefetch-Kernel-HX.
     enableAPTGetHX: bool = False
     aptGetHxDistance: int = 1
+    aptGetHxManualCandidateIds: str = ""
     # Omni-Fetch ablation toggles (Plan-A: three independent components)
     # Component 1 – Prefetch insertion (base; required by the other two)
     enablePrefetch: bool = False  # insert prefetch_in_situ ops in loop prologue/body

@@ -56,8 +56,16 @@ def main():
 
     parser = argparse.ArgumentParser(description="DEBUG tiny Mamba-130M")
     add_phase4_args(parser)
+    parser.add_argument("--device-iterations", type=int, default=1)
     args = parser.parse_args()
-    _MOD.mamba_130m(**phase4_kwargs_from_args(args))
+    _MOD.mamba_130m(
+        **phase4_kwargs_from_args(args),
+        device_iterations=args.device_iterations,
+        backend_profile=args.backend_profile,
+        prefetch_baseline=args.prefetch_baseline,
+        prefetch_baseline_distance=args.prefetch_baseline_distance,
+        apt_get_hx_manual_candidate_ids=args.apt_get_hx_manual_candidate_ids,
+    )
 
 
 if __name__ == "__main__":

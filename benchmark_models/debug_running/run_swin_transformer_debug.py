@@ -55,6 +55,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="DEBUG tiny Swin")
     add_phase4_args(parser)
+    parser.add_argument("--device-iterations", type=int, default=1)
     args = parser.parse_args()
     _MOD.swin_transformer(
         enable_hexkl=args.enable_hexkl,
@@ -64,6 +65,13 @@ def main():
         enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
         enable_omnifetch_items_1_7=args.enable_omnifetch_items_1_7,
         seq_len=args.seq_len,
+        device_iterations=args.device_iterations,
+        backend_profile=args.backend_profile,
+        enable_omnifetch_m_pad_hmx=args.enable_omnifetch_m_pad_hmx,
+        enable_out_params=args.enable_out_params,
+        prefetch_baseline=args.prefetch_baseline,
+        prefetch_baseline_distance=args.prefetch_baseline_distance,
+        apt_get_hx_manual_candidate_ids=args.apt_get_hx_manual_candidate_ids,
     )
 
 

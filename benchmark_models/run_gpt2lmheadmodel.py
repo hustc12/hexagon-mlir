@@ -405,6 +405,9 @@ def gpt2lmheadmodel(
     # None → legacy behaviour (short prompt; HexKL uses a hand-tuned 32-token string).
     seq_len: Optional[int] = None,
     device_iterations: int = 1,
+    prefetch_baseline: str = "none",
+    prefetch_baseline_distance: int = 1,
+    apt_get_hx_manual_candidate_ids: str = "",
 ):
 
     model_name = "openai-community/gpt2"
@@ -481,6 +484,10 @@ def gpt2lmheadmodel(
 
     mlir_text = None
     cumulative = bool(enable_omnifetch_items_1_7)
+    if prefetch_baseline not in ("none", "prefetch-kernel-hx", "apt-get-hx"):
+        raise ValueError(f"unknown prefetch baseline {prefetch_baseline!r}")
+    if prefetch_baseline != "none" and (enable_omnifetch_vdae or cumulative):
+        raise ValueError("external prefetch baselines cannot be combined with OmniFetch")
     if enable_hexkl:
         raw = module.operation.get_asm(binary=False)
         mlir_text, n = rewrite_matmul_inputs_to_f16(raw)
@@ -530,6 +537,17 @@ def gpt2lmheadmodel(
         )
         options["enableOmniFetchAttentionHmx"] = enable_omnifetch_attention_hmx
         options["enableHexKLPersistentVtcm"] = enable_hexkl_persistent_vtcm
+
+    options["enablePrefetchKernelHX"] = prefetch_baseline == "prefetch-kernel-hx"
+    options["prefetchKernelHxDistance"] = int(prefetch_baseline_distance)
+    options["enableAPTGetHX"] = prefetch_baseline == "apt-get-hx"
+    options["aptGetHxDistance"] = int(prefetch_baseline_distance)
+    options["aptGetHxManualCandidateIds"] = apt_get_hx_manual_candidate_ids
+    print(
+        f"[PrefetchBaseline] kind={prefetch_baseline} "
+        f"distance={prefetch_baseline_distance} "
+        f"manual_ids={apt_get_hx_manual_candidate_ids or 'none'}"
+    )
 
     if enablelwp:
         options["enableLWP"] = True
@@ -583,6 +601,13 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable the cumulative innovation items 1 through 7.",
     )
+    parser.add_argument(
+        "--prefetch-baseline",
+        choices=("none", "prefetch-kernel-hx", "apt-get-hx"),
+        default="none",
+    )
+    parser.add_argument("--prefetch-baseline-distance", type=int, default=1)
+    parser.add_argument("--apt-get-hx-manual-candidate-ids", default="")
     parser.add_argument(
         "--enable-omnifetch-dma-to-vtcm",
         action="store_true",
@@ -645,4 +670,7 @@ if __name__ == "__main__":
         enable_hexkl_persistent_vtcm=args.enable_hexkl_persistent_vtcm,
         seq_len=args.seq_len,
         device_iterations=args.device_iterations,
+        prefetch_baseline=args.prefetch_baseline,
+        prefetch_baseline_distance=args.prefetch_baseline_distance,
+        apt_get_hx_manual_candidate_ids=args.apt_get_hx_manual_candidate_ids,
     )

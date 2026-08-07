@@ -20,7 +20,10 @@
 #include "mlir/Interfaces/DestinationStyleOpInterface.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringSet.h"
+#include "llvm/Support/raw_ostream.h"
 #include <cstdint>
+#include <mutex>
 #include <optional>
 
 using namespace mlir;
@@ -45,6 +48,7 @@ struct BaselineStats {
   int64_t rejectedWrite = 0;
   int64_t rejectedOversize = 0;
   int64_t rejectedUnmarked = 0;
+  SmallVector<std::string> admittedIds;
 };
 
 static std::optional<int64_t> constantIndex(Value value) {
@@ -99,11 +103,13 @@ struct ClassifiedView {
 
 static std::optional<ClassifiedView>
 classifyView(scf::ForOp loop, memref::SubViewOp view, int64_t maxBytes,
-             bool enable2D, bool requireManualSafe, BaselineStats &stats) {
+             bool enable2D, bool requireManualSafe, StringRef candidateId,
+             const llvm::StringSet<> &manualIds, BaselineStats &stats) {
   ++stats.candidates;
   if (requireManualSafe &&
       !view->hasAttrOfType<UnitAttr>("prefetch_baseline.manual_safe") &&
-      !loop->hasAttrOfType<UnitAttr>("prefetch_baseline.manual_safe")) {
+      !loop->hasAttrOfType<UnitAttr>("prefetch_baseline.manual_safe") &&
+      !manualIds.contains(candidateId)) {
     ++stats.rejectedUnmarked;
     return std::nullopt;
   }
@@ -204,7 +210,8 @@ classifyView(scf::ForOp loop, memref::SubViewOp view, int64_t maxBytes,
 }
 
 static void emitHint(const ClassifiedView &candidate, int64_t distance,
-                     StringRef baselineKind, BaselineStats &stats) {
+                     StringRef baselineKind, StringRef candidateId,
+                     BaselineStats &stats) {
   scf::ForOp loop = candidate.loop;
   memref::SubViewOp view = candidate.view;
   OpBuilder builder(view);
@@ -232,6 +239,8 @@ static void emitHint(const ClassifiedView &candidate, int64_t distance,
                                                  static_cast<int32_t>(distance));
         hint->setAttr("prefetch_baseline.kind",
                       thenBuilder.getStringAttr(baselineKind));
+        hint->setAttr("prefetch_baseline.candidate_id",
+                      thenBuilder.getStringAttr(candidateId));
         hint->setAttr("prefetch_baseline.address_class",
                       thenBuilder.getStringAttr(candidate.isTwoDimensional
                                                     ? "affine_2d"
@@ -246,6 +255,7 @@ static void emitHint(const ClassifiedView &candidate, int64_t distance,
       });
 
   ++stats.hints;
+  stats.admittedIds.push_back(candidateId.str());
   stats.requestedBytes += candidate.requestedBytes;
   if (candidate.isTwoDimensional)
     ++stats.admitted2D;
@@ -271,18 +281,37 @@ struct PrefetchKernelHXPass
     }
 
     SmallVector<std::pair<scf::ForOp, memref::SubViewOp>> views;
+    SmallVector<std::string> candidateIds;
+    llvm::StringSet<> manualIds;
+    SmallVector<StringRef> manualTokens;
+    StringRef(manualCandidateIds).split(manualTokens, ',', /*MaxSplit=*/-1,
+                                        /*KeepEmpty=*/false);
+    for (StringRef token : manualTokens)
+      manualIds.insert(token.trim());
+    int64_t loopOrdinal = 0;
     func.walk([&](scf::ForOp loop) {
       ++stats.loops;
-      for (Operation &op : loop.getBody()->without_terminator())
-        if (auto view = dyn_cast<memref::SubViewOp>(op))
+      int64_t viewOrdinal = 0;
+      for (Operation &op : loop.getBody()->without_terminator()) {
+        if (auto view = dyn_cast<memref::SubViewOp>(op)) {
           views.emplace_back(loop, view);
+          candidateIds.push_back(
+              (func.getName() + ":loop" + Twine(loopOrdinal) + ":view" +
+               Twine(viewOrdinal))
+                  .str());
+          ++viewOrdinal;
+        }
+      }
+      ++loopOrdinal;
     });
-    for (auto [loop, view] : views) {
+    for (auto [ordinal, loopAndView] : llvm::enumerate(views)) {
+      auto [loop, view] = loopAndView;
+      StringRef candidateId = candidateIds[ordinal];
       auto candidate = classifyView(loop, view, maxCommandBytes,
                                     enableTwoDimensional, requireManualSafe,
-                                    stats);
+                                    candidateId, manualIds, stats);
       if (candidate)
-        emitHint(*candidate, distance, baselineKind, stats);
+        emitHint(*candidate, distance, baselineKind, candidateId, stats);
     }
 
     Builder b(func.getContext());
@@ -311,6 +340,28 @@ struct PrefetchKernelHXPass
                   b.getI64IntegerAttr(stats.rejectedUnmarked));
     func->setAttr("prefetch_kernel_hx.policy",
                   b.getStringAttr(baselineKind));
+    SmallVector<Attribute> admittedAttrs;
+    for (const std::string &id : stats.admittedIds)
+      admittedAttrs.push_back(b.getStringAttr(id));
+    func->setAttr("prefetch_kernel_hx.admitted_ids",
+                  b.getArrayAttr(admittedAttrs));
+
+    std::string ledgerText;
+    llvm::raw_string_ostream ledger(ledgerText);
+    ledger << '[' << baselineKind << "] function=" << func.getName()
+           << " loops=" << stats.loops << " candidates=" << stats.candidates
+           << " hints=" << stats.hints
+           << " requested_bytes=" << stats.requestedBytes
+           << " admitted_ids=";
+    if (stats.admittedIds.empty())
+      ledger << "none";
+    else
+      llvm::interleaveComma(stats.admittedIds, ledger);
+    ledger << '\n';
+    ledger.flush();
+    static std::mutex ledgerMutex;
+    std::lock_guard<std::mutex> lock(ledgerMutex);
+    llvm::errs() << ledgerText;
 
   }
 };

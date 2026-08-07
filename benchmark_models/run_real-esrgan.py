@@ -18,8 +18,6 @@ if not hasattr(huggingface_hub, "hf_hub_url"):
 
     huggingface_hub.hf_hub_url = _hf_hub_url
 
-from RealESRGAN import RealESRGAN
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hexkl_utils import (  # noqa: E402
     patch_dsp_heap_256mb,
@@ -58,6 +56,10 @@ def load_real_esrgan_model(device):
     Kept as a hook so the Debug runner can use a genuinely small topology.
     The normal/full benchmark always executes this implementation.
     """
+    # Keep the optional OpenCV-dependent wrapper out of Debug imports.  The
+    # reduced runner only needs the pure-PyTorch RRDB architecture.
+    from RealESRGAN import RealESRGAN
+
     model_wrapper = RealESRGAN(device, scale=4)
     weights_path = huggingface_hub.hf_hub_download(
         "ai-forever/Real-ESRGAN", "RealESRGAN_x4.pth"
@@ -75,6 +77,11 @@ def real_esrgan(
     enable_omnifetch_items_1_7: bool = False,
     seq_len: Optional[int] = None,
     input_size: Optional[int] = None,
+    backend_profile: str = "legacy-scalar",
+    prefetch_baseline: str = "none",
+    prefetch_baseline_distance: int = 1,
+    apt_get_hx_manual_candidate_ids: str = "",
+    device_iterations: int = 1,
 ):
     patch_dsp_heap_256mb()
     device = torch.device("cpu")
@@ -107,6 +114,10 @@ def real_esrgan(
         enable_omnifetch_adaptive,
         enable_omnifetch_items_1_7,
         lower_constants_separate=True,
+        backend_profile=backend_profile,
+        prefetch_baseline=prefetch_baseline,
+        prefetch_baseline_distance=prefetch_baseline_distance,
+        apt_get_hx_manual_candidate_ids=apt_get_hx_manual_candidate_ids,
     )
     if enable_omnifetch_items_1_7 and not (
         "linalg.matmul" in ir or "linalg.batch_matmul" in ir
@@ -120,7 +131,12 @@ def real_esrgan(
             "disabled persistent-WH replay"
         )
     hex_outputs = hex_execution(
-        module, func_name, [input_tensor], options, mlir_text=mlir_text
+        module,
+        func_name,
+        [input_tensor],
+        options,
+        mlir_text=mlir_text,
+        iterations=device_iterations,
     )
     print("Successfully ran Real-ESRGAN on Hexagon DSP!")
 
@@ -135,6 +151,7 @@ if __name__ == "__main__":
     )
     add_phase4_args(parser)
     parser.add_argument("--input-size", type=int, default=None)
+    parser.add_argument("--device-iterations", type=int, default=1)
     args = parser.parse_args()
     real_esrgan(
         enable_hexkl=args.enable_hexkl,
@@ -145,4 +162,9 @@ if __name__ == "__main__":
         enable_omnifetch_items_1_7=args.enable_omnifetch_items_1_7,
         seq_len=args.seq_len,
         input_size=args.input_size,
+        backend_profile=args.backend_profile,
+        prefetch_baseline=args.prefetch_baseline,
+        prefetch_baseline_distance=args.prefetch_baseline_distance,
+        apt_get_hx_manual_candidate_ids=args.apt_get_hx_manual_candidate_ids,
+        device_iterations=args.device_iterations,
     )

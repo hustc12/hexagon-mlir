@@ -484,6 +484,9 @@ def PrefetchKernelHX :
     Option<"requireManualSafe", "require-manual-safe", "bool",
            /*default=*/"false",
            "Require prefetch_baseline.manual_safe=true on the view or loop.">,
+    Option<"manualCandidateIds", "manual-candidate-ids", "std::string",
+           /*default=*/"\"\"",
+           "Comma-separated stable candidate IDs admitted by APT-GET-HX.">,
   ];
   let constructor = "hexagon::createPrefetchKernelHXPass()";
   let dependentDialects = [

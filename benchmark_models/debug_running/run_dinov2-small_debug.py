@@ -84,6 +84,11 @@ def run(args):
         disable_lwp_loop=args.disable_lwp_loop,
         omnifetch_items_through=args.omnifetch_items_through,
         enable_omnifetch_kv_vtcm=args.enable_omnifetch_kv_vtcm,
+        prefetch_baseline=args.prefetch_baseline,
+        prefetch_baseline_distance=args.prefetch_baseline_distance,
+        apt_get_hx_manual_candidate_ids=(
+            args.apt_get_hx_manual_candidate_ids
+        ),
     )
     output = hex_execution(
         module,

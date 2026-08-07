@@ -162,7 +162,7 @@ class TorchMlirHexagonWrapperGenerator(HexagonWrapperGenerator):
         return super().generate_update_tensor_calls()
 
     def generate_l2_scheduler_report(self):
-        if not self.options.get("enableOmniFetchVDAE", False):
+        if not self._uses_l2_scheduler():
             return ""
         return """
 uint64_t l2_scheduler_counts = __omni_fetch_l2_scheduler_counts();
@@ -184,6 +184,16 @@ if (l2_scheduler_report) {
   fclose(l2_scheduler_report);
 }
 """
+
+    def _uses_l2_scheduler(self):
+        return any(
+            self.options.get(option, False)
+            for option in (
+                "enableOmniFetchVDAE",
+                "enablePrefetchKernelHX",
+                "enableAPTGetHX",
+            )
+        )
 
     def generate_benchmarking_and_reporting(self, function_call):
         if not self.options.get("enableOmniFetchPersistentWhCache", False):
@@ -274,7 +284,7 @@ __omni_fetch_wh_cache_stats(void) { return 0; }
 extern "C" __attribute__((weak)) uint64_t
 __omni_fetch_w8_cache_stats(void) { return 0; }
 """
-        if self.options.get("enableOmniFetchVDAE", False):
+        if self._uses_l2_scheduler():
             code_headers += """
 extern "C" __attribute__((weak)) uint64_t
 __omni_fetch_l2_scheduler_counts(void) { return 0; }

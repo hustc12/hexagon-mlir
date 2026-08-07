@@ -4,6 +4,9 @@
 // RUN: linalg-hexagon-opt %s \
 // RUN:   -pass-pipeline='builtin.module(func.func(prefetch-kernel-hx{distance=2 baseline-kind=apt-get-hx require-manual-safe=true}))' \
 // RUN:   | FileCheck %s --check-prefix=APT
+// RUN: linalg-hexagon-opt %s \
+// RUN:   -pass-pipeline='builtin.module(func.func(prefetch-kernel-hx{distance=2 baseline-kind=apt-get-hx require-manual-safe=true manual-candidate-ids=apt_unmarked:loop0:view0}))' \
+// RUN:   | FileCheck %s --check-prefix=ALLOW
 
 // CHECK-LABEL: func.func @affine_1d
 // CHECK-SAME: prefetch_kernel_hx.admitted_1d = 1
@@ -16,6 +19,7 @@
 // CHECK: %[[VIEW:.+]] = memref.subview %arg0[%[[FUTURE]]] [64] [1]
 // CHECK: omni_fetch.l2_hint %[[VIEW]]
 // CHECK-SAME: prefetch_baseline.address_class = "affine_1d"
+// CHECK-SAME: prefetch_baseline.candidate_id = "affine_1d:loop0:view0"
 // CHECK-SAME: prefetch_baseline.distance = 2
 // CHECK-SAME: prefetch_baseline.kind = "prefetch-kernel-hx"
 // CHECK-SAME: prefetch_baseline.page_policy = "runtime_clip_v1"
@@ -103,6 +107,7 @@ func.func @reject_oversize(%src: memref<128x128xf16>) {
 // APT-SAME: prefetch_kernel_hx.policy = "apt-get-hx"
 // APT-SAME: prefetch_kernel_hx.rejected_unmarked = 0
 // APT: omni_fetch.l2_hint
+// APT-SAME: prefetch_baseline.candidate_id = "apt_manual_safe:loop0:view0"
 // APT-SAME: prefetch_baseline.kind = "apt-get-hx"
 func.func @apt_manual_safe(%src: memref<256xf16>) {
   %c0 = arith.constant 0 : index
@@ -125,6 +130,11 @@ func.func @apt_manual_safe(%src: memref<256xf16>) {
 // APT-SAME: prefetch_kernel_hx.hints = 0
 // APT-SAME: prefetch_kernel_hx.rejected_unmarked = 1
 // APT-NOT: omni_fetch.l2_hint
+// ALLOW-LABEL: func.func @apt_unmarked
+// ALLOW-SAME: prefetch_kernel_hx.hints = 1
+// ALLOW: omni_fetch.l2_hint
+// ALLOW-SAME: prefetch_baseline.candidate_id = "apt_unmarked:loop0:view0"
+// ALLOW-SAME: prefetch_baseline.kind = "apt-get-hx"
 func.func @apt_unmarked(%src: memref<256xf16>) {
   %c0 = arith.constant 0 : index
   %c64 = arith.constant 64 : index

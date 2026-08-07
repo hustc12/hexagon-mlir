@@ -82,6 +82,11 @@ def mamba_130m(
     enable_omnifetch_adaptive: bool = True,
     enable_omnifetch_items_1_7: bool = False,
     seq_len: Optional[int] = None,
+    device_iterations: int = 1,
+    backend_profile: str = "legacy-scalar",
+    prefetch_baseline: str = "none",
+    prefetch_baseline_distance: int = 1,
+    apt_get_hx_manual_candidate_ids: str = "",
 ):
     patch_dsp_heap_256mb()
 
@@ -153,9 +158,18 @@ def mamba_130m(
         omnifetch_lookahead,
         enable_omnifetch_adaptive,
         enable_omnifetch_items_1_7,
+        backend_profile=backend_profile,
+        prefetch_baseline=prefetch_baseline,
+        prefetch_baseline_distance=prefetch_baseline_distance,
+        apt_get_hx_manual_candidate_ids=apt_get_hx_manual_candidate_ids,
     )
     hex_outputs = hex_execution(
-        module, func_name, [input_ids], options, mlir_text=mlir_text
+        module,
+        func_name,
+        [input_ids],
+        options,
+        mlir_text=mlir_text,
+        iterations=device_iterations,
     )
     print("Successfully ran Mamba-130M on Hexagon DSP!")
 
@@ -177,5 +191,13 @@ if __name__ == "__main__":
         description="Mamba-130M Hexagon smoke (optional HexKL/OmniFetch)."
     )
     add_phase4_args(parser)
+    parser.add_argument("--device-iterations", type=int, default=1)
     args = parser.parse_args()
-    mamba_130m(**phase4_kwargs_from_args(args))
+    mamba_130m(
+        **phase4_kwargs_from_args(args),
+        device_iterations=args.device_iterations,
+        backend_profile=args.backend_profile,
+        prefetch_baseline=args.prefetch_baseline,
+        prefetch_baseline_distance=args.prefetch_baseline_distance,
+        apt_get_hx_manual_candidate_ids=args.apt_get_hx_manual_candidate_ids,
+    )

@@ -92,6 +92,9 @@ def swin_transformer(
     backend_profile: str = "hvx-vector",
     enable_omnifetch_m_pad_hmx: bool = False,
     enable_out_params: bool = False,
+    prefetch_baseline: str = "none",
+    prefetch_baseline_distance: int = 1,
+    apt_get_hx_manual_candidate_ids: str = "",
 ):
     # Full 28M-parameter graph exceeds the Debug runner's 256 MiB heap.
     patch_full_model_dsp_heap()
@@ -145,6 +148,9 @@ def swin_transformer(
         backend_profile=backend_profile,
         enable_omnifetch_m_pad_hmx=enable_omnifetch_m_pad_hmx,
         enable_out_params=enable_out_params,
+        prefetch_baseline=prefetch_baseline,
+        prefetch_baseline_distance=prefetch_baseline_distance,
+        apt_get_hx_manual_candidate_ids=apt_get_hx_manual_candidate_ids,
     )
     inputs = rel_pos_indices + [pixel_values]
     hex_outputs = hex_execution(
@@ -187,4 +193,7 @@ if __name__ == "__main__":
         backend_profile=args.backend_profile,
         enable_omnifetch_m_pad_hmx=args.enable_omnifetch_m_pad_hmx,
         enable_out_params=args.enable_out_params,
+        prefetch_baseline=args.prefetch_baseline,
+        prefetch_baseline_distance=args.prefetch_baseline_distance,
+        apt_get_hx_manual_candidate_ids=args.apt_get_hx_manual_candidate_ids,
     )

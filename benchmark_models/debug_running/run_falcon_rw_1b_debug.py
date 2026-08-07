@@ -74,6 +74,13 @@ def main():
     parser.add_argument("--omnifetch-lookahead", type=int, default=2)
     parser.add_argument("--disable-omnifetch-adaptive", action="store_true")
     parser.add_argument("--enable-omnifetch-items-1-7", action="store_true")
+    parser.add_argument(
+        "--prefetch-baseline",
+        choices=("none", "prefetch-kernel-hx", "apt-get-hx"),
+        default="none",
+    )
+    parser.add_argument("--prefetch-baseline-distance", type=int, default=1)
+    parser.add_argument("--apt-get-hx-manual-candidate-ids", default="")
     parser.add_argument("--enable-omnifetch-weight-prepack", action="store_true")
     parser.add_argument("--enable-omnifetch-persistent-wh-cache",
                         action="store_true")
@@ -128,6 +135,9 @@ def main():
         device_iterations=args.device_iterations,
         enable_hexkl_persistent_vtcm=args.enable_hexkl_persistent_vtcm,
         seq_len=args.seq_len,
+        prefetch_baseline=args.prefetch_baseline,
+        prefetch_baseline_distance=args.prefetch_baseline_distance,
+        apt_get_hx_manual_candidate_ids=args.apt_get_hx_manual_candidate_ids,
     )
 
 

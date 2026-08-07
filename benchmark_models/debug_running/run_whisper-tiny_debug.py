@@ -94,8 +94,18 @@ def run(args):
         enable_omnifetch_activation_multicast=(
             args.enable_omnifetch_activation_multicast
         ),
+        prefetch_baseline=args.prefetch_baseline,
+        prefetch_baseline_distance=args.prefetch_baseline_distance,
+        apt_get_hx_manual_candidate_ids=args.apt_get_hx_manual_candidate_ids,
     )
-    outputs = hex_execution(module, wrapped.__class__.__name__, inputs, options, mlir_text=patched)
+    outputs = hex_execution(
+        module,
+        wrapped.__class__.__name__,
+        inputs,
+        options,
+        mlir_text=patched,
+        iterations=args.device_iterations,
+    )
     with torch.no_grad():
         reference = wrapped(*inputs)
     diff = (outputs[0].float() - reference.float()).abs().max().item()
@@ -105,4 +115,5 @@ def run(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     add_phase4_args(parser)
+    parser.add_argument("--device-iterations", type=int, default=1)
     run(parser.parse_args())
