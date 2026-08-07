@@ -27,6 +27,8 @@ from triton.backends.qcom_hexagon_backend.hexagon_launcher_base import (
 from triton.backends.qcom_hexagon_backend.utils import (
     parse_return_types,
     profile_torch_mlir_inputs,
+    split_path,
+    get_shape,
 )
 from triton._C.libtriton import qcom_hexagon_backend, ir  # type: ignore
 
@@ -58,6 +60,7 @@ return 0;
 class TorchMlirHexagonWrapperGenerator(HexagonWrapperGenerator):
     def __init__(self, input_profs, iterations, func_name, output_profs, options: dict):
         self.options = options
+        self.use_out_params = options.get("enableBufferResultsToOutParams", False)
         super().__init__(
             input_profs,
             iterations,
@@ -67,8 +70,27 @@ class TorchMlirHexagonWrapperGenerator(HexagonWrapperGenerator):
             options,
         )
 
+    def _output_memrefdesc_name(self, idx):
+        return f"odt{idx}"
+
     def generate_llvm_function_signature(self):
         """Generate lowered LLVM function definition to be called from CPP launcher"""
+        if self.use_out_params:
+            # buffer-results-to-out-params ABI: the function returns void and the
+            # memref results are appended as trailing out-param arguments.
+            function_arg_string = self.generate_llvm_function_signature_arg_string()
+            for out in self.output_profs:
+                if not out.rank:
+                    continue
+                function_arg_string += (
+                    ", "
+                    + self.common_strings.extern_llvm_func_with_return_args.format(
+                        tensor_ctype=out.dtype, tensor_rank=out.rank
+                    )[:-2]
+                )
+            return self.common_strings.extern_llvm_func_defn.format(
+                kernel_name=self.func_name, function_arg_string=function_arg_string
+            )
         function_arg_string = ""
         for out in self.output_profs:
             function_arg_string += self.common_strings.extern_llvm_func_with_return_args.format(
@@ -81,6 +103,22 @@ class TorchMlirHexagonWrapperGenerator(HexagonWrapperGenerator):
 
     def generate_llvm_function_call(self):
         """Generates actual function call to lowered LLVM function call"""
+        if self.use_out_params:
+            # Inputs first, then the caller-allocated output descriptors as
+            # trailing out-params.
+            function_call_descriptor_string = (
+                self.generate_llvm_function_call_arg_string()
+            )
+            for idx, out in enumerate(self.output_profs):
+                if not out.rank:
+                    continue
+                function_call_descriptor_string += (
+                    ", " + self._output_memrefdesc_name(idx)
+                )
+            return self.common_strings.extern_llvm_func_call.format(
+                func_name=self.func_name,
+                descriptor_string=function_call_descriptor_string,
+            )
         function_call_descriptor_string = ""
         for i in range(len(self.output_profs)):
             function_call_descriptor_string += f"&(r->r{i}), "
@@ -88,6 +126,40 @@ class TorchMlirHexagonWrapperGenerator(HexagonWrapperGenerator):
         return self.common_strings.extern_llvm_func_call.format(
             func_name=self.func_name, descriptor_string=function_call_descriptor_string
         )
+
+    def generate_result_struct(self):
+        # In the out-param ABI the outputs are caller-allocated Tensors, so no
+        # FuncResult struct is needed.
+        if self.use_out_params:
+            return ""
+        return super().generate_result_struct()
+
+    def generate_result_struct_init(self):
+        # Allocate the output buffers on the host (caller) with the known static
+        # shape and expose their memref descriptors to pass as out-params.
+        if self.use_out_params:
+            alloc_string = ""
+            for idx, out in enumerate(self.output_profs):
+                if not out.rank:
+                    continue
+                sizes, strides = get_shape(out.shape)
+                alloc_string += (
+                    f"Tensor<{out.dtype}, {out.rank}> "
+                    f"{self.common_strings.output_tensor_name}{idx}"
+                    f"({{{sizes}, {strides}, 128}}, MemType::HEAP);\n"
+                    f"MemRefDescriptor<{out.dtype}, {out.rank}> *"
+                    f"{self._output_memrefdesc_name(idx)} = "
+                    f"{self.common_strings.output_tensor_name}{idx}.toMemRefDesc();\n"
+                )
+            return alloc_string
+        return super().generate_result_struct_init()
+
+    def generate_update_tensor_calls(self):
+        # Out-param outputs (O{idx}) are already live Tensors written in place by
+        # the callee, so nothing to re-wrap before dumping.
+        if self.use_out_params:
+            return ""
+        return super().generate_update_tensor_calls()
 
     def generate_l2_scheduler_report(self):
         if not self.options.get("enableOmniFetchVDAE", False):
@@ -130,7 +202,8 @@ uint64_t cold_time_us = benchmark_time_us(1, [&]() {{
 }});
 uint64_t cold_stats = __omni_fetch_wh_cache_stats();
 uint64_t cold_w8_stats = __omni_fetch_w8_cache_stats();
-uint64_t warm_time_us = benchmark_time_us({self.iterations}, [&]() {{
+std::vector<uint64_t> __warm_samples;
+uint64_t warm_time_us = benchmark_samples_us({self.iterations}, __warm_samples, [&]() {{
     {function_call}
 }});
 uint64_t wh_cache_stats = __omni_fetch_wh_cache_stats();
@@ -165,6 +238,11 @@ if (w8_cache_report) {{
           (unsigned)(cold_w8_stats >> 32), (unsigned)cold_w8_stats,
           (unsigned)(w8_cache_stats >> 32), (unsigned)w8_cache_stats);
   fclose(w8_cache_report);
+}}
+{{
+  FILE *__warm_perf_fp = fopen("perf.txt", "a");
+  report_percentiles("{self.func_name}", __warm_samples, __warm_perf_fp);
+  if (__warm_perf_fp) fclose(__warm_perf_fp);
 }}
 """ + self.generate_l2_scheduler_report()
 
@@ -276,6 +354,30 @@ class TorchMLIRHexagonLauncher(HexagonLauncherBase):
         )
         # Careful, this needs to be done before calling mlir_to_obj()
         result_types = qcom_hexagon_backend.get_return_list(mlir_mod, func_name)
+        result_shapes = qcom_hexagon_backend.get_return_shapes(mlir_mod, func_name)
+
+        # Guard against lifted-constant function arguments.  torch-mlir's frozen
+        # export inlines nn.Parameters and plain constant tensors, but lifts
+        # register_buffer buffers (persistent or not) into leading function
+        # arguments.  The host wrapper only supplies the user inputs, so any
+        # extra lifted argument is passed a NULL descriptor and faults on device
+        # (Bad VA 0x0).  Detect the mismatch here and fail loudly with guidance.
+        arg_list = qcom_hexagon_backend.get_arg_list(mlir_mod, func_name)
+        arg_shapes = qcom_hexagon_backend.get_arg_shapes(mlir_mod, func_name)
+        if len(arg_list) != len(inputs):
+            extra = [
+                arg_shapes[i] if i < len(arg_shapes) else "?"
+                for i in range(len(inputs), len(arg_list))
+            ]
+            raise ValueError(
+                f"Entry function '{func_name}' expects {len(arg_list)} arguments "
+                f"but the host provided {len(inputs)} input(s). This usually means "
+                f"torch-mlir lifted register_buffer buffers into function "
+                f"arguments (extra arg shapes: {extra}). Store frozen/derived "
+                f"tensors as plain attributes or nn.Parameters (not buffers) so "
+                f"they are inlined as constants instead of becoming arguments."
+            )
+
         func_name_with_ciface = "_mlir_ciface_" + func_name
 
         # MLIR to (potentially several) object files (as strings)
@@ -323,7 +425,7 @@ class TorchMLIRHexagonLauncher(HexagonLauncherBase):
             # 2 - If it's the principal module only, deal with the wrapper code that we need to generate and dump
             if i == 0:
                 # Creating the wrapper generator for the principal module
-                return_types = parse_return_types(result_types)
+                return_types = parse_return_types(result_types, result_shapes)
                 input_profs = profile_torch_mlir_inputs(inputs)
 
                 # Pass options to the wrapper generator.
@@ -411,6 +513,157 @@ class TorchMLIRHexagonLauncher(HexagonLauncherBase):
             wrapper_generator,
         )
         return results
+
+    @staticmethod
+    def _parse_perf_file(perf_path: str) -> dict:
+        """Parse a pulled <lib>_perf.txt into {mean, p50, p90, p99, pmin,
+        samples}. Missing fields are returned as None. Anchors match the
+        additive lines emitted by report_percentiles()."""
+        fields = {
+            "mean": None,
+            "p50": None,
+            "p90": None,
+            "p99": None,
+            "pmin": None,
+            "samples": None,
+        }
+        key_by_prefix = {
+            "Perf:": "mean",
+            "PerfP50:": "p50",
+            "PerfP90:": "p90",
+            "PerfP99:": "p99",
+            "PerfMin:": "pmin",
+            "PerfSamples:": "samples",
+        }
+        try:
+            with open(perf_path, "r") as fp:
+                for raw in fp:
+                    line = raw.strip()
+                    for prefix, key in key_by_prefix.items():
+                        if line.startswith(prefix):
+                            try:
+                                fields[key] = float(line[len(prefix):].strip())
+                            except ValueError:
+                                pass
+                            break
+        except FileNotFoundError:
+            pass
+        return fields
+
+    @staticmethod
+    def _percentiles(values: list) -> dict:
+        """Host-side p50/p90/p99/min over a list of per-round means."""
+        if not values:
+            return {"p50": None, "p90": None, "p99": None, "min": None, "n": 0}
+        s = sorted(values)
+        n = len(s)
+
+        def pct(p):
+            if n == 1:
+                return s[0]
+            idx = p * (n - 1)
+            lo = int(idx)
+            hi = min(lo + 1, n - 1)
+            frac = idx - lo
+            return s[lo] + frac * (s[hi] - s[lo])
+
+        return {
+            "p50": pct(0.50),
+            "p90": pct(0.90),
+            "p99": pct(0.99),
+            "min": s[0],
+            "n": n,
+        }
+
+    # Compile each profile once, then round-robin execute so thermal/DVFS drift
+    # is shared across configs rather than penalizing whichever ran last.
+    def run_torch_mlir_interleaved(
+        self,
+        configs_by_profile: dict,
+        inputs: list[Tensor],
+        func_name: str,
+        base_dir_for_artifacts: Optional[str] = None,
+        iterations: int = 1,
+        rounds: int = 1,
+        enable_etm=False,
+    ) -> dict:
+        # configs_by_profile maps a profile label to a dict with keys
+        # "launch_path" (the MLIR bytecode/text to compile for that profile,
+        # which may differ because HexKL profiles compile rewritten IR) and
+        # "options" (the HexagonOptions dict for that profile).
+        # Phase A: compile every profile once.
+        compiled = {}
+        for profile, cfg in configs_by_profile.items():
+            options = cfg.get("options") or HexagonOptions().__dict__
+            launch_path = cfg["launch_path"]
+            hexec = HexagonExecutor(options["enableLWP"], enable_etm)
+            local_dir_path = create_timestamped_folder(
+                f"{func_name}_{profile}", base_dir_for_artifacts
+            )
+            filename = os.path.basename(launch_path)
+            shutil.copy(launch_path, os.path.join(local_dir_path, filename))
+            start_time = time.time()
+            (wrapper_generator, so_paths) = self.compile_torch_mlir(
+                hexec,
+                local_dir_path,
+                launch_path,
+                inputs,
+                func_name,
+                options,
+                iterations,
+            )
+            end_time = time.time()
+            print(
+                f"==> [interleave] Compilation from initial MLIR to .so for "
+                f"profile '{profile}' took {end_time - start_time:.4f} seconds",
+                flush=True,
+            )
+            compiled[profile] = {
+                "hexec": hexec,
+                "local_dir": local_dir_path,
+                "so_paths": so_paths,
+                "wrapper_generator": wrapper_generator,
+            }
+
+        func_name_with_ciface = "_mlir_ciface_" + func_name
+
+        # Phase B: round-robin execute; snapshot each config's perf per round.
+        per_round_means = {profile: [] for profile in compiled}
+        last_results = {}
+        for r in range(rounds):
+            for profile, c in compiled.items():
+                results = self.execute_kernel(
+                    c["hexec"],
+                    c["local_dir"],
+                    func_name_with_ciface,
+                    c["so_paths"],
+                    c["wrapper_generator"],
+                )
+                last_results[profile] = results
+                principal = c["so_paths"][0]
+                ld, base, _ = split_path(principal)
+                perf_path = os.path.join(ld, f"{base}_perf.txt")
+                parsed = self._parse_perf_file(perf_path)
+                if parsed["mean"] is not None:
+                    per_round_means[profile].append(parsed["mean"])
+                print(
+                    f"==> [interleave] round {r + 1}/{rounds} profile "
+                    f"'{profile}' mean_us={parsed['mean']}",
+                    flush=True,
+                )
+
+        # Aggregate host-side percentiles over per-round means.
+        print("==> [interleave] Per-profile summary (percentiles over rounds):")
+        for profile, means in per_round_means.items():
+            agg = self._percentiles(means)
+            print(
+                f"InterleaveResult profile={profile} rounds={agg['n']} "
+                f"p50_us={agg['p50']} p90_us={agg['p90']} p99_us={agg['p99']} "
+                f"min_us={agg['min']}",
+                flush=True,
+            )
+
+        return last_results
 
     @staticmethod
     def get_output_tensor_path_count(wrapper_generator: HexagonWrapperGenerator):

@@ -10,28 +10,44 @@
 #include "VTCMPool.h"
 #include "HAP_compute_res.h"
 #include "HexagonCommon.h"
+#include "qurt.h"
 
 VtcmPool::VtcmPool() {
   compute_res_attr_t resInfo;
   HEXAGON_SAFE_CALL(HAP_compute_res_attr_init(&resInfo));
 
-  unsigned int availBlockSize;
+  unsigned int availBlockSize = 0;
   compute_res_vtcm_page_t totalBlockLayout;
   compute_res_vtcm_page_t availBlockLayout;
   unsigned int pageSize = 0;
 
-  HEXAGON_SAFE_CALL(compute_resource_query_VTCM(
-      /* application_id = */ 0, &vtcmDeviceSize_, &totalBlockLayout,
-      &availBlockSize, &availBlockLayout));
+  // A VTCM block can be transiently held while a previously crashed DSP
+  // process finishes releasing it. Re-query with a short back-off before
+  // giving up so a fresh run does not abort on leftover contention (which
+  // otherwise surfaces to the host as a non-zero run exit / "Less than 1MB
+  // VTCM available").
+  constexpr unsigned int kMinVtcmBytes = 1024 * 1024;
+  constexpr int kMaxQueryAttempts = 50;  // ~1s total at 20ms back-off
+  for (int attempt = 0;; ++attempt) {
+    HEXAGON_SAFE_CALL(compute_resource_query_VTCM(
+        /* application_id = */ 0, &vtcmDeviceSize_, &totalBlockLayout,
+        &availBlockSize, &availBlockLayout));
 
-  // Use the max page size form the page_list
-  for (int i = 0; i < totalBlockLayout.page_list_len; i++) {
-    if (pageSize < totalBlockLayout.page_list[i].page_size) {
-      pageSize = totalBlockLayout.page_list[i].page_size;
+    // Use the max page size from the page_list
+    pageSize = 0;
+    for (int i = 0; i < totalBlockLayout.page_list_len; i++) {
+      if (pageSize < totalBlockLayout.page_list[i].page_size) {
+        pageSize = totalBlockLayout.page_list[i].page_size;
+      }
     }
+
+    if (availBlockSize >= kMinVtcmBytes || attempt >= kMaxQueryAttempts) {
+      break;
+    }
+    qurt_sleep(/* microseconds = */ 20000);
   }
 
-  CHECK((availBlockSize >= (1024 * 1024)), "Less than 1MB VTCM available");
+  CHECK((availBlockSize >= kMinVtcmBytes), "Less than 1MB VTCM available");
 
   // allocate nbytes of vtcm on a single page
   HEXAGON_SAFE_CALL(HAP_compute_res_attr_set_vtcm_param_v2(

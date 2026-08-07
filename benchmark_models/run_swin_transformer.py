@@ -89,6 +89,9 @@ def swin_transformer(
     enable_omnifetch_items_1_7: bool = False,
     seq_len: Optional[int] = None,
     device_iterations: int = 1,
+    backend_profile: str = "hvx-vector",
+    enable_omnifetch_m_pad_hmx: bool = False,
+    enable_out_params: bool = False,
 ):
     # Full 28M-parameter graph exceeds the Debug runner's 256 MiB heap.
     patch_full_model_dsp_heap()
@@ -125,7 +128,9 @@ def swin_transformer(
 
     mlir_text = None
     if enable_hexkl:
-        ir2, n_bm, n_f16 = apply_hexkl_ir_rewrites(ir)
+        ir2, n_bm, n_f16 = apply_hexkl_ir_rewrites(
+            ir, enable_m_pad=enable_omnifetch_m_pad_hmx
+        )
         mlir_text = ir2
         print(f"[HexKL] batch_matmul→matmul={n_bm}, f16-input rewrite={n_f16}")
 
@@ -137,6 +142,9 @@ def swin_transformer(
         enable_omnifetch_adaptive,
         enable_omnifetch_items_1_7,
         lower_constants_separate=LOWER_CONSTANTS_SEPARATE,
+        backend_profile=backend_profile,
+        enable_omnifetch_m_pad_hmx=enable_omnifetch_m_pad_hmx,
+        enable_out_params=enable_out_params,
     )
     inputs = rel_pos_indices + [pixel_values]
     hex_outputs = hex_execution(
@@ -176,4 +184,7 @@ if __name__ == "__main__":
         enable_omnifetch_items_1_7=args.enable_omnifetch_items_1_7,
         seq_len=args.seq_len,
         device_iterations=args.device_iterations,
+        backend_profile=args.backend_profile,
+        enable_omnifetch_m_pad_hmx=args.enable_omnifetch_m_pad_hmx,
+        enable_out_params=args.enable_out_params,
     )

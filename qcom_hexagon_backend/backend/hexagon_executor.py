@@ -58,6 +58,28 @@ class HexagonExecutor:
                 if "Result" in line:
                     return line.split("Result:")[-1].strip()
 
+    def _device_files_present(self, device_paths):
+        """Return True iff every device path exists and is non-empty.
+
+        Used to distinguish a completed run whose only failure is an async
+        runtime teardown fault (outputs already written) from a genuine
+        mid-computation crash (no outputs)."""
+        if not device_paths:
+            return False
+        checks = "; ".join(
+            f'if [ ! -s "{path}" ]; then echo MISSING; fi'
+            for path in device_paths
+        )
+        command = "adb {} -s {} shell '{}'".format(
+            self.config.env_vars["ANDROID_HOST"],
+            self.config.env_vars["ANDROID_SERIAL"],
+            checks,
+        )
+        probe = subprocess.run(
+            command, shell=True, capture_output=True, text=True
+        )
+        return probe.returncode == 0 and "MISSING" not in probe.stdout
+
     # Returns the executable path if running on device.
     def get_Executable_Path(self):
         return self.device_path if self.exec_mode == "device" else ""
@@ -549,15 +571,72 @@ class HexagonExecutor:
                     continue
                 print(command, flush=True)
                 start_time = time.time()
-                result = subprocess.run(
-                    command,
-                    shell=True,
-                    capture_output=True,
-                    text=True
+                is_run_cmd = "run_main_on_hexagon 3" in command
+                max_attempts = (
+                    int(os.environ.get("HEXAGON_RUN_RETRIES", "3"))
+                    if is_run_cmd
+                    else 1
                 )
+                attempt = 0
+                while True:
+                    attempt += 1
+                    result = subprocess.run(
+                        command,
+                        shell=True,
+                        capture_output=True,
+                        text=True
+                    )
+                    if (
+                        result.returncode == 0
+                        or not is_run_cmd
+                        or attempt >= max_attempts
+                    ):
+                        break
+                    # Transient device-side failure (e.g. VTCMPool CHECK
+                    # 'Less than 1MB VTCM available' when a prior crashed DSP
+                    # process has not finished releasing VTCM). Clear any stale
+                    # run_main_on_hexagon process, back off, then retry.
+                    print(
+                        "Warning: run_main_on_hexagon exited "
+                        f"{result.returncode} (attempt {attempt}/{max_attempts}); "
+                        "clearing stale DSP state and retrying.",
+                        flush=True,
+                    )
+                    subprocess.run(
+                        "adb {} -s {} shell 'pkill run_main_on_hexagon "
+                        "2>/dev/null; true'".format(
+                            self.config.env_vars["ANDROID_HOST"],
+                            self.config.env_vars["ANDROID_SERIAL"],
+                        ),
+                        shell=True,
+                        capture_output=True,
+                        text=True,
+                    )
+                    time.sleep(2.0 * attempt)
                 if result.returncode != 0:
-                    print(f"Command failed with output: {result.stderr}")
-                    result.check_returncode()
+                    tolerate = os.environ.get(
+                        "HEXAGON_TOLERATE_TEARDOWN_FAULT", ""
+                    ).strip().lower() not in ("", "0", "false", "no")
+                    required = list(output_device_paths)
+                    if generatePerf and perf_device_path:
+                        required.append(perf_device_path)
+                    if (
+                        tolerate
+                        and is_run_cmd
+                        and required
+                        and self._device_files_present(required)
+                    ):
+                        print(
+                            "Warning: run_main_on_hexagon exited "
+                            f"{result.returncode} but all expected outputs and "
+                            "perf are present on device; treating as success "
+                            "(async teardown fault tolerated via "
+                            "HEXAGON_TOLERATE_TEARDOWN_FAULT).",
+                            flush=True,
+                        )
+                    else:
+                        print(f"Command failed with output: {result.stderr}")
+                        result.check_returncode()
                 end_time = time.time()
                 elapsed_time = end_time - start_time
                 print(f"Command took {elapsed_time:.4f} seconds.", flush=True)

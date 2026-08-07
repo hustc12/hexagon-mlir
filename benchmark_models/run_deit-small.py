@@ -45,8 +45,23 @@ def run(args: argparse.Namespace) -> None:
         num_labels=1000,
     )
     model = DeiTForImageClassification(config).half().eval()
+    # Externalize the learned position embedding as a non-persistent buffer so
+    # torch-mlir lifts it to the leading public function argument (matching the
+    # DINOv2 runner).  When the position embedding is left as an inlined
+    # nn.Parameter constant the on-device run faults with a NULL/TLBMISS in the
+    # async worker threads; supplying it as a runtime memref arg avoids that.
+    embeddings = model.deit.embeddings
+    fixed_position_embeddings = embeddings.position_embeddings.detach().clone()
+    del embeddings.position_embeddings
+    embeddings.register_buffer(
+        "position_embeddings", fixed_position_embeddings, persistent=False
+    )
     wrapped = DeiTSmallWrapper(model).eval()
     inputs = [torch.rand(1, 3, 224, 224, dtype=torch.float16)]
+    # torch-mlir lifts the buffer to the first argument; the Python model still
+    # exposes only pixel_values to callers, so the device call must supply the
+    # lifted position-embedding buffer explicitly before the pixel input.
+    device_inputs = [fixed_position_embeddings, inputs[0]]
     params = sum(parameter.numel() for parameter in model.parameters())
     print(
         "[FullModel] DeiT-Small patch16-224: tokens=198 layers=12 "
@@ -62,7 +77,9 @@ def run(args: argparse.Namespace) -> None:
     )
     patched = None
     if args.enable_hexkl:
-        candidate, n_batch, n_f16 = apply_hexkl_ir_rewrites(ir)
+        candidate, n_batch, n_f16 = apply_hexkl_ir_rewrites(
+            ir, enable_m_pad=args.enable_omnifetch_m_pad_hmx
+        )
         patched = candidate if n_batch or n_f16 else None
         print(
             f"[HexKL] batch_matmul→matmul={n_batch}, "
@@ -76,11 +93,14 @@ def run(args: argparse.Namespace) -> None:
         not args.disable_omnifetch_adaptive,
         args.enable_omnifetch_items_1_7,
         lower_constants_separate=True,
+        backend_profile=args.backend_profile,
+        enable_omnifetch_m_pad_hmx=args.enable_omnifetch_m_pad_hmx,
+        enable_out_params=args.enable_out_params,
     )
     output = hex_execution(
         module,
         wrapped.__class__.__name__,
-        inputs,
+        device_inputs,
         options,
         mlir_text=patched,
         iterations=args.device_iterations,

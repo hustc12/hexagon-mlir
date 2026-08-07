@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from typing import Optional
+import argparse
 import os
 import re
 from pathlib import Path
@@ -99,7 +100,7 @@ def rewrite_matmul_inputs_to_f16(ir: str) -> tuple[str, int]:
     return "".join(out), rewrites
 
 
-def rewrite_batch_matmul_to_matmul(ir: str) -> tuple[str, int]:
+def rewrite_batch_matmul_to_matmul(ir: str, enable_m_pad: bool = False) -> tuple[str, int]:
     """Collapse batch=1 linalg.batch_matmul into linalg.matmul for HexKL."""
     pat = re.compile(
         r"(?P<indent>\s*)(?P<res>%[\w]+)\s*=\s*linalg\.batch_matmul\s+"
@@ -123,7 +124,13 @@ def rewrite_batch_matmul_to_matmul(ir: str) -> tuple[str, int]:
             out_lines.append(line)
             continue
         M, K, N = int(m.group("m")), int(m.group("k")), int(m.group("n"))
-        if (M % 32) != 0 or (K % 32) != 0 or (N % 32) != 0:
+        # K and N must be tile-aligned.  M (rows / tokens) may be unaligned when
+        # M-pad is enabled: the C++ MatmulToHexKL pass pads M up to the next tile
+        # multiple and discards the padded output rows (safest pad direction).
+        if (K % 32) != 0 or (N % 32) != 0:
+            out_lines.append(line)
+            continue
+        if (M % 32) != 0 and not enable_m_pad:
             out_lines.append(line)
             continue
         if K == M or N == M:
@@ -197,15 +204,19 @@ def compile_to_linalg(model, input, dump_to_file=None, debug=False, decomp_pow=T
     return linalg
 
 
-def hex_execution(
+def _prepare_launch_path(
     module,
     func_name,
-    inputs,
-    options: dict = None,
     mlir_text: Optional[str] = None,
     out_dir: Optional[Path] = None,
-    iterations: int = 1,
 ):
+    """Dump the MLIR to disk and return the path to compile.
+
+    When mlir_text is provided (e.g. HexKL-rewritten f16 IR) it is cleaned of
+    cf.assert lines, re-parsed to bytecode for validation, and the cleaned text
+    is written to <func>_f16matmul.mlir. Otherwise the module's original
+    bytecode is preserved (re-parsing str(module) would drop dialects like
+    tm_tensor)."""
     out_dir = out_dir or Path(__file__).parent
     linalg_filename = out_dir / (str(func_name) + ".mlirbc")
 
@@ -225,22 +236,66 @@ def hex_execution(
         patched.write_text(text)
         launch_path = str(patched)
     else:
-        # Keep original module bytecode — re-parsing str(module) drops dialects
-        # like tm_tensor (BERT/GraphSAGE attention) and fails MLIR parse.
         bytecode = module.operation.get_asm(binary=True)
         launch_path = str(linalg_filename)
 
     with open(linalg_filename, "wb") as f:
         f.write(bytecode)
+    return launch_path
 
+
+def hex_execution(
+    module,
+    func_name,
+    inputs,
+    options: dict = None,
+    mlir_text: Optional[str] = None,
+    out_dir: Optional[Path] = None,
+    iterations: int = 1,
+):
+    launch_path = _prepare_launch_path(module, func_name, mlir_text, out_dir)
     options = options or {}
     return TorchMLIRHexagonLauncher().run_torch_mlir(
         launch_path, inputs, func_name, iterations=iterations, options=options
     )
 
 
-def apply_hexkl_ir_rewrites(ir: str) -> tuple[str, int, int]:
-    ir2, n_bm = rewrite_batch_matmul_to_matmul(ir)
+def hex_execution_interleaved(
+    module,
+    func_name,
+    inputs,
+    configs_by_profile: dict,
+    out_dir: Optional[Path] = None,
+    iterations: int = 1,
+    rounds: int = 1,
+):
+    """Round-robin interleaved measurement across profiles.
+
+    configs_by_profile maps a profile label to a dict with keys "options"
+    (HexagonOptions dict) and "mlir_text" (HexKL-rewritten IR text, or None to
+    compile the original module bytecode). Each profile's launch path is
+    prepared here so HexKL profiles compile the rewritten IR while HVX/scalar
+    profiles compile the original module."""
+    prepared = {}
+    for profile, cfg in configs_by_profile.items():
+        launch_path = _prepare_launch_path(
+            module, func_name, cfg.get("mlir_text"), out_dir
+        )
+        prepared[profile] = {
+            "launch_path": launch_path,
+            "options": cfg.get("options") or {},
+        }
+    return TorchMLIRHexagonLauncher().run_torch_mlir_interleaved(
+        prepared,
+        inputs,
+        func_name,
+        iterations=iterations,
+        rounds=rounds,
+    )
+
+
+def apply_hexkl_ir_rewrites(ir: str, enable_m_pad: bool = False) -> tuple[str, int, int]:
+    ir2, n_bm = rewrite_batch_matmul_to_matmul(ir, enable_m_pad=enable_m_pad)
     ir2, n_f16 = rewrite_matmul_inputs_to_f16(ir2)
     return ir2, n_bm, n_f16
 
@@ -259,6 +314,9 @@ def hexagon_options_phase4(
     disable_lwp_loop: bool = False,
     omnifetch_items_through: int = 0,
     enable_omnifetch_kv_vtcm: bool = False,
+    enable_omnifetch_activation_multicast: bool = False,
+    enable_omnifetch_m_pad_hmx: bool = False,
+    enable_out_params: bool = False,
 ):
     from triton.backends.qcom_hexagon_backend.compiler import HexagonOptions
 
@@ -316,6 +374,11 @@ def hexagon_options_phase4(
     # K/V cache pages; for encoders they are the current invocation's ordinary
     # attention K/V tensors.  Both are valid early-data-movement opportunities.
     options["enableOmniFetchKvCachePrefetch"] = cumulative_level >= 7
+    options["enableOmniFetchActivationMulticast"] = bool(
+        enable_omnifetch_activation_multicast
+    )
+    options["enableOmniFetchMPadHmx"] = bool(enable_omnifetch_m_pad_hmx)
+    options["enableBufferResultsToOutParams"] = bool(enable_out_params)
     options["enableOmniFetchDmaToVtcm"] = bool(enable_omnifetch_kv_vtcm)
     options["enableHexagonmemCopyToDMA"] = bool(enable_omnifetch_kv_vtcm)
     if cumulative_level:
@@ -368,6 +431,31 @@ def add_phase4_args(parser):
         ),
     )
     parser.add_argument(
+        "--enable-omnifetch-activation-multicast",
+        action="store_true",
+        help="Enable OmniFetch N2 activation multicast for sibling projections.",
+    )
+    parser.add_argument(
+        "--enable-omnifetch-m-pad-hmx",
+        action="store_true",
+        help=(
+            "Pad the M (rows/tokens) dimension up to a multiple of 32 so "
+            "unaligned-token encoders (DINOv2/BEiT/DeiT/Whisper) lower matmuls "
+            "through HexKL/HMX."
+        ),
+    )
+    parser.add_argument(
+        "--enable-out-params",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Convert memref function results into trailing out-param arguments "
+            "(function returns void). Avoids the by-value memref (sret) return "
+            "that the Hexagon backend miscompiles for large monolithic full "
+            "models. Use --no-enable-out-params to reproduce the legacy ABI."
+        ),
+    )
+    parser.add_argument(
         "--backend-profile",
         choices=("legacy-scalar", "hvx-vector", "hvx-vector-vtcm"),
         default=os.environ.get("OMNIFETCH_BACKEND_PROFILE", "legacy-scalar"),
@@ -394,7 +482,104 @@ def add_phase4_args(parser):
         help="Instrument only the function body, not individual loops.",
     )
     parser.add_argument("--seq-len", type=int, default=None)
+    parser.add_argument(
+        "--interleave-profiles",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated profiles to measure interleaved (compile once, "
+            "round-robin execute). Valid labels: legacy-scalar, hvx-vector, "
+            "hvx-vector-vtcm, hexkl (hvx-vector-vtcm + HexKL overlay), "
+            "hexkl-items17 (hexkl + OmniFetch items 1-7)."
+        ),
+    )
+    parser.add_argument(
+        "--rounds",
+        type=int,
+        default=1,
+        help="Number of round-robin rounds for --interleave-profiles.",
+    )
     return parser
+
+
+# Profile label -> hexagon_options_phase4 overrides for interleaved runs.
+# Each entry sets backend_profile plus the HexKL/items overlays; profiles whose
+# "hexkl" flag is True compile the HexKL-rewritten IR (mlir_text).
+INTERLEAVE_PROFILE_SPECS = {
+    "legacy-scalar": dict(
+        backend_profile="legacy-scalar", enable_hexkl=False, items_1_7=False
+    ),
+    "hvx-vector": dict(
+        backend_profile="hvx-vector", enable_hexkl=False, items_1_7=False
+    ),
+    "hvx-vector-vtcm": dict(
+        backend_profile="hvx-vector-vtcm", enable_hexkl=False, items_1_7=False
+    ),
+    "hexkl": dict(
+        backend_profile="hvx-vector-vtcm", enable_hexkl=True, items_1_7=False
+    ),
+    "hexkl-items17": dict(
+        backend_profile="hvx-vector-vtcm", enable_hexkl=True, items_1_7=True
+    ),
+}
+
+
+def build_interleave_configs(args, ir: str):
+    """Build {profile: {"options", "mlir_text"}} for --interleave-profiles.
+
+    ir is str(module); HexKL profiles use the rewritten f16 IR as mlir_text.
+    Raises ValueError on unknown profile labels."""
+    labels = [p.strip() for p in args.interleave_profiles.split(",") if p.strip()]
+    hexkl_text = None
+    configs = {}
+    for label in labels:
+        if label not in INTERLEAVE_PROFILE_SPECS:
+            raise ValueError(
+                f"unknown interleave profile {label!r}; expected one of "
+                f"{sorted(INTERLEAVE_PROFILE_SPECS)}"
+            )
+        spec = INTERLEAVE_PROFILE_SPECS[label]
+        options = hexagon_options_phase4(
+            spec["enable_hexkl"],
+            args.enable_omnifetch_vdae,
+            not args.disable_layout_aware,
+            args.omnifetch_lookahead,
+            not args.disable_omnifetch_adaptive,
+            spec["items_1_7"],
+            lower_constants_separate=True,
+            backend_profile=spec["backend_profile"],
+            enable_lwp=args.enable_lwp,
+            lwp_loop_depth=args.lwp_loop_depth,
+            disable_lwp_loop=args.disable_lwp_loop,
+            omnifetch_items_through=args.omnifetch_items_through,
+            enable_omnifetch_m_pad_hmx=(
+                spec["enable_hexkl"]
+                and getattr(args, "enable_omnifetch_m_pad_hmx", False)
+            ),
+        )
+        mlir_text = None
+        if spec["enable_hexkl"]:
+            if hexkl_text is None:
+                candidate, n_batch, n_f16 = apply_hexkl_ir_rewrites(
+                    ir,
+                    enable_m_pad=getattr(
+                        args, "enable_omnifetch_m_pad_hmx", False
+                    ),
+                )
+                if n_batch or n_f16:
+                    hexkl_text = candidate
+                print(
+                    f"[HexKL] batch_matmul→matmul={n_batch}, "
+                    f"f16-input rewrite={n_f16}"
+                )
+                if not (n_batch or n_f16):
+                    print(
+                        f"[HexKL] WARNING: profile {label!r} yielded 0 rewrites "
+                        "— no HMX coverage for this model shape"
+                    )
+            mlir_text = hexkl_text
+        configs[label] = {"options": options, "mlir_text": mlir_text}
+    return configs
 
 
 def phase4_kwargs_from_args(args):

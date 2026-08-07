@@ -48,6 +48,10 @@ class HexagonOptions:
     fusionDoMultiUse: bool = True
 
     enableBufferization: bool = True  # Used to disable for some dma testing
+    # Convert memref-typed function results into trailing out-param arguments
+    # (function returns void). Avoids the by-value memref (sret) return that the
+    # Hexagon backend miscompiles for large monolithic functions.
+    enableBufferResultsToOutParams: bool = False
     enableCollapseAddressSpace: bool = True  # lower llvm.ptr<1> if hexagonmem did not
     enableConvTiling: bool = False
     enableDoubleBuffering: bool = False  # enable double buffering optimization
@@ -57,6 +61,15 @@ class HexagonOptions:
     enableConvertToHexagonmem: bool = True  # rewrites memref.alloc/copy to hexagonmem.*
     enableHexagonmemCopyToDMA: bool = False  # rewrites hexmem.copy to memref.dma_*
     enableHexKL: bool = False  # use HexKL to lower matmul and convolutions
+    # Isolated external baseline: static safe affine address-kernel prefetch.
+    # It never enables OmniFetch staging, layout elimination, or V-DAE.
+    enablePrefetchKernelHX: bool = False
+    prefetchKernelHxDistance: int = 1
+    prefetchKernelHxMaxCommandBytes: int = 8191
+    # APT-GET-HX requires explicit manual_safe IR annotations and is evaluated
+    # independently from Prefetch-Kernel-HX.
+    enableAPTGetHX: bool = False
+    aptGetHxDistance: int = 1
     # Omni-Fetch ablation toggles (Plan-A: three independent components)
     # Component 1 – Prefetch insertion (base; required by the other two)
     enablePrefetch: bool = False  # insert prefetch_in_situ ops in loop prologue/body
@@ -77,6 +90,8 @@ class HexagonOptions:
     enableOmniFetchTwoDimPipeline: bool = False
     enableOmniFetchVtcmColoring: bool = False
     enableOmniFetchKvCachePrefetch: bool = False
+    enableOmniFetchWeightStationary: bool = False
+    enableOmniFetchActivationMulticast: bool = False
     enableOmniFetchDequantReshape: bool = False
     omniFetchKvCachePageTokens: int = 32
     # True dual-thread DAE scout (default off). Flag off ≡ current single-thread OF.
@@ -85,6 +100,9 @@ class HexagonOptions:
     enableOmniFetchInterLayerPrefetch: bool = False
     # Pad attention-like (K==M/N==M) matmuls into HexKL (default off).
     enableOmniFetchAttentionHmx: bool = False
+    # Pad the M (rows/tokens) dimension up to a multiple of 32 so unaligned-token
+    # encoders (DINOv2/BEiT/DeiT/Whisper) become HexKL-eligible (default off).
+    enableOmniFetchMPadHmx: bool = False
     # Reuse one max-sized VTCM slab across HexKL matmuls in a function
     # (DecomposeHexKLMatmul). Off by default — measured gain is ~noise and
     # OmniFetch combo needs more validation.

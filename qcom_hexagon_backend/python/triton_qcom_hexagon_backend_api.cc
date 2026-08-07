@@ -130,6 +130,74 @@ getReturnList(mlir::ModuleOp module_op, const std::string &fName) {
   return resultList;
 }
 
+// Extract the static shape (dimension sizes) of each result of a function.
+// Mirrors getReturnList but carries full shapes so the host can allocate the
+// out-param buffers used by the buffer-results-to-out-params ABI.
+std::vector<std::vector<int64_t>>
+getReturnShapes(mlir::ModuleOp module_op, const std::string &fName) {
+  std::vector<std::vector<int64_t>> shapeList;
+
+  for (auto funcOp : module_op.getOps<mlir::func::FuncOp>()) {
+    if (funcOp.getName() != fName)
+      continue;
+    for (auto resultType : funcOp.getResultTypes()) {
+      std::vector<int64_t> shape;
+      if (auto tensorType =
+              mlir::dyn_cast<mlir::RankedTensorType>(resultType)) {
+        for (int64_t dim : tensorType.getShape())
+          shape.push_back(dim);
+      }
+      shapeList.push_back(shape);
+    }
+  }
+  return shapeList;
+}
+
+// Extract the argument types (rank and dtype) of a function given its name.
+std::vector<std::pair<int, mlir::Type>>
+getArgList(mlir::ModuleOp module_op, const std::string &fName) {
+  std::vector<std::pair<int, mlir::Type>> argList;
+
+  for (auto funcOp : module_op.getOps<mlir::func::FuncOp>()) {
+    if (funcOp.getName() != fName)
+      continue;
+    for (auto argType : funcOp.getArgumentTypes()) {
+      int rank;
+      mlir::Type dtype;
+
+      if (auto tensorType = mlir::dyn_cast<mlir::RankedTensorType>(argType)) {
+        rank = tensorType.getRank();
+        dtype = tensorType.getElementType();
+      } else {
+        rank = 0;
+        dtype = argType;
+      }
+      argList.push_back(std::make_pair(rank, dtype));
+    }
+  }
+  return argList;
+}
+
+// Extract the static shape (dimension sizes) of each argument of a function.
+std::vector<std::vector<int64_t>>
+getArgShapes(mlir::ModuleOp module_op, const std::string &fName) {
+  std::vector<std::vector<int64_t>> shapeList;
+
+  for (auto funcOp : module_op.getOps<mlir::func::FuncOp>()) {
+    if (funcOp.getName() != fName)
+      continue;
+    for (auto argType : funcOp.getArgumentTypes()) {
+      std::vector<int64_t> shape;
+      if (auto tensorType = mlir::dyn_cast<mlir::RankedTensorType>(argType)) {
+        for (int64_t dim : tensorType.getShape())
+          shape.push_back(dim);
+      }
+      shapeList.push_back(shape);
+    }
+  }
+  return shapeList;
+}
+
 std::string extractSingleFuncName(mlir::ModuleOp &module_op) {
   std::string module_func_name;
   std::vector<std::string> vector_func_names;

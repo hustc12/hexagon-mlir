@@ -38,6 +38,7 @@ add_mlir_library(Transforms
   HoistScalarOps.cpp
   FoldMulFByZeroPass.cpp
   PrefetchInsertPass.cpp
+  PrefetchKernelHXPass.cpp
   VDAEDecouplePass.cpp
   LayoutOpsEliminationPass.cpp
 

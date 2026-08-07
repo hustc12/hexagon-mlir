@@ -92,7 +92,9 @@ createDecomposeHexKLMatmulPass(
 std::unique_ptr<OperationPass<func::FuncOp>> createMemoryOffsetsPass();
 
 std::unique_ptr<InterfacePass<FunctionOpInterface>>
-createScheduleMatmulForHVXPass();
+createScheduleMatmulForHVXPass(
+    const ScheduleMatmulForHVXOptions &options =
+        ScheduleMatmulForHVXOptions());
 
 std::unique_ptr<OperationPass<ModuleOp>> createSmallExponentToMultiplyPass(
     const SmallExponentToMultiplyOptions &options =
@@ -110,6 +112,12 @@ std::unique_ptr<Pass> createFoldMulFByZeroPass();
 std::unique_ptr<InterfacePass<FunctionOpInterface>>
 createPrefetchInsertPass(
     const PrefetchInsertOptions &options = PrefetchInsertOptions());
+
+/// Prefetch-Kernel-HX external baseline: reconstructs safe affine future tile
+/// addresses and emits fixed-distance L2 hints only.
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createPrefetchKernelHXPass(
+    const PrefetchKernelHXOptions &options = PrefetchKernelHXOptions());
 
 /// V-DAE: decouples Memory Access and Compute Execution using semaphores.
 std::unique_ptr<InterfacePass<FunctionOpInterface>>

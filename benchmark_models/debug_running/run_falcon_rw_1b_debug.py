@@ -65,6 +65,10 @@ def main():
     parser.add_argument("--enable-lwp", action="store_true")
     parser.add_argument("--enable-hexkl", action="store_true")
     parser.add_argument("--enable-hvx-vector", action="store_true")
+    parser.add_argument("--enable-omnifetch-weight-stationary",
+                        action="store_true")
+    parser.add_argument("--enable-omnifetch-activation-multicast",
+                        action="store_true")
     parser.add_argument("--enable-omnifetch-vdae", action="store_true")
     parser.add_argument("--disable-layout-aware", action="store_true")
     parser.add_argument("--omnifetch-lookahead", type=int, default=2)
@@ -91,6 +95,12 @@ def main():
         enablelwp=args.enable_lwp,
         enable_hexkl=args.enable_hexkl,
         enable_hvx_vector=args.enable_hvx_vector,
+        enable_omnifetch_weight_stationary=(
+            args.enable_omnifetch_weight_stationary
+        ),
+        enable_omnifetch_activation_multicast=(
+            args.enable_omnifetch_activation_multicast
+        ),
         enable_omnifetch_vdae=args.enable_omnifetch_vdae,
         enable_omnifetch_layout_aware=not args.disable_layout_aware,
         omnifetch_lookahead=args.omnifetch_lookahead,

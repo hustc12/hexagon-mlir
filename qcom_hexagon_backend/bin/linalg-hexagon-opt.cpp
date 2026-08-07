@@ -113,6 +113,7 @@ int main(int argc, char **argv) {
   mlir::hexagon::registerLowerTPtrPass();
   mlir::hexagon::registerFoldMulFByZeroPass();
   mlir::hexagon::registerPrefetchInsertPass();
+  mlir::hexagon::registerPrefetchKernelHXPass();
   mlir::hexagon::registerOmniFetchVDAEInsertPass();
   mlir::hexagon::registerLayoutOpsEliminationPass();
 

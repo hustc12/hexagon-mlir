@@ -81,7 +81,9 @@ def run(args: argparse.Namespace) -> None:
     )
     patched = None
     if args.enable_hexkl:
-        candidate, n_batch, n_f16 = apply_hexkl_ir_rewrites(ir)
+        candidate, n_batch, n_f16 = apply_hexkl_ir_rewrites(
+            ir, enable_m_pad=args.enable_omnifetch_m_pad_hmx
+        )
         patched = candidate if n_batch or n_f16 else None
         print(
             f"[HexKL] batch_matmul→matmul={n_batch}, "
@@ -95,6 +97,9 @@ def run(args: argparse.Namespace) -> None:
         not args.disable_omnifetch_adaptive,
         args.enable_omnifetch_items_1_7,
         lower_constants_separate=True,
+        backend_profile=args.backend_profile,
+        enable_omnifetch_m_pad_hmx=args.enable_omnifetch_m_pad_hmx,
+        enable_out_params=args.enable_out_params,
     )
     output = hex_execution(
         module,

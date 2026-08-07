@@ -64,11 +64,17 @@ struct FuncResult
         self.call_lwp = """WriteLWPOutput("{path}/{fname}.json");\n"""
 
         self.func_call_and_benchmarking = """
-uint64_t avg_time_us = benchmark_time_us({iterations}, [&]() {{
+std::vector<uint64_t> __perf_samples;
+uint64_t avg_time_us = benchmark_samples_us({iterations}, __perf_samples, [&]() {{
     {function_call}
 }});
 TestReport tr("{func_name}", avg_time_us, "us", Result::Pass);
 tr.save();
+{{
+    FILE *__perf_fp = fopen("perf.txt", "a");
+    report_percentiles("{func_name}", __perf_samples, __perf_fp);
+    if (__perf_fp) fclose(__perf_fp);
+}}
 """
 
         # Codegen string for the Headers in the generated CPP file.

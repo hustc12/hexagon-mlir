@@ -583,6 +583,8 @@ def falcon_rw_1b(
     enablelwp: bool = False,
     enable_hexkl: bool = False,
     enable_hvx_vector: bool = False,
+    enable_omnifetch_weight_stationary: bool = False,
+    enable_omnifetch_activation_multicast: bool = False,
     enable_omnifetch_vdae: bool = False,
     enable_omnifetch_layout_aware: bool = True,
     omnifetch_lookahead: int = 2,
@@ -669,6 +671,12 @@ def falcon_rw_1b(
     options["enableVectorization"] = bool(enable_hvx_vector)
     options["enableHexKL"] = bool(enable_hexkl)
     options["enableConvertToHexagonmem"] = bool(enable_hexkl)
+    options["enableOmniFetchWeightStationary"] = bool(
+        enable_omnifetch_weight_stationary
+    )
+    options["enableOmniFetchActivationMulticast"] = bool(
+        enable_omnifetch_activation_multicast
+    )
     cumulative = bool(enable_omnifetch_items_1_7)
     options["enablePrefetch"] = bool(
         enable_omnifetch_vdae
@@ -740,6 +748,16 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable the repaired HVX vector codegen path.",
     )
+    parser.add_argument(
+        "--enable-omnifetch-weight-stationary",
+        action="store_true",
+        help="Enable OmniFetch N1 weight-stationary projection scheduling.",
+    )
+    parser.add_argument(
+        "--enable-omnifetch-activation-multicast",
+        action="store_true",
+        help="Enable OmniFetch N2 activation multicast across sibling projections.",
+    )
     parser.add_argument("--enable-omnifetch-vdae", action="store_true")
     parser.add_argument("--disable-layout-aware", action="store_true")
     parser.add_argument("--omnifetch-lookahead", type=int, default=2)
@@ -780,6 +798,12 @@ if __name__ == "__main__":
         enablelwp=args.enable_lwp,
         enable_hexkl=args.enable_hexkl,
         enable_hvx_vector=args.enable_hvx_vector,
+        enable_omnifetch_weight_stationary=(
+            args.enable_omnifetch_weight_stationary
+        ),
+        enable_omnifetch_activation_multicast=(
+            args.enable_omnifetch_activation_multicast
+        ),
         enable_omnifetch_vdae=args.enable_omnifetch_vdae,
         enable_omnifetch_layout_aware=not args.disable_layout_aware,
         omnifetch_lookahead=args.omnifetch_lookahead,

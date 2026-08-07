@@ -371,3 +371,38 @@ The reusable model ablation entry point is:
 bash scripts/run_omnifetch_model_ablation.sh \
   --model falcon-debug --seq-len 128 --timeout 240
 ```
+
+## Drift-controlled percentile measurement (2026-07-30)
+
+The experiment protocol above requires warm p50/p90/p99, which the historical
+single-mean timing could not provide. Two additions close this gap:
+
+1. **Device-side per-iteration sampling.** `hexagon_benchmark.h` now provides
+   `benchmark_samples_us` and `report_percentiles`, which record each
+   iteration's wall-clock time and append `PerfP50/PerfP90/PerfP99/PerfMin/
+   PerfSamples` lines to stdout and `perf.txt`. The legacy `Perf:` mean line is
+   byte-identical, so existing awk parsers (anchored on `^\s*Perf:`) are
+   unaffected. Wired into both the default benchmark codegen
+   (`hexagon_launcher_base.py`) and the OmniFetch WH-cache warm phase
+   (`torch_mlir_hexagon_launcher.py`).
+
+2. **Interleaved compile-once round-robin.** `run_torch_mlir_interleaved`
+   compiles each backend profile once, then executes profiles round-robin for
+   N rounds so thermal/DVFS drift is shared across configs rather than
+   penalizing whichever ran last. Host-side aggregation emits
+   `InterleaveResult profile=… p50_us/p90_us/p99_us/min_us`. Exposed via
+   `--interleave-profiles` (labels: `legacy-scalar`, `hvx-vector`,
+   `hvx-vector-vtcm`, `hexkl`, `hexkl-items17`) and `--rounds`.
+
+**Fake-HMX guard.** HexKL profiles report their batch_matmul/f16 rewrite count;
+a model that yields 0 rewrites (shapes not 32-aligned, e.g. the DINOv2-debug
+proxy or DINOv2-full's 257 tokens) is labeled "no HMX coverage" rather than
+presented as an HMX baseline. First B0–B3 percentile rows are in
+`plan_todo.md` (Interleaved percentile baselines).
+
+**PS_aligna frame fix status.** The Hexagon LLVM aligned-frame-base ordering fix
+(`patches/llvm/0001-hexagon-order-aligned-frame-base-setup.patch`) is validated
+on device: the previously-faulting vector item-7 Falcon path and DINOv2-debug
+HVX-vector both pass with correct output. DINOv2-*full* still faults, but in
+output-tensor serialization (`tensor.h` `dump_to_file` fwrite / `remote_munmap64`
+ENOMEM), a separate capacity issue distinct from the frame bug.

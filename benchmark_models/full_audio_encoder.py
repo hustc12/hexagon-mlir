@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import types
 from pathlib import Path
 import sys
 
 import torch
+import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hexkl_utils import (  # noqa: E402
@@ -25,6 +27,36 @@ class FullAudioEncoderWrapper(torch.nn.Module):
 
     def forward(self, input_values: torch.Tensor) -> torch.Tensor:
         return self.model(input_values=input_values).logits
+
+
+def _reformulate_pos_conv(pos_conv_embed: torch.nn.Module) -> None:
+    """Rewrite the positional conv so it never grows the innermost dimension.
+
+    The stock forward transposes to channels-first and runs a padded conv1d,
+    which grows the innermost (sequence) axis and faults the Hexagon backend.
+    Instead pad the sequence while it is still the non-innermost axis of the
+    (batch, seq, hidden) input, then transpose and convolve with padding=0.
+    """
+    conv = pos_conv_embed.conv
+    pad = conv.padding[0] if isinstance(conv.padding, (tuple, list)) else conv.padding
+
+    def forward(self, hidden_states):
+        xp = F.pad(hidden_states, (0, 0, pad, pad))
+        y = xp.transpose(1, 2)
+        y = F.conv1d(
+            y,
+            self.conv.weight,
+            self.conv.bias,
+            stride=self.conv.stride,
+            padding=0,
+            dilation=self.conv.dilation,
+            groups=self.conv.groups,
+        )
+        y = self.padding(y)
+        y = self.activation(y)
+        return y.transpose(1, 2)
+
+    pos_conv_embed.forward = types.MethodType(forward, pos_conv_embed)
 
 
 def run_full_audio_encoder(
@@ -58,6 +90,10 @@ def run_full_audio_encoder(
             conv, "weight", leave_parametrized=True
         )
 
+    # Reusable device-crash fix: rewrite the positional conv so it never grows
+    # the innermost tensor dimension (shared across wav2vec2/hubert/data2vec/...).
+    _reformulate_pos_conv(root.encoder.pos_conv_embed)
+
     wrapped = FullAudioEncoderWrapper(model).eval()
     # The published seven-convolution frontend maps 20,560 samples to exactly
     # 64 encoder frames. At 16 kHz this is a stated 1.285-second workload.
@@ -80,7 +116,9 @@ def run_full_audio_encoder(
     )
     patched = None
     if args.enable_hexkl:
-        candidate, n_batch, n_f16 = apply_hexkl_ir_rewrites(ir)
+        candidate, n_batch, n_f16 = apply_hexkl_ir_rewrites(
+            ir, enable_m_pad=args.enable_omnifetch_m_pad_hmx
+        )
         patched = candidate if n_batch or n_f16 else None
         print(
             f"[HexKL] batch_matmul→matmul={n_batch}, "
@@ -94,6 +132,9 @@ def run_full_audio_encoder(
         not args.disable_omnifetch_adaptive,
         args.enable_omnifetch_items_1_7,
         lower_constants_separate=True,
+        backend_profile=args.backend_profile,
+        enable_omnifetch_m_pad_hmx=args.enable_omnifetch_m_pad_hmx,
+        enable_out_params=args.enable_out_params,
     )
     output = hex_execution(
         module,

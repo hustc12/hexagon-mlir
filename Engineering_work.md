@@ -434,6 +434,36 @@ reproducibly from this repository, rebuild, and rerun:
 
 No full-model performance claim is valid until this backend defect is fixed.
 
+### 11.1 Resolution (2026-07-30): PS_aligna fix applied and device-validated
+
+The bounded repair is now applied and built into the live toolchain:
+`patches/llvm/0001-hexagon-order-aligned-frame-base-setup.patch` splices
+`PS_aligna` to the prologue boundary with the `FrameSetup` flag
+(`HexagonFrameLowering.cpp::insertPrologueInBlock`) and marks the pseudo
+`hasSideEffects=1, isBarrier=1, isSolo=1` (`HexagonPseudo.td`) so its aligned
+frame-base definition can no longer be reordered after aligned-frame uses.
+`scripts/apply_llvm_hexagon_fixes.sh` tracks the patch idempotently against
+`../LLVM_DIR/llvm-project`; the rebuilt `libLLVMHexagonCodeGen.a` is linked into
+the runtime-loaded `libtriton.so` / `linalg-hexagon-opt`.
+
+Device validation:
+
+1. **item-7 vector Falcon debug — PASS.** `Result:Pass`, no Bad VA (the primary
+   PS_aligna blocker).
+2. **DINOv2-debug HVX-vector — PASS** with correct output (`top1_match=True`,
+   `max_abs_diff≈3e-4`).
+3. **Full DINOv2 HVX-vector — still faults, but the fault has moved.** It is no
+   longer the compute-prologue Bad VA; it is now in output-tensor serialization
+   (`tensor.h` `dump_to_file` → `fwrite` → `memcpy`, with `remote_munmap64
+   failed` and host `ENOMEM`). Because DINOv2-debug (same structure, smaller
+   shapes) passes cleanly, this is a full-model capacity/OOM issue in output
+   dumping, distinct from the frame-lowering defect. It is de-scoped from the
+   "LLVM frame bug + fair baselines" effort and tracked separately.
+
+The frame fix is therefore validated for its intended scope. Fair-baseline
+measurement (§ percentile tooling; see `plan_todo.md`) proceeds on the vehicles
+that run.
+
 ## 12. Item-7 acceptance criterion
 
 The current DINOv2 Debug evidence distinguishes implementation activity from

@@ -1329,6 +1329,366 @@ counters, VTCM stall counters, transformed operators removed, and physical
 bytes moved. This makes “early movement” and “less movement” independently
 measurable rather than inferring both from one latency number.
 
+## Movement-amortization regions: the next OmniFetch design layer
+
+### Story-line compatibility assessment
+
+The vector item-7 experiments exposed a limitation in the current
+site-by-site formulation. DINOv2 Debug obtained only a noise-sized improvement
+from fusion-preserving K/V hints, while synchronous and asynchronous
+whole-stream VTCM staging regressed substantially. Falcon Debug at sequence
+length 128 emitted eight real K/V hints for 65,536 logical bytes, but true HVX
+vector latency changed from 509.019 ms to 510.438 ms. The output remained
+correct. The reason is structural: these runners perform prefill with
+`use_cache=False`; K/V is produced locally and consumed immediately, so it is
+already hot and has neither a useful DDR miss nor enough producer-consumer
+distance to hide.
+
+This does not break the OmniFetch story. It clarifies its next abstraction:
+prefetch is useful only for an unavoidable future movement. The compiler must
+first remove redundant movements and maximize the number of consumers served
+by each admitted movement.
+
+The original and new contributions form one ordered story:
+
+```text
+Original OmniFetch
+  prefetch + DMA + in-situ layout production
+          |
+          v
+M1--M10: hierarchy-aware movement planning
+  page-safe issue, path/tier selection, ownership, residency, last use
+          |
+          v
+Movement-amortization region (MAR)
+  one admitted movement or producer handoff serves all compatible consumers
+```
+
+The three layers answer complementary questions:
+
+1. **Is the movement necessary?** Movement equivalence, view/reshape
+   elimination, producer-side direct placement, forwarding, and recomputation
+   remove unnecessary physical traffic.
+2. **When and where should necessary bytes move?** Prefetch leases, DMA,
+   VTCM/L2 selection, page/alignment constraints, and readiness ownership move
+   the remaining bytes early and safely.
+3. **How many uses can one movement serve?** Stationary scheduling, multicast,
+   online reductions, residual retention, and cross-engine residency amortize
+   one tile across several positions, consumers, or operators.
+
+The unified objective is:
+
+> Minimize mandatory physical bytes and exposed movement latency per useful
+> consumer while preserving precision, address semantics, and memory
+> ownership.
+
+This is logically continuous with the existing paper rather than
+“acceleration for acceleration's sake.” Prefetch remains the temporal part of
+the design, in-situ reshape remains the physical-layout part, and MAR supplies
+the missing reuse/dataflow part. The target is still faster inference, but
+every speedup must be explained by fewer physical reads/writes, more hidden
+mandatory movement, or better residency—not by an unrelated compute trick.
+
+General non-aligned or batched MatMul-to-HMX lowering remains the separately
+marked **Next Paper Idea**. MAR can improve data delivery to already-legal HMX
+operations, but it does not depend on broadening HMX eligibility.
+
+### MAR definition
+
+A movement-amortization region groups compatible consumers of one source
+version or producer result:
+
+```text
+source tile / producer result
+          |
+          | one L2 lease, DMA, or direct producer handoff
+          v
+  VRF or VTCM resident tile
+     /          |          \
+ consumer A  consumer B  consumer C
+     \          |          /
+      final-use store or eviction
+```
+
+Each candidate region records:
+
+- source identity, version, byte range, physical layout, and alignment;
+- first and last consumer plus reuse distance;
+- consumer layouts and whether they can be formed in situ;
+- baseline and predicted physical read/write bytes;
+- L2, DMA, VTCM, and direct-production path costs;
+- VRF and VTCM footprint, predicted spills, and live pages;
+- prefetch first-use distance and ownership event; and
+- final use and nontemporal legality.
+
+The compiler admits a region only when predicted saved traffic exceeds added
+padding, spill, synchronization, and staging traffic.
+
+### N1/P0: Phase-specialized stationary scheduling
+
+Choose the stationary operand from model phase and reuse:
+
+- **prefill:** keep a weight/output-channel tile in VRF or VTCM while several
+  sequence/image positions consume it;
+- **decode:** keep the active historical K/V page or head tile resident while
+  the query consumes it;
+- **vision/convolution:** select output-channel-, input-channel-, or
+  patch-stationary schedules from reuse and hierarchy pressure.
+
+For a projection with logical loops
+`[sequence, output-channel, reduction]`, a weight-stationary schedule processes
+a strip of sequence positions before advancing the weight tile. It can reduce
+repeated VMEM reads even if the whole weight tensor fits in L2, because VRF
+reuse is cheaper than repeated L2 access.
+
+The first target is one static FP16 projection in Falcon Debug, followed by
+GPT-2/Qwen and QKV/MLP projections in ViT/Swin. The gate is fewer final-object
+VMEM operations or predicted physical weight bytes, correctness, and stable
+HVX-vector latency improvement.
+
+### N2/P0: Activation multicast across sibling projections
+
+Load one activation vector and serve compatible sibling consumers before
+discarding it:
+
+- normalized activation feeding Q, K, and V;
+- MLP activation feeding gate and up;
+- encoder state feeding several cross-attention projections; and
+- a feature tile feeding multiple convolution branches.
+
+For HVX, one aligned VMEM load feeds several vector computations. For HMX, one
+AH staging value may feed several public HexKL calls when ABI and liveness
+permit. The metric is eliminated activation reads, not merely fewer dispatches.
+One shared prefetch lease replaces competing per-consumer hints.
+
+### N3/P1: Online reduction and consumer fusion
+
+Do not materialize a large reduction intermediate when bounded vector/tile
+state is sufficient:
+
+- retain LayerNorm/RMSNorm partial sum and square-sum and stage normalized
+  output directly for the projection;
+- maintain online softmax max/sum and consume V tiles without storing the full
+  score/probability matrix; and
+- fuse pooling/statistical epilogues with the following transform or consumer.
+
+An attention pipeline becomes:
+
+```text
+prefetch page-contained K/V tile t+1 (<8 KiB)
+  while
+Q + K/V tile t -> online max/sum/output accumulator in VRF/VTCM
+```
+
+It both removes score-matrix traffic and creates a real computation window for
+prefetch. The first implementation is an HVX path; HMX substitution is
+independent.
+
+### N4/P1: Residual rendezvous
+
+Retain a residual tile until its later add instead of storing it to DDR/L2 and
+reloading it. Depending on lifetime and pressure, keep it in VRF, a colored
+VTCM slot, or a bounded L2 lease. Strip processing may bring residual
+production and consumption closer. Fuse the add with the final consumer store
+and form the required output layout there.
+
+### N5/P1: Recompute versus reload
+
+Compare cheap vector recomputation with VMEM reload for causal/window masks,
+position-derived values, broadcasts, address expressions, and inexpensive
+elementwise epilogues:
+
+```text
+recompute packets
+    versus
+reload bytes + expected L2/TLB stalls
+```
+
+This extends movement-equivalence analysis: a deterministic value need not be
+retained or prefetched when regeneration is cheaper.
+
+### N6/P0: VRF-pressure-aware fusion and tile sizing
+
+Estimate live vector values, vector-pair requirements, spill bytes, and
+required hazard distance for each proposed region. Jointly select tile shape,
+number of multicast consumers, and pipeline depth. Fusion is rejected when
+spills erase the predicted movement saving. Final-object auditing must verify
+that VMEM operations fall rather than merely move to stack spill slots.
+
+N6 is developed alongside N1/N2 because it is their safety and profitability
+model, not an independent performance claim.
+
+### N7/P1: Overwrite-aware allocation and zero suppression
+
+Prove when a destination is fully overwritten and avoid initial DDR reads,
+copy initialization, or standalone zero-fill:
+
+- initialize reductions in VRF/HMX accumulators;
+- construct a complete aligned output tile before one store;
+- use VTCM for partial scratch instead of zeroing a DDR tensor; and
+- apply nontemporal policy to legal final one-pass stores.
+
+The scalar manual's `dczeroa` demonstrates the benefit of allocating a
+write-only cache line without fetching its old contents. HVX realizes the same
+principle through full-tile stores, ownership analysis, VTCM scratch, and
+cache-allocation policy rather than routing tensors through scalar L1.
+
+### N8/P2: Page-working-set supertiles
+
+Execute all compatible work for one page-contained supertile before advancing:
+
+1. issue one page-safe 2-D L2 lease or DMA;
+2. consume it across sibling operators or positions;
+3. perform in-situ layout placement and local reductions;
+4. release it at final use; and
+5. advance to the next page.
+
+This turns page-aware placement into a loop/dataflow transformation, reduces
+active pages and micro-TLB pressure, and amortizes one single-flight prefetch
+command.
+
+### N9/P1: HMX/HVX boundary residency
+
+Keep a public VTCM tile resident across an HMX/HVX boundary:
+
+```text
+HMX output in VTCM
+  -> HVX bias/activation/norm/residual
+  -> in-situ AH staging for the next legal HMX operation
+```
+
+This avoids an HMX-output DDR materialization and the next activation reload
+without assuming access to private HMX registers. It connects the same
+movement abstraction to HMX while keeping HMX lowering scope separate.
+
+### N10/P2: Multi-layer circular activation arena
+
+For activation-dominated graph regions, process a bounded sequence/image strip
+through adjacent operators or layers in a circular colored VTCM arena. For
+weight-dominated regions, preserve layer-major scheduling. A graph partitioner
+compares activation bytes saved with added weight reads, VTCM/VRF capacity,
+residual lifetime, layout compatibility, and prefetch overlap.
+
+### Ordered implementation plan
+
+| Order | Mechanism | Initial model gate |
+|---:|---|---|
+| 1 | N1 stationary scheduling plus N6 movement/spill ledger | Falcon/GPT-2 HVX vector |
+| 2 | N2 activation multicast | Falcon plus Swin/Whisper |
+| 3 | N3 online reduction/attention | LLM plus one vision/audio Transformer |
+| 4 | N4 residual rendezvous | Transformer and ResNet-like model |
+| 5 | N9 HMX/HVX boundary residency | one already-HMX-eligible model |
+| 6 | N5/N7 read suppression | three domains |
+| 7 | N8/N10 global supertile/region scheduling | selected full models |
+
+Every candidate must emit a movement ledger containing baseline reads/writes,
+predicted eliminated and added bytes, reuse count, VRF/VTCM footprint, active
+pages, alignment padding, predicted spills, and first-use distance. A mechanism
+enters the cumulative row only when the final object confirms the intended
+change, the complete model passes correctness, and repeated serial timing
+improves the matched true-HVX or HexKL baseline.
+
+### N1 prototype result: explicit transpose-equivalent scheduling is rejected
+
+The first N1 prototype was implemented behind
+`enableOmniFetchWeightStationary`. For a static FP16 projection
+`A[M,K] * B[K,N]`, it forms the mathematically equivalent operation
+`transpose(transpose(B) * transpose(A))`. The existing HVX scheduler then
+places `M` last in the loop order, so a contiguous vector of positions consumes
+one weight element. The pass emits per-function admission counts and a movement
+ledger, and excludes attention-shaped contractions where `K == M` or `N == M`.
+
+Compiler regression tests establish both sides of the gate:
+
+- `M=128, K=64, N=192` is admitted and becomes an `N x K x M` generic with
+  `M` as the innermost parallel dimension;
+- an attention-shaped `M=K=128` contraction is not admitted; and
+- the existing MatMul scheduling tests remain unchanged when the option is
+  disabled.
+
+The complete two-layer Falcon Debug model at sequence length 128 compiled and
+ran correctly on the v75 device. Five projection sites were admitted.
+
+| Metric | HVX-vector | HVX-vector + N1 prototype | Change |
+|---|---:|---:|---:|
+| Device latency | 509.019 ms | 661.809 ms | 1.300x slower |
+| Final-object instructions | 25,351 | 26,583 | +4.86% |
+| HVX-like instructions | 2,427 | 2,516 | +3.67% |
+| Vector load/store mentions | 2,735 | 2,827 | +3.36% |
+| Maximum logit difference | baseline-qualified | 0.0225 | correct |
+
+The prototype's static ledger reported 75,497,472 baseline weight bytes,
+589,824 stationary weight bytes, 10,780,672 added transpose bytes, and
+64,126,976 predicted saved bytes. The latency and final object falsify that
+prediction. The ledger counted one logical weight access per position as a
+new physical read, while the original loop nest already benefits from
+L2/cache-line reuse. Conversely, the explicit activation, initializer, and
+output transposes are real traffic and code.
+
+This is a useful negative result rather than a break in the story:
+
+1. stationary scheduling is not profitable when it first materializes the
+   stationary layout at every isolated MatMul;
+2. N6 must distinguish logical operand references, VMEM instructions, cache
+   line fills, and physical DMA/DDR bytes;
+3. a future N1 retry is legal only inside a multi-consumer MAR where a producer
+   directly creates the transposed activation and several consumers preserve
+   that layout, amortizing the entry/exit conversion; and
+4. the current explicit-transpose implementation remains opt-in for
+   reproducibility but is not admitted to the cumulative configuration.
+
+The ordered work therefore proceeds to N2 activation multicast. N2 has a
+stronger causal opportunity: sibling projections can consume one already
+loaded activation vector without changing the externally visible activation
+layout. The N2 gate will count eliminated final-object activation loads and
+will reject fusion that increases spill or store traffic.
+
+### N2 prototype status: compiler mechanism complete, model gate blocked
+
+The first N2 prototype is implemented behind
+`enableOmniFetchActivationMulticast`. It recognizes two static tensor MatMuls
+that:
+
+- consume exactly the same FP16 activation SSA value;
+- have equal weight and FP32 output shapes;
+- have an HVX-vectorizable output-channel dimension;
+- reside in the same block; and
+- have no use of the first result before the second projection.
+
+It replaces the pair with one multi-output `linalg.generic`. The region loads
+the activation scalar/vector once, uses it in both multiply-accumulates, and
+yields two independent results. Fusion is capped at two consumers to bound
+VRF pressure. The ledger reports candidates, admitted pairs, fused consumers,
+and conservative estimated vector activation bytes saved. Final-object load
+and spill counts remain the admission authority.
+
+A positive compiler test proves that two `128x64 * 64x64` sibling projections
+become one multi-output contraction and estimate 16,384 activation bytes
+saved. A negative test proves that an intervening consumer prevents illegal
+motion. N1, N2, and the existing MatMul scheduling regressions all pass.
+
+The current real-model gate exposed a backend-coverage blocker:
+
+| Model/configuration | N2 candidates | Device result | Interpretation |
+|---|---:|---|---|
+| Falcon Debug, seq=128, true HVX | 0 | pass, 491.355 ms | Falcon exports fused QKV; timing change is noise and cannot be attributed to N2 |
+| Whisper Debug, d=64, seq=128/64, true HVX baseline | not run | status 13 | widened graph is not a valid device baseline |
+| Whisper Debug, d=32, seq=32, true HVX baseline | not run | status 13 | legacy scalar runs, but current vector backend does not execute this graph |
+| TinyLlama Debug, seq=128/32, true HVX baseline | not run | status 13 | gate/up structure is suitable, but no valid vector baseline exists |
+
+The failed rows are not performance measurements. In particular, no N2
+optimized device run was attempted after its matching baseline failed.
+Whisper's temporary 64-dimensional screening change was reverted, so the
+committed Debug model topology remains the established 32-dimensional one.
+
+N2 is therefore **implemented but not performance-admitted**. The next bounded
+step is to diagnose the common true-HVX status-13 failure or find an already
+vector-runnable model with separate sibling projections. It is not valid to
+fall back to the historical scalar “HVX” row merely to obtain a favorable N2
+number. Once a valid baseline exists, the gate remains: correctness, fewer
+final-object activation loads, no compensating spills, and stable serial
+latency improvement.
+
 ## Triton and triton-shared dependency boundary
 
 The current repository is build-dependent on both submodules, even though the

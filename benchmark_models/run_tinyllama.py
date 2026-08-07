@@ -337,6 +337,8 @@ def load_tinyllama_model(model_name, config):
 
 def tinyllama_1_1b(
     enable_hexkl: bool = False,
+    enable_hvx_vector: bool = False,
+    enable_omnifetch_activation_multicast: bool = False,
     enable_omnifetch_vdae: bool = False,
     enable_omnifetch_layout_aware: bool = True,
     omnifetch_lookahead: int = 2,
@@ -445,7 +447,7 @@ def tinyllama_1_1b(
     options = HexagonOptions().__dict__
     options["enableLWP"] = False
     options["lowerConstantsInSeparateSharedObjects"] = True
-    options["enableVectorization"] = False
+    options["enableVectorization"] = bool(enable_hvx_vector)
     options["enableHexKL"] = bool(enable_hexkl)
     options["enableConvertToHexagonmem"] = bool(enable_hexkl)
     cumulative = bool(enable_omnifetch_items_1_7)
@@ -458,6 +460,9 @@ def tinyllama_1_1b(
     options["enableOmniFetchTwoDimPipeline"] = cumulative
     options["enableOmniFetchVtcmColoring"] = cumulative
     options["enableOmniFetchKvCachePrefetch"] = cumulative
+    options["enableOmniFetchActivationMulticast"] = bool(
+        enable_omnifetch_activation_multicast
+    )
 
     inputs = [input_ids, attention_mask, position_ids]
 
@@ -495,6 +500,9 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable HexKL + hexagonmem (vectorization stays off).",
     )
+    parser.add_argument("--enable-hvx-vector", action="store_true")
+    parser.add_argument("--enable-omnifetch-activation-multicast",
+                        action="store_true")
     parser.add_argument(
         "--enable-omnifetch-vdae",
         action="store_true",
@@ -518,6 +526,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
     tinyllama_1_1b(
         enable_hexkl=args.enable_hexkl,
+        enable_hvx_vector=args.enable_hvx_vector,
+        enable_omnifetch_activation_multicast=(
+            args.enable_omnifetch_activation_multicast
+        ),
         enable_omnifetch_vdae=args.enable_omnifetch_vdae,
         enable_omnifetch_layout_aware=not args.disable_layout_aware,
         omnifetch_lookahead=args.omnifetch_lookahead,

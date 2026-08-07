@@ -90,6 +90,10 @@ def run(args):
         not args.disable_layout_aware, args.omnifetch_lookahead,
         not args.disable_omnifetch_adaptive, args.enable_omnifetch_items_1_7,
         lower_constants_separate=False,
+        backend_profile=args.backend_profile,
+        enable_omnifetch_activation_multicast=(
+            args.enable_omnifetch_activation_multicast
+        ),
     )
     outputs = hex_execution(module, wrapped.__class__.__name__, inputs, options, mlir_text=patched)
     with torch.no_grad():

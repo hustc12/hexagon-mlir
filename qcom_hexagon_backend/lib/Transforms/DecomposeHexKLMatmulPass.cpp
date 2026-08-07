@@ -113,49 +113,88 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
     Value idx4096 = rewriter.create<arith::ConstantIndexOp>(loc, 4096);
 
     // Get dimensions dynamically
-    Value dimM = rewriter.create<memref::DimOp>(loc, lhs, idx0);
+    Value dimMOrig = rewriter.create<memref::DimOp>(loc, lhs, idx0);
     Value dimK = rewriter.create<memref::DimOp>(loc, lhs, idx1);
     Value dimNOrig = rewriter.create<memref::DimOp>(loc, rhs, idx1);
 
-    // Pad N up to a multiple of 32 so lm_head-class shapes (e.g. 50257) run on
-    // HMX.  MatmulToHexKL only converts static shapes, so padding is decided
-    // statically here.
-    bool doNPad = false;
-    int64_t staticNAligned = -1;
+    // Pad M (rows/tokens) and/or N (columns) up to a multiple of 32 so
+    // unaligned-token encoders (M, e.g. DINOv2's 257) and lm_head-class shapes
+    // (N, e.g. 50257) run on HMX.  MatmulToHexKL only converts static shapes, so
+    // padding is decided statically here and always materializes fresh
+    // contiguous buffers: the micro-HMX lowering models each operand as a dense
+    // row-major buffer whose row stride equals its logical dim, so a
+    // subview/offset operand (e.g. a tensor.pad result) would fault at large N.
+    bool doMPad = false, doNPad = false;
+    int64_t staticMAligned = -1, staticNAligned = -1;
+    if (lhsType.hasStaticShape()) {
+      int64_t staticM = lhsShape[0];
+      staticMAligned = (staticM + 31) / 32 * 32;
+      doMPad = staticMAligned != staticM;
+    }
     if (rhsType.hasStaticShape()) {
       int64_t staticN = rhsShape[1];
       staticNAligned = (staticN + 31) / 32 * 32;
       doNPad = staticNAligned != staticN;
     }
 
-    Value dimN = dimNOrig;
+    Value dimM =
+        doMPad ? rewriter.create<arith::ConstantIndexOp>(loc, staticMAligned)
+               : dimMOrig;
+    Value dimN =
+        doNPad ? rewriter.create<arith::ConstantIndexOp>(loc, staticNAligned)
+               : dimNOrig;
+
+    Value lhsWork = lhs;
     Value rhsWork = rhs;
     Value resultWork = result;
-    Value rhsPadAlloc, resultPadAlloc;
-    if (doNPad) {
-      dimN = rewriter.create<arith::ConstantIndexOp>(loc, staticNAligned);
+    Value lhsPadAlloc, rhsPadAlloc, resultPadAlloc;
 
+    SmallVector<OpFoldResult> padZeros = {rewriter.getIndexAttr(0),
+                                          rewriter.getIndexAttr(0)};
+    SmallVector<OpFoldResult> padStrides = {rewriter.getIndexAttr(1),
+                                            rewriter.getIndexAttr(1)};
+
+    if (doMPad) {
+      // Fresh [padM, K] activation buffer: copy valid rows, zero the pad rows.
+      // The padded output rows are discarded on copy-back.
+      auto lhsPadTy = MemRefType::get(
+          ArrayRef<int64_t>{staticMAligned, lhsShape[1]},
+          lhsType.getElementType(), MemRefLayoutAttrInterface{},
+          lhsType.getMemorySpace());
+      lhsPadAlloc = rewriter.create<memref::AllocOp>(loc, lhsPadTy);
+      Value zeroA = rewriter.create<arith::ConstantOp>(
+          loc, rewriter.getZeroAttr(lhsType.getElementType()));
+      SmallVector<OpFoldResult> lhsSizes = {dimMOrig, dimK};
+      Value lhsSv = rewriter.create<memref::SubViewOp>(loc, lhsPadAlloc, padZeros,
+                                                       lhsSizes, padStrides);
+      rewriter.create<memref::CopyOp>(loc, lhs, lhsSv);
+      rewriter.create<scf::ForOp>(
+          loc, dimMOrig, dimM, idx1, ValueRange{},
+          [&](OpBuilder &bb, Location loc, Value r, ValueRange) {
+            bb.create<scf::ForOp>(
+                loc, idx0, dimK, idx1, ValueRange{},
+                [&](OpBuilder &bbb, Location loc, Value c, ValueRange) {
+                  bbb.create<memref::StoreOp>(loc, zeroA, lhsPadAlloc,
+                                              ValueRange{r, c});
+                  bbb.create<scf::YieldOp>(loc);
+                });
+            bb.create<scf::YieldOp>(loc);
+          });
+      lhsWork = lhsPadAlloc;
+    }
+
+    if (doNPad) {
       auto rhsPadTy = MemRefType::get(
           ArrayRef<int64_t>{rhsShape[0], staticNAligned},
           rhsType.getElementType(), MemRefLayoutAttrInterface{},
           rhsType.getMemorySpace());
-      auto resultPadTy = MemRefType::get(
-          ArrayRef<int64_t>{resultShape[0], staticNAligned},
-          resultType.getElementType(), MemRefLayoutAttrInterface{},
-          resultType.getMemorySpace());
-
       rhsPadAlloc = rewriter.create<memref::AllocOp>(loc, rhsPadTy);
-      resultPadAlloc = rewriter.create<memref::AllocOp>(loc, resultPadTy);
       Value zeroW = rewriter.create<arith::ConstantOp>(
           loc, rewriter.getZeroAttr(rhsType.getElementType()));
       // Copy valid K×NOrig weights, then zero only the padding columns.
-      SmallVector<OpFoldResult> zeros = {rewriter.getIndexAttr(0),
-                                         rewriter.getIndexAttr(0)};
       SmallVector<OpFoldResult> rhsSizes = {dimK, dimNOrig};
-      SmallVector<OpFoldResult> strides = {rewriter.getIndexAttr(1),
-                                           rewriter.getIndexAttr(1)};
-      Value rhsSv = rewriter.create<memref::SubViewOp>(loc, rhsPadAlloc, zeros,
-                                                       rhsSizes, strides);
+      Value rhsSv = rewriter.create<memref::SubViewOp>(loc, rhsPadAlloc, padZeros,
+                                                       rhsSizes, padStrides);
       rewriter.create<memref::CopyOp>(loc, rhs, rhsSv);
       rewriter.create<scf::ForOp>(
           loc, idx0, dimK, idx1, ValueRange{},
@@ -170,6 +209,17 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
             bb.create<scf::YieldOp>(loc);
           });
       rhsWork = rhsPadAlloc;
+    }
+
+    if (doMPad || doNPad) {
+      // Result buffer spans the padded extents; the valid [Morig×Norig] region
+      // is copied back after compute.
+      int64_t rM = doMPad ? staticMAligned : resultShape[0];
+      int64_t rN = doNPad ? staticNAligned : resultShape[1];
+      auto resultPadTy = MemRefType::get(
+          ArrayRef<int64_t>{rM, rN}, resultType.getElementType(),
+          MemRefLayoutAttrInterface{}, resultType.getMemorySpace());
+      resultPadAlloc = rewriter.create<memref::AllocOp>(loc, resultPadTy);
       resultWork = resultPadAlloc;
     }
 
@@ -312,7 +362,7 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
                         Value scrOff =
                             bbb.create<arith::MulIOp>(loc, scrIdx, i32_4096);
                         bbb.create<hexkl::MicroHMXCopySubmatrixToF16Op>(
-                            loc, vtcm, scrOff, lhs, rowTile, kt, M, K);
+                            loc, vtcm, scrOff, lhsWork, rowTile, kt, M, K);
                         Value actOff =
                             bbb.create<arith::MulIOp>(loc, kt, i32_4096);
                         bbb.create<hexkl::MicroHMXRmToAhF16Op>(loc, vtcm,
@@ -365,7 +415,7 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
                   Value scrOff =
                       bb.create<arith::MulIOp>(loc, scrIdx, i32_4096);
                   bb.create<hexkl::MicroHMXCopySubmatrixToF16Op>(
-                      loc, vtcm, scrOff, lhs, rowTile, kt, M, K);
+                      loc, vtcm, scrOff, lhsWork, rowTile, kt, M, K);
                   Value actOff = bb.create<arith::MulIOp>(loc, kt, i32_4096);
                   bb.create<hexkl::MicroHMXRmToAhF16Op>(loc, vtcm, actOff,
                                                         scrOff);
@@ -414,16 +464,21 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
     // Explicitly deallocate VTCM buffer to avoid relying on ConvertToHexagonmem
     // rewriting of generic memref.dealloc for dynamic VTCM types.
     rewriter.setInsertionPointAfter(outerFor);
-    if (doNPad) {
+    if (doMPad || doNPad) {
+      // Copy the valid [Morig×Norig] region back into the caller's result and
+      // release the padded scratch buffers.
       SmallVector<OpFoldResult> zeros = {rewriter.getIndexAttr(0),
                                          rewriter.getIndexAttr(0)};
-      SmallVector<OpFoldResult> outSizes = {dimM, dimNOrig};
+      SmallVector<OpFoldResult> outSizes = {dimMOrig, dimNOrig};
       SmallVector<OpFoldResult> strides = {rewriter.getIndexAttr(1),
                                            rewriter.getIndexAttr(1)};
       Value outSv = rewriter.create<memref::SubViewOp>(
           loc, resultPadAlloc, zeros, outSizes, strides);
       rewriter.create<memref::CopyOp>(loc, outSv, result);
-      rewriter.create<memref::DeallocOp>(loc, rhsPadAlloc);
+      if (doMPad)
+        rewriter.create<memref::DeallocOp>(loc, lhsPadAlloc);
+      if (doNPad)
+        rewriter.create<memref::DeallocOp>(loc, rhsPadAlloc);
       rewriter.create<memref::DeallocOp>(loc, resultPadAlloc);
     }
     if (ownsVtcm)

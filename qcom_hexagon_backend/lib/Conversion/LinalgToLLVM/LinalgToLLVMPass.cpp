@@ -93,6 +93,13 @@ public:
     auto moduleOp = getOperation();
     MLIRContext *context = moduleOp.getContext();
 
+    if (enablePrefetchKernelHX && enableAPTGetHX) {
+      moduleOp.emitError(
+          "Prefetch-Kernel-HX and APT-GET-HX are independent baselines and "
+          "cannot be enabled in the same compilation");
+      return signalPassFailure();
+    }
+
     setTargetTriple(moduleOp);
     setDataLayout(moduleOp);
 
@@ -233,6 +240,7 @@ public:
     if (enableHexKL) {
       MatmulToHexKLOptions hexklOpts{};
       hexklOpts.enableAttentionHmx = enableOmniFetchAttentionHmx;
+      hexklOpts.enableMPadHmx = enableOmniFetchMPadHmx;
       pm.addNestedPass<func::FuncOp>(createMatmulToHexKLPass(hexklOpts));
     }
 
@@ -243,7 +251,21 @@ public:
     }
 
     pm.addNestedPass<func::FuncOp>(createConvertLayoutPass());
-    pm.addNestedPass<func::FuncOp>(createScheduleMatmulForHVXPass());
+    ScheduleMatmulForHVXOptions scheduleOpts{};
+    // MatmulToHexKLPass (above) already converted every HexKL-eligible matmul
+    // into a hexkl-dialect op, which ScheduleMatmulForHVXPass never matches.
+    // The only linalg.matmul ops still present are the ones HexKL declined
+    // (non-32-aligned / attention-shaped) and are therefore HVX-bound, so the
+    // weight-stationary / activation-multicast reducers are safe to run even
+    // when enableHexKL is set.  Gating them on !enableHexKL previously stripped
+    // the best HVX reducers on zero-HMX-coverage models (e.g. DINOv2 with 0
+    // HexKL rewrites), leaving hexkl-items17 no faster than plain hvx-vector.
+    scheduleOpts.enableWeightStationary =
+        enableOmniFetchWeightStationary && enableVectorization;
+    scheduleOpts.enableActivationMulticast =
+        enableOmniFetchActivationMulticast && enableVectorization;
+    pm.addNestedPass<func::FuncOp>(
+        createScheduleMatmulForHVXPass(scheduleOpts));
     pm.addNestedPass<func::FuncOp>(createLinalgGeneralizePass());
 
     if (returnValueOptimization)
@@ -315,17 +337,25 @@ public:
       }
     }
 
-    // VTCMTiling conflicts with Omni-Fetch: VTCMTiling moves data to VTCM
-    // early, so PrefetchInsertPass can't find DDR inputs in address space 0.
-    // Disable VTCMTiling whenever any Omni-Fetch component is active.
+    // VTCMTiling and Omni-Fetch prefetch both stage DDR data into VTCM.  We
+    // used to disable VTCMTiling whenever any Omni-Fetch component was active
+    // because VTCMTiling moves data to VTCM early, so PrefetchInsertPass could
+    // not find DDR inputs in address space 0.  That is only a functionality
+    // concern for prefetch, not a correctness hazard: VTCMTiling stages reused
+    // panels into AS1, PrefetchInsertPass.collectDDRInputs only collects AS0
+    // operands (so it skips the already-staged tiles), and the sync-prefetch
+    // path is bounded by kMaxVTCMBytes.  On zero-HMX-coverage models (e.g.
+    // DINOv2) VTCM staging is the single largest HVX data-movement win (~4.8%
+    // vs hvx-vector), so keep VTCMTiling on even when Omni-Fetch is active.
     const bool anyOmniFetchActive = enablePrefetch || enableOmniFetchVDAE;
-    if (enableVTCMTiling && !anyOmniFetchActive) {
+    if (enableVTCMTiling) {
+      if (anyOmniFetchActive)
+        LLVM_DEBUG(llvm::dbgs()
+                   << "[LinalgToLLVM] VTCMTiling + OmniFetch both active; "
+                      "prefetch will skip VTCM-resident tiles\n");
       pm.addNestedPass<func::FuncOp>(
           createVTCMTilingPass(setVTCMTiling(VTCMTilingOptions{})));
       pm.addPass(createCanonicalizerPass());
-    } else if (anyOmniFetchActive) {
-      LLVM_DEBUG(llvm::dbgs()
-                 << "[LinalgToLLVM] OmniFetch active, skipping VTCMTiling\n");
     }
 
     if (enableMultiThreading) {
@@ -409,6 +439,28 @@ public:
 
       pm.addNestedPass<func::FuncOp>(createConvertZeroSizeMemrefPass());
       pm.addPass(createConvertBufferizationToMemRefPass());
+
+      // In a single-basic-block monolithic function (e.g. a full transformer
+      // unrolled by torch-mlir), ownership-based deallocation sinks every
+      // dealloc to the block terminator, keeping all buffers live at once and
+      // exhausting DSP VTLB mappings. Sink each dealloc to right after its
+      // buffer's last user to bound the peak concurrent working set.
+      pm.addNestedPass<func::FuncOp>(
+          bufferization::createOptimizeAllocationLivenessPass());
+
+      // The Hexagon backend miscompiles the by-value memref (sret) return for
+      // large monolithic single-block functions: the return epilogue writes
+      // only the descriptor's `allocated` field, leaving aligned/offset/sizes/
+      // strides = 0, so the host reads a NULL data pointer. Rewrite memref
+      // results into trailing out-param arguments (function returns void) to
+      // avoid that return path entirely. hoistStaticAllocs reuses the caller's
+      // buffer so no copy is introduced for static output shapes.
+      if (enableBufferResultsToOutParams) {
+        bufferization::BufferResultsToOutParamsPassOptions outParamsOpts;
+        outParamsOpts.hoistStaticAllocs = true;
+        pm.addPass(
+            bufferization::createBufferResultsToOutParamsPass(outParamsOpts));
+      }
     }
 
     if (enableConvertToHexagonmem)
@@ -425,6 +477,22 @@ public:
       decomposeOptions.enableDmaToVtcm = enableOmniFetchDmaToVtcm;
       pm.addNestedPass<func::FuncOp>(
           createDecomposeHexKLMatmulPass(decomposeOptions));
+    }
+
+    // External baseline: infer safe future affine tile addresses and emit only
+    // destination-free L2 hints. Keep this outside the OmniFetch gates so a
+    // baseline run cannot inherit shadow buffers, DMA/VTCM staging, in-situ
+    // layout elimination, V-DAE, or adaptive OmniFetch policy.
+    if (enablePrefetchKernelHX || enableAPTGetHX) {
+      auto kernelOptions = PrefetchKernelHXOptions{};
+      kernelOptions.distance =
+          enableAPTGetHX ? aptGetHxDistance : prefetchKernelHxDistance;
+      kernelOptions.maxCommandBytes = prefetchKernelHxMaxCommandBytes;
+      kernelOptions.baselineKind =
+          enableAPTGetHX ? "apt-get-hx" : "prefetch-kernel-hx";
+      kernelOptions.requireManualSafe = enableAPTGetHX;
+      pm.addNestedPass<func::FuncOp>(
+          hexagon::createPrefetchKernelHXPass(kernelOptions));
     }
 
     // ===== Omni-Fetch: Plan-A 3-component architecture =====
@@ -534,7 +602,8 @@ public:
     // Lower omni_fetch dialect ops to extern-C runtime calls.
     // Required whenever Prefetch (Component 1) has emitted prefetch_in_situ ops,
     // or when weight prepack emitted prefetch_in_situ copies in DecomposeHexKL.
-    if (enablePrefetch || enableOmniFetchWeightPrepack) {
+    if (enablePrefetch || enableOmniFetchWeightPrepack ||
+        enablePrefetchKernelHX || enableAPTGetHX) {
       mlir::omni_fetch::OmniFetchToLLVMOptions ofOpts{};
       ofOpts.enableDualThreadDae =
           enableOmniFetchDualThreadDae && enableOmniFetchVDAE;

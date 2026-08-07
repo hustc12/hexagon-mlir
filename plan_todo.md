@@ -176,6 +176,78 @@ Harness: `benchmark_models/run_qwen2.5-0.5b.py` (full published arch). Debug shr
 | 2026-07-24 | HexKL+OF dma2d+WH-on-signal | GEMM 64×128×256 | **4.701 ms** | act+wt async | Y | **WH fixed in signal()**; slab+weight_off; ddr stage pack overlaps Mm |
 | 2026-07-24 | HexKL+OF DMA→VTCM stage | GEMM 64×128×256 | **9.42 ms** | same | Y | Correct but ~2× slower — DDR stage kept as default |
 
+### Interleaved percentile baselines (2026-07-30)
+
+Drift-controlled compile-once round-robin measurement (`--interleave-profiles`,
+`--rounds`); percentiles are over per-round means. PS_aligna LLVM frame fix
+validated on device (item-7 vector Falcon Pass; DINOv2-debug Pass). Times in µs.
+
+| Date | Profile | Vehicle | p50 µs | p90 µs | p99 µs | min µs | HMX | Pass? | Notes |
+|------|---------|---------|--------|--------|--------|--------|-----|-------|-------|
+| 2026-07-30 | B0 legacy-scalar | DINOv2-debug (10r×20i) | 187334 | 192557 | 193359 | 179244 | n/a | Y | scalar baseline; top1 match |
+| 2026-07-30 | B1 hvx-vector | DINOv2-debug (10r×20i) | 20844 | 20967 | 21084 | 20681 | n/a | Y | **~9.0× vs B0**; top1 match |
+| 2026-07-30 | B1+ hvx-vector-vtcm | DINOv2-debug (10r×20i) | 22001 | 22629 | 23162 | 21444 | n/a | Y | VTCM tiling ~neutral on tiny proxy |
+| 2026-07-30 | B2 hexkl | DINOv2-debug (10r×20i) | 21804 | 22010 | 22297 | 21278 | **no coverage** | Y | 0 HexKL rewrites (shapes not 32-aligned) → ≈ B1 |
+| 2026-07-30 | B3 hexkl-items17 | DINOv2-debug (10r×20i) | 20889 | 20977 | 20995 | 20757 | **no coverage** | Y | 0 rewrites → items-1-7 no-op here; ≈ B1 |
+
+Fake-HMX guard fired: DINOv2-debug proxy (image=32/patch=8) yields 0 batch_matmul/f16
+rewrites, so B2/B3 are honestly labeled "no HMX coverage" — they are NOT HMX baselines
+on this vehicle. A real-HMX B2/B3 row requires a 32-aligned matmul vehicle
+(DINOv2-full OOMs on output-tensor dump; a Falcon/GEMM interleave vehicle is the next
+step). All five profiles pass the top-1 correctness gate (max_abs_diff ≤ 3e-4).
+
+#### C1+B1 HVX data-movement fixes — hexkl-items17 now clearly > hvx-vector (2026-07-30)
+
+Goal: make hexkl-items17 obviously faster than the `hvx-vector` baseline even on a
+zero-HMX-coverage vehicle. Two compiler-pipeline fixes:
+
+- **C1** `LinalgToLLVMPass.cpp:246-256` — drop the `!enableHexKL` gate on the N1
+  weight-stationary / N2 activation-multicast HVX reducers. MatmulToHexKL already ran,
+  so the only remaining `linalg.matmul` are HexKL-declined (HVX-bound) ops; gating on
+  the flag had stripped the best HVX reducers on 0-rewrite models for no HMX gain.
+- **B1** `LinalgToLLVMPass.cpp:325-343` — stop globally disabling VTCMTiling when
+  OmniFetch is active. VTCMTiling stages reused panels into AS1; PrefetchInsert
+  (`collectDDRInputs`, AS0-only) skips them and the sync path is `kMaxVTCMBytes`-bounded.
+
+Within-run interleaved comparison (15r×40i, post-C1+B1); percentiles over per-round means:
+
+| Profile | p50 µs | p90 µs | p99 µs | vs hvx-vector | Pass? |
+|---------|--------|--------|--------|---------------|-------|
+| hvx-vector (baseline) | 21764 | 22041 | 22309 | — | Y |
+| hvx-vector-vtcm | 20882 | 21008 | 21019 | −4.1% | Y |
+| hexkl (0 rewrites) | 21709 | 21895 | 21988 | −0.3% | Y |
+| **hexkl-items17** | **20876** | **20914** | **20966** | **−4.1%** | Y |
+
+hexkl-items17 went from ≈ hvx-vector (pre-fix parity) to −4.1% p50 with tighter p90/p99.
+On this 0-HMX vehicle the win is pure HVX data-movement reduction (VTCM DDR→VTCM staging
++ N1/N2 reuse), independent of HMX. All profiles top-1 match (max_abs_diff = 3e-4).
+
+
+#### HMX anchor — aligned non-square GEMM proves the >2× regime (2026-07-30)
+
+Vehicle: `benchmark_models/run_gemm_anchor.py`, a single 32-aligned non-square
+`linalg.matmul` (M=64, K=128, N=256 — all ÷32, none equal so NOT attention-like) that
+admits the HexKL/HMX path. DINOv2 tokens (grid²+1 = 17/257) are never 32-aligned so they
+can only exercise HVX items; this GEMM isolates the HMX magnitude and guards that the
+C1/B1 HVX changes did not regress the HMX path.
+
+Within-run interleaved comparison (15r×30i); percentiles over per-round means:
+
+| Profile | p50 µs | p90 µs | p99 µs | vs hvx-vector | Pass? |
+|---------|--------|--------|--------|---------------|-------|
+| hvx-vector (baseline) | 67974 | 68001 | 68110 | — | Y |
+| hvx-vector-vtcm | 67583 | 67603 | 67607 | 1.01× | Y |
+| **hexkl (HMX)** | **1218** | 1261 | 1280 | **55.8×** | Y |
+| **hexkl-items17** | **1320** | 2365 | 2382 | **51.5×** | Y |
+
+HMX matmul on an aligned shape is ~52–56× vs the HVX baseline — far past the 2× target and
+confirming C1/B1 left the HMX path intact (max_abs_diff ≤ 1e-3, all Pass). items17 is
+slightly behind bare hexkl here (prefetch/layout setup is not amortized on a one-shot GEMM;
+the items win requires cross-token WH-cache reuse). Storyline consequence: the sole reason
+DINOv2 cannot reach this regime is the M=tokens 32-alignment gate in `MatmulToHexKLPass`;
+closing it (M-pad, mirroring the existing K/N attention-pad) is the remaining full-story step.
+
+
 ### GPT-2 full 12L notes (2026-07-23)
 
 Harness: `benchmark_models/run_gpt2lmheadmodel.py` (published 12L / 768-d). Device execution `Result:Pass` all three ways; host `compare` fails with NaN top-5 on Hexagon (CPU top-5 sane). Debug 2L previously Top-1 match — depth-related numerical / IR issue, not capacity failure. PrefetchInsert on OF path: `hexkl_func=1`, 96 candidate loops, 48 loops with `layout-fusion sites: 2` + `async_pipeline=1`.

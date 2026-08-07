@@ -88,6 +88,23 @@ def LinalgToLLVM : Pass<"linalg-to-llvm", "mlir::ModuleOp"> {
     Option<"enableHexKL", "enable-hexkl", "bool",
           /*default=*/"false",
           "Enable linalg matmul to hexkl dialect lowering">,
+    // External prefetch baselines. These options deliberately do not enable
+    // any OmniFetch transformation or consumer rewiring.
+    Option<"enablePrefetchKernelHX", "enable-prefetch-kernel-hx", "bool",
+          /*default=*/"false",
+          "Enable the isolated Prefetch-Kernel-HX affine address baseline">,
+    Option<"prefetchKernelHxDistance", "prefetch-kernel-hx-distance", "int",
+          /*default=*/"1",
+          "Static future-iteration distance used by Prefetch-Kernel-HX">,
+    Option<"prefetchKernelHxMaxCommandBytes", "prefetch-kernel-hx-max-command-bytes", "int",
+          /*default=*/"8191",
+          "Maximum bytes admitted for one Prefetch-Kernel-HX L2FETCH request">,
+    Option<"enableAPTGetHX", "enable-apt-get-hx", "bool",
+          /*default=*/"false",
+          "Enable APT-GET-HX timing for manually-safe address candidates">,
+    Option<"aptGetHxDistance", "apt-get-hx-distance", "int",
+          /*default=*/"1",
+          "Distance selected offline by scripts/apt_get_hx_select.py">,
     // Omni-Fetch: Plan-A three independent components -----------------------
     // Component 1: Prefetch insertion (base component; required by 2 & 3)
     Option<"enablePrefetch", "enable-prefetch", "bool",
@@ -126,6 +143,12 @@ def LinalgToLLVM : Pass<"linalg-to-llvm", "mlir::ModuleOp"> {
     Option<"enableOmniFetchKvCachePrefetch", "enable-omnifetch-kv-cache-prefetch", "bool",
           /*default=*/"false",
           "Enable page-aware L2 prefetch for compiler-identified attention K/V streams">,
+    Option<"enableOmniFetchWeightStationary", "enable-omnifetch-weight-stationary", "bool",
+          /*default=*/"false",
+          "Enable N1 phase-specialized weight-stationary HVX projection scheduling">,
+    Option<"enableOmniFetchActivationMulticast", "enable-omnifetch-activation-multicast", "bool",
+          /*default=*/"false",
+          "Enable N2 activation multicast across equal-shape sibling HVX projections">,
     Option<"enableOmniFetchDequantReshape", "enable-omnifetch-dequant-reshape", "bool",
           /*default=*/"false",
           "Fuse W8 compressed-tile load, dequantization, and HexKL WH reshape">,
@@ -142,6 +165,9 @@ def LinalgToLLVM : Pass<"linalg-to-llvm", "mlir::ModuleOp"> {
     Option<"enableOmniFetchAttentionHmx", "enable-omnifetch-attention-hmx", "bool",
           /*default=*/"false",
           "Pad attention-like matmuls (K==M or N==M) so they become HexKL-eligible">,
+    Option<"enableOmniFetchMPadHmx", "enable-omnifetch-m-pad-hmx", "bool",
+          /*default=*/"false",
+          "Pad the M (rows/tokens) dimension up to a multiple of 32 so unaligned-token encoders become HexKL-eligible">,
     Option<"enableHexKLPersistentVtcm", "enable-hexkl-persistent-vtcm", "bool",
           /*default=*/"false",
           "Reuse one max-sized VTCM slab across HexKL matmuls in a function">,
@@ -191,7 +217,13 @@ def LinalgToLLVM : Pass<"linalg-to-llvm", "mlir::ModuleOp"> {
           "Enable vectorization for HVX">,
     Option<"enableHVXInlining", "enable-hvx-inlining", "bool",
               /*default=*/"false",
-              "Enable aggressive inlining after linking runtime modules">
+              "Enable aggressive inlining after linking runtime modules">,
+    Option<"enableBufferResultsToOutParams", "enable-buffer-results-to-out-params", "bool",
+              /*default=*/"false",
+              "Convert memref-typed function results into trailing out-param "
+              "arguments (function returns void). Avoids the by-value memref "
+              "(sret) return that the Hexagon backend miscompiles for large "
+              "monolithic functions.">
    ];
 }
 

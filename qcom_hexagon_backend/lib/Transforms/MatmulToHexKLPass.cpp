@@ -13,6 +13,8 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Tensor/Utils/Utils.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/Support/Debug.h"
@@ -29,10 +31,12 @@ using namespace hexagon;
 namespace {
 
 struct MatmulToHexKL final : public OpRewritePattern<linalg::MatmulOp> {
-  MatmulToHexKL(MLIRContext *ctx, bool enableAttentionHmx)
-      : OpRewritePattern(ctx), enableAttentionHmx(enableAttentionHmx) {}
+  MatmulToHexKL(MLIRContext *ctx, bool enableAttentionHmx, bool enableMPadHmx)
+      : OpRewritePattern(ctx), enableAttentionHmx(enableAttentionHmx),
+        enableMPadHmx(enableMPadHmx) {}
 
   bool enableAttentionHmx;
+  bool enableMPadHmx;
 
   LogicalResult matchAndRewrite(linalg::MatmulOp op,
                                 PatternRewriter &rewriter) const override {
@@ -49,14 +53,35 @@ struct MatmulToHexKL final : public OpRewritePattern<linalg::MatmulOp> {
     if (K != rhsTy.getDimSize(0))
       return rewriter.notifyMatchFailure(op, "K mismatch");
     constexpr int64_t kHmxTile = 32;
-    // All of M/K/N must be tile-aligned for HMX.  Unaligned N (e.g. GPT-2
-    // lm_head 50257) previously took a DecomposeHexKL N-pad path, but that
-    // still faults on device (adb exit 13) for large padded buffers.  Keep
-    // those matmuls on HVX until N-pad is proven safe on-device.
-    if ((M % kHmxTile) != 0 || (K % kHmxTile) != 0 || (N % kHmxTile) != 0) {
-      DBG("skip HexKL: unaligned MxKxN=" << M << "x" << K << "x" << N);
+    // K and N must be tile-aligned.  M (rows / tokens) may be padded up to the
+    // next tile multiple when enableMPadHmx: the extra A rows are independent
+    // dot products whose padded output rows are discarded on unpad, so M-pad is
+    // the safest pad direction (correctness does not depend on zero-fill, unlike
+    // K/N pad).  Unaligned N (e.g. GPT-2 lm_head 50257) still faults on device
+    // for large padded buffers, so those matmuls stay on HVX.
+    if ((K % kHmxTile) != 0 || (N % kHmxTile) != 0) {
+      DBG("skip HexKL: unaligned K/N in MxKxN=" << M << "x" << K << "x" << N);
       return rewriter.notifyMatchFailure(
-          op, "shape not divisible by HMX tile size 32");
+          op, "K or N not divisible by HMX tile size 32");
+    }
+    const bool mUnaligned = (M % kHmxTile) != 0;
+    if (mUnaligned && !enableMPadHmx) {
+      DBG("skip HexKL: unaligned M=" << M << " (enableMPadHmx off)");
+      return rewriter.notifyMatchFailure(
+          op, "M not divisible by HMX tile size 32; enableMPadHmx off");
+    }
+    // M-pad allocates a fresh contiguous A/result buffer sized to the padded M.
+    // At large N the resulting total function-frame pressure trips a Hexagon
+    // frame-lowering stack-coloring defect (over-aligned dynamic frame clobbers
+    // the sret spill slot -> Bad VA on device).  The threshold is total-frame,
+    // not per-matmul, so N-tiling within one function does not help.  Until the
+    // frame defect is root-caused, keep M-pad matmuls with N>1024 on HVX.
+    constexpr int64_t kMaxMPadN = 1024;
+    if (mUnaligned && enableMPadHmx && N > kMaxMPadN) {
+      DBG("skip HexKL: M-pad with N=" << N << " > " << kMaxMPadN
+                                      << " (frame defect); keep HVX");
+      return rewriter.notifyMatchFailure(
+          op, "M-pad with N>1024 trips Hexagon frame defect; keep HVX");
     }
 
     // Attention score / context matmuls (after ReduceContractionRank collapses
@@ -76,6 +101,11 @@ struct MatmulToHexKL final : public OpRewritePattern<linalg::MatmulOp> {
     Value C = op.getOutputs()[0];
 
     if (!attentionLike) {
+      // Emit HexKL directly even when M is unaligned (gated above by
+      // enableMPadHmx).  DecomposeHexKLMatmul pads M up to a tile multiple
+      // internally with fresh contiguous buffers (mirroring its N-pad path),
+      // which avoids the tensor.pad/extract_slice buffers that faulted on
+      // device at large N.
       rewriter.replaceOpWithNewOp<hexkl::MatmulOp>(op, C.getType(), A, B, C);
       return success();
     }
@@ -190,8 +220,9 @@ struct MatmulToHexKL final : public OpRewritePattern<linalg::MatmulOp> {
 };
 
 void populateMatmulToHexKLPatterns(RewritePatternSet &patterns,
-                                   bool enableAttentionHmx) {
-  patterns.add<MatmulToHexKL>(patterns.getContext(), enableAttentionHmx);
+                                   bool enableAttentionHmx, bool enableMPadHmx) {
+  patterns.add<MatmulToHexKL>(patterns.getContext(), enableAttentionHmx,
+                              enableMPadHmx);
 }
 
 struct MatmulToHexKLPass : public ::impl::MatmulToHexKLBase<MatmulToHexKLPass> {
@@ -199,12 +230,13 @@ struct MatmulToHexKLPass : public ::impl::MatmulToHexKLBase<MatmulToHexKLPass> {
 
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<hexkl::HexKLDialect, memref::MemRefDialect,
-                    arith::ArithDialect, scf::SCFDialect>();
+                    arith::ArithDialect, scf::SCFDialect,
+                    tensor::TensorDialect>();
   }
 
   void runOnOperation() override {
     RewritePatternSet patterns(&getContext());
-    populateMatmulToHexKLPatterns(patterns, enableAttentionHmx);
+    populateMatmulToHexKLPatterns(patterns, enableAttentionHmx, enableMPadHmx);
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       return signalPassFailure();
     }

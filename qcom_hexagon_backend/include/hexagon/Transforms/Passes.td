@@ -237,6 +237,11 @@ def MatmulToHexKL :
            /*default=*/"false",
            "Pad attention-like matmuls (K==M or N==M) to break the skip heuristic "
            "and lower them through HexKL (unpad results).">,
+    Option<"enableMPadHmx", "enable-m-pad-hmx", "bool",
+           /*default=*/"false",
+           "Pad the M (rows/tokens) dimension of otherwise-eligible matmuls up "
+           "to the next multiple of 32 so unaligned-token encoders (DINOv2, "
+           "BEiT, DeiT, Whisper) can lower through HexKL (unpad results).">,
   ];
   let constructor = "hexagon::createMatmulToHexKLPass()";
 }
@@ -348,6 +353,16 @@ def FoldMulFByZeroPass : Pass<"fold-mulf-by-zero"> {
 def ScheduleMatmulForHVX :
     InterfacePass<"schedule-matmul-for-hvx", "mlir::FunctionOpInterface"> {
   let summary = "Pass to schedule matmul and its variants";
+  let options = [
+    Option<"enableWeightStationary", "enable-weight-stationary", "bool",
+           /*default=*/"false",
+           "Enable OmniFetch N1 transpose-equivalent weight-stationary "
+           "scheduling for profitable static FP16 projection matmuls">,
+    Option<"enableActivationMulticast", "enable-activation-multicast", "bool",
+           /*default=*/"false",
+           "Enable OmniFetch N2 fusion of equal-shape sibling FP16 "
+           "projections so one activation load feeds both consumers">,
+  ];
 
   let constructor =
        "hexagon::createScheduleMatmulForHVXPass()";
@@ -430,6 +445,47 @@ def PrefetchInsert :
 
   let constructor = "hexagon::createPrefetchInsertPass()";
 
+  let dependentDialects = [
+    "mlir::omni_fetch::OmniFetchDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::memref::MemRefDialect",
+  ];
+}
+
+//===----------------------------------------------------------------------===//
+// External prefetching baseline: Prefetch-Kernel-HX
+//===----------------------------------------------------------------------===//
+
+def PrefetchKernelHX :
+    InterfacePass<"prefetch-kernel-hx", "mlir::FunctionOpInterface"> {
+  let summary = "Insert fixed-distance Hexagon L2 hints from safe static address kernels";
+  let description = [{
+    Implements the load-free affine/2-D subset of the software prefetcher from
+    "Classifying Memory Access Patterns for Prefetching".  This is an external
+    baseline, not an OmniFetch cumulative component: it reconstructs a future
+    memref.subview from the loop induction value and emits only
+    omni_fetch.l2_hint.  It never allocates shadow storage, rewires consumers,
+    performs layout conversion, uses DMA/VTCM, or enables V-DAE.
+  }];
+  let options = [
+    Option<"distance", "distance", "int",
+           /*default=*/"1",
+           "Fixed future-iteration distance for the address-only baseline.">,
+    Option<"maxCommandBytes", "max-command-bytes", "int",
+           /*default=*/"8191",
+           "Maximum logical bytes admitted for one V73 L2FETCH request.">,
+    Option<"enableTwoDimensional", "enable-two-dimensional", "bool",
+           /*default=*/"true",
+           "Admit statically strided two-dimensional tile kernels.">,
+    Option<"baselineKind", "baseline-kind", "std::string",
+           /*default=*/"\"prefetch-kernel-hx\"",
+           "Ledger/hint identity: prefetch-kernel-hx or apt-get-hx.">,
+    Option<"requireManualSafe", "require-manual-safe", "bool",
+           /*default=*/"false",
+           "Require prefetch_baseline.manual_safe=true on the view or loop.">,
+  ];
+  let constructor = "hexagon::createPrefetchKernelHXPass()";
   let dependentDialects = [
     "mlir::omni_fetch::OmniFetchDialect",
     "mlir::scf::SCFDialect",

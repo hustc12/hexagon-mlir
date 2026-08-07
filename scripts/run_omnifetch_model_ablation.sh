@@ -11,7 +11,8 @@ usage() {
   echo "          [--device-iterations N] [--timeout SEC] [--serial SERIAL]"
   echo "          [--output-dir DIR]"
   echo "          [--m1-only]"
-  echo "          [--cumulative-only|--hvx-item7-only] [--enable-hvx-vector]"
+  echo "          [--cumulative-only|--hvx-item7-only|--hvx-n1-only|--hvx-n2-only]"
+  echo "          [--enable-hvx-vector]"
   echo "          [--include-experimental]"
 }
 
@@ -26,6 +27,8 @@ M1_ONLY=0
 CUMULATIVE_ONLY=0
 ENABLE_HVX_VECTOR=0
 HVX_ITEM7_ONLY=0
+HVX_N1_ONLY=0
+HVX_N2_ONLY=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -38,6 +41,8 @@ while [[ $# -gt 0 ]]; do
     --m1-only) M1_ONLY=1; shift ;;
     --cumulative-only) CUMULATIVE_ONLY=1; shift ;;
     --hvx-item7-only) HVX_ITEM7_ONLY=1; shift ;;
+    --hvx-n1-only) HVX_N1_ONLY=1; shift ;;
+    --hvx-n2-only) HVX_N2_ONLY=1; shift ;;
     --enable-hvx-vector) ENABLE_HVX_VECTOR=1; shift ;;
     --include-experimental) INCLUDE_EXPERIMENTAL=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -45,8 +50,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "${CUMULATIVE_ONLY}" -eq 1 && "${HVX_ITEM7_ONLY}" -eq 1 ]]; then
-  echo "--cumulative-only and --hvx-item7-only are mutually exclusive" >&2
+exclusive_modes=$((CUMULATIVE_ONLY + HVX_ITEM7_ONLY + HVX_N1_ONLY + HVX_N2_ONLY))
+if [[ "${exclusive_modes}" -gt 1 ]]; then
+  echo "Only one of --cumulative-only, --hvx-item7-only, --hvx-n1-only and --hvx-n2-only may be used" >&2
   exit 2
 fi
 
@@ -120,6 +126,28 @@ if [[ "${HVX_ITEM7_ONLY}" -eq 1 ]]; then
   run_case hvx_vector_item7 \
     --enable-hvx-vector \
     --enable-omnifetch-kv-cache-prefetch
+  exit 0
+fi
+
+if [[ "${HVX_N2_ONLY}" -eq 1 ]]; then
+  if [[ "${MODEL}" != "falcon-debug" && "${MODEL}" != "falcon-full" ]]; then
+    echo "--hvx-n2-only currently requires a Falcon runner" >&2
+    exit 2
+  fi
+  run_case hvx_vector_n2 \
+    --enable-hvx-vector \
+    --enable-omnifetch-activation-multicast
+  exit 0
+fi
+
+if [[ "${HVX_N1_ONLY}" -eq 1 ]]; then
+  if [[ "${MODEL}" != "falcon-debug" && "${MODEL}" != "falcon-full" ]]; then
+    echo "--hvx-n1-only currently requires a Falcon runner" >&2
+    exit 2
+  fi
+  run_case hvx_vector_n1 \
+    --enable-hvx-vector \
+    --enable-omnifetch-weight-stationary
   exit 0
 fi
 

@@ -103,8 +103,38 @@ void setLinalgToLLVMOptions(
       !arch_kwargs.at("enableVectorization").compare(TRUE);
   options.enableHVXInlining =
       !arch_kwargs.at("enableHVXInlining").compare(TRUE);
+  {
+    auto it = arch_kwargs.find("enableBufferResultsToOutParams");
+    options.enableBufferResultsToOutParams =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
   
   // OmniFetch options (Plan-A: three independent components)
+  {
+    auto it = arch_kwargs.find("enablePrefetchKernelHX");
+    options.enablePrefetchKernelHX =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("prefetchKernelHxDistance");
+    if (it != arch_kwargs.end())
+      options.prefetchKernelHxDistance = std::stoi(it->second);
+  }
+  {
+    auto it = arch_kwargs.find("prefetchKernelHxMaxCommandBytes");
+    if (it != arch_kwargs.end())
+      options.prefetchKernelHxMaxCommandBytes = std::stoi(it->second);
+  }
+  {
+    auto it = arch_kwargs.find("enableAPTGetHX");
+    options.enableAPTGetHX =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("aptGetHxDistance");
+    if (it != arch_kwargs.end())
+      options.aptGetHxDistance = std::stoi(it->second);
+  }
   options.enablePrefetch =
       !arch_kwargs.at("enablePrefetch").compare(TRUE);
   options.enableOmniFetchLayoutAware =
@@ -145,6 +175,16 @@ void setLinalgToLLVMOptions(
         (it != arch_kwargs.end() && !it->second.compare(TRUE));
   }
   {
+    auto it = arch_kwargs.find("enableOmniFetchWeightStationary");
+    options.enableOmniFetchWeightStationary =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableOmniFetchActivationMulticast");
+    options.enableOmniFetchActivationMulticast =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
     auto it = arch_kwargs.find("enableOmniFetchDequantReshape");
     options.enableOmniFetchDequantReshape =
         (it != arch_kwargs.end() && !it->second.compare(TRUE));
@@ -167,6 +207,11 @@ void setLinalgToLLVMOptions(
   {
     auto it = arch_kwargs.find("enableOmniFetchAttentionHmx");
     options.enableOmniFetchAttentionHmx =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableOmniFetchMPadHmx");
+    options.enableOmniFetchMPadHmx =
         (it != arch_kwargs.end() && !it->second.compare(TRUE));
   }
   {
