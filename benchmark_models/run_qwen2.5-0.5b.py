@@ -338,6 +338,7 @@ def load_qwen_model(model_name, config):
 
 def qwen2_5_0_5b(
     enable_hexkl: bool = False,
+    enable_hvx_vector: bool = False,
     enable_omnifetch_vdae: bool = False,
     enable_omnifetch_layout_aware: bool = True,
     omnifetch_lookahead: int = 2,
@@ -453,11 +454,10 @@ def qwen2_5_0_5b(
     options = HexagonOptions().__dict__
     options["enableLWP"] = False
     options["lowerConstantsInSeparateSharedObjects"] = True
-    # HexKL needs hexagonmem (VTCM).  Do NOT enable HVX vectorization here:
-    # with Qwen IR it still faults on device (Bad VA 0x28) even after
-    # FormAsyncThreads sequentializes scf.forall.  MicroHMX does not need it.
+    # HexKL needs hexagonmem.  Vector lowering remains opt-in for historical
+    # standalone compatibility; the controlled full-model matrix enables it.
     # Attention-like matmuls (K==M or N==M) are skipped inside MatmulToHexKL.
-    options["enableVectorization"] = False
+    options["enableVectorization"] = bool(enable_hvx_vector)
     options["enableHexKL"] = bool(enable_hexkl)
     options["enableConvertToHexagonmem"] = bool(enable_hexkl)
     cumulative = bool(enable_omnifetch_items_1_7)
@@ -506,7 +506,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--enable-hexkl",
         action="store_true",
-        help="Enable HexKL + hexagonmem (vectorization stays off for Qwen).",
+        help="Enable HexKL + hexagonmem.",
+    )
+    parser.add_argument(
+        "--enable-hvx-vector",
+        action="store_true",
+        help="Enable the real HVX vector lowering path for controlled baselines.",
     )
     parser.add_argument(
         "--enable-omnifetch-vdae",
@@ -531,6 +536,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     qwen2_5_0_5b(
         enable_hexkl=args.enable_hexkl,
+        enable_hvx_vector=args.enable_hvx_vector,
         enable_omnifetch_vdae=args.enable_omnifetch_vdae,
         enable_omnifetch_layout_aware=not args.disable_layout_aware,
         omnifetch_lookahead=args.omnifetch_lookahead,

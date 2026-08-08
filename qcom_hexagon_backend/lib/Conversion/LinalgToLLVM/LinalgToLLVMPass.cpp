@@ -251,6 +251,15 @@ public:
     }
 
     pm.addNestedPass<func::FuncOp>(createConvertLayoutPass());
+    // Recover semantic K/V identity while eager attention is still expressed
+    // as named batch_matmul + explicit transpose. ScheduleMatmulForHVX copies
+    // these attributes to its replacement generic op.
+    if (enableOmniFetchKvCachePrefetch) {
+      HexagonLowerTmTensorOptions kvMetadataOpts{};
+      kvMetadataOpts.emitKvCacheMetadata = true;
+      pm.addNestedPass<func::FuncOp>(
+          createHexagonLowerTmTensorPass(kvMetadataOpts));
+    }
     ScheduleMatmulForHVXOptions scheduleOpts{};
     // MatmulToHexKLPass (above) already converted every HexKL-eligible matmul
     // into a hexkl-dialect op, which ScheduleMatmulForHVXPass never matches.
@@ -267,6 +276,15 @@ public:
     pm.addNestedPass<func::FuncOp>(
         createScheduleMatmulForHVXPass(scheduleOpts));
     pm.addNestedPass<func::FuncOp>(createLinalgGeneralizePass());
+    // The generic Linalg generalizer rebuilds named contractions and does not
+    // preserve arbitrary attributes. Re-identify K/V immediately, while the
+    // unfused attention dataflow and indexing maps are still available.
+    if (enableOmniFetchKvCachePrefetch) {
+      HexagonLowerTmTensorOptions kvMetadataOpts{};
+      kvMetadataOpts.emitKvCacheMetadata = true;
+      pm.addNestedPass<func::FuncOp>(
+          createHexagonLowerTmTensorPass(kvMetadataOpts));
+    }
 
     if (returnValueOptimization)
       pm.addNestedPass<func::FuncOp>(createHexagonRVOPass());
@@ -298,11 +316,24 @@ public:
           createHexagonLowerTmTensorPass(kvMetadataOpts));
     }
 
-    if (enableSlicing)
+    // Full-size attention slicing currently rebuilds the contraction without
+    // copying semantic K/V attributes. Keep the marked boundary intact for
+    // item-7; ordinary HVX/HexKL configurations retain the existing slicing.
+    if (enableSlicing && !enableOmniFetchKvCachePrefetch)
       pm.addPass(createHexagonSlicingPass(
           setOpSlicingFactor(HexagonSlicingOptions{})));
 
     pm.addNestedPass<func::FuncOp>(createDecomposeTensorConcatPass());
+
+    // Slicing may rebuild the contraction and drop semantic attributes.
+    // Recover them at the last tensor-Linalg boundary so Hexagon tiling can
+    // propagate K/V identity into the vector transfer reads.
+    if (enableOmniFetchKvCachePrefetch) {
+      HexagonLowerTmTensorOptions kvMetadataOpts{};
+      kvMetadataOpts.emitKvCacheMetadata = true;
+      pm.addNestedPass<func::FuncOp>(
+          createHexagonLowerTmTensorPass(kvMetadataOpts));
+    }
 
     // -----------------------------------------------------------------------
     // Plan-A Omni-Fetch dependency / safety checks
@@ -533,6 +564,13 @@ public:
           enableOmniFetchTwoDimPipeline;
       prefetchOptions.enableKvCachePrefetch =
           enableOmniFetchKvCachePrefetch;
+      // An independently enabled item-7 has no other OmniFetch components.
+      // Keep that experiment causal by excluding ordinary loop prefetch;
+      // cumulative items 1-7 still execute the complete pipeline.
+      prefetchOptions.kvCacheOnly =
+          enableOmniFetchKvCachePrefetch && !enableOmniFetchVDAE &&
+          !enableOmniFetchPersistentWhCache &&
+          !enableOmniFetchTwoDimPipeline && !enableOmniFetchVtcmColoring;
       prefetchOptions.enableDequantReshape =
           enableOmniFetchDequantReshape;
       prefetchOptions.kvCachePageTokens = omniFetchKvCachePageTokens;

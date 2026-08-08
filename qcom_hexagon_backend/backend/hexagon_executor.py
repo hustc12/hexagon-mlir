@@ -578,6 +578,7 @@ class HexagonExecutor:
                     else 1
                 )
                 attempt = 0
+                tolerated_teardown_fault = False
                 while True:
                     attempt += 1
                     result = subprocess.run(
@@ -586,11 +587,63 @@ class HexagonExecutor:
                         capture_output=True,
                         text=True
                     )
+                    if result.returncode == 0 or not is_run_cmd:
+                        break
+
+                    # Preserve the first failure's diagnostics.  In particular,
+                    # run_main_on_hexagon writes AEE/FastRPC errors to stdout,
+                    # so only printing stderr after the final retry loses the
+                    # information needed to diagnose device failures.
+                    if result.stdout:
+                        print(
+                            "run_main_on_hexagon stdout:\n" + result.stdout,
+                            end="" if result.stdout.endswith("\n") else "\n",
+                            flush=True,
+                        )
+                    if result.stderr:
+                        print(
+                            "run_main_on_hexagon stderr:\n" + result.stderr,
+                            end="" if result.stderr.endswith("\n") else "\n",
+                            flush=True,
+                        )
+
+                    required = list(output_device_paths)
+                    if generatePerf and perf_device_path:
+                        required.append(perf_device_path)
+                    tolerate = os.environ.get(
+                        "HEXAGON_TOLERATE_TEARDOWN_FAULT", ""
+                    ).strip().lower() not in ("", "0", "false", "no")
                     if (
-                        result.returncode == 0
-                        or not is_run_cmd
-                        or attempt >= max_attempts
+                        result.returncode == 13
+                        and tolerate
+                        and required
+                        and self._device_files_present(required)
                     ):
+                        # AEE_EBADSTATE can be returned while tearing down the
+                        # ribbon/FastRPC thread after main() has already written
+                        # every output and perf.txt.  Continue to pull the files;
+                        # the caller's numerical correctness gate still decides
+                        # whether this is a valid inference.
+                        tolerated_teardown_fault = True
+                        print(
+                            "Warning: run_main_on_hexagon exited 13 after all "
+                            "expected outputs and perf were written; treating "
+                            "this as a teardown fault without retrying.",
+                            flush=True,
+                        )
+                        break
+
+                    # Exit 13 is AEE_EBADSTATE, not evidence of a transient
+                    # allocation failure.  Repeating a multi-minute full model
+                    # both destroys the failure site and wastes device time.
+                    if result.returncode == 13:
+                        print(
+                            "run_main_on_hexagon exit 13 (AEE_EBADSTATE); "
+                            "failing fast without retry.",
+                            flush=True,
+                        )
+                        break
+                    if attempt >= max_attempts:
                         break
                     # Transient device-side failure (e.g. VTCMPool CHECK
                     # 'Less than 1MB VTCM available' when a prior crashed DSP
@@ -613,30 +666,8 @@ class HexagonExecutor:
                         text=True,
                     )
                     time.sleep(2.0 * attempt)
-                if result.returncode != 0:
-                    tolerate = os.environ.get(
-                        "HEXAGON_TOLERATE_TEARDOWN_FAULT", ""
-                    ).strip().lower() not in ("", "0", "false", "no")
-                    required = list(output_device_paths)
-                    if generatePerf and perf_device_path:
-                        required.append(perf_device_path)
-                    if (
-                        tolerate
-                        and is_run_cmd
-                        and required
-                        and self._device_files_present(required)
-                    ):
-                        print(
-                            "Warning: run_main_on_hexagon exited "
-                            f"{result.returncode} but all expected outputs and "
-                            "perf are present on device; treating as success "
-                            "(async teardown fault tolerated via "
-                            "HEXAGON_TOLERATE_TEARDOWN_FAULT).",
-                            flush=True,
-                        )
-                    else:
-                        print(f"Command failed with output: {result.stderr}")
-                        result.check_returncode()
+                if result.returncode != 0 and not tolerated_teardown_fault:
+                    result.check_returncode()
                 end_time = time.time()
                 elapsed_time = end_time - start_time
                 print(f"Command took {elapsed_time:.4f} seconds.", flush=True)

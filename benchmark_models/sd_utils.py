@@ -127,6 +127,7 @@ def compare(hex_outputs, x86_outputs, atol=0.05, fail_on_mismatch: bool = False)
 
 def default_options(
     enablelwp: bool = False,
+    enable_hvx_vector: bool = False,
     enable_hexkl: bool = False,
     enable_omnifetch_vdae: bool = False,
     enable_omnifetch_layout_aware: bool = True,
@@ -138,7 +139,7 @@ def default_options(
     opts = HexagonOptions().__dict__
     opts["lowerConstantsInSeparateSharedObjects"] = True
     opts["enableVTCMTiling"] = False
-    opts["enableVectorization"] = False
+    opts["enableVectorization"] = bool(enable_hvx_vector)
     opts["enableHexKL"] = bool(enable_hexkl)
     opts["enableConvertToHexagonmem"] = bool(enable_hexkl)
     cumulative = bool(enable_omnifetch_items_1_7)
@@ -164,6 +165,7 @@ def default_options(
 
 def add_phase4_cli(parser):
     parser.add_argument("--lwp", action="store_true")
+    parser.add_argument("--enable-hvx-vector", action="store_true")
     parser.add_argument("--enable-hexkl", action="store_true")
     parser.add_argument("--enable-omnifetch-vdae", action="store_true")
     parser.add_argument("--disable-layout-aware", action="store_true")
@@ -181,6 +183,7 @@ def add_phase4_cli(parser):
 def options_from_args(args, enablelwp: bool = None):
     return default_options(
         enablelwp=args.lwp if enablelwp is None else enablelwp,
+        enable_hvx_vector=getattr(args, "enable_hvx_vector", False),
         enable_hexkl=getattr(args, "enable_hexkl", False),
         enable_omnifetch_vdae=getattr(args, "enable_omnifetch_vdae", False),
         enable_omnifetch_layout_aware=not getattr(args, "disable_layout_aware", False),

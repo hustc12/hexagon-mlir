@@ -320,6 +320,7 @@ def hexagon_options_phase4(
     prefetch_baseline: str = "none",
     prefetch_baseline_distance: int = 1,
     apt_get_hx_manual_candidate_ids: str = "",
+    enable_omnifetch_kv_cache_prefetch: bool = False,
 ):
     from triton.backends.qcom_hexagon_backend.compiler import HexagonOptions
 
@@ -374,7 +375,9 @@ def hexagon_options_phase4(
     options["aptGetHxDistance"] = int(prefetch_baseline_distance)
     options["aptGetHxManualCandidateIds"] = apt_get_hx_manual_candidate_ids
     options["enablePrefetch"] = bool(
-        enable_omnifetch_vdae or cumulative_level >= 1
+        enable_omnifetch_vdae
+        or cumulative_level >= 1
+        or enable_omnifetch_kv_cache_prefetch
     )
     options["enableOmniFetchLayoutAware"] = bool(enable_omnifetch_layout_aware)
     options["omniFetchLookahead"] = int(omnifetch_lookahead)
@@ -389,7 +392,9 @@ def hexagon_options_phase4(
     # streams.  For autoregressive decoders those streams may be persistent
     # K/V cache pages; for encoders they are the current invocation's ordinary
     # attention K/V tensors.  Both are valid early-data-movement opportunities.
-    options["enableOmniFetchKvCachePrefetch"] = cumulative_level >= 7
+    options["enableOmniFetchKvCachePrefetch"] = bool(
+        cumulative_level >= 7 or enable_omnifetch_kv_cache_prefetch
+    )
     options["enableOmniFetchActivationMulticast"] = bool(
         enable_omnifetch_activation_multicast
     )
@@ -456,6 +461,11 @@ def add_phase4_args(parser):
         default=0,
         metavar="N",
         help="Ablation: enable cumulative OmniFetch items through N (0-7).",
+    )
+    parser.add_argument(
+        "--enable-omnifetch-kv-cache-prefetch",
+        action="store_true",
+        help="Enable isolated item-7 attention K/V stream prefetch.",
     )
     parser.add_argument(
         "--enable-omnifetch-kv-vtcm",

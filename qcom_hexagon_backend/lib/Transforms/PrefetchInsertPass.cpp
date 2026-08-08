@@ -774,33 +774,112 @@ insertKvCachePrefetchHints(func::FuncOp func, int64_t kvCachePageTokens,
     return stats;
   }
 
-  SmallVector<linalg::LinalgOp> consumers;
+  struct KvConsumer {
+    Operation *op;
+    Value src;
+    OpOperand *replaceOperand;
+  };
+  SmallVector<KvConsumer> consumers;
+  int64_t markedLinalg = 0;
+  int64_t markedVector = 0;
   func.walk([&](linalg::LinalgOp op) {
-    if (op->hasAttr("omni_fetch.kv_cache_role"))
-      consumers.push_back(op);
-  });
-
-  for (linalg::LinalgOp consumer : consumers) {
+    if (!op->hasAttr("omni_fetch.kv_cache_role"))
+      return;
     auto operandAttr =
-        consumer->getAttrOfType<IntegerAttr>("omni_fetch.kv_cache_operand");
+        op->getAttrOfType<IntegerAttr>("omni_fetch.kv_cache_operand");
+    if (!operandAttr)
+      return;
+    int64_t index = operandAttr.getInt();
+    if (index < 0 || index >= static_cast<int64_t>(op.getDpsInputs().size()))
+      return;
+    consumers.push_back(
+        {op, op.getDpsInputs()[index], op.getDpsInputOperand(index)});
+    ++markedLinalg;
+  });
+  // Hexagon vectorization replaces the annotated contraction with transfer
+  // reads before one-shot bufferization. The vectorizer propagates item-7
+  // identity to the K/V read so it remains recoverable on final memref IR.
+  func.walk([&](vector::TransferReadOp read) {
+    if (read->hasAttr("omni_fetch.kv_cache_role"))
+      consumers.push_back({read, read.getBase(), nullptr});
+    if (read->hasAttr("omni_fetch.kv_cache_role"))
+      ++markedVector;
+  });
+  int64_t markedLoops = 0;
+  func.walk([&](scf::ForOp loop) {
+    if (!loop->hasAttr("omni_fetch.kv_cache_role"))
+      return;
+    Value src;
+    Operation *sourceConsumer = nullptr;
+    loop.walk([&](linalg::LinalgOp nested) {
+      if (src || nested.getNumReductionLoops() == 0 ||
+          nested.getDpsInputs().size() < 2)
+        return;
+      src = nested.getDpsInputs()[1];
+      sourceConsumer = nested;
+    });
+    if (!src) {
+      SmallVector<vector::TransferReadOp> reads;
+      loop.walk([&](vector::TransferReadOp read) { reads.push_back(read); });
+      if (reads.size() >= 2) {
+        src = reads[1].getBase();
+        sourceConsumer = reads[1];
+      }
+    }
+    if (!src)
+      return;
+    // Insert before the first concrete reader, while retaining role/layout
+    // from the durable loop carrier. No operand replacement is needed for an
+    // L2-only hint.
+    consumers.push_back({sourceConsumer ? sourceConsumer : loop.getOperation(),
+                         src, nullptr});
+    consumers.back().op->setAttr(
+        "omni_fetch.kv_cache_role",
+        loop->getAttr("omni_fetch.kv_cache_role"));
+    if (Attribute layout = loop->getAttr("omni_fetch.kv_cache_layout"))
+      consumers.back().op->setAttr("omni_fetch.kv_cache_layout", layout);
+    ++markedLoops;
+  });
+  llvm::errs() << "[KVPropagation] final_linalg=" << markedLinalg
+               << " final_vector_reads=" << markedVector
+               << " final_loops=" << markedLoops << "\n";
+
+  SmallVector<std::pair<Value, StringRef>> emitted;
+
+  for (KvConsumer candidate : consumers) {
+    Operation *consumer = candidate.op;
     auto role =
         consumer->getAttrOfType<StringAttr>("omni_fetch.kv_cache_role");
     auto layout =
         consumer->getAttrOfType<StringAttr>("omni_fetch.kv_cache_layout");
-    if (!operandAttr || !role)
-      continue;
-    int64_t operandIndex = operandAttr.getInt();
-    SmallVector<Value> inputs(consumer.getDpsInputs());
-    if (operandIndex < 0 ||
-        operandIndex >= static_cast<int64_t>(inputs.size()))
+    if (!role)
       continue;
 
-    Value src = inputs[operandIndex];
+    Value src = candidate.src;
+    while (true) {
+      if (auto subview = src.getDefiningOp<memref::SubViewOp>()) {
+        src = subview.getSource();
+        continue;
+      }
+      if (auto cast = src.getDefiningOp<memref::CastOp>()) {
+        src = cast.getSource();
+        continue;
+      }
+      break;
+    }
     auto srcType = dyn_cast<MemRefType>(src.getType());
     if (!srcType || !srcType.hasStaticShape() || srcType.getRank() < 2 ||
         srcType.getMemorySpaceAsInt() != 0 ||
         !isa<FloatType>(srcType.getElementType()))
       continue;
+
+    // A tiled contraction can contain several reads of the same base stream.
+    // One prefetch before its first read is sufficient and avoids turning
+    // item 7 into per-vector request spam.
+    if (llvm::is_contained(emitted,
+                           std::make_pair(src, role.getValue())))
+      continue;
+    emitted.emplace_back(src, role.getValue());
 
     ArrayRef<int64_t> shape = srcType.getShape();
     int64_t rank = srcType.getRank();
@@ -842,9 +921,11 @@ insertKvCachePrefetchHints(func::FuncOp func, int64_t kvCachePageTokens,
     int64_t pagesPerStream =
         (seqTokens + kvCachePageTokens - 1) / kvCachePageTokens;
     OpBuilder b(consumer);
-    Location loc = consumer.getLoc();
+    Location loc = consumer->getLoc();
 
     if (stageInVtcm) {
+      if (!candidate.replaceOperand)
+        continue;
       Value shadow = stagedBuffers.lookup(src);
       if (!shadow) {
         auto shadowTy = MemRefType::get(
@@ -882,7 +963,10 @@ insertKvCachePrefetchHints(func::FuncOp func, int64_t kvCachePageTokens,
         ++stats.vtcmStages;
         stats.bytes += streams * seqTokens * headDim * elemBytes;
       }
-      consumer.getDpsInputOperand(operandIndex)->set(shadow);
+      // Replacing a tiled vector subview with the full VTCM allocation needs a
+      // matching subview reconstruction. Keep the initial causal experiment
+      // L2-only; the DMA/VTCM variant is admitted for untiled linalg consumers.
+      candidate.replaceOperand->set(shadow);
       consumer->setAttr("omni_fetch.kv_layout",
                         b.getStringAttr(enableAsyncOverlap
                                             ? "vtcm_dma_overlapped"
@@ -1501,6 +1585,7 @@ struct PrefetchInsertPass
                  << ", enableTwoDimPipeline=" << enableTwoDimPipeline
                  << ", enableInterLayerPrefetch=" << enableInterLayerPrefetch
                  << ", enableKvCachePrefetch=" << enableKvCachePrefetch
+                 << ", kvCacheOnly=" << kvCacheOnly
                  << ", enableDequantReshape=" << enableDequantReshape
                  << ", kvCachePageTokens=" << kvCachePageTokens
                  << " (forced off in HVX insert for safety)\n";
@@ -1511,7 +1596,8 @@ struct PrefetchInsertPass
 
     const bool funcHasHexKL = containsHexKLCompute(func);
 
-    func.walk([&](scf::ForOp loop) {
+    if (!kvCacheOnly)
+      func.walk([&](scf::ForOp loop) {
       bool hasNestedFor = false;
       loop.getBody()->walk([&](scf::ForOp) { hasNestedFor = true; });
       // Default: innermost only.  Inter-layer mode also takes outer HexKL
@@ -1527,7 +1613,7 @@ struct PrefetchInsertPass
         if (!hasNestedFor)
           candidates.push_back(loop);
       }
-    });
+      });
 
     llvm::errs() << "[PrefetchInsert] Found " << candidates.size()
                  << " candidate loops (hexkl_func="

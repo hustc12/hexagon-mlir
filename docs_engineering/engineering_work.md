@@ -1045,3 +1045,252 @@ A mechanism enters the cumulative row only when:
 5. repeated serial measurements show a stable improvement beyond noise.
 
 This replaces blind feature trials with falsifiable, byte-level predictions.
+
+## 15. Return to complete-model execution (2026-08-06)
+
+### 15.1 What the independent prefetch baselines established
+
+The two-model Debug comparison did establish a useful OmniFetch advantage, but
+the claim must stay scoped to those workloads.  For DINOv2 Debug, OmniFetch
+issued 36 runtime prefetch requests versus 122,843 for the independent
+baseline.  For ViT Debug it issued 72 versus 36,274.  Latency improved only
+slightly, but the several-orders-of-magnitude reduction in commands is evidence
+that reuse-aware coalescing can avoid a prefetch-command storm.
+
+It is not valid to generalize that count result to every complete model.  The
+first true-vector full HuBERT run below exposed the opposite regime and is now
+the reason for adding an explicit traffic gate before continuing the remaining
+15-model matrix.
+
+### 15.2 Correct complete-model execution order
+
+The balanced target remains five language/text, five vision, and five
+speech/audio models.  Execution is strictly serial:
+
+1. make every `hvx` row explicitly select the repaired `hvx-vector` profile;
+2. screen one complete model in all three configurations;
+3. preserve the first device failure and diagnose it instead of retrying;
+4. reject or cap a cumulative plan whose predicted/runtime prefetch traffic
+   scales pathologically with layer count;
+5. continue HuBERT-family audio models, then language, then missing vision
+   rows; and
+6. only promote passing screens to repeated median/p90 experiments.
+
+The full-matrix script previously used configuration name `hvx` without
+explicitly selecting vector lowering for every runner.  It now passes
+`--backend-profile hvx-vector` to the shared vision/audio runners and
+`--enable-hvx-vector` to custom language/Stable-Diffusion runners.  Therefore
+older full rows without `profile=hvx-vector vectorization=1` must not be mixed
+with the new matrix.
+
+### 15.3 Exit 13 diagnosis and fail-fast policy
+
+The first HuBERT HVX execution returned exit 13.  The old executor silently
+retried it, discarding the stdout from each failed attempt.  The SDK definition
+is:
+
+```text
+AEE_EBADSTATE = 0x8000040d
+```
+
+The preserved HexKL stdout subsequently reported
+`-2147482611 = 0x8000040d`, followed by `Failed to close handle`.  In both the
+HVX and HexKL cases, `main()` had already written a non-empty `perf.txt` and the
+complete `1x64x32` FP16 output.  The recovered HVX output was compared on the
+host against the identical seed, model, and input:
+
+```text
+finite=True
+max_abs_diff=0.009094
+mean_abs_diff=0.001851
+last_frame_top1_match=True
+```
+
+This instance of exit 13 is consequently a FastRPC/ribbon teardown-state
+failure after valid computation, not a model-kernel failure.  The executor now:
+
+- prints the first failing command's stdout and stderr;
+- never retries exit 13;
+- accepts exit 13 only when this invocation produced every expected output and
+  `perf.txt`; and
+- still requires the model's numerical correctness gate to pass.
+
+`run_full_model_matrix.sh` also sets device retries to one.  A genuine exit 13
+without complete files fails immediately and preserves the original site.
+
+### 15.4 Full HuBERT-base true-vector result
+
+This is the complete 12-layer, hidden-768, 12-head, intermediate-3072
+HuBERT-base structure with 94,396,192 parameters and a 20,560-sample input
+(64 encoder frames).  All rows use a 512 MiB QuRT heap and one measured device
+invocation.
+
+| Configuration | Host codegen | Device latency | Correctness |
+|---|---:|---:|---|
+| HVX vector | 273.9298 s | 212,074.277 ms | finite; max error 0.0091; top-1 match |
+| HexKL + HVX vector | 176.5813 s | 268,255.667 ms | finite; max error 0.0088; top-1 match |
+| HexKL + items 1-7 + HVX vector | 174.9162 s | 620,050.837 ms | finite; max error 0.0088; top-1 match |
+
+HexKL is 1.265x slower than HVX.  The cumulative row is 2.312x slower than
+HexKL (`HexKL/combo = 0.4326x`) and 2.924x slower than HVX.  This is a negative
+full-model result; it must not be replaced by the much better one-layer Debug
+screen.
+
+The persistent wrapper's outer `Perf` timer was inconsistent with its command
+wall time: `Perf=921.902 s`, while cold=270.895 s, invalidated=619.855 s, and
+the whole ADB command was 1511.396 s.  The one warm sample
+`PerfP50=620.051 s` closes the timing identity to within wrapper overhead, so
+the full-matrix parser now uses the persistent warm sample for this row.  The
+raw contradictory values remain in the log for auditability.
+
+### 15.5 Why the complete model regressed
+
+The cumulative compiler/runtime counters were:
+
+```text
+prefetch sites            220
+in-situ operations        220
+sync choices               74
+async choices              73
+persistent choices         73
+VTCM peak bytes saved  413,696
+runtime L2 requests    386,294
+page-clipped requests  386,294
+requested bytes       791,130,112
+issued bytes           50,142,592
+WH cold hits/misses     39,421 / 127,235
+WH total hits/misses    78,388 / 254,924
+```
+
+No attention-K/V sites were selected (`sites=0`).  The regression is therefore
+not caused by K/V stream prefetch.  It comes from applying layout-fusion and
+weight movement choices independently at nearly every repeated layer/site.
+Every L2 request was page-clipped, and the persistent cache had substantially
+more misses than hits.  The Debug policy's selectivity did not scale to the
+12-layer graph.
+
+Before running the structurally similar Wav2Vec2/UniSpeech models, the
+cumulative planner needs a full-graph traffic budget and reuse gate:
+
+```text
+accept only if predicted_saved_reload_bytes
+  > issued_prefetch_bytes + command_cost + cache_miss_cost
+```
+
+The gate must also cap commands per unique physical page, deduplicate repeated
+layer-local requests, and reject persistence when predicted misses exceed
+reuse hits.  The full HuBERT row is the first mandatory negative test for that
+policy; the two Debug baseline models remain positive selectivity tests.
+
+## 16. HVX execution audit and Attention K/V prefetch (2026-08-06)
+
+### 16.1 Is the complete model really running on HVX?
+
+Yes, but “HVX is enabled” must not be confused with “all important work is
+efficiently vectorized.” The executed full-HuBERT HVX object was audited with
+the V73 `hexagon-llvm-objdump`, rather than relying only on the Python option:
+
+```text
+plain HVX object:
+  instruction lines       116,139
+  HVX instruction lines    55,057  (47.41%)
+  vmem lines                8,159
+  vector-math lines        16,579
+
+HVX + K/V-prefetch object:
+  instruction lines       132,665
+  HVX instruction lines    59,749  (45.04%)
+  vmem lines                9,971
+  vector-math lines        20,217
+```
+
+The objects contain real V73 instructions including `vmem`, `vmpy`, `vadd`,
+`vlut16`, `vzxt`, and `vsplat`. Therefore the 212-second result is not a
+scalar-only execution. Static instruction share is not dynamic time share,
+but it proves that HVX code executes while also exposing incomplete coverage:
+more than half of the static instruction stream is still scalar,
+address/control, or helper code.
+
+The matched profile was:
+
+```text
+profile=hvx-vector vectorization=1 vtcm_tiling=0 hexagonmem=1 hexkl=0
+```
+
+Consequently, the current row uses HVX but not the compiler's VTCM tiling
+profile. The remaining latency is consistent with a 94.4M-parameter monolithic
+graph, generic unfused attention/softmax/transpose paths, partial vector
+coverage, and DDR/L2-resident intermediate traffic. It is not evidence that
+the Scalar Processor alone ran the model.
+
+### 16.2 Why item 7 previously selected zero HuBERT sites
+
+HuBERT exports each attention contraction as `[12,64,64]`: batch is flattened
+to the 12 heads, sequence length is 64, and head dimension is also 64. The old
+inference deliberately required `sequence != head_dim` to avoid guessing that
+an arbitrary square batch matmul was attention. It therefore emitted
+`KVCachePrefetch sites=0`.
+
+The repaired analysis recognizes square attention structurally:
+
+- QK is proved by the explicit/folded last-two-dimension K transpose;
+- AV is paired with QK and its softmax/head-layout dataflow;
+- K/V identity is attached before generalization/fusion;
+- semantic attributes are preserved across HVX scheduling and tiling; and
+- surviving SCF tile loops carry identity through vectorization and
+  bufferization, after which requests are deduplicated by physical source.
+
+For the complete 12-layer model, the final compiler result is:
+
+```text
+semantic K/V sites       24  (12 K + 12 V)
+tiling carriers          72
+deduplicated sites       24
+coalesced L2 hints      288
+logical pages           576
+ordinary prefetch sites   0
+```
+
+This is an isolated K/V experiment; it does not enable the ordinary HexKL/HVX
+weight-prefetch loop or items 1-6.
+
+### 16.3 Complete-model K/V L2-prefetch result
+
+The model, seed, input, heap, vector profile, and one-invocation timing policy
+match section 15.4.
+
+| Configuration | Host codegen | Device latency | Relative to plain HVX | Correctness |
+|---|---:|---:|---:|---|
+| HVX vector | 273.9298 s | 212,074.277 ms | 1.0000x | finite; top-1 match |
+| HVX vector + K/V L2 prefetch-only | 373.6175 s | 217,146.200 ms | 0.9766x | finite; max error 0.0088; top-1 match |
+
+The L2-only K/V experiment regressed latency by 2.39%. This falsifies the
+claim that attention K/V L2 hints are automatically beneficial on this full
+HuBERT shape. With only 64 sequence tokens, each K/V stream is small and is
+consumed shortly after production; 288 hint commands add cost while much of
+the data is plausibly already cache-resident.
+
+There is one attribution caveat: preserving semantic K/V identity currently
+keeps the marked attention boundary intact and disables the slicing rewrite
+that drops those attributes. Thus this row measures the deployable
+`boundary preservation + K/V hints` implementation, not a hypothetical
+zero-codegen-difference hint toggle. A metadata/boundary-only control is
+needed before assigning the full 2.39% delta solely to the hardware hints.
+
+This negative L2 result does **not** settle the DMA-to-VTCM design. The next
+memory-hierarchy experiment should stage only a bounded K/V tile or page into
+double-buffered VTCM, preserve its subview offsets, overlap DMA with the
+preceding projection/softmax work, and reject the transform unless predicted
+DDR-stall savings exceed DMA, synchronization, and VTCM-pressure costs. A
+full-tensor synchronous copy is not an acceptable substitute.
+
+Reproduction command:
+
+```bash
+scripts/run_full_model_matrix.sh \
+  --config hvx_kv_prefetch \
+  --dsp-heap-mb 512 \
+  --timeout 1200 \
+  --output-dir /tmp/omnifetch-full-hubert-kv-result-20260806 \
+  hubert-base
+```

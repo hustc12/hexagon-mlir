@@ -133,6 +133,10 @@ def run_full_audio_encoder(
         args.enable_omnifetch_items_1_7,
         lower_constants_separate=True,
         backend_profile=args.backend_profile,
+        enable_omnifetch_kv_cache_prefetch=(
+            args.enable_omnifetch_kv_cache_prefetch
+        ),
+        enable_omnifetch_kv_vtcm=args.enable_omnifetch_kv_vtcm,
         enable_omnifetch_m_pad_hmx=args.enable_omnifetch_m_pad_hmx,
         enable_out_params=args.enable_out_params,
     )

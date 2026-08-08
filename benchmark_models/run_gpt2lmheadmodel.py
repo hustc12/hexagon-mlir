@@ -385,6 +385,7 @@ class GPT2LogitsWrapper(torch.nn.Module):
 
 def gpt2lmheadmodel(
     enablelwp: bool = False,
+    enable_hvx_vector: bool = False,
     # Mirror HexagonOptions defaults: HexKL off, VTCM tiling and hexagonmem
     # conversion also off for GPT2 (mixed f32/f16 pipeline).
     enable_hexkl: bool = False,
@@ -493,10 +494,11 @@ def gpt2lmheadmodel(
         mlir_text, n = rewrite_matmul_inputs_to_f16(raw)
         print(f"[HexKL] Rewrote {n} linalg.matmul inputs to f16 for HMX")
         _patch_dsp_heap_256mb()
-        # Match Qwen/Falcon HexKL: no vectorization (avoids Bad VA on forall).
+        # The explicit flag selects the repaired HVX path; the default remains
+        # scalar for compatibility with historical standalone invocations.
         options = HexagonOptions(
             enableHexKL=True,
-            enableVectorization=False,
+            enableVectorization=enable_hvx_vector,
             enableVTCMTiling=enable_vtcm_tiling,
             enableConvertToHexagonmem=True,
             enablePrefetch=enable_omnifetch_vdae or cumulative,
@@ -517,6 +519,7 @@ def gpt2lmheadmodel(
         ).__dict__
     else:
         options = HexagonOptions().__dict__
+        options["enableVectorization"] = bool(enable_hvx_vector)
         options["enableHexKL"] = False
         options["enableVTCMTiling"] = enable_vtcm_tiling
         options["enableConvertToHexagonmem"] = enable_convert_to_hexagonmem
@@ -580,6 +583,11 @@ def gpt2lmheadmodel(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run GPT2 LMHead on Hexagon with optional Omni-Fetch ablation toggles.")
     parser.add_argument("--enable-lwp", action="store_true", help="Enable lightweight profiling instrumentation.")
+    parser.add_argument(
+        "--enable-hvx-vector",
+        action="store_true",
+        help="Enable the real HVX vector lowering path for controlled baselines.",
+    )
 
     parser.add_argument("--enable-hexkl", action="store_true",
                         help="Enable HexKL lowering (requires a fully-f16 pipeline; off by default for GPT2).")
@@ -654,6 +662,7 @@ if __name__ == "__main__":
 
     gpt2lmheadmodel(
         enablelwp=args.enable_lwp,
+        enable_hvx_vector=args.enable_hvx_vector,
         enable_hexkl=args.enable_hexkl,
         enable_vtcm_tiling=args.enable_vtcm_tiling,
         enable_convert_to_hexagonmem=args.enable_convert_to_hexagonmem,

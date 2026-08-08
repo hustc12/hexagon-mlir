@@ -93,7 +93,7 @@ Options:
   --dsp-heap-mb N   QuRT heap reservation for full graphs (default: ${DSP_HEAP_MB})
   --device-iterations N
                     Serial in-process measured calls (screening default: ${DEVICE_ITERATIONS})
-  --config NAME     Run only hvx, hexkl, or hexkl_omnifetch_1_7
+  --config NAME     Run hvx, hexkl, hexkl_omnifetch_1_7, or hvx_kv_prefetch
   --output-dir DIR  Result directory (default: ${OUT})
   --runtime-root DIR
                     Built hexagon-mlir runtime tree (default: source tree)
@@ -121,7 +121,9 @@ while (($#)); do
     --device-iterations) DEVICE_ITERATIONS=$2; shift 2 ;;
     --config)
       case "$2" in
-        hvx|hexkl|hexkl_omnifetch_1_7) configs=("$2") ;;
+        hvx|hexkl|hexkl_omnifetch_1_7|hvx_kv_prefetch)
+          configs=("$2")
+          ;;
         *) echo "ERROR: invalid configuration: $2" >&2; exit 2 ;;
       esac
       shift 2
@@ -201,6 +203,13 @@ export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export OMNIFETCH_DSP_HEAP_MB="${DSP_HEAP_MB}"
 export PYTHONUNBUFFERED=1
+# Full graphs can run for tens of minutes.  Never repeat a failed device run;
+# preserve the first failure for diagnosis.  A known FastRPC teardown quirk may
+# return AEE_EBADSTATE (13) after main() has written all outputs and perf.txt;
+# in that exact case the runner pulls the files and the model correctness gate
+# still decides whether the row passes.
+export HEXAGON_RUN_RETRIES="${HEXAGON_RUN_RETRIES:-1}"
+export HEXAGON_TOLERATE_TEARDOWN_FAULT="${HEXAGON_TOLERATE_TEARDOWN_FAULT:-1}"
 
 CSV="${OUT}/results.csv"
 CSV_HEADER='model,domain,weight_status,config,attempt,status,perf_us,perf_ms,seq_len,dsp_heap_mb,device_iterations,compile_s,prefetch_sites,in_situ_ops,async_choices,persistent_choices,vtcm_saved_bytes,kv_prefetch_sites,log'
@@ -228,6 +237,14 @@ base_args_for() {
       printf '%s\n' --seq-len "${SEQ_LEN}"
       ;;
   esac
+  case "$1" in
+    falcon_rw_1b|gpt2lmheadmodel|qwen2.5-0.5b|tinyllama|sd_text_encoder)
+      printf '%s\n' --enable-hvx-vector
+      ;;
+    *)
+      printf '%s\n' --backend-profile hvx-vector
+      ;;
+  esac
   printf '%s\n' --device-iterations "${DEVICE_ITERATIONS}"
 }
 
@@ -238,11 +255,14 @@ config_args_for() {
     hexkl_omnifetch_1_7)
       printf '%s\n' --enable-hexkl --enable-omnifetch-items-1-7
       ;;
+    hvx_kv_prefetch)
+      printf '%s\n' --enable-omnifetch-kv-cache-prefetch
+      ;;
   esac
 }
 
 run_one() {
-  local model=$1 config=$2 runner attempt status log perf_us perf_ms recorded_seq
+  local model=$1 config=$2 runner attempt status log perf_us perf_p50_us perf_ms recorded_seq
   local compile_s prefetch_sites in_situ_ops async_choices persistent_choices
   local vtcm_saved_bytes kv_prefetch_sites
   local -a args=()
@@ -273,6 +293,21 @@ run_one() {
     status="FAIL_$?"
   fi
   perf_us=$(awk -F: '/^[[:space:]]*Perf:/{gsub(/[[:space:]]/,"",$2);v=$2}END{print v}' "${log}")
+  # The persistent-WH wrapper records the measured warm invocation in
+  # PerfP50.  For a one-sample full-model screen this is also the only timer
+  # that is consistent with cold_us + warm + invalidated_us and the enclosing
+  # ADB wall time.  Some long V73 runs return a corrupted outer warm_avg timer,
+  # so do not use that duplicate for the combination row.
+  if [[ "${config}" == hexkl_omnifetch_1_7 ]] && \
+      grep -q '^OmniFetchWHCache:' "${log}"; then
+    perf_p50_us=$(awk -F: '/^[[:space:]]*PerfP50:/{gsub(/[[:space:]]/,"",$2);v=$2}END{print v}' "${log}")
+    if [[ -n "${perf_p50_us}" ]]; then
+      if [[ -n "${perf_us}" && "${perf_us}" != "${perf_p50_us}" ]]; then
+        echo "METRIC_OVERRIDE ${model} ${config}: Perf=${perf_us}us PerfP50=${perf_p50_us}us (persistent warm sample)"
+      fi
+      perf_us=${perf_p50_us}
+    fi
+  fi
   if [[ -n "${perf_us}" ]]; then
     perf_ms=$(awk -v us="${perf_us}" 'BEGIN{printf "%.6f",us/1000.0}')
   else

@@ -64,6 +64,7 @@ def load_clip(config):
 
 def test_text_encoder(
     enablelwp: bool = False,
+    enable_hvx_vector: bool = False,
     enable_hexkl: bool = False,
     enable_omnifetch_vdae: bool = False,
     enable_omnifetch_layout_aware: bool = True,
@@ -122,6 +123,7 @@ def test_text_encoder(
 
     args = _Args()
     args.lwp = enablelwp
+    args.enable_hvx_vector = enable_hvx_vector
     args.enable_hexkl = enable_hexkl
     args.enable_omnifetch_vdae = enable_omnifetch_vdae
     args.disable_layout_aware = not enable_omnifetch_layout_aware
@@ -153,6 +155,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     test_text_encoder(
         enablelwp=args.lwp,
+        enable_hvx_vector=args.enable_hvx_vector,
         enable_hexkl=args.enable_hexkl,
         enable_omnifetch_vdae=args.enable_omnifetch_vdae,
         enable_omnifetch_layout_aware=not args.disable_layout_aware,

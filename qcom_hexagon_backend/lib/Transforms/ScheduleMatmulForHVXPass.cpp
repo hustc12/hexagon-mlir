@@ -51,6 +51,7 @@ namespace {
 static void copyOmniFetchAttrs(Operation *from, Operation *to) {
   for (StringRef name :
        {"omni_fetch.kv_cache_role", "omni_fetch.kv_cache_operand",
+        "omni_fetch.kv_cache_layout",
         "omni_fetch.n1_weight_stationary", "omni_fetch.n1_mkn",
         "omni_fetch.n1_baseline_weight_bytes",
         "omni_fetch.n1_stationary_weight_bytes",

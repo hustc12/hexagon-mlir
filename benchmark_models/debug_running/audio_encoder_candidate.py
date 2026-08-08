@@ -37,7 +37,9 @@ def run_candidate(args, name, config, model_cls, root_name, seed):
     opts=hexagon_options_phase4(args.enable_hexkl,args.enable_omnifetch_vdae,
         not args.disable_layout_aware,args.omnifetch_lookahead,
         not args.disable_omnifetch_adaptive,args.enable_omnifetch_items_1_7,
-        lower_constants_separate=False)
+        lower_constants_separate=False, backend_profile=args.backend_profile,
+        enable_omnifetch_kv_cache_prefetch=args.enable_omnifetch_kv_cache_prefetch,
+        enable_omnifetch_kv_vtcm=args.enable_omnifetch_kv_vtcm)
     out=hex_execution(module,wrapped.__class__.__name__,inputs,opts,mlir_text=patched)
     with torch.no_grad(): ref=wrapped(*inputs)
     diff=(out[0].float()-ref.float()).abs().max().item()

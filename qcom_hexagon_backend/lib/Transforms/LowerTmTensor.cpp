@@ -26,11 +26,13 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 #include "mlir/Dialect/Utils/StructuredOpsUtils.h"
+#include "mlir/Interfaces/DestinationStyleOpInterface.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 
 #include "llvm/Support/Debug.h"
+#include "llvm/ADT/DenseMap.h"
 #include <algorithm>
 #include <numeric>
 #include <vector>
@@ -267,10 +269,163 @@ struct LowerAttentionOp : public OpRewritePattern<AttentionOp> {
 ///   QK^T: [B, S, H] x [B, H, S] -> [B, S, S]
 ///   AV:   [B, S, S] x [B, S, H] -> [B, S, H]
 ///
-/// Require S != H so a square, non-attention batch matmul is never guessed.
+/// Square attention (S == H), which occurs in audio encoders such as HuBERT
+/// with S=64 and head_dim=64, needs structural evidence because its shapes
+/// alone are indistinguishable from a generic square batch matmul. Recognize
+/// QK only when the RHS originates at a last-two-dim transpose, then recognize
+/// AV only when its probability input depends on that already-marked QK.
 /// The explicit metadata emitted by LowerAttentionOp always takes precedence.
+static Operation *findLastDpsWriterBefore(Value buffer, Operation *consumer) {
+  Operation *last = nullptr;
+  for (Operation *user : buffer.getUsers()) {
+    if (user->getBlock() != consumer->getBlock() ||
+        !user->isBeforeInBlock(consumer))
+      continue;
+    auto dps = dyn_cast<DestinationStyleOpInterface>(user);
+    if (!dps)
+      continue;
+    if (llvm::any_of(dps.getDpsInitsMutable(),
+                     [&](OpOperand &init) { return init.get() == buffer; }) &&
+        (!last || last->isBeforeInBlock(user)))
+      last = user;
+  }
+  return last;
+}
+
+static bool isLastTwoDimTransposeGeneric(linalg::GenericOp generic) {
+  if (generic.getNumDpsInputs() != 1 || generic.getNumDpsInits() != 1 ||
+      generic.getNumReductionLoops() != 0)
+    return false;
+  SmallVector<AffineMap> maps = generic.getIndexingMapsArray();
+  if (maps.size() != 2 || maps[0].getNumResults() < 2 ||
+      !maps[1].isIdentity() ||
+      maps[0].getNumResults() != maps[1].getNumResults())
+    return false;
+  const unsigned rank = maps[0].getNumResults();
+  for (unsigned i = 0; i < rank - 2; ++i)
+    if (maps[0].getResult(i) != getAffineDimExpr(i, generic.getContext()))
+      return false;
+  return maps[0].getResult(rank - 2) ==
+             getAffineDimExpr(rank - 1, generic.getContext()) &&
+         maps[0].getResult(rank - 1) ==
+             getAffineDimExpr(rank - 2, generic.getContext());
+}
+
+static bool hasLastTwoDimTransposeAncestor(Value value, Operation *consumer,
+                                           unsigned depth = 0) {
+  if (depth > 8)
+    return false;
+  Operation *def = value.getDefiningOp();
+  if (isa<MemRefType>(value.getType())) {
+    if (Operation *writer = findLastDpsWriterBefore(value, consumer)) {
+      if (isa<linalg::TransposeOp>(writer))
+        return true;
+      if (auto generic = dyn_cast<linalg::GenericOp>(writer))
+        if (isLastTwoDimTransposeGeneric(generic))
+          return true;
+      def = writer;
+    }
+  }
+  if (!def)
+    return false;
+  if (auto transpose = dyn_cast<linalg::TransposeOp>(def)) {
+    ArrayRef<int64_t> permutation = transpose.getPermutation();
+    if (permutation.size() >= 2) {
+      const int64_t rank = permutation.size();
+      bool prefixIdentity = true;
+      for (int64_t i = 0; i < rank - 2; ++i)
+        prefixIdentity &= permutation[i] == i;
+      if (prefixIdentity && permutation[rank - 2] == rank - 1 &&
+          permutation[rank - 1] == rank - 2)
+        return true;
+    }
+    return false;
+  }
+  if (!isa<tensor::CollapseShapeOp, tensor::ExpandShapeOp, tensor::CastOp>(def))
+    return false;
+  return llvm::any_of(def->getOperands(), [&](Value operand) {
+    return hasLastTwoDimTransposeAncestor(operand, def, depth + 1);
+  });
+}
+
+static bool hasBshdToBhsdTransposeAncestor(Value value,
+                                           unsigned depth = 0) {
+  if (depth > 8)
+    return false;
+  Operation *def = value.getDefiningOp();
+  if (!def)
+    return false;
+  if (auto transpose = dyn_cast<linalg::TransposeOp>(def)) {
+    ArrayRef<int64_t> p = transpose.getPermutation();
+    return p.size() == 4 && p[0] == 0 && p[1] == 2 && p[2] == 1 &&
+           p[3] == 3;
+  }
+  if (!isa<tensor::CollapseShapeOp, tensor::ExpandShapeOp, tensor::CastOp>(def))
+    return false;
+  return llvm::any_of(def->getOperands(), [&](Value operand) {
+    return hasBshdToBhsdTransposeAncestor(operand, depth + 1);
+  });
+}
+
+static bool hasFoldedBatchKtAccess(linalg::LinalgOp op) {
+  if (!isa<linalg::GenericOp>(op.getOperation()))
+    return false;
+  SmallVector<AffineMap> maps = op.getIndexingMapsArray();
+  if (op.getNumLoops() != 4 || maps.size() < 2 ||
+      maps[1].getNumResults() != 3)
+    return false;
+  MLIRContext *ctx = op.getContext();
+  return maps[1].getResult(0) == getAffineDimExpr(0, ctx) &&
+         maps[1].getResult(1) == getAffineDimExpr(2, ctx) &&
+         maps[1].getResult(2) == getAffineDimExpr(3, ctx);
+}
+
+static bool dependsOnMarkedAttentionKey(Value value, Operation *consumer,
+                                        unsigned depth = 0) {
+  if (depth > 32)
+    return false;
+  Operation *def = value.getDefiningOp();
+  if (isa<MemRefType>(value.getType()))
+    if (Operation *writer = findLastDpsWriterBefore(value, consumer))
+      def = writer;
+  if (!def)
+    return false;
+  if (auto role =
+          def->getAttrOfType<StringAttr>("omni_fetch.kv_cache_role"))
+    if (role.getValue() == "key")
+      return true;
+  return llvm::any_of(def->getOperands(), [&](Value operand) {
+    return dependsOnMarkedAttentionKey(operand, def, depth + 1);
+  });
+}
+
+static bool dependsOnSoftmaxLike(Value value, Operation *consumer,
+                                 unsigned depth = 0) {
+  if (depth > 32)
+    return false;
+  Operation *def = value.getDefiningOp();
+  if (isa<MemRefType>(value.getType()))
+    if (Operation *writer = findLastDpsWriterBefore(value, consumer))
+      def = writer;
+  if (!def)
+    return false;
+  bool softmaxMath = false;
+  def->walk([&](Operation *nested) {
+    if (isa<math::ExpOp, arith::DivFOp>(nested))
+      softmaxMath = true;
+  });
+  if (softmaxMath)
+    return true;
+  return llvm::any_of(def->getOperands(), [&](Value operand) {
+    return dependsOnSoftmaxLike(operand, def, depth + 1);
+  });
+}
+
 static int64_t annotateEagerAttentionKvStreams(FunctionOpInterface func) {
   int64_t inferred = 0;
+  int64_t keys = 0;
+  int64_t values = 0;
+  DenseMap<Block *, Operation *> pendingSquareKey;
   func.walk([&](linalg::LinalgOp op) {
     if (op->hasAttr("omni_fetch.kv_cache_role") ||
         op.getNumReductionLoops() == 0 || op.getDpsInputs().size() < 2 ||
@@ -366,6 +521,25 @@ static int64_t annotateEagerAttentionKvStreams(FunctionOpInterface func) {
       else if (a[1] == a[2] && a[1] == b[1] && b[1] == c[1] &&
                b[2] == c[2] && c[1] != c[2])
         role = "value";
+      else if (a[1] == a[2] && b[1] == b[2] && c[1] == c[2] &&
+               a[1] == b[1] && b[1] == c[1]) {
+        if (hasFoldedBatchKtAccess(op) ||
+            hasLastTwoDimTransposeAncestor(op.getDpsInputs()[1], op))
+          role = "key";
+        else if (hasBshdToBhsdTransposeAncestor(op.getDpsInputs()[1]))
+          role = "value";
+        else if (dependsOnMarkedAttentionKey(op.getDpsInputs()[0], op) ||
+                 dependsOnSoftmaxLike(op.getDpsInputs()[0], op))
+          role = "value";
+        else if (Operation *key = pendingSquareKey.lookup(op->getBlock())) {
+          unsigned distance = 0;
+          for (Operation *cursor = key->getNextNode(); cursor && cursor != op;
+               cursor = cursor->getNextNode())
+            ++distance;
+          if (distance <= 32)
+            role = "value";
+        }
+      }
       if (!role.empty())
         operandIndex = 1;
     }
@@ -378,8 +552,17 @@ static int64_t annotateEagerAttentionKvStreams(FunctionOpInterface func) {
     op->setAttr("omni_fetch.kv_cache_operand",
                 bld.getI64IntegerAttr(operandIndex));
     op->setAttr("omni_fetch.kv_cache_layout", bld.getStringAttr(layout));
+    if (role == "key")
+      pendingSquareKey[op->getBlock()] = op;
+    else if (role == "value")
+      pendingSquareKey.erase(op->getBlock());
+    keys += role == "key";
+    values += role == "value";
     ++inferred;
   });
+  if (inferred)
+    llvm::errs() << "[KVCacheMetadataRoles] key=" << keys
+                 << " value=" << values << "\n";
   return inferred;
 }
 

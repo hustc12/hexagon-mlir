@@ -243,6 +243,10 @@ void HexagonFusionPass::runOnOperation() {
   linalg::ControlFusionFn fuseByExpansionControlFn =
       [](OpOperand *fusedOperand) {
         Operation *producer = fusedOperand->get().getDefiningOp();
+        if (fusedOperand->getOwner()->hasAttr("omni_fetch.kv_cache_role") ||
+            (producer &&
+             producer->hasAttr("omni_fetch.kv_cache_role")))
+          return false;
         return producer->hasOneUse();
       };
   linalg::populateFoldReshapeOpsByExpansionPatterns(fusionPatterns,
@@ -275,7 +279,11 @@ void HexagonFusionPass::runOnOperation() {
     return signalPassFailure();
   }
 
-  if (fusionDoMultiUse) {
+  bool hasKvBoundary = false;
+  funcOp.walk([&](Operation *op) {
+    hasKvBoundary |= op->hasAttr("omni_fetch.kv_cache_role");
+  });
+  if (fusionDoMultiUse && !hasKvBoundary) {
     unsigned nIter = 0;
     while (nIter++ < MaxMultiUseFusionIterations) {
       auto &domInfo = getAnalysis<DominanceInfo>();
