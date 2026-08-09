@@ -21,6 +21,7 @@ DEVICE_ITERATIONS="${OMNIFETCH_DEVICE_ITERATIONS:-1}"
 FORCE=0
 LIST_ONLY=0
 NATIVE_ONLY=0
+CONFIG_EXPLICIT=0
 
 all_models=(
   falcon_rw_1b
@@ -129,6 +130,7 @@ while (($#)); do
       case "$2" in
         hvx|hexkl|hexkl_omnifetch_1_7|hvx_kv_prefetch)
           configs=("$2")
+          CONFIG_EXPLICIT=1
           ;;
         *) echo "ERROR: invalid configuration: $2" >&2; exit 2 ;;
       esac
@@ -143,8 +145,17 @@ while (($#)); do
   esac
 done
 
-if [[ "${NATIVE_ONLY}" -eq 1 ]]; then
+if [[ "${NATIVE_ONLY}" -eq 1 && "${CONFIG_EXPLICIT}" -eq 0 ]]; then
   configs=(hvx hexkl)
+fi
+if [[ "${NATIVE_ONLY}" -eq 1 && "${CONFIG_EXPLICIT}" -eq 1 ]]; then
+  case "${configs[0]}" in
+    hvx|hexkl) ;;
+    *)
+      echo "ERROR: --native-only only permits an explicit hvx or hexkl config" >&2
+      exit 2
+      ;;
+  esac
 fi
 
 [[ "${SEQ_LEN}" =~ ^[1-9][0-9]*$ ]] || {

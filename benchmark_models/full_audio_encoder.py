@@ -59,6 +59,33 @@ def _reformulate_pos_conv(pos_conv_embed: torch.nn.Module) -> None:
     pos_conv_embed.forward = types.MethodType(forward, pos_conv_embed)
 
 
+def _patch_group_norm_f32_accumulation(model: torch.nn.Module) -> int:
+    """Keep GroupNorm statistics in f32 instead of exporting an f64 reduction.
+
+    torch-mlir currently decomposes the half-precision GroupNorm used by the
+    wav2vec2/HuBERT convolutional frontend through an f64 variance reduction.
+    The upstream Hexagon ExtendPackUnpackFrontier pass then converts the
+    reduction operand to f32 without updating its region argument, producing
+    invalid Linalg IR.  Explicit f32 accumulation is both numerically standard
+    for an fp16 model and preserves the published GroupNorm operation, learned
+    parameters, and output dtype.
+    """
+    patched = 0
+
+    def forward(self, input):
+        weight = self.weight.float() if self.weight is not None else None
+        bias = self.bias.float() if self.bias is not None else None
+        return F.group_norm(
+            input.float(), self.num_groups, weight, bias, self.eps
+        ).to(input.dtype)
+
+    for module in model.modules():
+        if isinstance(module, torch.nn.GroupNorm):
+            module.forward = types.MethodType(forward, module)
+            patched += 1
+    return patched
+
+
 def run_full_audio_encoder(
     args: argparse.Namespace,
     *,
@@ -76,6 +103,8 @@ def run_full_audio_encoder(
     config.feat_extract_activation = "gelu_new"
     config._attn_implementation = "eager"
     model = model_cls(config).half().eval()
+    group_norms = _patch_group_norm_f32_accumulation(model)
+    print(f"[ExportCompat] group_norm_f32_accumulation={group_norms}")
 
     # Weight normalization is training-time parametrization. Freeze its
     # effective convolution weight before torch-mlir export.

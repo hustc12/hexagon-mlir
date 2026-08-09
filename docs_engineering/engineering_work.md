@@ -1423,3 +1423,96 @@ movement work outside eligible matrix kernels.  This is an observed
 correlation; operator-level profiling is required before assigning exact time
 shares.  Logs and CSV output are under
 `/tmp/hexagon-mlir-native-v73-smoke-whisper` and are not tracked by Git.
+
+### 17.7 Strict-native complete-model progress: 10/15 dual PASS
+
+The remaining validation is strictly serial, uses one measured device
+invocation, a 512 MB DSP heap, no host timeout, v73 artifacts, and the same
+correctness gate for HVX and HexKL.  `--native-only` disables all OmniFetch
+passes and host-side matrix rewrites.  The current dual-PASS set is:
+
+| Domain | Complete model | HVX vector (ms) | HexKL (ms) | HVX / HexKL |
+|---|---|---:|---:|---:|
+| vision | DINOv2-small | 30,396.932 | 9,873.013 | 3.078x |
+| vision | DeiT-small | 24,075.094 | 8,342.079 | 2.886x |
+| vision | SegFormer MiT-B0 | 27,488.063 | 9,349.189 | 2.940x |
+| vision | Swin Transformer | 122,531.193 | 73,079.566 | 1.677x |
+| vision | BEiT-base | 129,376.464 | 13,495.335 | 9.587x |
+| speech | Whisper-tiny | 160,182.939 | 112,048.671 | 1.430x |
+| speech | HuBERT-base | 216,665.328 | 190,385.382 | 1.138x |
+| speech | Wav2Vec2-base | 216,404.775 | 174,978.035 | 1.237x |
+| speech | UniSpeech-base | 215,996.232 | 174,108.521 | 1.241x |
+| speech | UniSpeech-SAT-base | 215,612.362 | 174,006.382 | 1.239x |
+
+The four 12-layer speech encoders use the published 94,396,192-parameter
+structure, 20,560 input samples (1.285 seconds at 16 kHz), and 64 encoder
+frames.  Their original torch-mlir export contained an f64 GroupNorm variance
+reduction.  Upstream `ExtendPackUnpackFrontier` converted its operand to f32
+without updating the Linalg region argument and rejected the resulting IR.
+The shared model harness now explicitly performs GroupNorm accumulation in
+f32 and casts back to the original fp16 dtype.  This preserves the operation,
+learned parameters, layer count, and output structure; it is an export
+compatibility repair, not an OmniFetch optimization.  Both native baselines
+use it identically.
+
+All four speech graphs contain 98 `linalg.batch_matmul` operations and zero
+plain `linalg.matmul` operations at the audited boundary.  Strict-native mode
+does not apply the project's batch-matmul-to-matmul rewrite.  The observed
+1.14--1.24x HexKL improvement is therefore consistent with limited HMX
+coverage and substantial non-matrix work; this is evidence for the separate
+"batch/non-aligned MatMul to HMX" Next Paper Idea, not an OmniFetch result.
+
+Logs and CSV files are kept under the corresponding
+`/tmp/hexagon-mlir-native-v73-smoke-*` directories and are intentionally not
+tracked by Git.
+
+### 17.8 Host-codegen scalability blocker for the remaining language models
+
+GPT-2 and the Stable Diffusion CLIP text encoder were each attempted with the
+strict native HVX configuration and no timeout.  Neither reached device
+execution:
+
+* GPT-2 (12 layers, hidden 768, vocab 50,257, sequence length 32) reached
+  approximately 15.1 GB RSS even after constants were split and native HVX
+  retained the model's intentional f32 data type.
+* CLIP text encoder (12 layers, hidden 768, 12 heads, vocab 49,408, sequence
+  length 77) reached 13.43 GB RSS while still growing; physical free memory
+  had fallen to 141 MB.
+
+Both process groups were terminated before the machine could repeat the prior
+system crash.  These were resource-safety aborts, not timeouts, device exit 13,
+or model-correctness failures.  The logs are preserved under
+`/tmp/hexagon-mlir-native-v73-smoke-gpt2-*` and
+`/tmp/hexagon-mlir-native-v73-smoke-sd-text`.
+
+Separating constants is insufficient because the remaining compute body is
+still lowered and optimized as one large LLVM module.  The latest upstream
+tree contains no layer/function compute-module splitting facility; its
+multiple-module support only outlines constants.  Qwen2.5-0.5B,
+Falcon-RW-1B, and TinyLlama-1.1B are larger than both measured failures and
+must not be launched through the same monolithic path on this 16 GB host.
+The required repair is function/layer-granular compute codegen with a DSP-side
+orchestrator and device-resident intermediates.  Host round trips between
+layers are not an acceptable performance implementation.  GPT-2 is the first
+repair target; the larger three language models remain pending until that
+mechanism is validated.
+
+The first GPT-2 staging probe is implemented by
+`scripts/probe_gpt2_layered_export.py`.  It retains the published checkpoint,
+full 12-block depth, sequence length 32, full 50,257-way LM head, and f32
+numerics.  The staged CPU path (embedding, 12 blocks, final norm+LM head)
+matches the original model exactly (`max_abs=0`, last-token top-1 match).  All
+14 stages export independently: each transformer block is about 56.7 MB of
+Linalg bytecode instead of presenting the backend with the complete 1.30 GB
+export at once.  Embedding and head bytecode are approximately 315 MB and
+309 MB because the tied token-embedding/LM-head weight is currently duplicated
+across those two exports; the device orchestrator must share that weight rather
+than store two copies.
+
+A block-0 HVX probe has already completed Linalg-to-object translation.  Its
+first two launcher attempts stopped before device execution because the new
+standalone probe had not yet inherited `ANDROID_HOST` and then
+`HEXAGON_RUNTIME_LIBS_DIR` from the matrix harness.  No device failure or exit
+13 occurred.  The next step is to finish the single-stage link/ABI test, then
+generate one DSP-side wrapper that calls all 14 stage functions between two
+reused device-resident hidden-state buffers and times the entire chain.

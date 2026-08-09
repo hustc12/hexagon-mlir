@@ -11,6 +11,7 @@ from pathlib import Path
 from triton.backends.qcom_hexagon_backend.compiler import HexagonOptions
 from triton.backends.qcom_hexagon_backend.torch_mlir_hexagon_launcher import TorchMLIRHexagonLauncher
 from triton.backends.qcom_hexagon_backend import hexagon_launcher_base as _hlb
+from hexkl_utils import patch_full_model_dsp_heap
 
 # HMX tiles are 32-wide; keep DSP heap inside the mapped TLB window (same as
 # verify_omnifetch_Attention.py).
@@ -411,6 +412,10 @@ def gpt2lmheadmodel(
     apt_get_hx_manual_candidate_ids: str = "",
 ):
 
+    upstream_strict = os.environ.get("HEXAGON_BASELINE_MODE") == "upstream-strict"
+    if upstream_strict:
+        patch_full_model_dsp_heap()
+
     model_name = "openai-community/gpt2"
     # Default short prompt (seq≈7).  HexKL needs M multiple of 32, so use a
     # fixed 32-token prompt (no padding / attention-mask) when HexKL is on.
@@ -489,7 +494,7 @@ def gpt2lmheadmodel(
         raise ValueError(f"unknown prefetch baseline {prefetch_baseline!r}")
     if prefetch_baseline != "none" and (enable_omnifetch_vdae or cumulative):
         raise ValueError("external prefetch baselines cannot be combined with OmniFetch")
-    if enable_hexkl:
+    if enable_hexkl and not upstream_strict:
         raw = module.operation.get_asm(binary=False)
         mlir_text, n = rewrite_matmul_inputs_to_f16(raw)
         print(f"[HexKL] Rewrote {n} linalg.matmul inputs to f16 for HMX")
@@ -517,6 +522,34 @@ def gpt2lmheadmodel(
             enableOmniFetchAttentionHmx=enable_omnifetch_attention_hmx,
             enableHexKLPersistentVtcm=enable_hexkl_persistent_vtcm,
         ).__dict__
+    elif upstream_strict:
+        if enable_hexkl:
+            print("[UpstreamStrict] host-side GPT-2 matmul rewrites disabled")
+        # Match the strict native configuration used by the other complete
+        # model runners.  Separating the 50,257x768 embedding/lm-head constant
+        # is required to avoid a >15 GB monolithic LLVM optimization peak.
+        options = HexagonOptions().__dict__.copy()
+        options["enableVectorization"] = True
+        options["enableHexKL"] = bool(enable_hexkl)
+        options["enableVTCMTiling"] = False
+        options["enableConvertToHexagonmem"] = True
+        # GPT-2 is intentionally kept in FP32 for numerical stability.  The
+        # blanket conversion pass expands the complete 12-layer graph enough
+        # to drive host LLVM codegen above 14 GB RSS.  Keep the native HVX row
+        # in FP32; HexKL still enables conversion because HMX consumes FP16.
+        options["enableConversionToFp16"] = bool(enable_hexkl)
+        options["lowerConstantsInSeparateSharedObjects"] = True
+        if "enableBufferResultsToOutParams" in options:
+            options["enableBufferResultsToOutParams"] = True
+        print(
+            "[BackendConfig] profile=upstream-native "
+            f"vectorization={int(options['enableVectorization'])} "
+            f"vtcm_tiling={int(options['enableVTCMTiling'])} "
+            f"hexagonmem={int(options['enableConvertToHexagonmem'])} "
+            f"hexkl={int(options['enableHexKL'])} "
+            f"fp16_conversion={int(options['enableConversionToFp16'])} "
+            "split_constants=1 host_rewrites=0"
+        )
     else:
         options = HexagonOptions().__dict__
         options["enableVectorization"] = bool(enable_hvx_vector)
@@ -541,11 +574,12 @@ def gpt2lmheadmodel(
         options["enableOmniFetchAttentionHmx"] = enable_omnifetch_attention_hmx
         options["enableHexKLPersistentVtcm"] = enable_hexkl_persistent_vtcm
 
-    options["enablePrefetchKernelHX"] = prefetch_baseline == "prefetch-kernel-hx"
-    options["prefetchKernelHxDistance"] = int(prefetch_baseline_distance)
-    options["enableAPTGetHX"] = prefetch_baseline == "apt-get-hx"
-    options["aptGetHxDistance"] = int(prefetch_baseline_distance)
-    options["aptGetHxManualCandidateIds"] = apt_get_hx_manual_candidate_ids
+    if not upstream_strict:
+        options["enablePrefetchKernelHX"] = prefetch_baseline == "prefetch-kernel-hx"
+        options["prefetchKernelHxDistance"] = int(prefetch_baseline_distance)
+        options["enableAPTGetHX"] = prefetch_baseline == "apt-get-hx"
+        options["aptGetHxDistance"] = int(prefetch_baseline_distance)
+        options["aptGetHxManualCandidateIds"] = apt_get_hx_manual_candidate_ids
     print(
         f"[PrefetchBaseline] kind={prefetch_baseline} "
         f"distance={prefetch_baseline_distance} "
