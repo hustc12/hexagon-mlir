@@ -212,19 +212,27 @@ def make_profiled_return(iter_in):
             "idx",  # Index of return type
             "dtype",  # CPP data type of the return type
             "rank",  # Rank of the return type (None for scalars)
+            "shape",  # Static dim sizes (list; empty for scalars)
         ),
     )
     return profiled_return(*iter_in)
 
 
-def parse_return_types(return_type_list):
+def parse_return_types(return_type_list, return_shape_list=None):
 
     return_types = []
     for idx, r in enumerate(return_type_list):
         rank = None if r[0] == 0 else r[0]
         dtype = str(r[1])
+        shape = (
+            list(return_shape_list[idx])
+            if return_shape_list is not None and idx < len(return_shape_list)
+            else []
+        )
 
-        return_types.append(make_profiled_return([idx, get_mlir_to_ctype(dtype), rank]))
+        return_types.append(
+            make_profiled_return([idx, get_mlir_to_ctype(dtype), rank, shape])
+        )
 
     return return_types
 

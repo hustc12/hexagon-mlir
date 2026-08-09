@@ -40,6 +40,7 @@
 #include <dlfcn.h>
 #include <filesystem>
 #include <iterator>
+#include <string>
 
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h"
@@ -54,6 +55,13 @@
 void setLinalgToLLVMOptions(
     mlir::hexagon::LinalgToLLVMOptions &options,
     const std::unordered_map<std::string, std::string> &arch_kwargs) {
+
+  // DEBUG (disabled): print all options received from Python
+  // llvm::errs() << "\n[setLinalgToLLVMOptions] Received options from Python:\n";
+  // for (const auto &kv : arch_kwargs) {
+  //   llvm::errs() << "  " << kv.first << " = " << kv.second << "\n";
+  // }
+  // llvm::errs() << "\n";
 
   // Note: seems very counter-intuitive due to the fact that compare() returns 0
   // when the strings are actually equal, which is why we negate it to convert
@@ -108,6 +116,128 @@ void setLinalgToLLVMOptions(
       !arch_kwargs.at("enableSCFLoopUnroll").compare(TRUE);
   options.enableConversionToFp16 =
       !arch_kwargs.at("enableConversionToFp16").compare(TRUE);
+  {
+    auto it = arch_kwargs.find("enableBufferResultsToOutParams");
+    options.enableBufferResultsToOutParams =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  
+  // OmniFetch options (Plan-A: three independent components)
+  {
+    auto it = arch_kwargs.find("enablePrefetchKernelHX");
+    options.enablePrefetchKernelHX =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("prefetchKernelHxDistance");
+    if (it != arch_kwargs.end())
+      options.prefetchKernelHxDistance = std::stoi(it->second);
+  }
+  {
+    auto it = arch_kwargs.find("prefetchKernelHxMaxCommandBytes");
+    if (it != arch_kwargs.end())
+      options.prefetchKernelHxMaxCommandBytes = std::stoi(it->second);
+  }
+  {
+    auto it = arch_kwargs.find("enableAPTGetHX");
+    options.enableAPTGetHX =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("aptGetHxDistance");
+    if (it != arch_kwargs.end())
+      options.aptGetHxDistance = std::stoi(it->second);
+  }
+  {
+    auto it = arch_kwargs.find("aptGetHxManualCandidateIds");
+    if (it != arch_kwargs.end())
+      options.aptGetHxManualCandidateIds = it->second;
+  }
+  options.enablePrefetch =
+      !arch_kwargs.at("enablePrefetch").compare(TRUE);
+  options.enableOmniFetchLayoutAware =
+      !arch_kwargs.at("enableOmniFetchLayoutAware").compare(TRUE);
+  options.omniFetchLookahead = std::stoi(arch_kwargs.at("omniFetchLookahead"));
+  {
+    auto it = arch_kwargs.find("enableOmniFetchDmaToVtcm");
+    options.enableOmniFetchDmaToVtcm =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  options.enableOmniFetchVDAE =
+      !arch_kwargs.at("enableOmniFetchVDAE").compare(TRUE);
+  options.enableOmniFetchAdaptive =
+      !arch_kwargs.at("enableOmniFetchAdaptive").compare(TRUE);
+  {
+    auto it = arch_kwargs.find("enableOmniFetchWeightPrepack");
+    options.enableOmniFetchWeightPrepack =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableOmniFetchPersistentWhCache");
+    options.enableOmniFetchPersistentWhCache =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableOmniFetchTwoDimPipeline");
+    options.enableOmniFetchTwoDimPipeline =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableOmniFetchVtcmColoring");
+    options.enableOmniFetchVtcmColoring =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableOmniFetchKvCachePrefetch");
+    options.enableOmniFetchKvCachePrefetch =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableOmniFetchWeightStationary");
+    options.enableOmniFetchWeightStationary =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableOmniFetchActivationMulticast");
+    options.enableOmniFetchActivationMulticast =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableOmniFetchDequantReshape");
+    options.enableOmniFetchDequantReshape =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("omniFetchKvCachePageTokens");
+    if (it != arch_kwargs.end())
+      options.omniFetchKvCachePageTokens = std::stoi(it->second);
+  }
+  {
+    auto it = arch_kwargs.find("enableOmniFetchDualThreadDae");
+    options.enableOmniFetchDualThreadDae =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableOmniFetchInterLayerPrefetch");
+    options.enableOmniFetchInterLayerPrefetch =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableOmniFetchAttentionHmx");
+    options.enableOmniFetchAttentionHmx =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableOmniFetchMPadHmx");
+    options.enableOmniFetchMPadHmx =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableHexKLPersistentVtcm");
+    // Default false when key absent (matches Passes.td / HexagonOptions).
+    options.enableHexKLPersistentVtcm =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
 }
 
 namespace mlir {

@@ -50,6 +50,10 @@ add_mlir_library(Transforms
   EliminateRedundantUnpackPackPass.cpp
   DivToMulOptimizationPass.cpp
   SCFLoopUnrollPass.cpp
+  PrefetchInsertPass.cpp
+  PrefetchKernelHXPass.cpp
+  VDAEDecouplePass.cpp
+  LayoutOpsEliminationPass.cpp
 
   DEPENDS
   TransformsPassIncGen
@@ -63,8 +67,11 @@ add_mlir_library(Transforms
   MLIRIR
   MLIRMathDialect
   MLIRPass
+  MLIRSCFDialect
   MLIRTensorDialect
   MLIRTransforms
   MLIRMathTransforms
   MLIRSupport
+  HexagonCommon
+  OmniFetch
 )

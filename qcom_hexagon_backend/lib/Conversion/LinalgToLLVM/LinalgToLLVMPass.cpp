@@ -18,9 +18,11 @@
 #include "hexagon/Conversion/LinalgToLLVM/LinalgToLLVM.h"
 #include "hexagon/Conversion/LinalgToLLVM/Passes.h"
 #include "hexagon/Dialect/Crouton/IR/CroutonDialect.h"
+#include "hexagon/Conversion/OmniFetchToLLVM/OmniFetchToLLVM.h"
 #include "hexagon/Dialect/HexKL/IR/HexKLDialect.h"
 #include "hexagon/Dialect/HexagonMem/IR/HexagonMemDialect.h"
 #include "hexagon/Dialect/HexagonTPtr/IR/HexagonTPtrDialect.h"
+#include "hexagon/Dialect/OmniFetch/IR/OmniFetchDialect.h"
 #include "hexagon/Dialect/TTX/IR/TTXDialect.h"
 #include "hexagon/Transforms/Passes.h"
 
@@ -75,12 +77,29 @@ public:
                     vector::VectorDialect, memref::MemRefDialect,
                     LLVM::LLVMDialect, crouton::CroutonDialect, ttx::TTXDialect,
                     tptr::HexagonTPtrDialect, hexagonmem::HexagonMemDialect,
-                    hexkl::HexKLDialect, quant::QuantDialect>();
+                    hexkl::HexKLDialect, omni_fetch::OmniFetchDialect,
+                    quant::QuantDialect>();
   }
 
   void runOnOperation() override {
+    // DEBUG (disabled): pass entry banner and option dump
+    // llvm::errs() << "\n[LinalgToLLVM] ========== Pass Starting ==========\n";
+    // llvm::errs() << "[LinalgToLLVM] enableOmniFetchVDAE = " << enableOmniFetchVDAE << "\n";
+    // llvm::errs() << "[LinalgToLLVM] enableHexKL = " << enableHexKL << "\n";
+    // llvm::errs() << "[LinalgToLLVM] omniFetchLookahead = " << omniFetchLookahead << "\n";
+    // llvm::errs() << "[LinalgToLLVM] enableOmniFetchAdaptive = " << enableOmniFetchAdaptive << "\n";
+    // llvm::errs() << "[LinalgToLLVM] enableOmniFetchLayoutAware = " << enableOmniFetchLayoutAware << "\n";
+    // llvm::errs() << "[LinalgToLLVM] ==========================================\n\n";
+    
     auto moduleOp = getOperation();
     MLIRContext *context = moduleOp.getContext();
+
+    if (enablePrefetchKernelHX && enableAPTGetHX) {
+      moduleOp.emitError(
+          "Prefetch-Kernel-HX and APT-GET-HX are independent baselines and "
+          "cannot be enabled in the same compilation");
+      return signalPassFailure();
+    }
 
     setTargetTriple(moduleOp);
     setDataLayout(moduleOp);
@@ -144,6 +163,10 @@ public:
       passOption.LWPloopDepth = LWPloopDepth;
       return passOption;
     };
+    auto setOmniFetchVDAE = [&](auto passOption) {
+      passOption.enableAdaptive = enableOmniFetchAdaptive;
+      return passOption;
+    };
 
     auto setDeviceType = [&](auto passOption) {
       passOption.device_type = device_type;
@@ -201,7 +224,13 @@ public:
     pm.addNestedPass<func::FuncOp>(createLowerTTXPass());
     pm.addPass(createLowerLibdevicePass());
     pm.addNestedPass<func::FuncOp>(createLowerTPtrPass());
-    pm.addNestedPass<func::FuncOp>(createHexagonLowerTmTensorPass());
+    HexagonLowerTmTensorOptions lowerTmOpts{};
+    // Lower attention first, but infer item-7 K/V streams only after fusion.
+    // Attaching semantic attributes here forces fusion either to preserve
+    // every rewrite manually or to disable useful optimization globally.
+    lowerTmOpts.emitKvCacheMetadata = false;
+    pm.addNestedPass<func::FuncOp>(
+        createHexagonLowerTmTensorPass(lowerTmOpts));
     pm.addNestedPass<func::FuncOp>(createReduceContractionRankPass());
     pm.addPass(createLinalgFoldUnitExtentDimsPass());
     pm.addPass(createCanonicalizerPass());
@@ -262,8 +291,41 @@ public:
       pm.addNestedPass<func::FuncOp>(createPreprocessTiledConv2DPass());
     }
 
-    pm.addNestedPass<func::FuncOp>(createScheduleMatmulForHVXPass());
+    pm.addNestedPass<func::FuncOp>(createConvertLayoutPass());
+    // Recover semantic K/V identity while eager attention is still expressed
+    // as named batch_matmul + explicit transpose. ScheduleMatmulForHVX copies
+    // these attributes to its replacement generic op.
+    if (enableOmniFetchKvCachePrefetch) {
+      HexagonLowerTmTensorOptions kvMetadataOpts{};
+      kvMetadataOpts.emitKvCacheMetadata = true;
+      pm.addNestedPass<func::FuncOp>(
+          createHexagonLowerTmTensorPass(kvMetadataOpts));
+    }
+    ScheduleMatmulForHVXOptions scheduleOpts{};
+    // MatmulToHexKLPass (above) already converted every HexKL-eligible matmul
+    // into a hexkl-dialect op, which ScheduleMatmulForHVXPass never matches.
+    // The only linalg.matmul ops still present are the ones HexKL declined
+    // (non-32-aligned / attention-shaped) and are therefore HVX-bound, so the
+    // weight-stationary / activation-multicast reducers are safe to run even
+    // when enableHexKL is set.  Gating them on !enableHexKL previously stripped
+    // the best HVX reducers on zero-HMX-coverage models (e.g. DINOv2 with 0
+    // HexKL rewrites), leaving hexkl-items17 no faster than plain hvx-vector.
+    scheduleOpts.enableWeightStationary =
+        enableOmniFetchWeightStationary && enableVectorization;
+    scheduleOpts.enableActivationMulticast =
+        enableOmniFetchActivationMulticast && enableVectorization;
+    pm.addNestedPass<func::FuncOp>(
+        createScheduleMatmulForHVXPass(scheduleOpts));
     pm.addNestedPass<func::FuncOp>(createLinalgGeneralizePass());
+    // The generic Linalg generalizer rebuilds named contractions and does not
+    // preserve arbitrary attributes. Re-identify K/V immediately, while the
+    // unfused attention dataflow and indexing maps are still available.
+    if (enableOmniFetchKvCachePrefetch) {
+      HexagonLowerTmTensorOptions kvMetadataOpts{};
+      kvMetadataOpts.emitKvCacheMetadata = true;
+      pm.addNestedPass<func::FuncOp>(
+          createHexagonLowerTmTensorPass(kvMetadataOpts));
+    }
 
     if (returnValueOptimization)
       pm.addNestedPass<func::FuncOp>(createHexagonRVOPass());
@@ -285,7 +347,20 @@ public:
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
 
-    if (enableSlicing)
+    // Recover K/V identity from the final, fused contraction shapes.  This
+    // keeps the normal HVX fusion pipeline intact while providing stable
+    // metadata to the later bufferized prefetch insertion pass.
+    if (enableOmniFetchKvCachePrefetch) {
+      HexagonLowerTmTensorOptions kvMetadataOpts{};
+      kvMetadataOpts.emitKvCacheMetadata = true;
+      pm.addNestedPass<func::FuncOp>(
+          createHexagonLowerTmTensorPass(kvMetadataOpts));
+    }
+
+    // Full-size attention slicing currently rebuilds the contraction without
+    // copying semantic K/V attributes. Keep the marked boundary intact for
+    // item-7; ordinary HVX/HexKL configurations retain the existing slicing.
+    if (enableSlicing && !enableOmniFetchKvCachePrefetch)
       pm.addPass(createHexagonSlicingPass(
           setOpSlicingFactor(HexagonSlicingOptions{})));
 
@@ -300,6 +375,24 @@ public:
 
     pm.addNestedPass<func::FuncOp>(createLowerPackPass());
     pm.addPass(createCSEPass());
+
+    // Slicing may rebuild the contraction and drop semantic attributes.
+    // Recover them at the last tensor-Linalg boundary so Hexagon tiling can
+    // propagate K/V identity into the vector transfer reads.
+    if (enableOmniFetchKvCachePrefetch) {
+      HexagonLowerTmTensorOptions kvMetadataOpts{};
+      kvMetadataOpts.emitKvCacheMetadata = true;
+      pm.addNestedPass<func::FuncOp>(
+          createHexagonLowerTmTensorPass(kvMetadataOpts));
+    }
+
+    // Validate the dependencies of the independently selectable components.
+    if (enableOmniFetchLayoutAware && !enablePrefetch)
+      moduleOp->emitWarning(
+          "[OmniFetch] layout-aware mode requires prefetch; no-op");
+    if (enableOmniFetchVDAE && !enablePrefetch)
+      moduleOp->emitWarning(
+          "[OmniFetch] V-DAE requires prefetch operations; no-op");
 
     // VTCMTilingPass must run when scratch > 0 to create the VTCM allocs
     // that MemoryOffsetsPass will replace with views into the scratch buffer.
@@ -407,6 +500,28 @@ public:
 
       pm.addNestedPass<func::FuncOp>(createConvertZeroSizeMemrefPass());
       pm.addPass(createConvertBufferizationToMemRefPass());
+
+      // In a single-basic-block monolithic function (e.g. a full transformer
+      // unrolled by torch-mlir), ownership-based deallocation sinks every
+      // dealloc to the block terminator, keeping all buffers live at once and
+      // exhausting DSP VTLB mappings. Sink each dealloc to right after its
+      // buffer's last user to bound the peak concurrent working set.
+      pm.addNestedPass<func::FuncOp>(
+          bufferization::createOptimizeAllocationLivenessPass());
+
+      // The Hexagon backend miscompiles the by-value memref (sret) return for
+      // large monolithic single-block functions: the return epilogue writes
+      // only the descriptor's `allocated` field, leaving aligned/offset/sizes/
+      // strides = 0, so the host reads a NULL data pointer. Rewrite memref
+      // results into trailing out-param arguments (function returns void) to
+      // avoid that return path entirely. hoistStaticAllocs reuses the caller's
+      // buffer so no copy is introduced for static output shapes.
+      if (enableBufferResultsToOutParams) {
+        bufferization::BufferResultsToOutParamsPassOptions outParamsOpts;
+        outParamsOpts.hoistStaticAllocs = true;
+        pm.addPass(
+            bufferization::createBufferResultsToOutParamsPass(outParamsOpts));
+      }
     }
 
     if (enableConvertToHexagonmem)
@@ -425,10 +540,111 @@ public:
       if (hexKLMode == "macro") {
         // Lower to HexKL macro API
         pm.addNestedPass<func::FuncOp>(createLowerHexKLMatmulToMacroPass());
-      } else {
-        // Decompose hexkl.matmul to micro ops
-        pm.addNestedPass<func::FuncOp>(createDecomposeHexKLMatmulPass());
       }
+    }
+
+    // Decompose hexkl.matmul to micro ops first so PrefetchInsert can see
+    // MicroHMX DDR→VTCM copies (tile_row/tile_col) in innermost loops.
+    if (enableHexKL && hexKLMode != "macro") {
+      auto decomposeOptions = DecomposeHexKLMatmulOptions{};
+      decomposeOptions.enableWeightPrepack = enableOmniFetchWeightPrepack;
+      decomposeOptions.enablePersistentVtcm = enableHexKLPersistentVtcm;
+      decomposeOptions.enableVtcmLifetimeColoring =
+          enableOmniFetchVtcmColoring;
+      decomposeOptions.enableDmaToVtcm = enableOmniFetchDmaToVtcm;
+      pm.addNestedPass<func::FuncOp>(
+          createDecomposeHexKLMatmulPass(decomposeOptions));
+    }
+
+    // External baseline: infer safe future affine tile addresses and emit only
+    // destination-free L2 hints. Keep this outside the OmniFetch gates so a
+    // baseline run cannot inherit shadow buffers, DMA/VTCM staging, in-situ
+    // layout elimination, V-DAE, or adaptive OmniFetch policy.
+    if (enablePrefetchKernelHX || enableAPTGetHX) {
+      auto kernelOptions = PrefetchKernelHXOptions{};
+      kernelOptions.distance =
+          enableAPTGetHX ? aptGetHxDistance : prefetchKernelHxDistance;
+      kernelOptions.maxCommandBytes = prefetchKernelHxMaxCommandBytes;
+      kernelOptions.baselineKind =
+          enableAPTGetHX ? "apt-get-hx" : "prefetch-kernel-hx";
+      kernelOptions.requireManualSafe = enableAPTGetHX;
+      kernelOptions.manualCandidateIds =
+          enableAPTGetHX ? aptGetHxManualCandidateIds.getValue()
+                         : std::string();
+      pm.addNestedPass<func::FuncOp>(
+          hexagon::createPrefetchKernelHXPass(kernelOptions));
+    }
+
+    // ===== Omni-Fetch: Plan-A 3-component architecture =====
+    //
+    //  Component 1 – Prefetch Insertion   (gate: enablePrefetch)
+    //  Component 2 – In-Situ Reshape      (gate: enablePrefetch && enableOmniFetchLayoutAware)
+    //                Layout Ops Elim      (gate: enablePrefetch && enableOmniFetchLayoutAware)
+    //  Component 3 – V-DAE Decouple       (gate: enableOmniFetchVDAE)
+    //
+    // OmniFetchToLLVM lowers all omni_fetch dialect ops.  It must run whenever
+    // any component has emitted such ops (i.e. whenever enablePrefetch is true).
+
+    // --- Component 1: Prefetch Insertion ---
+    if (enablePrefetch) {
+      // Tiling, vectorization, and one-shot bufferization may replace the
+      // contraction operation after the earlier post-fusion annotation.
+      // Re-infer item-7 metadata on the final bufferized Linalg operations so
+      // the prefetch pass never depends on attributes surviving rewrites.
+      if (enableOmniFetchKvCachePrefetch) {
+        HexagonLowerTmTensorOptions kvMetadataOpts{};
+        kvMetadataOpts.emitKvCacheMetadata = true;
+        pm.addNestedPass<func::FuncOp>(
+            createHexagonLowerTmTensorPass(kvMetadataOpts));
+      }
+      auto prefetchOptions = PrefetchInsertOptions{};
+      prefetchOptions.lookahead = omniFetchLookahead;
+      // Layout-aware flag controls in-situ reshape during prefetch.
+      prefetchOptions.enableLayoutAware = enableOmniFetchLayoutAware;
+      prefetchOptions.enableDmaToVtcm = enableOmniFetchDmaToVtcm;
+      prefetchOptions.enableInterLayerPrefetch =
+          enableOmniFetchInterLayerPrefetch;
+      prefetchOptions.enablePersistentWhCache =
+          enableOmniFetchPersistentWhCache;
+      prefetchOptions.enableTwoDimPipeline =
+          enableOmniFetchTwoDimPipeline;
+      prefetchOptions.enableKvCachePrefetch =
+          enableOmniFetchKvCachePrefetch;
+      // An independently enabled item-7 has no other OmniFetch components.
+      // Keep that experiment causal by excluding ordinary loop prefetch;
+      // cumulative items 1-7 still execute the complete pipeline.
+      prefetchOptions.kvCacheOnly =
+          enableOmniFetchKvCachePrefetch && !enableOmniFetchVDAE &&
+          !enableOmniFetchPersistentWhCache &&
+          !enableOmniFetchTwoDimPipeline && !enableOmniFetchVtcmColoring;
+      prefetchOptions.enableDequantReshape =
+          enableOmniFetchDequantReshape;
+      prefetchOptions.kvCachePageTokens = omniFetchKvCachePageTokens;
+      pm.addNestedPass<func::FuncOp>(
+          hexagon::createPrefetchInsertPass(prefetchOptions));
+      pm.addPass(createCanonicalizerPass());
+      // PrefetchInsert may emit AS1 memref.alloc for large VTCM tiles after
+      // the earlier ConvertToHexagonmem pass; convert those now.
+      if (enableConvertToHexagonmem)
+        pm.addNestedPass<func::FuncOp>(createConvertToHexagonmemPass());
+    }
+
+    // --- Component 2: Layout Ops Elimination (In-Situ Reshape partner) ---
+    // Only meaningful when both Prefetch and Layout-Aware are active.
+    if (enablePrefetch && enableOmniFetchLayoutAware) {
+      pm.addNestedPass<func::FuncOp>(
+          hexagon::createLayoutOpsEliminationPass());
+    }
+
+    // --- Component 3: V-DAE (Virtual Decoupled Access-Execute) ---
+    // Adds wait/signal semaphore synchronization around prefetch operations.
+    // Requires Component 1 to have already inserted prefetch ops.
+    if (enableOmniFetchVDAE) {
+      pm.addNestedPass<func::FuncOp>(
+          hexagon::createOmniFetchVDAEInsertPass(
+              setOmniFetchVDAE(OmniFetchVDAEInsertOptions{})));
+      if (mlir::hexagon::isEnvTrue("DUMP_AFTER_VDAE"))
+        pm.addPass(createCanonicalizerPass());
     }
 
     // Lower linalg ops with library_call attribute set to custom fns.
@@ -471,6 +687,16 @@ public:
     pm.addPass(hexagonmem::createHexagonMemToLLVMPass(
         setDeviceType(hexagonmem::HexagonMemToLLVMOptions{})));
     pm.addPass(hexkl::createHexKLToLLVMPass());
+    // Lower omni_fetch dialect ops to extern-C runtime calls.
+    // Required whenever Prefetch (Component 1) has emitted prefetch_in_situ ops,
+    // or when weight prepack emitted prefetch_in_situ copies in DecomposeHexKL.
+    if (enablePrefetch || enableOmniFetchWeightPrepack ||
+        enablePrefetchKernelHX || enableAPTGetHX) {
+      mlir::omni_fetch::OmniFetchToLLVMOptions ofOpts{};
+      ofOpts.enableDualThreadDae =
+          enableOmniFetchDualThreadDae && enableOmniFetchVDAE;
+      pm.addPass(omni_fetch::createOmniFetchToLLVMPass(ofOpts));
+    }
 
     if (enableCollapseAddressSpace) {
       pm.addPass(createCollapseAddressSpacePass());
@@ -480,6 +706,11 @@ public:
     pm.addPass(createFinalizeMemRefToLLVMConversionPass());
     pm.addPass(createArithToLLVMConversionPass());
     pm.addPass(createConvertControlFlowToLLVMPass());
+    // Some late conversion patterns legitimately materialize ub.poison after
+    // the zero-substitution cleanup.  Convert any residual UB ops to their
+    // LLVM dialect equivalents so translateModuleToLLVMIR never sees an
+    // untranslated UB dialect operation.
+    pm.addPass(createUBToLLVMConversionPass());
 
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());

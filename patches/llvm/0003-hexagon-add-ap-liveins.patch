@@ -1,0 +1,85 @@
+From 2e10b62995915d35ba528872e70aacda7223bd18 Mon Sep 17 00:00:00 2001
+From: pkarveti <pkarveti@qti.qualcomm.com>
+Date: Fri, 27 Mar 2026 20:04:03 +0530
+Subject: [PATCH] [Hexagon] Add AP register to liveins when used for frame
+ index access (#188942)
+
+This is a follow-up to commit 3ef59d80c5ce ("[Hexagon] Fix
+use-before-def of AP register in prologue CSR spills").
+
+When the AP (alignment pointer) register is used as a base register for
+frame index elimination, add it to the basic block's livein set. This
+ensures liveness information is accurate for the machine verifier.
+The original commit fixed the use-before-def issue by moving PS_aligna
+after CSR spills. However, when the prologepilog pass is run in
+isolation (as in MIR tests) with expensive checks enabled, the verifier
+reports an error because AP is used in blocks where it's not marked as
+live-in.
+In the full compilation pipeline, the Hexagon Packetizer adds AP as an
+implicit operand to instruction bundles, which satisfies the verifier.
+However, when running only the prologepilog pass (before packetization),
+AP remains an explicit operand and must be in the livein set.
+This fix adds AP to liveins when AP is used as the base register,
+ensuring correct liveness tracking regardless of whether packetization
+has run.
+---
+ llvm/lib/Target/Hexagon/HexagonRegisterInfo.cpp        | 10 ++++++++++
+ .../test/CodeGen/Hexagon/aligna-prologue-expansion.mir | 10 ++++++++++
+ 2 files changed, 20 insertions(+)
+
+diff --git a/llvm/lib/Target/Hexagon/HexagonRegisterInfo.cpp b/llvm/lib/Target/Hexagon/HexagonRegisterInfo.cpp
+index a56dfc5f5839..254f1bb021f9 100644
+--- a/llvm/lib/Target/Hexagon/HexagonRegisterInfo.cpp
++++ b/llvm/lib/Target/Hexagon/HexagonRegisterInfo.cpp
+@@ -242,6 +242,16 @@ bool HexagonRegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
+   // Add the offset from the instruction.
+   int RealOffset = Offset + MI.getOperand(FIOp+1).getImm();
+ 
++  // If AP is used as the base register, add it to this block's liveins.
++  // AP is defined in the entry block and may be used in other blocks for
++  // stack access. Liveness must be accurate for the verifier.
++  auto &HMFI = *MF.getInfo<HexagonMachineFunctionInfo>();
++  Register AP = HMFI.getStackAlignBaseReg();
++  if (AP.isValid() && BP == AP) {
++    if (!MB.isLiveIn(AP))
++      MB.addLiveIn(AP);
++  }
++
+   unsigned Opc = MI.getOpcode();
+   switch (Opc) {
+     case Hexagon::PS_fia:
+diff --git a/llvm/test/CodeGen/Hexagon/aligna-prologue-expansion.mir b/llvm/test/CodeGen/Hexagon/aligna-prologue-expansion.mir
+index 903d5d2ec035..fefe6e40fbef 100644
+--- a/llvm/test/CodeGen/Hexagon/aligna-prologue-expansion.mir
++++ b/llvm/test/CodeGen/Hexagon/aligna-prologue-expansion.mir
+@@ -1,5 +1,6 @@
+ # RUN: llc -mtriple=hexagon -run-pass prologepilog %s -o - | FileCheck %s
+ # RUN: llc -mtriple=hexagon -run-pass prologepilog -spill-func-threshold=0 %s -o - | FileCheck --check-prefix=SPILL-FUNC %s
++# RUN: llc -mtriple=hexagon -run-pass prologepilog -verify-machineinstrs %s -o - | FileCheck %s
+ #
+ # Verify that PS_aligna is placed AFTER all CSR spills.
+ #
+@@ -14,11 +15,20 @@
+ # CHECK: PS_aligna
+ # CHECK-NOT: S2_storerd_io
+ #
++# Verify that AP (R16) is added to liveins of blocks that use it.
++# CHECK: bb.3:
++# CHECK-NEXT: successors:
++# CHECK-NEXT: liveins: {{.*}}$r16
++#
+ # SPILL-FUNC-LABEL: name: test_aligna_expansion
+ # SPILL-FUNC: S2_allocframe
+ # SPILL-FUNC: SAVE_REGISTERS_CALL_V4
+ # SPILL-FUNC: PS_aligna
+ # SPILL-FUNC-NOT: SAVE_REGISTERS_CALL_V4
++#
++# SPILL-FUNC: bb.3:
++# SPILL-FUNC-NEXT: successors:
++# SPILL-FUNC-NEXT: liveins: {{.*}}$r16
+ 
+ --- |
+   declare void @external_func()
+-- 
+2.34.1
+

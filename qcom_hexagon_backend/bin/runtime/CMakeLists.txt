@@ -80,6 +80,7 @@ set(HEXAGON_RUNTIME_SRC
     src/HexagonAPI.cpp
     src/HexagonCAPI.cpp
     src/HexKLAPI.cpp
+    src/OmniFetchRuntime.c
 )
 
 add_library(hexagon_runtime STATIC)

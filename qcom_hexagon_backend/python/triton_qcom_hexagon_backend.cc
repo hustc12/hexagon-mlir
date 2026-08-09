@@ -56,6 +56,18 @@ void init_triton_hexagon_translation(py::module &m) {
     return hexagon_backend::getReturnList(module_op, fName);
   });
 
+  m.def("get_return_shapes", [](mlir::ModuleOp &module_op, std::string fName) {
+    return hexagon_backend::getReturnShapes(module_op, fName);
+  });
+
+  m.def("get_arg_list", [](mlir::ModuleOp &module_op, std::string fName) {
+    return hexagon_backend::getArgList(module_op, fName);
+  });
+
+  m.def("get_arg_shapes", [](mlir::ModuleOp &module_op, std::string fName) {
+    return hexagon_backend::getArgShapes(module_op, fName);
+  });
+
   m.def("extract_func_name_from_mlir_module", [](mlir::ModuleOp &module_op) {
     return hexagon_backend::extractSingleFuncName(module_op);
   });

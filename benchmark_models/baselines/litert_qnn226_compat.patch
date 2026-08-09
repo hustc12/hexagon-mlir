@@ -1,0 +1,220 @@
+diff --git a/WORKSPACE b/WORKSPACE
+--- a/WORKSPACE
++++ b/WORKSPACE
+@@ -39,7 +39,7 @@ tensorflow_source_repo(
+     name = "org_tensorflow",
+     sha256 = "",
+-    strip_prefix = "tensorflow-master",
+-    urls = ["https://github.com/tensorflow/tensorflow/archive/master.tar.gz"],
++    strip_prefix = "tensorflow-f291a2e7b91ae11648d30cb2c1965c30f772af71",
++    urls = ["https://github.com/tensorflow/tensorflow/archive/f291a2e7b91ae11648d30cb2c1965c30f772af71.tar.gz"],
+ )
+
+ # Initialize the TensorFlow repository and all dependencies.
+@@ -121,15 +121,15 @@ pip_parse(
+ )
+
+ load(
+-    "@rules_ml_toolchain//cc/deps:cc_toolchain_deps.bzl",
++    "@rules_ml_toolchain//cc_toolchain/deps:cc_toolchain_deps.bzl",
+     "cc_toolchain_deps",
+ )
+
+ cc_toolchain_deps()
+
+-register_toolchains("@rules_ml_toolchain//cc:linux_x86_64_linux_x86_64")
++register_toolchains("@rules_ml_toolchain//cc_toolchain:lx64_lx64")
+
+-register_toolchains("@rules_ml_toolchain//cc:linux_x86_64_linux_x86_64_cuda")
++register_toolchains("@rules_ml_toolchain//cc_toolchain:lx64_lx64_cuda")
+
+ load(
+     "@rules_ml_toolchain//third_party/gpus/cuda/hermetic:cuda_json_init_repository.bzl",
+diff --git a/litert/vendors/qualcomm/compiler/graph_mapper.cc b/litert/vendors/qualcomm/compiler/graph_mapper.cc
+--- a/litert/vendors/qualcomm/compiler/graph_mapper.cc
++++ b/litert/vendors/qualcomm/compiler/graph_mapper.cc
+@@ -34,7 +34,7 @@ namespace litert::qnn {
+ namespace litert::qnn {
+
+ inline absl::Span<const QnnGraph_Config_t*> GetDefaultGraphConfigs() {
+-  static std::array<QnnHtpGraph_CustomConfig_t, 4> graph_custom_configs;
++  static std::array<QnnHtpGraph_CustomConfig_t, 5> graph_custom_configs;
+   // QNN suggest always enable relax precision.
+   graph_custom_configs[0] = QNN_HTP_GRAPH_CUSTOM_CONFIG_INIT;
+   graph_custom_configs[0].option = QNN_HTP_GRAPH_CONFIG_OPTION_PRECISION;
+@@ -55,8 +55,14 @@ inline absl::Span<const QnnGraph_Config_t*> GetDefaultGraphConfigs() {
+   graph_custom_configs[3].option =
+       QNN_HTP_GRAPH_CONFIG_OPTION_FOLD_RELU_ACTIVATION_INTO_CONV_OFF;
+   graph_custom_configs[3].foldReluActivationIntoConvOff = true;
++  // Keep the external baseline comparable with the single-thread
++  // hexagon-mlir and direct-QNN runs.
++  graph_custom_configs[4] = QNN_HTP_GRAPH_CUSTOM_CONFIG_INIT;
++  graph_custom_configs[4].option =
++      QNN_HTP_GRAPH_CONFIG_OPTION_NUM_HVX_THREADS;
++  graph_custom_configs[4].numHvxThreads = 1;
+
+-  static std::array<QnnGraph_Config_t, 4> graph_configs;
++  static std::array<QnnGraph_Config_t, 5> graph_configs;
+   graph_configs[0] = QNN_GRAPH_CONFIG_INIT;
+   graph_configs[0].option = QNN_GRAPH_CONFIG_OPTION_CUSTOM;
+   graph_configs[0].customConfig = &graph_custom_configs[0];
+@@ -73,15 +79,19 @@ inline absl::Span<const QnnGraph_Config_t*> GetDefaultGraphConfigs() {
+   graph_configs[3].option = QNN_GRAPH_CONFIG_OPTION_CUSTOM;
+   graph_configs[3].customConfig = &graph_custom_configs[3];
+
+-  static std::array<const QnnGraph_Config_t*, 5> result = {
++  graph_configs[4] = QNN_GRAPH_CONFIG_INIT;
++  graph_configs[4].option = QNN_GRAPH_CONFIG_OPTION_CUSTOM;
++  graph_configs[4].customConfig = &graph_custom_configs[4];
++
++  static std::array<const QnnGraph_Config_t*, 6> result = {
+       &graph_configs[0], &graph_configs[1], &graph_configs[2],
+-      &graph_configs[3], nullptr};
++      &graph_configs[3], &graph_configs[4], nullptr};
+
+   return absl::MakeSpan(result.data(), result.size());
+ }
+
+ inline absl::Span<const QnnGraph_Config_t*> GetLegacyGraphConfigs() {
+-  static std::array<QnnHtpGraph_CustomConfig_t, 3> graph_custom_configs;
++  static std::array<QnnHtpGraph_CustomConfig_t, 4> graph_custom_configs;
+   // Default use O3 for now.
+   graph_custom_configs[0] = QNN_HTP_GRAPH_CUSTOM_CONFIG_INIT;
+   graph_custom_configs[0].option = QNN_HTP_GRAPH_CONFIG_OPTION_OPTIMIZATION;
+@@ -99,8 +109,12 @@ inline absl::Span<const QnnGraph_Config_t*> GetLegacyGraphConfigs() {
+   graph_custom_configs[2].option =
+       QNN_HTP_GRAPH_CONFIG_OPTION_FOLD_RELU_ACTIVATION_INTO_CONV_OFF;
+   graph_custom_configs[2].foldReluActivationIntoConvOff = true;
++  graph_custom_configs[3] = QNN_HTP_GRAPH_CUSTOM_CONFIG_INIT;
++  graph_custom_configs[3].option =
++      QNN_HTP_GRAPH_CONFIG_OPTION_NUM_HVX_THREADS;
++  graph_custom_configs[3].numHvxThreads = 1;
+
+-  static std::array<QnnGraph_Config_t, 3> graph_configs;
++  static std::array<QnnGraph_Config_t, 4> graph_configs;
+   graph_configs[0] = QNN_GRAPH_CONFIG_INIT;
+   graph_configs[0].option = QNN_GRAPH_CONFIG_OPTION_CUSTOM;
+   graph_configs[0].customConfig = &graph_custom_configs[0];
+@@ -113,8 +127,13 @@ inline absl::Span<const QnnGraph_Config_t*> GetLegacyGraphConfigs() {
+   graph_configs[2].option = QNN_GRAPH_CONFIG_OPTION_CUSTOM;
+   graph_configs[2].customConfig = &graph_custom_configs[2];
+
+-  static std::array<const QnnGraph_Config_t*, 4> result = {
+-      &graph_configs[0], &graph_configs[1], &graph_configs[2], nullptr};
++  graph_configs[3] = QNN_GRAPH_CONFIG_INIT;
++  graph_configs[3].option = QNN_GRAPH_CONFIG_OPTION_CUSTOM;
++  graph_configs[3].customConfig = &graph_custom_configs[3];
++
++  static std::array<const QnnGraph_Config_t*, 5> result = {
++      &graph_configs[0], &graph_configs[1], &graph_configs[2],
++      &graph_configs[3], nullptr};
+
+   return absl::MakeSpan(result.data(), result.size());
+ }
+diff --git a/litert/vendors/qualcomm/context_binary_info.cc b/litert/vendors/qualcomm/context_binary_info.cc
+--- a/litert/vendors/qualcomm/context_binary_info.cc
++++ b/litert/vendors/qualcomm/context_binary_info.cc
+@@ -104,22 +104,6 @@ Expected<void> GraphInfo::Init(const QnnSystemContext_GraphInfo_t& graph_info) {
+         !status) {
+       return Unexpected(status.Error());
+     }
+-  } else if (graph_info.version == QNN_SYSTEM_CONTEXT_GRAPH_INFO_VERSION_3) {
+-    const auto& graph_info_ = graph_info.graphInfoV3;
+-    name_ = graph_info_.graphName;
+-    LITERT_LOG(LITERT_INFO, "Found qnn graph: %s", name_.c_str());
+-
+-    if (auto status = InsertQnnTensors(graph_info_.numGraphInputs,
+-                                       graph_info_.graphInputs, inputs_);
+-        !status) {
+-      return Unexpected(status.Error());
+-    }
+-    if (auto status = InsertQnnTensors(graph_info_.numGraphOutputs,
+-                                       graph_info_.graphOutputs, outputs_);
+-        !status) {
+-      return Unexpected(status.Error());
+-    }
+-
+   } else {
+     return Unexpected(kLiteRtStatusErrorRuntimeFailure,
+                       "Unsupported graph info version.");
+@@ -153,19 +137,6 @@ Expected<void> ContextBinaryInfo::Init(
+         !status) {
+       return Unexpected(status.Error());
+     }
+-  } else if (binary_info.version == QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_3) {
+-    const auto& context_binary_info = binary_info.contextBinaryInfoV3;
+-    if (auto status = InsertQnnTensors(context_binary_info.numContextTensors,
+-                                       context_binary_info.contextTensors,
+-                                       context_tensors_);
+-        !status) {
+-      return Unexpected(status.Error());
+-    }
+-    if (auto status = InsertQnnGraphInfos(context_binary_info.numGraphs,
+-                                          context_binary_info.graphs, &graphs_);
+-        !status) {
+-      return Unexpected(status.Error());
+-    }
+   } else {
+     return Unexpected(kLiteRtStatusErrorRuntimeFailure,
+                       "Unsupported context binary version.");
+diff --git a/litert/tools/run_model.cc b/litert/tools/run_model.cc
+--- a/litert/tools/run_model.cc
++++ b/litert/tools/run_model.cc
+@@ -14,5 +14,6 @@
+
+ #define INCLUDE_QUALCOMM_RUNTIME_FLAGS
++#define INCLUDE_QUALCOMM_COMPILE_FLAGS
+ #define INCLUDE_MEDIATEK_RUNTIME_FLAGS
+ #define INCLUDE_GOOGLE_TENSOR_RUNTIME_FLAGS
+
+@@ -355,6 +356,18 @@ Expected<void> RunModel() {
+                  << std::accumulate(timers.begin(), timers.end(), uint64_t{0}) /
+                         timers.size()
+                  << " microseconds";
++  if (timers.size() > 1) {
++    const uint64_t steady_sum =
++        std::accumulate(timers.begin() + 1, timers.end(), uint64_t{0});
++    std::vector<uint64_t> steady(timers.begin() + 1, timers.end());
++    std::sort(steady.begin(), steady.end());
++    ABSL_LOG(INFO) << "Steady-state runs excluding first took average "
++                   << steady_sum / steady.size() << " microseconds";
++    ABSL_LOG(INFO) << "Steady-state median " << steady[steady.size() / 2]
++                   << " microseconds";
++    ABSL_LOG(INFO) << "Steady-state p90 "
++                   << steady[(steady.size() * 9) / 10] << " microseconds";
++  }
+
+   // Print output tensor information and values if requested
+   if (absl::GetFlag(FLAGS_print_tensors)) {
+@@ -373,7 +386,30 @@ Expected<void> RunModel() {
+ }  // namespace litert
+
+ int main(int argc, char** argv) {
+-  absl::ParseCommandLine(argc, argv);
++  // Some Android static-link configurations garbage-collect Abseil's flag
++  // registration objects. Keep this runner usable through environment vars.
++  const char* graph = std::getenv("LITERT_GRAPH");
++  const char* accelerator = std::getenv("LITERT_ACCELERATOR");
++  const char* iterations = std::getenv("LITERT_ITERATIONS");
++  const char* dispatch_dir = std::getenv("LITERT_DISPATCH_DIR");
++  if (graph != nullptr) absl::SetFlag(&FLAGS_graph, std::string(graph));
++  if (accelerator != nullptr) {
++    absl::SetFlag(&FLAGS_accelerator, std::string(accelerator));
++  }
++  if (iterations != nullptr) {
++    absl::SetFlag(&FLAGS_iterations,
++                  static_cast<size_t>(std::strtoull(iterations, nullptr, 10)));
++  }
++  if (dispatch_dir != nullptr) {
++    absl::SetFlag(&FLAGS_dispatch_library_dir, std::string(dispatch_dir));
++  }
++  absl::SetFlag(&FLAGS_compare_numerical, true);
++  absl::SetFlag(&FLAGS_qualcomm_log_level, kLiteRtQualcommLogOff);
++  absl::SetFlag(&FLAGS_qualcomm_htp_performance_mode,
++                kLiteRtQualcommHtpPerformanceModeDefault);
++  const char* print_tensors = std::getenv("LITERT_PRINT_TENSORS");
++  absl::SetFlag(&FLAGS_print_tensors,
++                print_tensors == nullptr || std::strcmp(print_tensors, "0"));
+
+   auto res = litert::RunModel();
+   if (!res) {

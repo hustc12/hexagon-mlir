@@ -34,6 +34,9 @@
 #Triton build files
 .triton
 
+# Generated model compiler artifacts
+*.mlirbc
+
 # Python caches
 __pycache__/
 *.py[cod]

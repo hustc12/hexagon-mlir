@@ -1,0 +1,357 @@
+From 689ecf880373bb4e0f01ed5e004f19a466e869dc Mon Sep 17 00:00:00 2001
+From: Brian Cain <brian.cain@oss.qualcomm.com>
+Date: Fri, 20 Feb 2026 19:17:46 -0600
+Subject: [PATCH] [Hexagon] Handle subreg copies between DoubleRegs and IntRegs
+ (#181360)
+
+ISel can generate truncating COPYs from DoubleRegs to IntRegs when a
+64-bit result (e.g., C2_mask) is used in a 32-bit context. Several
+passes crashed on this pattern:
+
+BitTracker asserted WD >= WS for COPY instructions. Handle the WD < WS
+case by extracting the low WD bits from the source.
+
+HexagonInstrInfo::copyPhysReg had no case for IntRegs <- DoubleRegs or
+DoubleRegs <- IntRegs. Add both directions, respecting the subreg index
+on the operand (isub_lo/isub_hi) when present.
+
+HexagonTfrCleanup asserted that source and destination register sizes
+match. Replace with proper subreg resolution on both operands and a
+hasNoVRegs() guard since the pass runs post-RA.
+
+HexagonGenMux asserted no subregs on physical register operands.
+Preserve subreg information when building mux instructions and resolve
+subregs when fixing kill flags.
+
+Co-authored-by: Sergei Larin <slarin@codeaurora.org>
+
+---------
+
+Co-authored-by: Sergei Larin <slarin@codeaurora.org>
+---
+ llvm/lib/Target/Hexagon/BitTracker.cpp        | 14 ++++-
+ llvm/lib/Target/Hexagon/HexagonGenMux.cpp     | 42 +++++++++++---
+ llvm/lib/Target/Hexagon/HexagonInstrInfo.cpp  | 27 +++++++++
+ llvm/lib/Target/Hexagon/HexagonTfrCleanup.cpp | 56 ++++++++++++++++---
+ .../CodeGen/Hexagon/copy-phys-int-dbl.mir     | 32 +++++++++++
+ .../Hexagon/tfr-cleanup-subreg-copy.ll        | 20 +++++++
+ .../Hexagon/truncating-copy-double-to-int.ll  | 22 ++++++++
+ 7 files changed, 195 insertions(+), 18 deletions(-)
+ create mode 100644 llvm/test/CodeGen/Hexagon/copy-phys-int-dbl.mir
+ create mode 100644 llvm/test/CodeGen/Hexagon/tfr-cleanup-subreg-copy.ll
+ create mode 100644 llvm/test/CodeGen/Hexagon/truncating-copy-double-to-int.ll
+
+diff --git a/llvm/lib/Target/Hexagon/BitTracker.cpp b/llvm/lib/Target/Hexagon/BitTracker.cpp
+index 80eedabb0d03..193eadb8fb4d 100644
+--- a/llvm/lib/Target/Hexagon/BitTracker.cpp
++++ b/llvm/lib/Target/Hexagon/BitTracker.cpp
+@@ -736,16 +736,24 @@ bool BT::MachineEvaluator::evaluate(const MachineInstr &MI,
+     case TargetOpcode::COPY: {
+       // COPY can transfer a smaller register into a wider one.
+       // If that is the case, fill the remaining high bits with 0.
++      // COPY can also transfer a wider register into a narrower one,
++      // in which case the high bits are simply truncated.
+       RegisterRef RD = MI.getOperand(0);
+       RegisterRef RS = MI.getOperand(1);
+       assert(RD.Sub == 0);
+       uint16_t WD = getRegBitWidth(RD);
+       uint16_t WS = getRegBitWidth(RS);
+-      assert(WD >= WS);
+       RegisterCell Src = getCell(RS, Inputs);
+       RegisterCell Res(WD);
+-      Res.insert(Src, BitMask(0, WS-1));
+-      Res.fill(WS, WD, BitValue::Zero);
++      if (WD <= WS) {
++        // Truncating copy: extract low WD bits from source.
++        RegisterCell Trunc = Src.extract(BitMask(0, WD - 1));
++        Res.insert(Trunc, BitMask(0, WD - 1));
++      } else {
++        // Widening copy: insert all source bits, zero-fill high bits.
++        Res.insert(Src, BitMask(0, WS - 1));
++        Res.fill(WS, WD, BitValue::Zero);
++      }
+       putCell(RD, Res, Outputs);
+       break;
+     }
+diff --git a/llvm/lib/Target/Hexagon/HexagonGenMux.cpp b/llvm/lib/Target/Hexagon/HexagonGenMux.cpp
+index c6fffde84af5..1029095b27c5 100644
+--- a/llvm/lib/Target/Hexagon/HexagonGenMux.cpp
++++ b/llvm/lib/Target/Hexagon/HexagonGenMux.cpp
+@@ -324,18 +324,41 @@ bool HexagonGenMux::genMuxInBlock(MachineBasicBlock &B) {
+ 
+     MachineBasicBlock &B = *MX.At->getParent();
+     const DebugLoc &DL = B.findDebugLoc(MX.At);
+-    auto NewMux = BuildMI(B, MX.At, DL, HII->get(MxOpc), MX.DefR)
+-                      .addReg(MX.PredR)
+-                      .add(*MX.SrcT)
+-                      .add(*MX.SrcF);
+-    NewMux->clearKillInfo();
++    MachineInstrBuilder MIB = BuildMI(B, MX.At, DL, HII->get(MxOpc), MX.DefR);
++    MIB.addReg(MX.PredR);
++    auto AddSrc = [&](MachineOperand *SrcOp) {
++      if (!SrcOp->isReg()) {
++        MIB.add(*SrcOp);
++        return;
++      }
++      Register Reg = SrcOp->getReg();
++      unsigned Sub = SrcOp->getSubReg();
++      RegState RS = {};
++      if (SrcOp->isKill())
++        RS |= RegState::Kill;
++      if (SrcOp->isUndef())
++        RS |= RegState::Undef;
++      if (SrcOp->isDebug())
++        RS |= RegState::Debug;
++      if (SrcOp->isInternalRead())
++        RS |= RegState::InternalRead;
++      if (Sub) {
++        // Preserve subregister information instead of resolving to physical
++        // reg.
++        MIB.addReg(Reg, RS, Sub);
++      } else {
++        MIB.addReg(Reg, RS);
++      }
++    };
++    AddSrc(MX.SrcT);
++    AddSrc(MX.SrcF);
++    MIB.getInstr()->clearKillInfo();
+     B.remove(MX.Def1);
+     B.remove(MX.Def2);
+     Changed = true;
+   }
+ 
+   // Fix up kill flags.
+-
+   LiveRegUnits LPR(*HRI);
+   LPR.addLiveOuts(B);
+   for (MachineInstr &I : llvm::reverse(B)) {
+@@ -348,7 +371,12 @@ bool HexagonGenMux::genMuxInBlock(MachineBasicBlock &B) {
+     for (MachineOperand &Op : I.operands()) {
+       if (!Op.isReg() || !Op.isUse())
+         continue;
+-      assert(Op.getSubReg() == 0 && "Should have physical registers only");
++      if (Op.getSubReg() != 0) {
++        Register R = HRI->getSubReg(Op.getReg(), Op.getSubReg());
++        bool Live = !LPR.available(R);
++        Op.setIsKill(!Live);
++        continue;
++      }
+       bool Live = !LPR.available(Op.getReg());
+       Op.setIsKill(!Live);
+     }
+diff --git a/llvm/lib/Target/Hexagon/HexagonInstrInfo.cpp b/llvm/lib/Target/Hexagon/HexagonInstrInfo.cpp
+index 9f511efdfb46..2984858439e5 100644
+--- a/llvm/lib/Target/Hexagon/HexagonInstrInfo.cpp
++++ b/llvm/lib/Target/Hexagon/HexagonInstrInfo.cpp
+@@ -882,6 +882,33 @@ void HexagonInstrInfo::copyPhysReg(MachineBasicBlock &MBB,
+       .addReg(SrcReg).addReg(SrcReg, KillFlag);
+     return;
+   }
++  if (Hexagon::IntRegsRegClass.contains(DestReg) &&
++      Hexagon::DoubleRegsRegClass.contains(SrcReg)) {
++    // Truncating copy: extract the specified or low sub-register.
++    unsigned SrcSub = Hexagon::isub_lo;
++    if (I->isCopy()) {
++      unsigned OpSub = I->getOperand(1).getSubReg();
++      if (OpSub == Hexagon::isub_lo || OpSub == Hexagon::isub_hi)
++        SrcSub = OpSub;
++    }
++    Register SrcHalf = HRI.getSubReg(SrcReg, SrcSub);
++    BuildMI(MBB, I, DL, get(Hexagon::A2_tfr), DestReg)
++        .addReg(SrcHalf, KillFlag);
++    return;
++  }
++  if (Hexagon::DoubleRegsRegClass.contains(DestReg) &&
++      Hexagon::IntRegsRegClass.contains(SrcReg)) {
++    // Inserting copy: write into the specified or low sub-register half.
++    unsigned DstSub = Hexagon::isub_lo;
++    if (I->isCopy()) {
++      unsigned OpSub = I->getOperand(0).getSubReg();
++      if (OpSub == Hexagon::isub_lo || OpSub == Hexagon::isub_hi)
++        DstSub = OpSub;
++    }
++    Register DstHalf = HRI.getSubReg(DestReg, DstSub);
++    BuildMI(MBB, I, DL, get(Hexagon::A2_tfr), DstHalf).addReg(SrcReg, KillFlag);
++    return;
++  }
+   if (Hexagon::CtrRegsRegClass.contains(DestReg) &&
+       Hexagon::IntRegsRegClass.contains(SrcReg)) {
+     BuildMI(MBB, I, DL, get(Hexagon::A2_tfrrcr), DestReg)
+diff --git a/llvm/lib/Target/Hexagon/HexagonTfrCleanup.cpp b/llvm/lib/Target/Hexagon/HexagonTfrCleanup.cpp
+index 5a85f348fdaf..528a679dda5c 100644
+--- a/llvm/lib/Target/Hexagon/HexagonTfrCleanup.cpp
++++ b/llvm/lib/Target/Hexagon/HexagonTfrCleanup.cpp
+@@ -181,23 +181,59 @@ bool HexagonTfrCleanup::rewriteIfImm(MachineInstr *MI, ImmediateMap &IMap,
+     return false;
+   }
+ 
+-  unsigned DstR = MI->getOperand(0).getReg();
+-  unsigned SrcR = MI->getOperand(1).getReg();
+-  bool Tmp, Is32;
+-  if (!isIntReg(DstR, Is32) || !isIntReg(SrcR, Tmp))
++  Register DstBase = MI->getOperand(0).getReg();
++  Register SrcBase = MI->getOperand(1).getReg();
++  unsigned DstSub = MI->getOperand(0).getSubReg();
++  unsigned SrcSub = MI->getOperand(1).getSubReg();
++
++  if (!DstBase.isPhysical() || !SrcBase.isPhysical())
+     return false;
+-  assert(Tmp == Is32 && "Register size mismatch");
++
++  // Determine effective registers and widths, accounting for subregs.
++  bool Is32Dst = false, Is32Src = false;
++  unsigned DstR = DstBase;
++  unsigned SrcR = SrcBase;
++
++  if (DstSub) {
++    if (DstSub != Hexagon::isub_lo && DstSub != Hexagon::isub_hi)
++      return false;
++    Is32Dst = true;
++    DstR = TRI->getSubReg(DstBase, DstSub);
++  } else {
++    if (!isIntReg(DstBase, Is32Dst))
++      return false;
++  }
++
++  if (SrcSub) {
++    if (SrcSub != Hexagon::isub_lo && SrcSub != Hexagon::isub_hi)
++      return false;
++    if (!Hexagon::DoubleRegsRegClass.contains(SrcBase))
++      return false;
++    Is32Src = true;
++    SrcR = TRI->getSubReg(SrcBase, SrcSub);
++  } else {
++    if (!isIntReg(SrcBase, Is32Src))
++      return false;
++  }
++
++  // After resolving subregs, check that effective register sizes match.
++  bool Is32DstResolved = Hexagon::IntRegsRegClass.contains(DstR);
++  bool Is32SrcResolved = Hexagon::IntRegsRegClass.contains(SrcR);
++  if (Is32DstResolved != Is32SrcResolved)
++    return false;
++
+   uint64_t Val;
+   bool Found = getReg(SrcR, Val, IMap);
+   if (!Found)
+     return false;
+ 
+   MachineBasicBlock &B = *MI->getParent();
++  MachineFunction *F = B.getParent();
+   DebugLoc DL = MI->getDebugLoc();
+-  int64_t SVal = Is32 ? int32_t(Val) : Val;
+-  auto &HST = B.getParent()->getSubtarget<HexagonSubtarget>();
++  int64_t SVal = Is32Dst ? int32_t(Val) : Val;
++  auto &HST = F->getSubtarget<HexagonSubtarget>();
+   MachineInstr *NewMI;
+-  if (Is32)
++  if (Is32Dst)
+     NewMI = BuildMI(B, MI, DL, HII->get(A2_tfrsi), DstR).addImm(SVal);
+   else if (isInt<8>(SVal))
+     NewMI = BuildMI(B, MI, DL, HII->get(A2_tfrpi), DstR).addImm(SVal);
+@@ -259,6 +295,10 @@ bool HexagonTfrCleanup::eraseIfRedundant(MachineInstr *MI,
+ }
+ 
+ bool HexagonTfrCleanup::runOnMachineFunction(MachineFunction &MF) {
++  // This pass is intended to run post-RA. If virtual registers are present,
++  // skip safely to avoid touching non-physical registers.
++  if (!MF.getProperties().hasNoVRegs())
++    return false;
+   bool Changed = false;
+   // Map: 32-bit register -> immediate value.
+   // 64-bit registers are stored through their subregisters.
+diff --git a/llvm/test/CodeGen/Hexagon/copy-phys-int-dbl.mir b/llvm/test/CodeGen/Hexagon/copy-phys-int-dbl.mir
+new file mode 100644
+index 000000000000..5b4212b31515
+--- /dev/null
++++ b/llvm/test/CodeGen/Hexagon/copy-phys-int-dbl.mir
+@@ -0,0 +1,32 @@
++# RUN: llc -mtriple=hexagon -verify-machineinstrs %s -o - | FileCheck %s
++# RUN: llc -mtriple=hexagon -stop-after=tfr-cleanup -verify-machineinstrs %s -o - | FileCheck %s --check-prefix=MIR
++
++# Ensure copyPhysReg handles int<-dbl subregister and dbl subregister<-int,
++# and does not crash on scalar copies.
++
++# CHECK-LABEL: phys_copy:
++# CHECK:       combine(
++
++# MIR-LABEL: name: phys_copy
++# MIR: $r5 = {{A2_tfr|COPY}} $r4
++# MIR: $r6 = COPY {{.*}}$r4
++# MIR: $r1 = COPY {{.*}}$r6
++
++---
++name: phys_copy
++tracksRegLiveness: true
++body: |
++  bb.0:
++    liveins: $r4, $r0
++    ; Int<-Int
++    $r5 = COPY $r4
++    ; Use $r5 so it isn't DCE'd
++    $r0 = COPY $r5
++    ; Dbl subreg<-Int (use virtual double)
++    %0:doubleregs = REG_SEQUENCE $r4, %subreg.isub_lo, $r4, %subreg.isub_hi
++    ; Int<-Dbl subreg
++    $r6 = COPY %0.isub_lo
++    ; Use $r6 to keep it live
++    $r1 = COPY $r6
++    PS_jmpret $r31, implicit-def dead $pc, implicit $r0, implicit $r1
++...
+diff --git a/llvm/test/CodeGen/Hexagon/tfr-cleanup-subreg-copy.ll b/llvm/test/CodeGen/Hexagon/tfr-cleanup-subreg-copy.ll
+new file mode 100644
+index 000000000000..08a93c0e7668
+--- /dev/null
++++ b/llvm/test/CodeGen/Hexagon/tfr-cleanup-subreg-copy.ll
+@@ -0,0 +1,20 @@
++; RUN: llc -stop-after=tfr-cleanup -verify-machineinstrs -mtriple=hexagon %s -o - | FileCheck %s
++
++; Create a copy from a 64-bit argument (double regs) to 32-bit intregs via subreg.
++; The tfr-cleanup pass should not assert on size mismatch and should leave the
++; copy intact when sizes differ.
++
++; CHECK: name:            test
++; CHECK: liveins: $d0, $r2
++; CHECK: renamable $r0 = A2_add killed renamable $r0, renamable $r1
++; CHECK: S2_storeri_io
++
++define dso_local void @test(i64 %x, ptr nocapture %out) local_unnamed_addr {
++entry:
++  %lo = trunc i64 %x to i32
++  %hi.shift = lshr i64 %x, 32
++  %hi = trunc i64 %hi.shift to i32
++  %sum = add i32 %lo, %hi
++  store i32 %sum, ptr %out, align 4
++  ret void
++}
+diff --git a/llvm/test/CodeGen/Hexagon/truncating-copy-double-to-int.ll b/llvm/test/CodeGen/Hexagon/truncating-copy-double-to-int.ll
+new file mode 100644
+index 000000000000..762163890a6b
+--- /dev/null
++++ b/llvm/test/CodeGen/Hexagon/truncating-copy-double-to-int.ll
+@@ -0,0 +1,22 @@
++; RUN: llc -mtriple=hexagon -mcpu=hexagonv73 -mattr=+hvxv73,+hvx-length128b \
++; RUN:   < %s | FileCheck %s
++;
++; Check that a truncating copy from DoubleRegs to IntRegs (generated by
++; C2_mask + truncation) does not crash in BitTracker, HexagonTfrCleanup,
++; or ExpandPostRAPseudo.
++
++target datalayout = "e-m:e-p:32:32:32-a:0-n16:32-i64:64:64-i32:32:32-i16:16:16-i1:8:8-f32:32:32-f64:64:64-v32:32:32-v64:64:64-v512:512:512-v1024:1024:1024-v2048:2048:2048"
++target triple = "hexagon-unknown-linux-musl"
++
++; CHECK-LABEL: endgame:
++; CHECK:       mask(p0)
++; CHECK:       popcount
++; CHECK:       jumpr r31
++define i16 @endgame(<8 x i32> %0) {
++entry:
++  %1 = icmp eq <8 x i32> %0, zeroinitializer
++  %rdx.op150 = shufflevector <8 x i1> zeroinitializer, <8 x i1> %1, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
++  %2 = bitcast <16 x i1> %rdx.op150 to i16
++  %3 = call i16 @llvm.ctpop.i16(i16 %2)
++  ret i16 %3
++}
+-- 
+2.34.1
+

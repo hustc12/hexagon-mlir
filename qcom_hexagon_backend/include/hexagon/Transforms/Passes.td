@@ -162,6 +162,11 @@ def HexagonDoubleBufferGenericS2 :
 def HexagonLowerTmTensor :
     InterfacePass<"hexagon-lower-tm-tensor", "mlir::FunctionOpInterface"> {
   let summary = "Lower lower tm-tensor ops to mlir dialect ops";
+  let options = [
+    Option<"emitKvCacheMetadata", "emit-kv-cache-metadata", "bool",
+           /*default=*/"false",
+           "Attach semantic K/V stream metadata for item-7 page-aware prefetch.">,
+  ];
   let constructor = "hexagon::createHexagonLowerTmTensorPass()";
 }
 
@@ -266,6 +271,29 @@ def DecomposeHexKLMatmul :
     - HMX matrix multiplication with accumulation
     - Result readback and format conversion (f16 to f32)
   }];
+
+  let options = [
+    Option<"enableWeightPrepack", "enable-weight-prepack", "bool",
+           /*default=*/"false",
+           "Hoist the RM->WH weight transform out of the M-loop into a one-time "
+           "prologue that pre-packs every (kt,colTile) tile into a DDR WH buffer; "
+           "the inner K-loop then only copies the pre-packed tile into VTCM.">,
+    Option<"enablePersistentVtcm", "enable-persistent-vtcm", "bool",
+           /*default=*/"false",
+           "Allocate one function-scoped VTCM slab sized to the max HexKL matmul "
+           "requirement and reuse it across matmuls (avoids per-matmul "
+           "alloc/dealloc churn). Falls back to per-matmul alloc when any K is "
+           "dynamic. Default off: measured gain is noise-level and OmniFetch "
+           "interaction needs more validation.">,
+    Option<"enableVtcmLifetimeColoring", "enable-vtcm-lifetime-coloring", "bool",
+           /*default=*/"false",
+           "Assign VTCM offsets from phase lifetimes so scratch, weight, "
+           "activation, flat-output, and accumulator regions reuse storage.">,
+    Option<"enableDmaToVtcm", "enable-dma-to-vtcm", "bool",
+           /*default=*/"false",
+           "Reserve a non-aliasing VTCM staging tile for OmniFetch DMA.">,
+  ];
+
   let constructor = "hexagon::createDecomposeHexKLMatmulPass()";
 }
 
@@ -425,6 +453,16 @@ def FoldResourceTranspose : Pass<"fold-resource-transpose"> {
 def ScheduleMatmulForHVX :
     InterfacePass<"schedule-matmul-for-hvx", "mlir::FunctionOpInterface"> {
   let summary = "Pass to schedule matmul and its variants";
+  let options = [
+    Option<"enableWeightStationary", "enable-weight-stationary", "bool",
+           /*default=*/"false",
+           "Enable OmniFetch N1 transpose-equivalent weight-stationary "
+           "scheduling for profitable static FP16 projection matmuls">,
+    Option<"enableActivationMulticast", "enable-activation-multicast", "bool",
+           /*default=*/"false",
+           "Enable OmniFetch N2 fusion of equal-shape sibling FP16 "
+           "projections so one activation load feeds both consumers">,
+  ];
 
   let constructor =
        "hexagon::createScheduleMatmulForHVXPass()";
@@ -628,6 +666,224 @@ def SCFLoopUnroll : Pass<"scf-loop-unroll", "func::FuncOp"> {
            "Factor by which to unroll loops">
   ];
   let constructor = "hexagon::createSCFLoopUnrollPass()";
+}
+
+//===----------------------------------------------------------------------===//
+// Omni-Fetch: Prefetch insertion pass
+//===----------------------------------------------------------------------===//
+
+def PrefetchInsert :
+    InterfacePass<"prefetch-insert", "mlir::FunctionOpInterface"> {
+  let summary = "Insert prefetch operations to preload data from DDR to VTCM";
+  let description = [{
+    This pass inserts prefetch operations to preload data from DDR to VTCM,
+    reducing memory latency during compute operations.
+
+    The pass:
+    1. Detects loops with HMX compute operations
+    2. Identifies DDR inputs that need to be prefetched
+    3. Allocates VTCM shadow buffers
+    4. Inserts prefetch operations in prologue and loop body
+
+    The prefetch can optionally perform in-situ layout transformation during
+    the DDR→VTCM transfer (controlled by enableLayoutAware option).
+
+    This pass is independent of V-DAE. It only inserts prefetch operations
+    without any synchronization mechanism. The V-DAE pass (if enabled) will
+    later add semaphore synchronization around these prefetch operations.
+
+    Options
+    -------
+    - `lookahead`       : static prefetch look-ahead distance (default: 2)
+    - `enable-layout-aware` : enable in-situ layout transformation during prefetch
+  }];
+
+  let options = [
+    Option<"lookahead", "lookahead", "int",
+           /*default=*/"2",
+           "Static prefetch look-ahead distance (number of iterations).">,
+    Option<"enableLayoutAware", "enable-layout-aware", "bool",
+           /*default=*/"true",
+           "Enable in-situ layout-aware prefetch; when false, emit linear prefetches only.">,
+    Option<"enableDmaToVtcm", "enable-dma-to-vtcm", "bool",
+           /*default=*/"false",
+           "DMA-pack weight tiles into VTCM staging (flatOff); when false, pack into DDR stage.">,
+    Option<"enableInterLayerPrefetch", "enable-inter-layer-prefetch", "bool",
+           /*default=*/"false",
+           "Also consider outer (non-innermost) HexKL loops for weight prefetch.">,
+    Option<"enablePersistentWhCache", "enable-persistent-wh-cache", "bool",
+           /*default=*/"false",
+           "Use the generation-safe runtime WH cache for profitable weight sites.">,
+    Option<"enableTwoDimPipeline", "enable-two-dim-pipeline", "bool",
+           /*default=*/"false",
+           "Pipeline DDR load for tile t+1, WH transform for tile t+1, and "
+           "HMX compute for tile t without redundantly transforming current tiles.">,
+    Option<"enableKvCachePrefetch", "enable-kv-cache-prefetch", "bool",
+           /*default=*/"false",
+           "Insert page-coalesced L2 hints for compiler-identified attention K/V streams.">,
+    Option<"kvCacheOnly", "kv-cache-only", "bool",
+           /*default=*/"false",
+           "Insert only attention K/V prefetch and skip generic/HexKL loop prefetch.">,
+    Option<"enableDequantReshape", "enable-dequant-reshape", "bool",
+           /*default=*/"false",
+           "Use the W8 compressed cache and fuse dequantization with WH production.">,
+    Option<"kvCachePageTokens", "kv-cache-page-tokens", "int",
+           /*default=*/"32",
+           "Logical K/V cache page size in sequence tokens used for accounting and coalescing.">,
+  ];
+
+  let constructor = "hexagon::createPrefetchInsertPass()";
+
+  let dependentDialects = [
+    "mlir::omni_fetch::OmniFetchDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::memref::MemRefDialect",
+  ];
+}
+
+//===----------------------------------------------------------------------===//
+// External prefetching baseline: Prefetch-Kernel-HX
+//===----------------------------------------------------------------------===//
+
+def PrefetchKernelHX :
+    InterfacePass<"prefetch-kernel-hx", "mlir::FunctionOpInterface"> {
+  let summary = "Insert fixed-distance Hexagon L2 hints from safe static address kernels";
+  let description = [{
+    Implements the load-free affine/2-D subset of the software prefetcher from
+    "Classifying Memory Access Patterns for Prefetching".  This is an external
+    baseline, not an OmniFetch cumulative component: it reconstructs a future
+    memref.subview from the loop induction value and emits only
+    omni_fetch.l2_hint.  It never allocates shadow storage, rewires consumers,
+    performs layout conversion, uses DMA/VTCM, or enables V-DAE.
+  }];
+  let options = [
+    Option<"distance", "distance", "int",
+           /*default=*/"1",
+           "Fixed future-iteration distance for the address-only baseline.">,
+    Option<"maxCommandBytes", "max-command-bytes", "int",
+           /*default=*/"8191",
+           "Maximum logical bytes admitted for one V73 L2FETCH request.">,
+    Option<"enableTwoDimensional", "enable-two-dimensional", "bool",
+           /*default=*/"true",
+           "Admit statically strided two-dimensional tile kernels.">,
+    Option<"baselineKind", "baseline-kind", "std::string",
+           /*default=*/"\"prefetch-kernel-hx\"",
+           "Ledger/hint identity: prefetch-kernel-hx or apt-get-hx.">,
+    Option<"requireManualSafe", "require-manual-safe", "bool",
+           /*default=*/"false",
+           "Require prefetch_baseline.manual_safe=true on the view or loop.">,
+    Option<"manualCandidateIds", "manual-candidate-ids", "std::string",
+           /*default=*/"\"\"",
+           "Comma-separated stable candidate IDs admitted by APT-GET-HX.">,
+  ];
+  let constructor = "hexagon::createPrefetchKernelHXPass()";
+  let dependentDialects = [
+    "mlir::omni_fetch::OmniFetchDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::memref::MemRefDialect",
+  ];
+}
+
+//===----------------------------------------------------------------------===//
+// Omni-Fetch: V-DAE (Virtual Decoupled Access-Execute) pass
+//===----------------------------------------------------------------------===//
+
+def OmniFetchVDAEInsert :
+    InterfacePass<"omni-fetch-vdae-insert", "mlir::FunctionOpInterface"> {
+  let summary = "Decouple Memory Access and Compute Execution using semaphores";
+  let description = [{
+    Implements the Virtual Decoupled Access-Execute (V-DAE) transformation
+    for DNN inference loops on Hexagon NPU.
+
+    **Problem**: VLIW (Very Long Instruction Word) architecture means a single
+    memory load stall can halt an entire instruction packet, freezing all
+    compute units in the same cycle.
+
+    **Solution**: Decouple Memory Access and Compute Execution using hardware
+    semaphores, allowing Access Thread and Execute Thread to run in parallel.
+
+    The pass walks loops that already have `omni_fetch.prefetch_in_situ`
+    operations (inserted by PrefetchInsertPass) and adds synchronization:
+
+      Prologue:
+        %sem = omni_fetch.create_sem
+        <existing prefetch operations>
+        omni_fetch.signal %sem
+
+      Loop body (per iteration i):
+        omni_fetch.wait %sem           -- ensure tile [i] is ready
+        <existing HMX compute on tile[i]>
+        <existing prefetch for tile[i + lookahead]>
+        omni_fetch.signal %sem         -- notify tile [i + lookahead] ready
+        %dist = omni_fetch.adaptive_control(%dist)  -- optional
+
+    **Key design**: This pass does NOT insert prefetch operations. It only
+    adds synchronization around existing prefetch operations. The prefetch
+    operations should be inserted by PrefetchInsertPass first.
+
+    Options
+    -------
+    - `enable-adaptive` : emit adaptive_control ops to tune at runtime
+  }];
+
+  let options = [
+    Option<"enableAdaptive", "enable-adaptive", "bool",
+           /*default=*/"true",
+           "Emit omni_fetch.adaptive_control ops for runtime PMU tuning.">,
+  ];
+
+  let constructor = "hexagon::createOmniFetchVDAEInsertPass()";
+
+  let dependentDialects = [
+    "mlir::omni_fetch::OmniFetchDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::arith::ArithDialect",
+  ];
+}
+
+//===----------------------------------------------------------------------===//
+// Omni-Fetch: Layout Ops Elimination pass
+//===----------------------------------------------------------------------===//
+
+def LayoutOpsElimination :
+    InterfacePass<"layout-ops-elimination", "mlir::FunctionOpInterface"> {
+  let summary = "Eliminate redundant layout ops when in-situ reshape is enabled";
+  let description = [{
+    This pass eliminates redundant layout transformation operations
+    (transpose, permute, slice) when in-situ reshape is enabled during
+    prefetch operations.
+
+    The pass works by:
+    1. Finding all `omni_fetch.prefetch_in_situ` operations with
+       `layout_transform != None`
+    2. Walking backward from each prefetch's `src` operand to find
+       layout ops that match the in-situ transform
+    3. Marking those ops as redundant (since the hardware performs
+       the transform during prefetch)
+    4. Deleting the marked ops
+
+    This pass should run AFTER any pass that inserts prefetch_in_situ
+    operations (e.g., V-DAE pass) and BEFORE lowering to LLVM.
+
+    Key insight: This pass detects `prefetch_in_situ` operations, NOT
+    loops. It works at function level and is independent of V-DAE.
+    Even without V-DAE, if other passes insert prefetch_in_situ operations,
+    this pass will eliminate redundant layout ops.
+
+    Design: This pass is bound to in-situ reshape. Whenever layout-aware
+    prefetch is enabled, this pass should run to eliminate redundant ops.
+  }];
+
+  let constructor = "hexagon::createLayoutOpsEliminationPass()";
+
+  let dependentDialects = [
+    "mlir::omni_fetch::OmniFetchDialect",
+    "mlir::linalg::LinalgDialect",
+    "mlir::memref::MemRefDialect",
+    "mlir::tensor::TensorDialect",
+  ];
 }
 
 #endif

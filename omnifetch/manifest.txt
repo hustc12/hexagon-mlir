@@ -1,0 +1,46 @@
+# Upstream integration surface. Custom new files are discovered by the
+# `omni_fetch`/`OmniFetch` path or symbol; this list records existing Qualcomm
+# files intentionally touched by the overlay and therefore reviewed on rebase.
+.gitignore
+qcom_hexagon_backend/CMakeLists.txt
+qcom_hexagon_backend/backend/hexagon_launcher_base.py
+qcom_hexagon_backend/backend/hexagon_options.py
+qcom_hexagon_backend/backend/torch_mlir_hexagon_launcher.py
+qcom_hexagon_backend/backend/triton_hexagon_launcher.py
+qcom_hexagon_backend/backend/utils.py
+qcom_hexagon_backend/bin/CMakeLists.txt
+qcom_hexagon_backend/bin/LinkRuntimeModules.cpp
+qcom_hexagon_backend/bin/linalg-hexagon-opt.cpp
+qcom_hexagon_backend/bin/runtime/CMakeLists.txt
+qcom_hexagon_backend/bin/runtime/multithreading/HexagonThreadPool.cpp
+qcom_hexagon_backend/bin/runtime/src/VTCMPool.cpp
+qcom_hexagon_backend/bin/runtime/test/CMakeLists.txt
+qcom_hexagon_backend/include/hexagon/Conversion/CMakeLists.txt
+qcom_hexagon_backend/include/hexagon/Conversion/LinalgToLLVM/Passes.td
+qcom_hexagon_backend/include/hexagon/Dialect/CMakeLists.txt
+qcom_hexagon_backend/include/hexagon/Transforms/Passes.td
+qcom_hexagon_backend/include/hexagon/Transforms/Transforms.h
+qcom_hexagon_backend/lib/Conversion/CMakeLists.txt
+qcom_hexagon_backend/lib/Conversion/AffineToLLVM/AffineToLLVMPass.cpp
+qcom_hexagon_backend/lib/Conversion/LinalgToLLVM/CMakeLists.txt
+qcom_hexagon_backend/lib/Conversion/LinalgToLLVM/FusionPass.cpp
+qcom_hexagon_backend/lib/Conversion/LinalgToLLVM/LinalgToLLVMPass.cpp
+qcom_hexagon_backend/lib/Conversion/LinalgToLLVM/TilingPass.cpp
+qcom_hexagon_backend/lib/Conversion/LinalgToLLVM/VectorizationPass.cpp
+qcom_hexagon_backend/lib/Dialect/CMakeLists.txt
+qcom_hexagon_backend/lib/Target/Linalg_MLLVMIR/CMakeLists.txt
+qcom_hexagon_backend/lib/Target/Linalg_MLLVMIR/MLLVMIRTranslation.cpp
+qcom_hexagon_backend/lib/Transforms/CMakeLists.txt
+qcom_hexagon_backend/lib/Transforms/DecomposeHexKLMatmulPass.cpp
+qcom_hexagon_backend/lib/Transforms/GeneralizePass.cpp
+qcom_hexagon_backend/lib/Transforms/LowerTmTensor.cpp
+qcom_hexagon_backend/lib/Transforms/ScheduleMatmulForHVXPass.cpp
+qcom_hexagon_backend/lib/Transforms/Transforms.cpp
+qcom_hexagon_backend/lib/Transforms/UseHexagonRoutines.cpp
+qcom_hexagon_backend/python/triton_qcom_hexagon_backend.cc
+qcom_hexagon_backend/python/triton_qcom_hexagon_backend_api.cc
+qcom_hexagon_backend/python/triton_qcom_hexagon_backend_api.h
+qcom_hexagon_backend/test/Conversion/TmTensorToLinalg/SDPA.mlir
+scripts/build_triton.sh
+scripts/set_local_env.sh
+test/utils/dsp/include/hexagon_benchmark.h

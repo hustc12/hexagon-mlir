@@ -8,4 +8,9 @@ add_mlir_translation_library(TritonLinalgLLVM
         MLIRIR
         MLIRSupport
         MLIRTargetLLVMIRExport
+        LinalgToLLVM
+        DMAToLLVM
+        HexKLToLLVM
+        HexagonMemToLLVM
+        HexagonCommon
         )

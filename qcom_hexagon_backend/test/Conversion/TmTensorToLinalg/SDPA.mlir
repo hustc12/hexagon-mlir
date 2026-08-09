@@ -1,4 +1,5 @@
-// RUN: linalg-hexagon-opt -pass-pipeline='builtin.module(func.func(hexagon-lower-tm-tensor))' %s | FileCheck %s
+// RUN: linalg-hexagon-opt -pass-pipeline='builtin.module(func.func(hexagon-lower-tm-tensor{emit-kv-cache-metadata=true}))' %s | FileCheck %s
+// RUN: linalg-hexagon-opt -pass-pipeline='builtin.module(func.func(hexagon-lower-tm-tensor))' %s | FileCheck %s --check-prefix=NO-KV
 
 func.func @SDPA(%arg0: tensor<2x4x8xf32>, %arg1: tensor<2x4x8xf32>,
                             %arg2: tensor<2x4x8xf32>, %arg3: tensor<2x4x4xf32>) -> tensor<2x4x8xf32> {
@@ -21,7 +22,9 @@ func.func @SDPA(%arg0: tensor<2x4x8xf32>, %arg1: tensor<2x4x8xf32>,
 // CHECK: %[[TRANSPOSED:.*]] = linalg.transpose ins(%arg1 : tensor<2x4x8xf32>) outs(%{{.*}} : tensor<2x8x4xf32>)
 // CHECK-SAME:                  permutation = [0, 2, 1]
 
-// CHECK: %[[QK:.*]] = linalg.batch_matmul ins(%arg0, %[[TRANSPOSED]] : tensor<2x4x8xf32>, tensor<2x8x4xf32>)
+// CHECK: %[[QK:.*]] = linalg.batch_matmul
+// CHECK-SAME:                 {omni_fetch.kv_cache_operand = 1 : i64, omni_fetch.kv_cache_role = "key"}
+// CHECK-SAME:                 ins(%arg0, %[[TRANSPOSED]] : tensor<2x4x8xf32>, tensor<2x8x4xf32>)
 // CHECK-SAME:                 outs(%{{.*}} : tensor<2x4x4xf32>) -> tensor<2x4x4xf32>
 
 // CHECK: %[[SCALED:.*]] = linalg.generic {{.*}} ins(%[[QK]] : tensor<2x4x4xf32>) outs(%{{.*}} : tensor<2x4x4xf32>) {
@@ -54,6 +57,12 @@ func.func @SDPA(%arg0: tensor<2x4x8xf32>, %arg1: tensor<2x4x8xf32>,
 // CHECK-NEXT: ^bb0(%[[IN:.*]]: f32, %[[IN_3:.*]]: f32, %[[OUT:.*]]: f32):
 // CHECK-NEXT: %{{.*}} = arith.divf %[[IN]], %[[IN_3]] : f32
 
-// CHECK: %[[RESULT:.*]] = linalg.batch_matmul ins(%[[SOFTMAX]], %arg2 : tensor<2x4x4xf32>, tensor<2x4x8xf32>)
+// CHECK: %[[RESULT:.*]] = linalg.batch_matmul
+// CHECK-SAME:                {omni_fetch.kv_cache_operand = 1 : i64, omni_fetch.kv_cache_role = "value"}
+// CHECK-SAME:                ins(%[[SOFTMAX]], %arg2 : tensor<2x4x4xf32>, tensor<2x4x8xf32>)
 // CHECK-SAME:                outs(%{{.*}} : tensor<2x4x8xf32>) -> tensor<2x4x8xf32>
 // CHECK: return %[[RESULT]] : tensor<2x4x8xf32>
+
+// NO-KV-LABEL: func.func @SDPA
+// NO-KV-NOT: omni_fetch.kv_cache_role
+// NO-KV: return

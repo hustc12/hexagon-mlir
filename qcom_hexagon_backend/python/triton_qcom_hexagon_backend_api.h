@@ -22,6 +22,12 @@
 namespace hexagon_backend {
 std::vector<std::pair<int, mlir::Type>> getReturnList(mlir::ModuleOp module_op,
                                                       const std::string &fName);
+std::vector<std::vector<int64_t>>
+getReturnShapes(mlir::ModuleOp module_op, const std::string &fName);
+std::vector<std::pair<int, mlir::Type>> getArgList(mlir::ModuleOp module_op,
+                                                   const std::string &fName);
+std::vector<std::vector<int64_t>>
+getArgShapes(mlir::ModuleOp module_op, const std::string &fName);
 std::string extractSingleFuncName(mlir::ModuleOp &module_op);
 void loadDialects(mlir::MLIRContext &context);
 

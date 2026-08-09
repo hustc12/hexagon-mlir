@@ -1,0 +1,350 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ac153df137..7185493e50 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -18,6 +18,10 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+ # Options
+ option(TRITON_BUILD_PYTHON_MODULE "Build Python Triton bindings" OFF)
+ option(TRITON_BUILD_PROTON "Build the Triton Proton profiler" ON)
++option(TRITON_BUILD_EXAMPLES "Build Triton examples and example plugins" ON)
++option(TRITON_BUILD_TOOLS "Build standalone Triton command-line tools" ON)
++option(TRITON_BUILD_TESTS "Build Triton core test support" ON)
++option(TRITON_BUILD_TEST_ANALYSIS "Build the TritonTestAnalysis helper library" OFF)
+ option(TRITON_BUILD_UT "Build C++ Triton Unit Tests" ON)
+ option(TRITON_BUILD_WITH_CCACHE "Build with ccache (if available)" ON)
+ option(LLVM_BUILD_SHARED_LIBS
+@@ -185,12 +189,25 @@ if(TRITON_BUILD_PYTHON_MODULE)
+     add_subdirectory(third_party/${CODEGEN_BACKEND})
+   endforeach()
+ 
++  # Several backend-neutral TritonGPU transforms still include NVIDIA/NVWS
++  # dialect declarations.  When the NVIDIA codegen plugin is disabled, build
++  # only those dialects and their TableGen outputs; do not build NVPTX
++  # conversion, the CUDA plugin, or require LLVM's NVPTX target.
++  if(NOT "nvidia" IN_LIST TRITON_CODEGEN_BACKENDS)
++    message(STATUS "Building NVIDIA dialect definitions without NVIDIA codegen")
++    include_directories(${CMAKE_CURRENT_SOURCE_DIR}/third_party/nvidia/include)
++    include_directories(${CMAKE_CURRENT_BINARY_DIR}/third_party/nvidia/include)
++    add_subdirectory(third_party/nvidia/include/Dialect)
++    add_subdirectory(third_party/nvidia/lib/Dialect)
++    add_subdirectory(third_party/nvidia/hopper/include)
++    add_subdirectory(third_party/nvidia/hopper/lib)
++  endif()
++
+   if (TRITON_BUILD_PROTON)
+     add_subdirectory(third_party/proton)
++    list(APPEND TRITON_PLUGIN_NAMES "proton")
++    add_subdirectory(third_party/proton/Dialect)
+   endif()
+-  # We always build proton dialect
+-  list(APPEND TRITON_PLUGIN_NAMES "proton")
+-  add_subdirectory(third_party/proton/Dialect)
+ 
+   if (DEFINED TRITON_PLUGIN_DIRS)
+     foreach(PLUGIN_DIR ${TRITON_PLUGIN_DIRS})
+@@ -241,15 +258,18 @@ if(TRITON_BUILD_PYTHON_MODULE)
+ 
+     # LLVM
+     LLVMPasses
+-    LLVMNVPTXCodeGen
+-    # LLVMNVPTXAsmPrinter
+-    LLVMAMDGPUCodeGen
+-    LLVMAMDGPUAsmParser
+-
++    LLVMMIRParser
++    LLVMPlugins
+     Python3::Module
+     pybind11::headers
+ 
+   )
++  if("nvidia" IN_LIST TRITON_CODEGEN_BACKENDS)
++    list(APPEND TRITON_LIBRARIES LLVMNVPTXCodeGen)
++  endif()
++  if("amd" IN_LIST TRITON_CODEGEN_BACKENDS)
++    list(APPEND TRITON_LIBRARIES LLVMAMDGPUCodeGen LLVMAMDGPUAsmParser)
++  endif()
+   if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64" OR # Linux arm64
+      CMAKE_SYSTEM_PROCESSOR MATCHES "arm64" OR # macOS arm64
+      CMAKE_OSX_ARCHITECTURES MATCHES "arm64")  # also macOS arm64
+@@ -282,14 +302,20 @@ if(TRITON_BUILD_PYTHON_MODULE)
+ 
+   set(TRITON_BACKENDS_TUPLE "(${TRITON_BACKENDS_TUPLE})")
+   add_compile_definitions(TRITON_BACKENDS_TUPLE=${TRITON_BACKENDS_TUPLE})
+-  add_library(triton SHARED ${PYTHON_SRC_PATH}/main.cc
++  set(TRITON_PYTHON_BINDING_SOURCES
++                  ${PYTHON_SRC_PATH}/main.cc
+                   ${PYTHON_SRC_PATH}/ir.cc
+-                  ${PYTHON_SRC_PATH}/gluon_ir.cc
+                   ${PYTHON_SRC_PATH}/linear_layout.cc
+                   ${PYTHON_SRC_PATH}/passes.cc
+                   ${PYTHON_SRC_PATH}/interpreter.cc
+                   ${PYTHON_SRC_PATH}/llvm.cc
+                   ${PYTHON_SRC_PATH}/specialize.cc)
++  if("amd" IN_LIST TRITON_CODEGEN_BACKENDS)
++    list(APPEND TRITON_PYTHON_BINDING_SOURCES ${PYTHON_SRC_PATH}/gluon_ir.cc)
++  else()
++    add_compile_definitions(TRITON_DISABLE_GLUON_IR)
++  endif()
++  add_library(triton SHARED ${TRITON_PYTHON_BINDING_SOURCES})
+ 
+   # Link triton with its dependencies
+   target_link_libraries(triton PRIVATE ${TRITON_LIBRARIES})
+@@ -336,15 +362,35 @@ if(NOT TRITON_BUILD_PYTHON_MODULE)
+   foreach(CODEGEN_BACKEND ${TRITON_CODEGEN_BACKENDS})
+     add_subdirectory(third_party/${CODEGEN_BACKEND})
+   endforeach()
+-  add_subdirectory(third_party/proton/Dialect)
++  if(NOT "nvidia" IN_LIST TRITON_CODEGEN_BACKENDS)
++    include_directories(${CMAKE_CURRENT_SOURCE_DIR}/third_party/nvidia/include)
++    include_directories(${CMAKE_CURRENT_BINARY_DIR}/third_party/nvidia/include)
++    add_subdirectory(third_party/nvidia/include/Dialect)
++    add_subdirectory(third_party/nvidia/lib/Dialect)
++    add_subdirectory(third_party/nvidia/hopper/include)
++    add_subdirectory(third_party/nvidia/hopper/lib)
++  endif()
++  if(TRITON_BUILD_PROTON)
++    add_subdirectory(third_party/proton/Dialect)
++  endif()
+ endif()
+ 
+ find_package(Threads REQUIRED)
+ 
+ add_subdirectory(third_party/f2reduce)
+-add_subdirectory(bin)
+-add_subdirectory(test)
+-add_subdirectory(examples)
++if(TRITON_BUILD_TOOLS)
++  add_subdirectory(bin)
++endif()
++if(TRITON_BUILD_TESTS)
++  add_subdirectory(test)
++elseif(TRITON_BUILD_TEST_ANALYSIS)
++  # Some external backends still link this helper from their command-line
++  # tools even when the upstream Triton test suite itself is not built.
++  add_subdirectory(test/lib/Analysis)
++endif()
++if(TRITON_BUILD_EXAMPLES)
++  add_subdirectory(examples)
++endif()
+ 
+ if(TRITON_BUILD_UT)
+   add_subdirectory(unittest)
+diff --git a/lib/Conversion/CMakeLists.txt b/lib/Conversion/CMakeLists.txt
+index 84aba4f3d2..bde5ad761e 100644
+--- a/lib/Conversion/CMakeLists.txt
++++ b/lib/Conversion/CMakeLists.txt
+@@ -1,3 +1,5 @@
+ add_subdirectory(TritonToTritonGPU)
+ add_subdirectory(TritonGPUToLLVM)
+-add_subdirectory(TritonInstrumentToLLVM)
++if("nvidia" IN_LIST TRITON_CODEGEN_BACKENDS OR "amd" IN_LIST TRITON_CODEGEN_BACKENDS)
++  add_subdirectory(TritonInstrumentToLLVM)
++endif()
+diff --git a/lib/Conversion/TritonToTritonGPU/CMakeLists.txt b/lib/Conversion/TritonToTritonGPU/CMakeLists.txt
+index ed879c7dd5..9a76397582 100644
+--- a/lib/Conversion/TritonToTritonGPU/CMakeLists.txt
++++ b/lib/Conversion/TritonToTritonGPU/CMakeLists.txt
+@@ -1,3 +1,14 @@
++set(TRITON_TO_TRITON_GPU_LINK_LIBS
++    MLIRIR
++    MLIRPass
++    MLIRTransforms
++    TritonIR
++    TritonGPUIR
++)
++if(TRITON_BUILD_PROTON)
++  list(APPEND TRITON_TO_TRITON_GPU_LINK_LIBS ProtonIR)
++endif()
++
+ add_triton_library(TritonToTritonGPU
+     RelayoutTritonGPU.cpp
+     TritonGPUConversion.cpp
+@@ -7,10 +18,5 @@ add_triton_library(TritonToTritonGPU
+     TritonConversionPassIncGen
+ 
+     LINK_LIBS PUBLIC
+-    MLIRIR
+-    MLIRPass
+-    MLIRTransforms
+-    TritonIR
+-    ProtonIR
+-    TritonGPUIR
++    ${TRITON_TO_TRITON_GPU_LINK_LIBS}
+ )
+diff --git a/python/src/ir.cc b/python/src/ir.cc
+index 64fd2d9d2d..87f7e7135a 100644
+--- a/python/src/ir.cc
++++ b/python/src/ir.cc
+@@ -361,7 +361,12 @@ void init_triton_ir(py::module &&m) {
+            [](MLIRContext &self, bool v) { self.printOpOnDiagnostic(v); })
+       .def("printStackTraceOnDiagnostic", [](MLIRContext &self, bool v) {
+         self.printStackTraceOnDiagnostic(v);
+-      });
++      })
++      // Kept for external backends written against the pre-3.6 binding. The
++      // context is already constructed with threading disabled above, so this
++      // compatibility method is idempotent.
++      .def("disable_multithreading",
++           [](MLIRContext &self) { self.disableMultithreading(); });
+ 
+   py::class_<SourceMgrDiagnosticHandler>(m, "source_mgr_diag",
+                                          py::module_local())
+diff --git a/python/src/main.cc b/python/src/main.cc
+index 40b19f77ea..ed9a8698c1 100644
+--- a/python/src/main.cc
++++ b/python/src/main.cc
+@@ -42,7 +42,9 @@ void init_triton_llvm(pybind11::module &&m);
+ void init_triton_interpreter(pybind11::module &&m);
+ void init_triton_passes(pybind11::module &&m);
+ void init_triton_stacktrace_hook(pybind11::module &m);
++#ifndef TRITON_DISABLE_GLUON_IR
+ void init_gluon_ir(pybind11::module &&m);
++#endif
+ void init_linear_layout(pybind11::module &&m);
+ void init_native_specialize(pybind11::module &m);
+ FOR_EACH_P(DECLARE_BACKEND, TRITON_BACKENDS_TUPLE)
+@@ -57,6 +59,8 @@ PYBIND11_MODULE(libtriton, m) {
+   init_triton_interpreter(m.def_submodule("interpreter"));
+   init_triton_llvm(m.def_submodule("llvm"));
+   init_linear_layout(m.def_submodule("linear_layout"));
++#ifndef TRITON_DISABLE_GLUON_IR
+   init_gluon_ir(m.def_submodule("gluon_ir"));
++#endif
+   FOR_EACH_P(INIT_BACKEND, TRITON_BACKENDS_TUPLE)
+ }
+diff --git a/python/triton/language/extra/libdevice.py b/python/triton/language/extra/libdevice.py
+index e29810bfba..39acd2d6d3 100644
+--- a/python/triton/language/extra/libdevice.py
++++ b/python/triton/language/extra/libdevice.py
+@@ -788,3 +788,7 @@ def logb(arg0):
+ 
+ def isfinited(arg0):
+     ...
++
++
++def sigmoid(arg0):
++    ...
+diff --git a/setup.py b/setup.py
+index fccb4ef17e..649dfcc59a 100644
+--- a/setup.py
++++ b/setup.py
+@@ -513,7 +513,11 @@ class CMakeBuild(build_ext):
+ 
+         # environment variables we will pass through to cmake
+         passthrough_args = [
++            "TRITON_BUILD_EXAMPLES",
+             "TRITON_BUILD_PROTON",
++            "TRITON_BUILD_TESTS",
++            "TRITON_BUILD_TEST_ANALYSIS",
++            "TRITON_BUILD_TOOLS",
+             "TRITON_BUILD_WITH_CCACHE",
+             "TRITON_PARALLEL_LINK_JOBS",
+         ]
+@@ -539,6 +543,8 @@ class CMakeBuild(build_ext):
+ 
+ 
+ def download_and_copy_dependencies():
++    if "nvidia" not in get_in_tree_backends():
++        return
+     nvidia_version_path = os.path.join(get_base_dir(), "cmake", "nvidia-toolchain-version.json")
+     with open(nvidia_version_path, "r") as nvidia_version_file:
+         # parse this json file to get the version of the nvidia toolchain
+@@ -624,7 +630,18 @@ def download_and_copy_dependencies():
+     )
+ 
+ 
+-backends = [*BackendInstaller.copy(["nvidia", "amd"]), *BackendInstaller.copy_externals()]
++def get_in_tree_backends():
++    """Return the requested built-in backends.
++
++    Upstream Triton builds NVIDIA and AMD by default. Downstream CPU/NPU-only
++    plugins can set TRITON_IN_TREE_BACKENDS to an empty string and avoid
++    requiring LLVM's NVPTX and AMDGPU targets.
++    """
++    requested = os.getenv("TRITON_IN_TREE_BACKENDS", "nvidia;amd")
++    return [name for name in requested.replace(",", ";").split(";") if name]
++
++
++backends = [*BackendInstaller.copy(get_in_tree_backends()), *BackendInstaller.copy_externals()]
+ 
+ 
+ def get_package_dirs():
+diff --git a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/TargetInfo.cpp b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/TargetInfo.cpp
+index 7e9500523d..d72991ac50 100644
+--- a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/TargetInfo.cpp
++++ b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/TargetInfo.cpp
+@@ -7,6 +7,8 @@
+ #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
+ #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+ #include "llvm/Support/MathExtras.h"
++#include <optional>
++#include <utility> // std::declval
+ 
+ using namespace mlir;
+ 
+@@ -85,8 +87,13 @@ LLVM::LLVMFuncOp getAssertfailDeclaration(RewriterBase &rewriter) {
+ 
+ namespace mlir::triton::NVIDIA {
+ 
++// TODO(compat): Upstream MLIR renamed NVVM enum type from 'ReduxKind' to 'ReductionKind'.
++// Qualcomm Downstream LLVM has not picked up this change; however,
++// NVVM::ReduxOp exists in both upstream and downstream LLVM, so we can use decltype to avoid compatibility issues.
++// Remove this typedef once Qualcomm Downstream LLVM has been updated to match upstream LLVM.
++using ReduxKindTy = decltype(std::declval<NVVM::ReduxOp>().getKind());
+ // Check if the reduction can use a redux op and return the kind.
+-static std::optional<NVVM::ReductionKind>
++static std::optional<ReduxKindTy>
+ matchReduxKind(triton::ReduceOp op, int computeCapability,
+                bool &useNanQualifier) {
+   useNanQualifier = false;
+@@ -99,29 +106,29 @@ matchReduxKind(triton::ReduceOp op, int computeCapability,
+     if (isa<arith::MinimumFOp, arith::MaximumFOp>(reduceOp))
+       useNanQualifier = true;
+     if (isa<arith::MaxNumFOp, arith::MaximumFOp>(reduceOp))
+-      return NVVM::ReductionKind::FMAX;
++      return ReduxKindTy::FMAX;
+     if (isa<arith::MinNumFOp, arith::MinimumFOp>(reduceOp))
+-      return NVVM::ReductionKind::FMIN;
++      return ReduxKindTy::FMIN;
+   }
+   auto intType = dyn_cast<IntegerType>(reduceOp->getResultTypes()[0]);
+   if (!intType || intType.getWidth() > 32)
+     return std::nullopt;
+   if (isa<arith::AddIOp>(reduceOp))
+-    return NVVM::ReductionKind::ADD;
++    return ReduxKindTy::ADD;
+   if (isa<arith::AndIOp>(reduceOp))
+-    return NVVM::ReductionKind::AND;
++    return ReduxKindTy::AND;
+   if (isa<arith::OrIOp>(reduceOp))
+-    return NVVM::ReductionKind::OR;
++    return ReduxKindTy::OR;
+   if (isa<arith::XOrIOp>(reduceOp))
+-    return NVVM::ReductionKind::XOR;
++    return ReduxKindTy::XOR;
+   if (isa<arith::MinSIOp>(reduceOp))
+-    return NVVM::ReductionKind::MIN;
++    return ReduxKindTy::MIN;
+   if (isa<arith::MinUIOp>(reduceOp))
+-    return NVVM::ReductionKind::UMIN;
++    return ReduxKindTy::UMIN;
+   if (isa<arith::MaxSIOp>(reduceOp))
+-    return NVVM::ReductionKind::MAX;
++    return ReduxKindTy::MAX;
+   if (isa<arith::MaxUIOp>(reduceOp))
+-    return NVVM::ReductionKind::UMAX;
++    return ReduxKindTy::UMAX;
+   return std::nullopt;
+ }
+ 
+@@ -491,8 +498,8 @@ bool TargetInfo::warpReduce(RewriterBase &rewriter, Location loc,
+       unsigned bitwidth = acc[i].getType().getIntOrFloatBitWidth();
+       if (acc[i].getType().isInteger()) {
+         if (bitwidth < 32) {
+-          if (*kind == NVVM::ReductionKind::MIN ||
+-              *kind == NVVM::ReductionKind::MAX)
++          if (*kind == ReduxKindTy::MIN ||
++              *kind == ReduxKindTy::MAX)
+             acc[i] = b.sext(i32_ty, acc[i]);
+           else
+             acc[i] = b.zext(i32_ty, acc[i]);

@@ -14,6 +14,7 @@
 
 #include "hexagon/Dialect/HexKL/IR/HexKLDialect.h"
 #include "hexagon/Dialect/HexagonMem/IR/HexagonMemDialect.h"
+#include "hexagon/Dialect/OmniFetch/IR/OmniFetchDialect.h"
 #include "hexagon/Transforms/Transforms.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -23,6 +24,9 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/Support/Debug.h"
+
+#include <algorithm>
+#include <optional>
 
 #define DEBUG_TYPE "decompose-hexkl-matmul"
 
@@ -38,7 +42,19 @@ using namespace hexagon;
 namespace {
 
 struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
-  DecomposeHexKLMatmul(MLIRContext *ctx) : OpRewritePattern(ctx) {}
+  DecomposeHexKLMatmul(MLIRContext *ctx, bool enableWeightPrepack,
+                       bool enableVtcmLifetimeColoring,
+                       bool enableDmaToVtcm, Value sharedVtcm)
+      : OpRewritePattern(ctx), enableWeightPrepack(enableWeightPrepack),
+        enableVtcmLifetimeColoring(enableVtcmLifetimeColoring),
+        enableDmaToVtcm(enableDmaToVtcm),
+        sharedVtcm(sharedVtcm) {}
+
+  bool enableWeightPrepack;
+  bool enableVtcmLifetimeColoring;
+  bool enableDmaToVtcm;
+  /// Non-null when the pass allocated a function-scoped VTCM arena.
+  Value sharedVtcm;
 
   LogicalResult matchAndRewrite(hexkl::MatmulOp op,
                                 PatternRewriter &rewriter) const override {
@@ -84,173 +100,583 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
     // Create constants
     auto i32Ty = rewriter.getI32Type();
 
-    Value idx0 = arith::ConstantIndexOp::create(rewriter, loc, 0);
-    Value idx1 = arith::ConstantIndexOp::create(rewriter, loc, 1);
-    Value idx32 = arith::ConstantIndexOp::create(rewriter, loc, 32);
-    Value idx31 = arith::ConstantIndexOp::create(rewriter, loc, 31);
+    Value idx0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    Value idx1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    Value idx32 = rewriter.create<arith::ConstantIndexOp>(loc, 32);
+    Value idx31 = rewriter.create<arith::ConstantIndexOp>(loc, 31);
 
-    Value i32_0 = arith::ConstantIntOp::create(rewriter, loc, i32Ty, 0);
-    Value i32_1 = arith::ConstantIntOp::create(rewriter, loc, i32Ty, 1);
-    Value i32_32 = arith::ConstantIntOp::create(rewriter, loc, i32Ty, 32);
-    Value i32_4096 = arith::ConstantIntOp::create(rewriter, loc, i32Ty, 4096);
-    Value idx4096 = arith::ConstantIndexOp::create(rewriter, loc, 4096);
+    Value i32_0 = rewriter.create<arith::ConstantIntOp>(loc, i32Ty, 0);
+    Value i32_1 = rewriter.create<arith::ConstantIntOp>(loc, i32Ty, 1);
+    Value i32_2 = rewriter.create<arith::ConstantIntOp>(loc, i32Ty, 2);
+    Value i32_32 = rewriter.create<arith::ConstantIntOp>(loc, i32Ty, 32);
+    Value i32_4096 = rewriter.create<arith::ConstantIntOp>(loc, i32Ty, 4096);
+    Value idx4096 = rewriter.create<arith::ConstantIndexOp>(loc, 4096);
 
     // Get dimensions dynamically
-    Value dimM = memref::DimOp::create(rewriter, loc, lhs, idx0);
-    Value dimK = memref::DimOp::create(rewriter, loc, lhs, idx1);
-    Value dimN = memref::DimOp::create(rewriter, loc, rhs, idx1);
+    Value dimMOrig = rewriter.create<memref::DimOp>(loc, lhs, idx0);
+    Value dimK = rewriter.create<memref::DimOp>(loc, lhs, idx1);
+    Value dimNOrig = rewriter.create<memref::DimOp>(loc, rhs, idx1);
 
-    Value M = arith::IndexCastOp::create(rewriter, loc, i32Ty, dimM);
-    Value K = arith::IndexCastOp::create(rewriter, loc, i32Ty, dimK);
-    Value N = arith::IndexCastOp::create(rewriter, loc, i32Ty, dimN);
+    // Pad M (rows/tokens) and/or N (columns) up to a multiple of 32 so
+    // unaligned-token encoders (M, e.g. DINOv2's 257) and lm_head-class shapes
+    // (N, e.g. 50257) run on HMX.  MatmulToHexKL only converts static shapes, so
+    // padding is decided statically here and always materializes fresh
+    // contiguous buffers: the micro-HMX lowering models each operand as a dense
+    // row-major buffer whose row stride equals its logical dim, so a
+    // subview/offset operand (e.g. a tensor.pad result) would fault at large N.
+    bool doMPad = false, doNPad = false;
+    int64_t staticMAligned = -1, staticNAligned = -1;
+    if (lhsType.hasStaticShape()) {
+      int64_t staticM = lhsShape[0];
+      staticMAligned = (staticM + 31) / 32 * 32;
+      doMPad = staticMAligned != staticM;
+    }
+    if (rhsType.hasStaticShape()) {
+      int64_t staticN = rhsShape[1];
+      staticNAligned = (staticN + 31) / 32 * 32;
+      doNPad = staticNAligned != staticN;
+    }
+
+    Value dimM =
+        doMPad ? rewriter.create<arith::ConstantIndexOp>(loc, staticMAligned)
+               : dimMOrig;
+    Value dimN =
+        doNPad ? rewriter.create<arith::ConstantIndexOp>(loc, staticNAligned)
+               : dimNOrig;
+
+    Value lhsWork = lhs;
+    Value rhsWork = rhs;
+    Value resultWork = result;
+    Value lhsPadAlloc, rhsPadAlloc, resultPadAlloc;
+
+    SmallVector<OpFoldResult> padZeros = {rewriter.getIndexAttr(0),
+                                          rewriter.getIndexAttr(0)};
+    SmallVector<OpFoldResult> padStrides = {rewriter.getIndexAttr(1),
+                                            rewriter.getIndexAttr(1)};
+
+    if (doMPad) {
+      // Fresh [padM, K] activation buffer: copy valid rows, zero the pad rows.
+      // The padded output rows are discarded on copy-back.
+      auto lhsPadTy = MemRefType::get(
+          ArrayRef<int64_t>{staticMAligned, lhsShape[1]},
+          lhsType.getElementType(), MemRefLayoutAttrInterface{},
+          lhsType.getMemorySpace());
+      lhsPadAlloc = rewriter.create<memref::AllocOp>(loc, lhsPadTy);
+      Value zeroA = rewriter.create<arith::ConstantOp>(
+          loc, rewriter.getZeroAttr(lhsType.getElementType()));
+      SmallVector<OpFoldResult> lhsSizes = {dimMOrig, dimK};
+      Value lhsSv = rewriter.create<memref::SubViewOp>(loc, lhsPadAlloc, padZeros,
+                                                       lhsSizes, padStrides);
+      rewriter.create<memref::CopyOp>(loc, lhs, lhsSv);
+      rewriter.create<scf::ForOp>(
+          loc, dimMOrig, dimM, idx1, ValueRange{},
+          [&](OpBuilder &bb, Location loc, Value r, ValueRange) {
+            bb.create<scf::ForOp>(
+                loc, idx0, dimK, idx1, ValueRange{},
+                [&](OpBuilder &bbb, Location loc, Value c, ValueRange) {
+                  bbb.create<memref::StoreOp>(loc, zeroA, lhsPadAlloc,
+                                              ValueRange{r, c});
+                  bbb.create<scf::YieldOp>(loc);
+                });
+            bb.create<scf::YieldOp>(loc);
+          });
+      lhsWork = lhsPadAlloc;
+    }
+
+    if (doNPad) {
+      auto rhsPadTy = MemRefType::get(
+          ArrayRef<int64_t>{rhsShape[0], staticNAligned},
+          rhsType.getElementType(), MemRefLayoutAttrInterface{},
+          rhsType.getMemorySpace());
+      rhsPadAlloc = rewriter.create<memref::AllocOp>(loc, rhsPadTy);
+      Value zeroW = rewriter.create<arith::ConstantOp>(
+          loc, rewriter.getZeroAttr(rhsType.getElementType()));
+      // Copy valid K×NOrig weights, then zero only the padding columns.
+      SmallVector<OpFoldResult> rhsSizes = {dimK, dimNOrig};
+      Value rhsSv = rewriter.create<memref::SubViewOp>(loc, rhsPadAlloc, padZeros,
+                                                       rhsSizes, padStrides);
+      rewriter.create<memref::CopyOp>(loc, rhs, rhsSv);
+      rewriter.create<scf::ForOp>(
+          loc, idx0, dimK, idx1, ValueRange{},
+          [&](OpBuilder &bb, Location loc, Value r, ValueRange) {
+            bb.create<scf::ForOp>(
+                loc, dimNOrig, dimN, idx1, ValueRange{},
+                [&](OpBuilder &bbb, Location loc, Value c, ValueRange) {
+                  bbb.create<memref::StoreOp>(loc, zeroW, rhsPadAlloc,
+                                              ValueRange{r, c});
+                  bbb.create<scf::YieldOp>(loc);
+                });
+            bb.create<scf::YieldOp>(loc);
+          });
+      rhsWork = rhsPadAlloc;
+    }
+
+    if (doMPad || doNPad) {
+      // Result buffer spans the padded extents; the valid [Morig×Norig] region
+      // is copied back after compute.
+      int64_t rM = doMPad ? staticMAligned : resultShape[0];
+      int64_t rN = doNPad ? staticNAligned : resultShape[1];
+      auto resultPadTy = MemRefType::get(
+          ArrayRef<int64_t>{rM, rN}, resultType.getElementType(),
+          MemRefLayoutAttrInterface{}, resultType.getMemorySpace());
+      resultPadAlloc = rewriter.create<memref::AllocOp>(loc, resultPadTy);
+      resultWork = resultPadAlloc;
+    }
+
+    Value M = rewriter.create<arith::IndexCastOp>(loc, i32Ty, dimM);
+    Value K = rewriter.create<arith::IndexCastOp>(loc, i32Ty, dimK);
+    Value N = rewriter.create<arith::IndexCastOp>(loc, i32Ty, dimN);
 
     // Calculate numKTiles = (k + 31) / 32
-    Value kPlus31 = arith::AddIOp::create(rewriter, loc, dimK, idx31);
-    Value kTiles = arith::DivUIOp::create(rewriter, loc, kPlus31, idx32);
-    Value kTilesI32 = arith::IndexCastOp::create(rewriter, loc, i32Ty, kTiles);
+    Value kPlus31 = rewriter.create<arith::AddIOp>(loc, dimK, idx31);
+    Value kTiles = rewriter.create<arith::DivUIOp>(loc, kPlus31, idx32);
+    Value kTilesI32 = rewriter.create<arith::IndexCastOp>(loc, i32Ty, kTiles);
 
-    // Calculate VTCM size: (numKTiles*2 + 2 + 3) * 4096
-    // Layout: [act_tiles | scratch_tiles | flat_out | acc_read | extra]
-    Value twoKTiles =
-        arith::MulIOp::create(rewriter, loc, kTiles,
-                              arith::ConstantIndexOp::create(rewriter, loc, 2));
-    Value dataTiles =
-        arith::AddIOp::create(rewriter, loc, twoKTiles,
-                              arith::ConstantIndexOp::create(rewriter, loc, 2));
-    Value vtcmTiles =
-        arith::AddIOp::create(rewriter, loc, dataTiles,
-                              arith::ConstantIndexOp::create(rewriter, loc, 3));
-    Value vtcmBytes = arith::MulIOp::create(rewriter, loc, vtcmTiles, idx4096);
+    // VTCM layout (legacy HexKL reuses scratch as weight ping-pong after act load):
+    //   default:  act[0..kTiles) | scratch/w0/w1/flat/acc starting at kTiles
+    //             (= (2*kTiles+7)*4096 budget)
+    //   prepack:  act[0..kTiles) | scratch[kTiles..2*kTiles) | wh[2*kTiles..3*kTiles)
+    //             | flat | acc | extra
+    //             WH for one column stays in VTCM; RmToWh once per (col,kt).
+    Value twoKTiles = rewriter.create<arith::MulIOp>(
+        loc, kTiles, rewriter.create<arith::ConstantIndexOp>(loc, 2));
+    Value vtcmTiles;
+    if (enableVtcmLifetimeColoring && enableWeightPrepack) {
+      // [0,K): AH, [K,2K): persistent WH. One scratch tile at 2K is
+      // sufficient because CopySubmatrix -> RmToAh consumes it immediately.
+      vtcmTiles = rewriter.create<arith::AddIOp>(
+          loc, twoKTiles, rewriter.create<arith::ConstantIndexOp>(loc, 1));
+    } else if (enableVtcmLifetimeColoring) {
+      // [0,K): AH. Scratch, w0 and w1 share the post-AH phase colors K/K+1.
+      // Output flat/acc reuse colors 0/1 after the final HMX consume.
+      Value extraTiles = rewriter.create<arith::ConstantIndexOp>(
+          loc, enableDmaToVtcm ? 3 : 2);
+      vtcmTiles = rewriter.create<arith::AddIOp>(loc, kTiles, extraTiles);
+    } else if (enableWeightPrepack) {
+      Value threeK = rewriter.create<arith::AddIOp>(loc, twoKTiles, kTiles);
+      vtcmTiles = rewriter.create<arith::AddIOp>(
+          loc, threeK, rewriter.create<arith::ConstantIndexOp>(loc, 5));
+    } else {
+      Value dataTiles = rewriter.create<arith::AddIOp>(
+          loc, twoKTiles, rewriter.create<arith::ConstantIndexOp>(loc, 4));
+      vtcmTiles = rewriter.create<arith::AddIOp>(
+          loc, dataTiles, rewriter.create<arith::ConstantIndexOp>(loc, 3));
+    }
+    Value vtcmBytes = rewriter.create<arith::MulIOp>(loc, vtcmTiles, idx4096);
 
-    // Manual VTCM alloc; tag for bufferization and dealloc after outer loop.
-    auto vtcmType =
-        MemRefType::get({ShapedType::kDynamic}, rewriter.getI8Type(),
-                        MemRefLayoutAttrInterface{},
-                        IntegerAttr::get(rewriter.getI32Type(), 1));
-    auto vtcmAlloc =
-        hexagonmem::AllocOp::create(rewriter, loc, vtcmType, vtcmBytes);
-    vtcmAlloc->setAttr("bufferization.manual_deallocation",
-                       rewriter.getUnitAttr());
-    Value vtcm = vtcmAlloc.getResult();
+    Value vtcm;
+    bool ownsVtcm = false;
+    if (sharedVtcm) {
+      vtcm = sharedVtcm;
+    } else {
+      auto vtcmType =
+          MemRefType::get({ShapedType::kDynamic}, rewriter.getI8Type(),
+                          MemRefLayoutAttrInterface{},
+                          IntegerAttr::get(rewriter.getI32Type(), 1));
+      auto vtcmAlloc =
+          rewriter.create<hexagonmem::AllocOp>(loc, vtcmType, vtcmBytes);
+      vtcmAlloc->setAttr("bufferization.manual_deallocation",
+                         rewriter.getUnitAttr());
+      vtcm = vtcmAlloc.getResult();
+      ownsVtcm = true;
+    }
 
-    // Setup HMX accumulator
-    hexkl::MicroHMXSetupAccReadF16Op::create(rewriter, loc, vtcm);
+    rewriter.create<hexkl::MicroHMXSetupAccReadF16Op>(loc, vtcm);
 
-    // Hoist loop-invariant offset calculations
-    // weightOffset = numKTiles * 4096 (weight buffer starts after activation
-    // tiles)
-    Value wOff = arith::MulIOp::create(rewriter, loc, kTilesI32, i32_4096);
+    // Default HexKL: weights reuse scratch base (kTiles*4096). Prepack: WH after
+    // full scratch bank (2*kTiles*4096) so act reload does not clobber WH.
+    Value wOff0 = rewriter.create<arith::MulIOp>(loc, kTilesI32, i32_4096);
+    Value wOff1 = rewriter.create<arith::AddIOp>(loc, wOff0, i32_4096);
+    Value wRegionBase = enableWeightPrepack && !enableVtcmLifetimeColoring
+                            ? rewriter.create<arith::MulIOp>(
+                                  loc,
+                                  rewriter.create<arith::AddIOp>(loc, kTilesI32,
+                                                                 kTilesI32),
+                                  i32_4096)
+                            : wOff0;
+    Value flatOff;
+    Value accOff;
+    if (enableVtcmLifetimeColoring) {
+      // In the default M-outer schedule AH remains live across every N tile,
+      // while each column's WH ping-pong slots die before its readback. Reuse
+      // WH colors there. In the prepack N-outer schedule WH remains live
+      // across M rows, while AH dies before each row's readback; reuse AH.
+      flatOff = enableWeightPrepack ? i32_0 : wOff0;
+      accOff = enableWeightPrepack ? i32_4096 : wOff1;
+    } else if (enableWeightPrepack) {
+      Value threeKI32 = rewriter.create<arith::AddIOp>(
+          loc, rewriter.create<arith::AddIOp>(loc, kTilesI32, kTilesI32),
+          kTilesI32);
+      flatOff = rewriter.create<arith::MulIOp>(loc, threeKI32, i32_4096);
+      accOff = rewriter.create<arith::AddIOp>(loc, flatOff, i32_4096);
+    } else {
+      Value kTilesPlus2 = rewriter.create<arith::AddIOp>(
+          loc, kTilesI32, rewriter.create<arith::ConstantIntOp>(loc, i32Ty, 2));
+      flatOff = rewriter.create<arith::MulIOp>(loc, kTilesPlus2, i32_4096);
+      Value kTilesPlus3 = rewriter.create<arith::AddIOp>(
+          loc, kTilesI32, rewriter.create<arith::ConstantIntOp>(loc, i32Ty, 3));
+      accOff = rewriter.create<arith::MulIOp>(loc, kTilesPlus3, i32_4096);
+    }
 
-    // flatOffset = numKTiles * 4096 (flat output buffer location)
-    Value flatOff = wOff;
+    scf::ForOp outerFor;
+    if (enableWeightPrepack) {
+      // Column-outer: pack all K WH tiles for this column into VTCM cache,
+      // then stream all M rows against the cached weights.
+      outerFor = rewriter.create<scf::ForOp>(
+          loc, idx0, dimN, idx32, ValueRange{},
+          [&](OpBuilder &b, Location loc, Value col, ValueRange) {
+            Value colI32 = b.create<arith::IndexCastOp>(loc, i32Ty, col);
+            Value colTile = b.create<arith::DivUIOp>(loc, colI32, i32_32);
 
-    // accReadOffset = (numKTiles + 1) * 4096 (accumulator readback location)
-    Value kTilesPlus1 = arith::AddIOp::create(rewriter, loc, kTilesI32, i32_1);
-    Value accOff = arith::MulIOp::create(rewriter, loc, kTilesPlus1, i32_4096);
+            b.create<scf::ForOp>(
+                loc, idx0, kTiles, idx1, ValueRange{},
+                [&](OpBuilder &bb, Location loc, Value ktIdx, ValueRange) {
+                  Value kt = bb.create<arith::IndexCastOp>(loc, i32Ty, ktIdx);
+                  Value wOff = bb.create<arith::AddIOp>(
+                      loc, wRegionBase,
+                      bb.create<arith::MulIOp>(loc, kt, i32_4096));
+                  bb.create<hexkl::MicroHMXRmToWhF16Op>(loc, vtcm, wOff,
+                                                        rhsWork, kt, colTile, N);
+                  bb.create<scf::YieldOp>(loc);
+                });
 
-    // Outer loop: iterate over rows (M dimension) in 32-row tiles
-    auto outerFor = scf::ForOp::create(
-        rewriter, loc, idx0, dimM, idx32, ValueRange{},
-        [&](OpBuilder &b, Location loc, Value row, ValueRange) {
-          Value rowI32 = arith::IndexCastOp::create(b, loc, i32Ty, row);
-          Value rowTile = arith::DivUIOp::create(b, loc, rowI32, i32_32);
+            b.create<scf::ForOp>(
+                loc, idx0, dimM, idx32, ValueRange{},
+                [&](OpBuilder &bb, Location loc, Value row, ValueRange) {
+                  Value rowI32 =
+                      bb.create<arith::IndexCastOp>(loc, i32Ty, row);
+                  Value rowTile =
+                      bb.create<arith::DivUIOp>(loc, rowI32, i32_32);
 
-          // Load and layout activation tiles for this row
-          scf::ForOp::create(
-              b, loc, idx0, kTiles, idx1, ValueRange{},
-              [&](OpBuilder &bb, Location loc, Value ktIdx, ValueRange) {
-                Value kt = arith::IndexCastOp::create(bb, loc, i32Ty, ktIdx);
+                  bb.create<scf::ForOp>(
+                      loc, idx0, kTiles, idx1, ValueRange{},
+                      [&](OpBuilder &bbb, Location loc, Value ktIdx,
+                          ValueRange) {
+                        Value kt =
+                            bbb.create<arith::IndexCastOp>(loc, i32Ty, ktIdx);
+                        Value scrIdx = enableVtcmLifetimeColoring
+                            ? bbb.create<arith::AddIOp>(
+                                  loc, kTilesI32, kTilesI32)
+                            : bbb.create<arith::AddIOp>(
+                                  loc, kTilesI32, kt);
+                        Value scrOff =
+                            bbb.create<arith::MulIOp>(loc, scrIdx, i32_4096);
+                        bbb.create<hexkl::MicroHMXCopySubmatrixToF16Op>(
+                            loc, vtcm, scrOff, lhsWork, rowTile, kt, M, K);
+                        Value actOff =
+                            bbb.create<arith::MulIOp>(loc, kt, i32_4096);
+                        bbb.create<hexkl::MicroHMXRmToAhF16Op>(loc, vtcm,
+                                                               actOff, scrOff);
+                        bbb.create<scf::YieldOp>(loc);
+                      });
 
-                // scratchOffset = (numKTiles + kTile) * 4096
-                Value scrIdx = arith::AddIOp::create(bb, loc, kTilesI32, kt);
-                Value scrOff = arith::MulIOp::create(bb, loc, scrIdx, i32_4096);
+                  bb.create<hexkl::MicroHMXAccClearF16Op>(loc);
+                  bb.create<scf::ForOp>(
+                      loc, idx0, kTiles, idx1, ValueRange{},
+                      [&](OpBuilder &bbb, Location loc, Value ktIdx,
+                          ValueRange) {
+                        Value kt =
+                            bbb.create<arith::IndexCastOp>(loc, i32Ty, ktIdx);
+                        Value wOff = bbb.create<arith::AddIOp>(
+                            loc, wRegionBase,
+                            bbb.create<arith::MulIOp>(loc, kt, i32_4096));
+                        Value actOff =
+                            bbb.create<arith::MulIOp>(loc, kt, i32_4096);
+                        bbb.create<hexkl::MicroHMXMmF16Op>(loc, vtcm, actOff,
+                                                           wOff);
+                        bbb.create<scf::YieldOp>(loc);
+                      });
 
-                // Copy activation tile to scratch
-                hexkl::MicroHMXCopySubmatrixToF16Op::create(
-                    bb, loc, vtcm, scrOff, lhs, rowTile, kt, M, K);
+                  bb.create<hexkl::MicroHMXAccReadF16Op>(loc, vtcm, accOff);
+                  bb.create<hexkl::MicroHMXAhToRmF16Op>(loc, vtcm, flatOff,
+                                                        accOff);
+                  bb.create<hexkl::MicroHMXCopyF16ToF32SubmatrixOp>(
+                      loc, vtcm, flatOff, resultWork, rowTile, colTile, M, N);
+                  bb.create<scf::YieldOp>(loc);
+                });
+            b.create<scf::YieldOp>(loc);
+          });
+    } else {
+      // Default: M-outer with dual ping-pong weight slots for OmniFetch.
+      (void)wOff1;
+      outerFor = rewriter.create<scf::ForOp>(
+          loc, idx0, dimM, idx32, ValueRange{},
+          [&](OpBuilder &b, Location loc, Value row, ValueRange) {
+            Value rowI32 = b.create<arith::IndexCastOp>(loc, i32Ty, row);
+            Value rowTile = b.create<arith::DivUIOp>(loc, rowI32, i32_32);
 
-                // Layout activation from scratch to activation buffer
-                Value actOff = arith::MulIOp::create(bb, loc, kt, i32_4096);
-                hexkl::MicroHMXRmToAhF16Op::create(bb, loc, vtcm, actOff,
-                                                   scrOff);
+            b.create<scf::ForOp>(
+                loc, idx0, kTiles, idx1, ValueRange{},
+                [&](OpBuilder &bb, Location loc, Value ktIdx, ValueRange) {
+                  Value kt = bb.create<arith::IndexCastOp>(loc, i32Ty, ktIdx);
+                  Value scrIdx = enableVtcmLifetimeColoring
+                      ? kTilesI32
+                      : bb.create<arith::AddIOp>(loc, kTilesI32, kt);
+                  Value scrOff =
+                      bb.create<arith::MulIOp>(loc, scrIdx, i32_4096);
+                  bb.create<hexkl::MicroHMXCopySubmatrixToF16Op>(
+                      loc, vtcm, scrOff, lhsWork, rowTile, kt, M, K);
+                  Value actOff = bb.create<arith::MulIOp>(loc, kt, i32_4096);
+                  bb.create<hexkl::MicroHMXRmToAhF16Op>(loc, vtcm, actOff,
+                                                        scrOff);
+                  bb.create<scf::YieldOp>(loc);
+                });
 
-                scf::YieldOp::create(bb, loc);
-              });
-
-          // Inner loop: iterate over columns (N dimension) in 32-col tiles
-          scf::ForOp::create(
-              b, loc, idx0, dimN, idx32, ValueRange{},
-              [&](OpBuilder &bb, Location loc, Value col, ValueRange) {
-                Value colI32 = arith::IndexCastOp::create(bb, loc, i32Ty, col);
-                Value colTile = arith::DivUIOp::create(bb, loc, colI32, i32_32);
-
-                // Clear accumulator
-                hexkl::MicroHMXAccClearF16Op::create(bb, loc);
-
-                // Innermost loop: iterate over K tiles for accumulation
-                scf::ForOp::create(
-                    bb, loc, idx0, kTiles, idx1, ValueRange{},
-                    [&](OpBuilder &bbb, Location loc, Value ktIdx, ValueRange) {
-                      Value kt =
-                          arith::IndexCastOp::create(bbb, loc, i32Ty, ktIdx);
-
-                      // Load weight tile
-                      hexkl::MicroHMXRmToWhF16Op::create(bbb, loc, vtcm, wOff,
-                                                         rhs, kt, colTile, N);
-
-                      // Perform matrix multiplication (accumulates)
-                      Value actOff2 =
-                          arith::MulIOp::create(bbb, loc, kt, i32_4096);
-                      hexkl::MicroHMXMmF16Op::create(bbb, loc, vtcm, actOff2,
-                                                     wOff);
-
-                      scf::YieldOp::create(bbb, loc);
-                    });
-
-                // Read accumulator
-                hexkl::MicroHMXAccReadF16Op::create(bb, loc, vtcm, accOff);
-
-                // Convert from activation layout to flat layout
-                hexkl::MicroHMXAhToRmF16Op::create(bb, loc, vtcm, flatOff,
-                                                   accOff);
-
-                // Copy result to output (f16 -> f32)
-                hexkl::MicroHMXCopyF16ToF32SubmatrixOp::create(
-                    bb, loc, vtcm, flatOff, result, rowTile, colTile, M, N);
-
-                scf::YieldOp::create(bb, loc);
-              });
-
-          scf::YieldOp::create(b, loc);
-        });
+            b.create<scf::ForOp>(
+                loc, idx0, dimN, idx32, ValueRange{},
+                [&](OpBuilder &bb, Location loc, Value col, ValueRange) {
+                  Value colI32 =
+                      bb.create<arith::IndexCastOp>(loc, i32Ty, col);
+                  Value colTile =
+                      bb.create<arith::DivUIOp>(loc, colI32, i32_32);
+                  bb.create<hexkl::MicroHMXAccClearF16Op>(loc);
+                  bb.create<scf::ForOp>(
+                      loc, idx0, kTiles, idx1, ValueRange{},
+                      [&](OpBuilder &bbb, Location loc, Value ktIdx,
+                          ValueRange) {
+                        Value kt =
+                            bbb.create<arith::IndexCastOp>(loc, i32Ty, ktIdx);
+                        Value phase =
+                            bbb.create<arith::RemUIOp>(loc, kt, i32_2);
+                        Value isOdd = bbb.create<arith::CmpIOp>(
+                            loc, arith::CmpIPredicate::ne, phase, i32_0);
+                        Value curW = bbb.create<arith::SelectOp>(
+                            loc, isOdd, wOff1, wOff0);
+                        bbb.create<hexkl::MicroHMXRmToWhF16Op>(
+                            loc, vtcm, curW, rhsWork, kt, colTile, N);
+                        Value actOff2 =
+                            bbb.create<arith::MulIOp>(loc, kt, i32_4096);
+                        bbb.create<hexkl::MicroHMXMmF16Op>(loc, vtcm, actOff2,
+                                                           curW);
+                        bbb.create<scf::YieldOp>(loc);
+                      });
+                  bb.create<hexkl::MicroHMXAccReadF16Op>(loc, vtcm, accOff);
+                  bb.create<hexkl::MicroHMXAhToRmF16Op>(loc, vtcm, flatOff,
+                                                        accOff);
+                  bb.create<hexkl::MicroHMXCopyF16ToF32SubmatrixOp>(
+                      loc, vtcm, flatOff, resultWork, rowTile, colTile, M, N);
+                  bb.create<scf::YieldOp>(loc);
+                });
+            b.create<scf::YieldOp>(loc);
+          });
+    }
 
     // Explicitly deallocate VTCM buffer to avoid relying on ConvertToHexagonmem
     // rewriting of generic memref.dealloc for dynamic VTCM types.
     rewriter.setInsertionPointAfter(outerFor);
-    hexagonmem::DeallocOp::create(rewriter, loc, vtcm);
+    if (doMPad || doNPad) {
+      // Copy the valid [Morig×Norig] region back into the caller's result and
+      // release the padded scratch buffers.
+      SmallVector<OpFoldResult> zeros = {rewriter.getIndexAttr(0),
+                                         rewriter.getIndexAttr(0)};
+      SmallVector<OpFoldResult> outSizes = {dimMOrig, dimNOrig};
+      SmallVector<OpFoldResult> strides = {rewriter.getIndexAttr(1),
+                                           rewriter.getIndexAttr(1)};
+      Value outSv = rewriter.create<memref::SubViewOp>(
+          loc, resultPadAlloc, zeros, outSizes, strides);
+      rewriter.create<memref::CopyOp>(loc, outSv, result);
+      if (doMPad)
+        rewriter.create<memref::DeallocOp>(loc, lhsPadAlloc);
+      if (doNPad)
+        rewriter.create<memref::DeallocOp>(loc, rhsPadAlloc);
+      rewriter.create<memref::DeallocOp>(loc, resultPadAlloc);
+    }
+    if (ownsVtcm)
+      rewriter.create<hexagonmem::DeallocOp>(loc, vtcm);
 
     rewriter.eraseOp(op);
     return success();
   }
 };
 
-void populateDecomposeHexKLMatmulPatterns(RewritePatternSet &patterns) {
-  patterns.add<DecomposeHexKLMatmul>(patterns.getContext());
+struct VtcmLiveRegion {
+  int64_t tiles;
+  int beginPhase;
+  int endPhase;
+  int64_t color = -1;
+};
+
+/// First-fit interval coloring with contiguous tile ranges. Two regions
+/// interfere only when both their phase intervals and assigned tile ranges
+/// overlap. Phases are: 0=activation/prepack, 1=HMX compute preparation,
+/// 2=HMX consume, 3=accumulator readback, 4=result copy.
+static int64_t computeColoredVtcmTiles(int64_t kTiles, bool weightPrepack,
+                                       bool dmaToVtcm) {
+  SmallVector<VtcmLiveRegion> regions;
+  if (weightPrepack) {
+    regions.push_back({kTiles, 0, 5}); // WH retained across all M rows
+    regions.push_back({kTiles, 1, 3}); // AH bank
+    regions.push_back({1, 1, 2});      // one reusable RM scratch tile
+  } else {
+    regions.push_back({kTiles, 0, 5}); // AH retained across all N columns
+    regions.push_back({1, 0, 1});      // RM scratch, dead before WH
+    regions.push_back({2, 1, 3});      // WH ping-pong slots
+    if (dmaToVtcm)
+      regions.push_back({1, 1, 2});    // non-aliasing async DMA stage
+  }
+  regions.push_back({1, 3, 4}); // accumulator read tile
+  regions.push_back({1, 3, 5}); // flat result tile; overlaps accumulator
+
+  int64_t peak = 0;
+  for (VtcmLiveRegion &region : regions) {
+    for (int64_t candidate = 0;; ++candidate) {
+      bool conflicts = false;
+      for (const VtcmLiveRegion &placed : regions) {
+        if (placed.color < 0)
+          continue;
+        bool lifetimeOverlap =
+            region.beginPhase < placed.endPhase &&
+            placed.beginPhase < region.endPhase;
+        bool addressOverlap =
+            candidate < placed.color + placed.tiles &&
+            placed.color < candidate + region.tiles;
+        if (lifetimeOverlap && addressOverlap) {
+          conflicts = true;
+          break;
+        }
+      }
+      if (!conflicts) {
+        region.color = candidate;
+        peak = std::max(peak, candidate + region.tiles);
+        break;
+      }
+    }
+  }
+  return peak;
+}
+
+/// VTCM bytes for a HexKL matmul with static K. The legacy layout reserves
+/// (2*kTiles+7) tiles by default or (3*kTiles+5) for prepack. Item 6 uses the
+/// interference graph above to compute the compact peak.
+static std::optional<int64_t>
+estimateVtcmBytes(hexkl::MatmulOp op, bool enableWeightPrepack,
+                  bool enableVtcmLifetimeColoring, bool enableDmaToVtcm) {
+  auto lhsType = dyn_cast<MemRefType>(op.getLhs().getType());
+  if (!lhsType || !lhsType.hasStaticShape() || lhsType.getRank() != 2)
+    return std::nullopt;
+  int64_t K = lhsType.getShape()[1];
+  if (K <= 0)
+    return std::nullopt;
+  int64_t kTiles = (K + 31) / 32;
+  if (enableVtcmLifetimeColoring)
+    return computeColoredVtcmTiles(kTiles, enableWeightPrepack,
+                                   enableDmaToVtcm) *
+           4096;
+  int64_t defBytes = (kTiles * 2 + 4 + 3) * 4096;
+  int64_t prepackBytes = (kTiles * 3 + 5) * 4096;
+  return enableWeightPrepack ? prepackBytes : defBytes;
+}
+
+void populateDecomposeHexKLMatmulPatterns(RewritePatternSet &patterns,
+                                          bool enableWeightPrepack,
+                                          bool enableVtcmLifetimeColoring,
+                                          bool enableDmaToVtcm,
+                                          Value sharedVtcm) {
+  patterns.add<DecomposeHexKLMatmul>(
+      patterns.getContext(), enableWeightPrepack,
+      enableVtcmLifetimeColoring, enableDmaToVtcm, sharedVtcm);
 }
 
 struct DecomposeHexKLMatmulPass
     : public ::impl::DecomposeHexKLMatmulBase<DecomposeHexKLMatmulPass> {
+  using DecomposeHexKLMatmulBase::DecomposeHexKLMatmulBase;
+
   void getDependentDialects(DialectRegistry &registry) const override {
     registry
         .insert<hexkl::HexKLDialect, hexagonmem::HexagonMemDialect,
-                arith::ArithDialect, scf::SCFDialect, memref::MemRefDialect>();
+                omni_fetch::OmniFetchDialect, arith::ArithDialect,
+                scf::SCFDialect, memref::MemRefDialect>();
   }
 
   void runOnOperation() override {
+    auto func = getOperation();
+    Value sharedVtcm;
+
+    // #4: hoist one max-sized VTCM slab to the function entry when every HexKL
+    // matmul has a static K.  Per-matmul alloc/dealloc churn is replaced by a
+    // single arena reused sequentially across matmuls.
+    if (enablePersistentVtcm) {
+      SmallVector<hexkl::MatmulOp> matmuls;
+      func.walk([&](hexkl::MatmulOp op) { matmuls.push_back(op); });
+      std::optional<int64_t> maxBytes;
+      bool allStatic = !matmuls.empty();
+      for (hexkl::MatmulOp op : matmuls) {
+        auto bytes = estimateVtcmBytes(
+            op, enableWeightPrepack, enableVtcmLifetimeColoring,
+            enableDmaToVtcm);
+        if (!bytes) {
+          allStatic = false;
+          break;
+        }
+        maxBytes = maxBytes ? std::max(*maxBytes, *bytes) : *bytes;
+      }
+      if (allStatic && maxBytes && *maxBytes > 0) {
+        Block &entry = func.getFunctionBody().front();
+        OpBuilder b(func.getContext());
+        b.setInsertionPointToStart(&entry);
+        Location loc = func.getLoc();
+        Value bytesVal =
+            b.create<arith::ConstantIndexOp>(loc, *maxBytes);
+        auto vtcmType = MemRefType::get(
+            {ShapedType::kDynamic}, b.getI8Type(), MemRefLayoutAttrInterface{},
+            IntegerAttr::get(b.getI32Type(), 1));
+        auto alloc = b.create<hexagonmem::AllocOp>(loc, vtcmType, bytesVal);
+        alloc->setAttr("bufferization.manual_deallocation", b.getUnitAttr());
+        sharedVtcm = alloc.getResult();
+        LLVM_DEBUG(DBGS() << "persistent VTCM arena bytes=" << *maxBytes
+                          << " matmuls=" << matmuls.size() << "\n");
+      }
+    }
+
     RewritePatternSet patterns(&getContext());
-    populateDecomposeHexKLMatmulPatterns(patterns);
-    if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
+    // Report the peak static arena reduction before rewriting the matmuls.
+    int64_t legacyPeak = 0;
+    int64_t coloredPeak = 0;
+    int64_t staticSites = 0;
+    func.walk([&](hexkl::MatmulOp op) {
+      auto legacy = estimateVtcmBytes(op, enableWeightPrepack,
+                                      /*coloring=*/false,
+                                      enableDmaToVtcm);
+      auto colored = estimateVtcmBytes(op, enableWeightPrepack,
+                                       /*coloring=*/true,
+                                       enableDmaToVtcm);
+      if (!legacy || !colored)
+        return;
+      legacyPeak = std::max(legacyPeak, *legacy);
+      coloredPeak = std::max(coloredPeak, *colored);
+      ++staticSites;
+    });
+    if (enableVtcmLifetimeColoring && staticSites > 0) {
+      Builder b(func.getContext());
+      func->setAttr("omni_fetch.vtcm_coloring_enabled", b.getUnitAttr());
+      func->setAttr("omni_fetch.vtcm_legacy_peak_bytes",
+                    b.getI64IntegerAttr(legacyPeak));
+      func->setAttr("omni_fetch.vtcm_colored_peak_bytes",
+                    b.getI64IntegerAttr(coloredPeak));
+      func->setAttr("omni_fetch.vtcm_saved_peak_bytes",
+                    b.getI64IntegerAttr(legacyPeak - coloredPeak));
+      func->setAttr("omni_fetch.vtcm_colored_sites",
+                    b.getI64IntegerAttr(staticSites));
+      llvm::errs() << "[VTCMLifetimeColoring] function=" << func.getName()
+                   << " sites=" << staticSites
+                   << " legacy_peak=" << legacyPeak
+                   << " colored_peak=" << coloredPeak
+                   << " saved_peak=" << (legacyPeak - coloredPeak) << "\n";
+    }
+
+    populateDecomposeHexKLMatmulPatterns(
+        patterns, enableWeightPrepack, enableVtcmLifetimeColoring,
+        enableDmaToVtcm, sharedVtcm);
+    if (failed(applyPatternsGreedily(func, std::move(patterns)))) {
       return signalPassFailure();
+    }
+
+    if (sharedVtcm) {
+      // Dealloc once per return after all matmul bodies have used the arena.
+      func.walk([&](func::ReturnOp ret) {
+        OpBuilder b(ret);
+        b.create<hexagonmem::DeallocOp>(ret.getLoc(), sharedVtcm);
+      });
     }
   }
 };
@@ -258,6 +684,7 @@ struct DecomposeHexKLMatmulPass
 } // namespace
 
 std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
-hexagon::createDecomposeHexKLMatmulPass() {
-  return std::make_unique<DecomposeHexKLMatmulPass>();
+hexagon::createDecomposeHexKLMatmulPass(
+    const DecomposeHexKLMatmulOptions &options) {
+  return std::make_unique<DecomposeHexKLMatmulPass>(options);
 }

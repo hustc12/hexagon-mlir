@@ -227,6 +227,13 @@ void HexagonFusionPass::runOnOperation() {
 
   auto controlElemwiseFn = [&](OpOperand *operand) {
     Operation *producer = operand->get().getDefiningOp();
+    // Item 7 attaches K/V stream identity to the attention contraction.
+    // Generic elementwise fusion creates a replacement op and currently does
+    // not preserve arbitrary semantic attributes, so keep this small boundary
+    // intact until KV page hints have been inserted after bufferization.
+    if (operand->getOwner()->hasAttr("omni_fetch.kv_cache_role") ||
+        (producer && producer->hasAttr("omni_fetch.kv_cache_role")))
+      return false;
     return linalg::areElementwiseOpsFusable(operand) &&
            (producer->hasOneUse() || fusionAllowRecompute);
   };
@@ -236,6 +243,10 @@ void HexagonFusionPass::runOnOperation() {
   linalg::ControlFusionFn fuseByExpansionControlFn =
       [](OpOperand *fusedOperand) {
         Operation *producer = fusedOperand->get().getDefiningOp();
+        if (fusedOperand->getOwner()->hasAttr("omni_fetch.kv_cache_role") ||
+            (producer &&
+             producer->hasAttr("omni_fetch.kv_cache_role")))
+          return false;
         return producer->hasOneUse();
       };
   linalg::populateFoldReshapeOpsByExpansionPatterns(fusionPatterns,
@@ -268,7 +279,11 @@ void HexagonFusionPass::runOnOperation() {
     return signalPassFailure();
   }
 
-  if (fusionDoMultiUse) {
+  bool hasKvBoundary = false;
+  funcOp.walk([&](Operation *op) {
+    hasKvBoundary |= op->hasAttr("omni_fetch.kv_cache_role");
+  });
+  if (fusionDoMultiUse && !hasKvBoundary) {
     unsigned nIter = 0;
     while (nIter++ < MaxMultiUseFusionIterations) {
       auto &domInfo = getAnalysis<DominanceInfo>();

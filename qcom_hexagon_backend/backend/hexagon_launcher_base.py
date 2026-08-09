@@ -64,11 +64,17 @@ struct FuncResult
         self.call_lwp = """WriteLWPOutput("{path}/{fname}.json");\n"""
 
         self.func_call_and_benchmarking = """
-uint64_t avg_time_us = benchmark_time_us({iterations}, [&]() {{
+std::vector<uint64_t> __perf_samples;
+uint64_t avg_time_us = benchmark_samples_us({iterations}, __perf_samples, [&]() {{
     {function_call}
 }});
 TestReport tr("{func_name}", avg_time_us, "us", Result::Pass, "{save_path}");
 tr.save();
+{{
+    FILE *__perf_fp = fopen("perf.txt", "a");
+    report_percentiles("{func_name}", __perf_samples, __perf_fp);
+    if (__perf_fp) fclose(__perf_fp);
+}}
 """
 
         # Codegen string for the Headers in the generated CPP file.
@@ -113,6 +119,11 @@ return 0;
         # Codegen string for the entire CPP file.
         self.code_string = """
 {code_headers}
+
+extern "C" {{
+    unsigned int _QURT_MAX_HEAP_SIZE = 1073741824; // 1 GB Max Heap Size
+}}
+
 {code_define}
 {code_body}
 """
@@ -301,7 +312,7 @@ class HexagonWrapperGenerator:
                 read_from_file_string += write_call
         return read_from_file_string
 
-    def generate_lwp_call(self):
+    def generate_lwp_call(self, exec_dir):
         if self.enable_lwp:
             return self.common_strings.call_lwp.format(
                 path="/data/local/tmp", fname="lwp"
@@ -356,7 +367,7 @@ class HexagonWrapperGenerator:
             write_to_file_calls=self.generate_tensor_write_to_file_calls(
                 file_name, exec_dir
             ),
-            lwp=self.generate_lwp_call(),
+            lwp=self.generate_lwp_call(exec_dir),
         )
         return code_body
 

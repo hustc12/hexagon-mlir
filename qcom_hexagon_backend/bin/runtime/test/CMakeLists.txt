@@ -49,7 +49,7 @@ set(TEST_PATH "${CMAKE_BINARY_DIR}/test/")
 set(BENCHMARK "libhexagon_runtime_test")
 set(DEVICE_HOST "$ENV{ANDROID_HOST}")
 set(DEVICE_SERIAL "$ENV{ANDROID_SERIAL}")
-set(DEVICE_PATH "/vendor/bin/${BENCHMARK}")
+set(DEVICE_PATH "/data/local/tmp/${BENCHMARK}")
 set(Q6_VERSION "$ENV{HEXAGON_ARCH_VERSION}")
 set(DSP_STACK_SIZE "262144")
 
@@ -67,7 +67,7 @@ set(SHELL_SCRIPT_CONTENT "#!/bin/bash"
   "adb -H \$ANDROID_HOST -s \$ANDROID_SERIAL push ${HEXAGON_SDK_ROOT}/libs/run_main_on_hexagon/ship/android_aarch64/run_main_on_hexagon ${DEVICE_PATH}/run_main_on_hexagon"
   "adb -H \$ANDROID_HOST -s \$ANDROID_SERIAL push ${HEXAGON_SDK_ROOT}/libs/run_main_on_hexagon/ship/hexagon_tool${HEXAGON_TOOL_VERSION}_v${Q6_VERSION}/librun_main_on_hexagon_skel.so /vendor/lib/rfsa/adsp/"
   "adb -H \$ANDROID_HOST -s \$ANDROID_SERIAL push ${TEST_PATH}/${BENCHMARK}.so ${DEVICE_PATH}"
-  "adb -H \$ANDROID_HOST -s \$ANDROID_SERIAL shell 'cd ${DEVICE_PATH}\; touch /vendor/lib/rfsa/adsp/run_main_on_hexagon.farf\; ./run_main_on_hexagon 3 ${DEVICE_PATH}/${BENCHMARK}.so --gtest-args=\"\" stack_size=262144'"
+  "adb -H \$ANDROID_HOST -s \$ANDROID_SERIAL shell 'cd ${DEVICE_PATH}\; export ADSP_LIBRARY_PATH=${DEVICE_PATH}\; touch run_main_on_hexagon.farf\; ./run_main_on_hexagon 3 ${BENCHMARK}.so --gtest-args=\"\" stack_size=262144'"
   "adb -H \$ANDROID_HOST -s \$ANDROID_SERIAL pull ${DEVICE_PATH}/gtest_output.txt ."
   "cat gtest_output.txt"
 )

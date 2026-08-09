@@ -1,0 +1,4 @@
+hexagon-mlir 9b4b8fcea2b93c801b5de784ee750ca9350d504f
+triton df38505e451a1541555379bcf378be9e8c00545c
+triton-shared 0614763d270ec0eacba9d5d8283cdff6bedb03c8
+llvm-project ac5dc54d509169d387fcfd495d71853d81c46484

@@ -101,6 +101,17 @@ static LogicalResult applyTiling(IRRewriter &rewriter, linalg::LinalgOp op,
   if (failed(tiledOp)) {
     return failure();
   }
+  for (StringRef name :
+       {"omni_fetch.kv_cache_role", "omni_fetch.kv_cache_operand",
+        "omni_fetch.kv_cache_layout"})
+    if (Attribute attr = op->getAttr(name)) {
+      tiledOp->op->setAttr(name, attr);
+      // SCF survives vectorization and one-shot bufferization even when the
+      // tiled linalg op is rebuilt. Keep one semantic carrier on the
+      // innermost tile loop for final item-7 source recovery.
+      for (Operation *loop : tiledOp->loops)
+        loop->setAttr(name, attr);
+    }
   rewriter.replaceOp(op, tiledOp->tensorResults);
   return success();
 }
@@ -262,7 +273,9 @@ struct HexagonTilingPass : public ::impl::HexagonTilingBase<HexagonTilingPass> {
     moduleOp.walk([&](linalg::LinalgOp op) {
       bool appliedSplitReduction = false;
       IRRewriter rewriter(&getContext());
-      if (enableSplitReduction && isa<linalg::GenericOp>(op) &&
+      if (enableSplitReduction &&
+          !op->hasAttr("omni_fetch.kv_cache_role") &&
+          isa<linalg::GenericOp>(op) &&
           IsSplitReductionCandidate(op)) {
         if ((op.getNumLoops() >= 1) &&
             op.getIteratorTypesArray()[(op.getNumLoops() - 1)] ==
@@ -278,11 +291,16 @@ struct HexagonTilingPass : public ::impl::HexagonTilingBase<HexagonTilingPass> {
       }
       if (!appliedSplitReduction) {
         DBG("tiling candidate: " << op);
-        if (succeeded(
-                tileLinalgOp(op, useInterchangeVector, splitTilingRange))) {
+        bool isKv = op->hasAttr("omni_fetch.kv_cache_role");
+        if (succeeded(tileLinalgOp(op, useInterchangeVector,
+                                  splitTilingRange))) {
           DBG("-> tiling succeeded.");
+          if (isKv)
+            llvm::errs() << "[KVPropagation] tiling=succeeded\n";
         } else {
           DBG("-> tiling failed.");
+          if (isKv)
+            llvm::errs() << "[KVPropagation] tiling=failed\n";
         }
       }
       return WalkResult::advance();

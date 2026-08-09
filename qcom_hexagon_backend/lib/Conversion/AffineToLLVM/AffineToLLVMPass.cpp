@@ -123,6 +123,12 @@ public:
     bufferization::buildBufferDeallocationPipeline(
         pm, bufferization::BufferDeallocationPipelineOptions{});
 
+    // Sink each dealloc to right after its buffer's last user so a monolithic
+    // single-block function does not keep every buffer live until the end
+    // (which exhausts DSP VTLB mappings).
+    pm.addNestedPass<func::FuncOp>(
+        bufferization::createOptimizeAllocationLivenessPass());
+
     // Lower Linalg to Affine Loops
     pm.addPass(createConvertLinalgToAffineLoopsPass());
 

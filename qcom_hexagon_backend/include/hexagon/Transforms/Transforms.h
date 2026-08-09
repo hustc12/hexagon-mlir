@@ -54,7 +54,9 @@ std::unique_ptr<OperationPass<ModuleOp>>
 createHexagonLLVMEnableHexagonRoutinesPass();
 
 std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
-createHexagonLowerTmTensorPass();
+createHexagonLowerTmTensorPass(
+    const HexagonLowerTmTensorOptions &options =
+        HexagonLowerTmTensorOptions());
 
 std::unique_ptr<OperationPass<func::FuncOp>> createHexagonLWPPass(
     const HexagonLWPPassOptions &options = HexagonLWPPassOptions());
@@ -84,7 +86,8 @@ std::unique_ptr<InterfacePass<FunctionOpInterface>> createMatmulToHexKLPass(
     const MatmulToHexKLOptions &options = MatmulToHexKLOptions());
 
 std::unique_ptr<InterfacePass<FunctionOpInterface>>
-createDecomposeHexKLMatmulPass();
+createDecomposeHexKLMatmulPass(
+    const DecomposeHexKLMatmulOptions &options = DecomposeHexKLMatmulOptions());
 
 std::unique_ptr<OperationPass<func::FuncOp>> createInsertScratchArgPass(
     const InsertScratchArgOptions &options = InsertScratchArgOptions());
@@ -92,7 +95,9 @@ std::unique_ptr<OperationPass<func::FuncOp>> createInsertScratchArgPass(
 std::unique_ptr<OperationPass<func::FuncOp>> createMemoryOffsetsPass();
 
 std::unique_ptr<InterfacePass<FunctionOpInterface>>
-createScheduleMatmulForHVXPass();
+createScheduleMatmulForHVXPass(
+    const ScheduleMatmulForHVXOptions &options =
+        ScheduleMatmulForHVXOptions());
 
 std::unique_ptr<InterfacePass<FunctionOpInterface>>
 createSeedLayoutConversionsPass();
@@ -131,6 +136,27 @@ std::unique_ptr<OperationPass<func::FuncOp>> createDivToMulOptimizationPass();
 
 std::unique_ptr<OperationPass<func::FuncOp>> createSCFLoopUnrollPass(
     const SCFLoopUnrollOptions &options = SCFLoopUnrollOptions());
+
+/// Prefetch: inserts prefetch operations to preload data from DDR to VTCM.
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createPrefetchInsertPass(
+    const PrefetchInsertOptions &options = PrefetchInsertOptions());
+
+/// Prefetch-Kernel-HX external baseline: reconstructs safe affine future tile
+/// addresses and emits fixed-distance L2 hints only.
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createPrefetchKernelHXPass(
+    const PrefetchKernelHXOptions &options = PrefetchKernelHXOptions());
+
+/// V-DAE: decouples Memory Access and Compute Execution using semaphores.
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createOmniFetchVDAEInsertPass(
+    const OmniFetchVDAEInsertOptions &options = OmniFetchVDAEInsertOptions());
+
+/// Layout Ops Elimination: eliminates redundant layout ops when in-situ
+/// reshape is enabled.
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createLayoutOpsEliminationPass();
 
 } // namespace hexagon
 } // namespace mlir

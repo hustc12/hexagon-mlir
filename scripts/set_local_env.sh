@@ -25,7 +25,7 @@ export HEXAGON_SDK_VERSION=6.4.0.2
 export HEXAGON_SDK_ROOT=${BASE_DIR}/HEXAGON_SDK/Hexagon_SDK/$HEXAGON_SDK_VERSION
 export HEXKL_ROOT=${BASE_DIR}/HEXKL_DIR/hexkl_addon
 
-export HEXAGON_ARCH_VERSION=75
+export HEXAGON_ARCH_VERSION="${HEXAGON_ARCH_VERSION:-73}"
 export TRITON_HOME=$HEXAGON_MLIR_ROOT
 export TRITON_PLUGIN_DIRS="$HEXAGON_MLIR_ROOT/triton_shared;$HEXAGON_MLIR_ROOT/qcom_hexagon_backend"
 export PATH=$TRITON_ROOT/build/cmake.linux-x86_64-cpython-${PYTHON_VERSION}/third_party/qcom_hexagon_backend/bin/:$TRITON_ROOT/build/cmake.linux-x86_64-cpython-${PYTHON_VERSION}/third_party/triton_shared/tools/triton-shared-opt:$PATH

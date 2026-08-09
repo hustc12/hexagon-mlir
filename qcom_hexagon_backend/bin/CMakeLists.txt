@@ -59,6 +59,8 @@ target_link_libraries(linalg-hexagon-opt PRIVATE
     ${extension_libs}
     # tests
     TritonTestAnalysis
+    OmniFetch
+    OmniFetchToLLVM
 
     LLVMCore
     LLVMSupport

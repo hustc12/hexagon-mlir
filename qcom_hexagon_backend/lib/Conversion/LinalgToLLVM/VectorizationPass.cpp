@@ -22,6 +22,7 @@
 #include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
@@ -70,10 +71,36 @@ static LogicalResult vectorizeLinalgOp(linalg::LinalgOp op) {
   SmallVector<bool> scalableDims(numLoops, false);
   vecSizes[numLoops - 1] = innerLoopDim;
 
+  auto role = op->getAttrOfType<StringAttr>("omni_fetch.kv_cache_role");
+  auto operand =
+      op->getAttrOfType<IntegerAttr>("omni_fetch.kv_cache_operand");
+  auto layout = op->getAttrOfType<StringAttr>("omni_fetch.kv_cache_layout");
+  Value kvSource;
+  if (role && operand && operand.getInt() >= 0 &&
+      operand.getInt() < static_cast<int64_t>(op.getDpsInputs().size()))
+    kvSource = op.getDpsInputs()[operand.getInt()];
+
+  Operation *previous = op->getPrevNode();
   FailureOr<mlir::linalg::VectorizationResult> vectorResults =
       linalg::vectorize(rewriter, op, vecSizes, scalableDims);
   if (failed(vectorResults))
     return failure();
+  if (role)
+    llvm::errs() << "[KVPropagation] vectorization=succeeded role="
+                 << role.getValue() << "\n";
+  if (kvSource) {
+    Operation *created = previous ? previous->getNextNode()
+                                  : &op->getBlock()->front();
+    while (created && created != op) {
+      if (auto read = dyn_cast<vector::TransferReadOp>(created)) {
+        if (read.getBase() == kvSource) {
+          read->setAttr("omni_fetch.kv_cache_role", role);
+          read->setAttr("omni_fetch.kv_cache_layout", layout);
+        }
+      }
+      created = created->getNextNode();
+    }
+  }
   // Replace the original op with the vectorized op.
   rewriter.replaceOp(op, vectorResults->replacements);
   return success();

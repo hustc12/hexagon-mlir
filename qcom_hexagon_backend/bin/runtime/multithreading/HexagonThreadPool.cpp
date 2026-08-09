@@ -66,3 +66,11 @@ void HexagonThreadPool::workerThread() {
     task();
   }
 }
+
+// OmniFetch dual-thread DAE scout entry (Phase 2).
+extern "C" void hexagon_runtime_scout_enqueue(void (*fn)(void *), void *arg) {
+  static HexagonThreadPool pool(/*numThreads=*/1);
+  if (!fn)
+    return;
+  pool.enqueueTask([fn, arg]() { fn(arg); });
+}
