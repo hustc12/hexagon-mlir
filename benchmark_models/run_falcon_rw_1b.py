@@ -508,7 +508,7 @@ def load_falcon_model(model_name, config):
         model_name,
         config=config,
         torch_dtype=torch.float16,
-        trust_remote_code=True,
+        trust_remote_code=False,
     )
 
 
@@ -606,7 +606,7 @@ def falcon_rw_1b(
 ):
     _patch_dsp_heap_256mb()
 
-    model_name = "Rocketknight1/falcon-rw-1b"  # tiiuae/falcon-rw-1b
+    model_name = "tiiuae/falcon-rw-1b"
     prompt = "What is nature of our existence?"
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)

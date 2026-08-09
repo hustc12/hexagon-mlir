@@ -75,9 +75,8 @@ domain_for() {
 
 weight_status_for() {
   case "$1" in
-    gpt2lmheadmodel|qwen2.5-0.5b) printf '%s\n' cached_checkpoint ;;
+    falcon_rw_1b|gpt2lmheadmodel|qwen2.5-0.5b|tinyllama) printf '%s\n' cached_checkpoint ;;
     swin_transformer|sd_text_encoder) printf '%s\n' random_full_structure ;;
-    falcon_rw_1b|tinyllama) printf '%s\n' checkpoint_missing ;;
     segformer-mit-b0|deit-small|beit-base|dinov2-small|whisper-tiny|hubert-base|wav2vec2-base|unispeech-base|unispeech-sat-base)
       printf '%s\n' random_full_structure
       ;;

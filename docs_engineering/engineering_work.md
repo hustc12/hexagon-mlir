@@ -1516,3 +1516,252 @@ standalone probe had not yet inherited `ANDROID_HOST` and then
 13 occurred.  The next step is to finish the single-stage link/ABI test, then
 generate one DSP-side wrapper that calls all 14 stage functions between two
 reused device-resident hidden-state buffers and times the entire chain.
+
+### 17.9 Full GPT-2 staged HVX validation and softmax lowering repair
+
+The complete published `openai-community/gpt2` checkpoint now passes on the
+v73 device without reducing its 12-layer depth, hidden size 768, sequence
+length 32, or 50,257-token vocabulary.  It remains entirely f32; the probe
+explicitly disables implicit f16 conversion even when HexKL is requested.
+
+Differential device probes isolated the former block-level numerical failure:
+
+| Boundary on block 0 | HVX time | Maximum absolute error | Result |
+|---|---:|---:|---|
+| identity | 0.197 ms | 0 | PASS |
+| layer norm 1 | 0.515 ms | 8.94e-7 | PASS |
+| QKV projection | 219.046 ms | 1.67e-5 | PASS |
+| scaled QK-transpose batch matmul | 197.821 ms | 4.39e-5 | PASS |
+| causal mask, before softmax | 236.081 ms | 4.39e-5 | PASS |
+| stock softmax with `-FLT_MAX` sentinel | 196.427 ms | 0.939394 | **FAIL** |
+| softmax with `-1e4` sentinel | 233.946 ms | 4.41e-6 | PASS |
+| safe softmax through AV and output projection | 268.349 ms | 4.86e-5 | PASS |
+| safe complete transformer block | 742.066 ms | 8.01e-5 | PASS |
+| MLP-only path | 482.305 ms | 4.27e-4 | PASS |
+
+Thus the fault is not the input ABI, tensor layout, QKV projection, transpose,
+batch matmul, causal-mask selection, AV product, or MLP.  It is the interaction
+between the current HVX softmax lowering/math path and the `torch.finfo(f32).min`
+sentinel.  Replacing only masked entries with `-1e4` is f32-softmax equivalent
+for this causal attention (`exp(-10000)` underflows to zero), and it restores
+device correctness without mixed precision or an upstream source patch.
+
+The complete model was then run as host-orchestrated NPU stages: embedding,
+all 12 safe transformer blocks, and final layer norm plus the full LM head.
+Every compute stage executed on the v73 device and passed its local numerical
+gate.  The final logits were finite, had maximum absolute error 9.77e-4 versus
+the original monolithic CPU model, and preserved the last-token top-1 result.
+
+| Full GPT-2 stage | HVX device time |
+|---|---:|
+| token + position embedding | 2.889 ms |
+| 12 transformer blocks (sum) | 8,911.649 ms |
+| final layer norm + 50,257-way LM head | 20,219.321 ms |
+| compute-stage sum | 29,133.859 ms |
+
+This is a support/correctness milestone, not yet the final performance result.
+The launcher currently returns each hidden state to the host and reloads the
+next stage, and independently exported embedding/head modules duplicate the
+tied vocabulary weight.  The reported sum excludes those host round trips.
+The next performance implementation remains a DSP-side orchestrator with two
+reused device-resident hidden buffers and one shared embedding/head weight.
+It is also clear that the unfused full-vocabulary head, rather than the 12-block
+transformer body, is now the largest device-time bottleneck.
+
+### 17.10 Full SD/CLIP text-encoder staged HVX validation
+
+The same non-monolithic method now runs the complete model definition used by
+`benchmark_models/run_sd_text_encoder.py`: 12 encoder layers, hidden size 768,
+12 attention heads, vocabulary 49,408, and the published CLIP context length
+77.  This harness intentionally constructs the published structure with
+fixed-seed random weights; it does not load and must not be reported as the
+pretrained Stable Diffusion text-encoder checkpoint.
+
+The staged CPU graph exactly matches the formal runner (`max_abs=0`).  The
+all-ones tokenizer attention mask contributes zero, while the causal mask uses
+the same finite `-1e4` sentinel validated on GPT-2.  All stages remain f32 and
+run with true HVX vectorization; no mixed-precision conversion is enabled.
+
+| Full SD/CLIP stage | HVX device time |
+|---|---:|
+| token + position embedding | 3.644 ms |
+| 12 CLIP encoder layers (sum) | 109,651.795 ms |
+| final layer norm | 1.484 ms |
+| compute-stage sum | 109,656.923 ms |
+
+Individual encoder layers took 8,892.214--9,318.974 ms.  Every local result
+was finite and its maximum absolute error was between 2.21e-6 and 2.98e-6.
+The final hidden state was finite and differed from the formal CPU model by
+only 1.45e-5.  Therefore the complete 12-layer model is now supported through
+host-orchestrated NPU stages without topology reduction.
+
+As with GPT-2, the compute-stage sum excludes host round trips between stages.
+It is a correctness/support measurement, not a paper-ready end-to-end latency.
+The large difference between CLIP (sequence 77, about 109.7 seconds for the
+encoder stack) and GPT-2 (sequence 32, about 8.9 seconds for the stack) also
+shows why sequence shape must remain part of every reported model identity.
+
+### 17.11 Full Qwen2.5-0.5B staged HVX validation and f16 SiLU repair
+
+The published `Qwen/Qwen2.5-0.5B` checkpoint now completes on the v73 device
+without reducing its 24-layer depth, hidden size 896, intermediate size 4,864,
+14/2 query/KV heads, sequence length 32, or 151,936-token vocabulary.  The
+checkpoint remains in its original f16 dtype; no mixed-precision conversion was
+introduced.  The stable staged CPU path differs from the original model by at
+most 0.05078125 in the final logits and preserves last-token Top-5 exactly.
+
+The initial full-layer probe passed layers 0 and 1 but produced a maximum error
+of 58,848.1094 at layer 2.  Component-level device isolation on the exact
+checkpoint activation established the following boundary:
+
+| Layer-2 component | Result |
+|---|---|
+| input RMSNorm | PASS |
+| complete attention core | PASS |
+| post-attention RMSNorm | PASS |
+| gate projection | PASS |
+| up projection | PASS |
+| down projection on the CPU product | PASS |
+| stock `SiLU(gate) * up` fused subgraph | **FAIL (NaN)** |
+| stock complete MLP | **FAIL (58,849.69 max error)** |
+
+The repair uses the mathematically equivalent, same-dtype expression
+`e=exp(-abs(x)); where(x>=0, x/(1+e), x*e/(1+e))`.  Its exponential argument is
+never positive, avoiding the overflowing f16 intermediate in the current HVX
+SiLU lowering.  On the checkpoint activation its CPU product differs from the
+stock f16 SiLU product by only 0.0078125.  The repaired complete MLP passes the
+device gate with maximum error 0.03125, and the repaired complete layer passes
+with maximum error 0.0625.  This is a model-side semantic normalization in the
+standalone harness, not an invasive patch to upstream Hexagon-MLIR.
+
+All 24 repaired layers then ran serially on true v73 HVX.  Layer 21 remained
+finite but had a local maximum error of 1.0 (1.49% relative to its 66.94 peak),
+so execution resumed from its saved device output rather than rerunning the
+already completed prefix.  Layers 22 and 23 passed, the complete vocabulary
+head passed, and the final device logits are finite with maximum absolute error
+0.55078125 versus the original checkpoint and exact last-token Top-5 agreement.
+
+| Full Qwen2.5-0.5B stage | HVX device time |
+|---|---:|
+| embedding | 0.302 ms |
+| 24 transformer layers (sum) | 373,885.177 ms |
+| final norm + full 151,936-way LM head | 39,005.833 ms |
+| compute-stage sum | 412,891.312 ms |
+
+Individual layer times are 15,301.000--15,872.951 ms.  As with GPT-2 and CLIP,
+the sum excludes host round trips and recompiles equivalent layer compute for
+each independently exported weight set.  It is therefore a full-checkpoint
+support/correctness result, not a paper-ready end-to-end latency.  The large
+cost also motivates a shared layer executable, separated per-layer constants,
+and device-resident hidden-state ping-pong buffers before performance claims.
+
+### 17.12 Falcon-RW-1B boundary and explicit 4-layer fallback
+
+The existing `Rocketknight1/falcon-rw-1b` cache contained tokenizer/config
+files but no weights.  The official, architecture-equivalent
+`tiiuae/falcon-rw-1b` checkpoint was therefore downloaded and pinned for this
+probe.  Its full identity is 24 layers, hidden size 2,048, 32 attention heads,
+vocabulary 50,304, f16 weights, and sequence length 32.  The host-staged CPU
+path exactly matches the full model (`max_abs=0`, exact Top-5).
+
+The v73 HVX execution passed embedding and layers 0--3.  Layer 4 then returned
+NaN while the launcher itself reported `Result:Pass`; this was not exit 13.
+Replacing the extreme causal sentinel with `-1e4` preserved the CPU model
+exactly but did not repair the failure.  Differential execution on the saved
+layer-3 device output showed that attention, MLP, and the three-way residual
+combine each pass independently; only the fused complete layer fails.  The
+next layer's standalone LayerNorm also exposes the underlying dynamic-range
+problem: its input peaks near 1,424, so a naive f16 square/reduction over 2,048
+features either overflows or loses accuracy.  Algebraic input/epsilon scaling
+by 256 removed NaNs but left 40.9% relative error; scaling by 1,024 underflowed
+the variance path and was worse.  No mixed precision was introduced.
+
+Following the explicit fallback policy, this model is therefore **not counted
+as a full Falcon-RW-1B NPU pass**.  A clearly named `Falcon-RW-1B-4L cropped`
+variant preserves the official embedding, hidden width, head count, full
+vocabulary, first four checkpoint blocks, and LM projection.  Only the depth is
+reduced from 24 to 4, leaving a nontrivial several-hundred-million-parameter
+model.  Its final LayerNorm uses a host fallback because the same HVX f16
+reduction issue also makes the fused head NaN; the full LM projection remains
+on HVX.
+
+| Falcon-RW-1B-4L stage | Device time |
+|---|---:|
+| embedding | 2.295 ms |
+| four transformer blocks (sum) | 61,244.779 ms |
+| host final LayerNorm | excluded; host fallback |
+| full 50,304-way LM projection | 144,173.448 ms |
+| measured NPU compute sum | 205,420.522 ms |
+
+The cropped result is finite, differs from its matched cropped CPU definition
+by at most 0.05859375, and preserves last-token Top-5 exactly.  This result is
+useful for support engineering, but it must remain in a separate cropped/
+fallback table and must not be presented as the 24-layer Falcon result.  The
+proper full-model repair requires a numerically stable f16 HVX LayerNorm
+reduction (or an explicitly allowed higher-precision accumulator) plus avoiding
+the whole-layer fusion bug.
+
+### 17.13 Full TinyLlama-1.1B staged HVX validation
+
+The initially cached `TinyLlama/TinyLlama-1.1B-Chat-v1.0` snapshot was also
+missing its weights, so the official complete checkpoint was downloaded rather
+than substituting a smaller model.  The validated identity is 22 layers,
+hidden size 2,048, intermediate size 5,632, 32/4 query/KV heads, vocabulary
+32,000, sequence length 32, and checkpoint f16 weights.
+
+TinyLlama shares the gated SiLU structure exercised by Qwen, so the same-dtype
+overflow-safe SiLU expression is used.  The complete staged CPU path
+differs from the formal checkpoint by at most 0.14453125 and preserves the
+last-token Top-5.  All 22 complete transformer layers then executed serially on
+v73 HVX without cropping, a host normalization fallback, exit 13, or a device
+restart.  The final RMSNorm plus full vocabulary head also passed.
+
+| Full TinyLlama-1.1B stage | HVX device time |
+|---|---:|
+| embedding | 2.299 ms |
+| 22 transformer layers (sum) | 956,517.646 ms |
+| final RMSNorm + full 32,000-way LM head | 18,953.017 ms |
+| compute-stage sum | 975,472.962 ms |
+
+Individual layers take 41,718.289--45,562.444 ms.  The final device logits are
+finite, have maximum absolute error 0.453125 against the original checkpoint,
+and preserve last-token Top-5 exactly.  As for the other staged LLM probes,
+the sum excludes host transfers between stages and repeated compile/load
+overheads, so it demonstrates full-checkpoint correctness/support rather than
+paper-ready end-to-end latency.
+
+### 17.14 Current complete-model support count
+
+After this recovery pass, **14 of the 15 selected full model definitions now
+complete on native upstream v73 HVX**: the previously recorded ten models plus
+GPT-2, SD/CLIP text encoder, Qwen2.5-0.5B, and TinyLlama-1.1B.  Falcon-RW-1B is
+the only remaining full-depth exception.  Its official 24-layer checkpoint was
+attempted and diagnosed, while the separately labeled 4-layer cropped variant
+with a final-LayerNorm host fallback passes.  The cropped Falcon result must not
+be included in the 14/15 full-model count.
+
+The next performance phase should therefore use the 14 full passes as the
+primary corpus.  Falcon can remain a documented compiler-numerics stress case,
+or be replaced by another roughly comparable Hugging Face model only if the
+experiment requires 15 full, device-only models before the upstream f16
+LayerNorm reduction is repaired.
+
+The reproducible commands are:
+
+```bash
+# One selected model (all commands are serial and contain no timeout).
+scripts/run_gpt2_layered_probe.sh --output-dir /tmp/gpt2-full-hvx
+scripts/run_clip_layered_probe.sh --output-dir /tmp/clip-full-hvx
+scripts/run_qwen_layered_probe.sh --output-dir /tmp/qwen-full-hvx
+scripts/run_tinyllama_layered_probe.sh --output-dir /tmp/tinyllama-full-hvx
+
+# Explicitly cropped/fallback Falcon; never label this as full 24-layer Falcon.
+scripts/run_falcon_layered_probe.sh --effective-layers 4 --split-head \
+  --output-dir /tmp/falcon-rw-1b-4l-hvx
+
+# Run the five staged definitions above in the same order, strictly serially.
+scripts/run_remaining_staged_models.sh
+```
+
+All generated MLIR, objects, shared libraries, raw tensors, and downloaded
+checkpoint caches remain outside Git and must not be committed.
