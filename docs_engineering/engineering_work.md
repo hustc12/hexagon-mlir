@@ -1765,3 +1765,202 @@ scripts/run_remaining_staged_models.sh
 
 All generated MLIR, objects, shared libraries, raw tensors, and downloaded
 checkpoint caches remain outside Git and must not be committed.
+
+### 17.15 Full staged HexKL measurements for the four recovered models
+
+The four host-staged full models above were subsequently rerun with HexKL
+enabled.  These runs preserve exactly the corresponding HVX model identity,
+sequence length, layer count, vocabulary, stage boundaries, checkpoint dtype,
+and correctness gate.  They use true v73 vectorization,
+`enableConvertToHexagonmem`, no VTCM tiling, and no implicit f16 conversion.
+The table reports the sum of device `Perf` values only; compilation, ADB
+transfer, and host round trips between stages are excluded from both columns.
+Thus `HVX / HexKL > 1` means that HexKL is faster under the matched staged
+measurement.
+
+| Complete staged model | Dtype | HVX (ms) | HexKL (ms) | HVX / HexKL | Correctness |
+|---|---|---:|---:|---:|---|
+| GPT-2, 12L, seq 32, vocab 50,257 | f32 | 29,133.859 | 28,661.474 | 1.016x | max abs 9.77e-4; Top-1 exact |
+| SD/CLIP text encoder, 12L, seq 77 | f32 | 109,656.923 | 107,141.040 | 1.023x | max abs 1.45e-5 |
+| Qwen2.5-0.5B, 24L, seq 32, vocab 151,936 | f16 | 412,891.312 | 13,537.873 | **30.499x** | max abs 0.56640625; Top-5 exact |
+| TinyLlama-1.1B, 22L, seq 32, vocab 32,000 | f16 | 975,472.962 | 32,908.259 | **29.642x** | max abs 0.453125; Top-5 exact |
+
+The HexKL stage breakdowns are:
+
+| Model | Embedding | Transformer stack | Final norm/head | Total |
+|---|---:|---:|---:|---:|
+| GPT-2 | 3.053 ms | 8,917.680 ms | 19,740.741 ms | 28,661.474 ms |
+| SD/CLIP | 3.553 ms | 107,136.014 ms | 1.473 ms | 107,141.040 ms |
+| Qwen2.5-0.5B | 0.304 ms | 12,234.852 ms | 1,302.717 ms | 13,537.873 ms |
+| TinyLlama-1.1B | 2.247 ms | 32,313.698 ms | 592.314 ms | 32,908.259 ms |
+
+This sharply separates two cases.  GPT-2 and CLIP deliberately remain f32;
+their block/encoder-stack times are essentially unchanged, so merely enabling
+and linking HexKL does not imply useful HMX execution.  Qwen and TinyLlama use
+uniform checkpoint f16 and have regular, large linear projections.  Their
+roughly 30x improvements, including the full vocabulary heads, demonstrate
+that those matrix shapes do enter the effective HexKL path.  This is also why
+the earlier statement that HexKL can play an HMX-like role needs a shape and
+dtype qualification: it is true for the compatible f16 projections here, but
+not for arbitrary f32 or unsupported/batched MatMul forms.
+
+During the first TinyLlama attempt, an external `/tmp` cleanup removed every
+timestamped launcher artifact directory between folder creation and object
+write.  The resulting host exception was `FileNotFoundError`, not exit 13, a
+DSP restart, or a lowering failure.  Disk, inode, and memory pressure were all
+low.  The clean rerun set `HEXAGON_MLIR_DUMP_DIR` to the untracked, repository-
+external directory `../run_artifacts/tinyllama_hexkl` and completed all 22
+layers continuously.  Generated artifacts remain excluded from Git.
+
+Reproduction commands (strictly serial, no timeout) are:
+
+```bash
+scripts/run_gpt2_layered_probe.sh --enable-hexkl \
+  --device-stage safe_full_model --device-iterations 1 \
+  --skip-full-export --output-dir /tmp/gpt2-full-hexkl
+scripts/run_clip_layered_probe.sh --enable-hexkl --device-iterations 1 \
+  --output-dir /tmp/clip-full-hexkl
+scripts/run_qwen_layered_probe.sh --enable-hexkl --device-iterations 1 \
+  --output-dir /tmp/qwen-full-hexkl
+HEXAGON_MLIR_DUMP_DIR=../run_artifacts/tinyllama_hexkl \
+  scripts/run_tinyllama_layered_probe.sh --enable-hexkl \
+  --device-iterations 1 \
+  --output-dir ../run_artifacts/tinyllama_hexkl/mlirbc
+```
+
+### 17.16 Falcon decision after the complete HexKL comparison
+
+Falcon-RW-1B is likely to have HexKL-friendly f16 projections: its published
+shape is 24 layers, hidden size 2,048, 32 heads, and vocabulary 50,304.  The
+current blocker, however, occurs before a trustworthy full-model timing can be
+claimed: f16 LayerNorm reduction and whole-layer fusion become numerically
+invalid at layer 4.  Extending the cropped Falcon result to 24 layers would
+therefore require a new numerics/codegen project rather than routine model
+staging.  It should remain a documented stress case and must not be silently
+counted as a full model.
+
+For the primary 15-model performance corpus, the preferred replacement is
+`HuggingFaceTB/SmolLM2-1.7B`.  It closely matches Falcon's relevant compute
+envelope (24 layers, hidden size 2,048, 32 heads, intermediate size 8,192, and
+vocabulary 49,152) while using the Llama-family RMSNorm plus SiLU structure
+already exercised successfully by TinyLlama/Qwen.  It also adds more
+architectural diversity than simply scaling Qwen2.5-0.5B to Qwen2.5-1.5B.
+The recommended next order is therefore:
+
+1. add a staged SmolLM2-1.7B runner by reusing the validated Llama/Qwen stable
+   SiLU and device-state machinery;
+2. run its full HVX and HexKL baselines serially with sequence length 32;
+3. keep full Falcon repair as a separate compiler-numerics investigation;
+4. revisit Falcon only after the main 15-model corpus and OmniFetch comparison
+   are complete, unless Falcon-specific coverage becomes a paper requirement.
+
+### 17.17 Uniform-f16 GPT-2/CLIP comparison and full SmolLM2 replacement
+
+The recommendation in Section 17.16 has now been implemented.  Full-depth
+`HuggingFaceTB/SmolLM2-1.7B` replaces the cropped/host-fallback Falcon entry in
+the primary 15-model corpus.  Falcon remains a separately documented compiler
+numerics stress case and is not included in the complete-model table below.
+
+GPT-2 and the SD/CLIP text encoder were also rerun in uniform f16.  This is not
+mixed precision: weights, activations, masks, and stage interfaces all remain
+f16.  GPT-2 needs a same-dtype algebraic LayerNorm normalization that scales the
+input before the mean/variance reduction and scales epsilon consistently.  It
+prevents f16 reduction overflow without introducing an f32 accumulator.  The
+complete 12-layer device result is finite and preserves the last-token Top-1.
+The complete CLIP encoder did not require this LayerNorm rewrite and differs
+from its matched CPU definition by at most 0.015625.
+
+The CLIP row uses the repository's existing benchmark identity: the published
+Stable Diffusion CLIP text-encoder configuration (12 layers, sequence length
+77), with fixed-seed randomly initialized weights.  It is a complete model
+structure benchmark, but must not be described as a pretrained SD checkpoint
+accuracy result.  GPT-2, Qwen, TinyLlama, and SmolLM2 use their named published
+checkpoints.
+
+| Full f16 staged model | HVX (ms) | HexKL (ms) | HVX / HexKL | Correctness |
+|---|---:|---:|---:|---|
+| GPT-2, 12L, seq 32, vocab 50,257 | 21,324.308 | 3,359.199 | **6.348x** | finite; Top-1 exact |
+| SD/CLIP text encoder, 12L, seq 77 | 244,487.748 | 5,440.120 | **44.942x** | finite; max abs 0.015625 |
+| SmolLM2-1.7B, 24L, seq 32, vocab 49,152 | 1,549,937.550 | 42,315.577 | **36.628x** | finite; Top-5 exact |
+
+The GPT-2 f16 stage breakdown is 3.277 ms embedding, 10,563.889 ms for
+12 blocks, and 10,757.142 ms for final normalization plus the full vocabulary
+head on HVX.  The corresponding HexKL values are 3.222, 2,903.796, and
+452.181 ms.  SmolLM2 is 2.046 + 1,520,768.746 + 29,166.758 ms on HVX and
+2.059 + 40,619.353 + 1,694.165 ms on HexKL.  These sums use device `Perf`
+only and exclude compilation, ADB transfer, and host round trips.
+
+SmolLM2 uses the complete official shape: 24 layers, hidden size 2,048,
+intermediate size 8,192, 32/32 query/KV heads, vocabulary 49,152, and sequence
+length 32.  Its safe staged CPU path differs from the formal checkpoint by at
+most 0.09765625 and preserves last-token Top-5.  All 24 blocks and the full LM
+head pass on both backends.  The HVX final maximum error is 1.5; HexKL is
+1.51953125; both preserve Top-5 exactly.
+
+The HexKL run was interrupted by a host-system crash after layer 16.  Artifact
+size validation showed that layer 0--16 had valid 99-byte perf records and
+131,108-byte output memrefs, while the next two timestamp directories contained
+zero-byte/incomplete files.  Execution therefore resumed from the saved layer
+16 output with `--start-layer 17 --resume-output-raw ...`, wrote the suffix to a
+separate artifact directory, and passed the complete final-output gate.  The
+reported 42,315.577 ms merges exactly 26 nonempty records: one embedding,
+24 distinct blocks, and one head.  Zero-byte crash artifacts and duplicate
+stages are excluded.
+
+#### Current 15-complete-model HVX/HexKL corpus
+
+All entries below are complete model definitions, use f16, run serially on the
+same SM8550/v73 phone, use one device iteration, and report summed device
+compute-stage `Perf`.  `HVX / HexKL > 1` means HexKL is faster.  The three
+domains remain balanced at five models each.  “Language/text” includes the
+CLIP text-conditioning encoder because its measured computation is a text
+Transformer, although it is used by a generative-vision pipeline.
+
+| Domain | Complete model | HVX (ms) | HexKL (ms) | HVX / HexKL |
+|---|---|---:|---:|---:|
+| Computer vision | DINOv2-small | 30,396.932 | 9,873.013 | **3.078x** |
+| Computer vision | DeiT-small | 24,075.094 | 8,342.079 | **2.886x** |
+| Computer vision | SegFormer MiT-B0 | 27,488.063 | 9,349.189 | **2.940x** |
+| Computer vision | Swin Transformer | 122,531.193 | 73,079.566 | **1.677x** |
+| Computer vision | BEiT-base | 129,376.464 | 13,495.335 | **9.587x** |
+| Speech/audio | Whisper-tiny | 160,182.939 | 112,048.671 | **1.430x** |
+| Speech/audio | HuBERT-base | 216,665.328 | 190,385.382 | **1.138x** |
+| Speech/audio | Wav2Vec2-base | 216,404.775 | 174,978.035 | **1.237x** |
+| Speech/audio | UniSpeech-base | 215,996.232 | 174,108.521 | **1.241x** |
+| Speech/audio | UniSpeech-SAT-base | 215,612.362 | 174,006.382 | **1.239x** |
+| Language/text | GPT-2 | 21,324.308 | 3,359.199 | **6.348x** |
+| Language/text | SD/CLIP text encoder | 244,487.748 | 5,440.120 | **44.942x** |
+| Language/text | Qwen2.5-0.5B | 412,891.312 | 13,537.873 | **30.499x** |
+| Language/text | TinyLlama-1.1B | 975,472.962 | 32,908.259 | **29.642x** |
+| Language/text | SmolLM2-1.7B | 1,549,937.550 | 42,315.577 | **36.628x** |
+
+This table supersedes the earlier 14/15 support count in Section 17.14 and the
+f32 GPT-2/CLIP rows in Section 17.15 for the primary uniform-f16 corpus.  It
+does not make an end-to-end latency claim: current staged runners transfer the
+hidden state and compile/load each weight-bearing stage independently.  The
+same exclusion applies symmetrically to HVX and HexKL.
+
+Reproduction commands (strictly serial, no timeout) are:
+
+```bash
+HEXAGON_MLIR_DUMP_DIR=../run_artifacts/gpt2_fp16_hvx \
+  scripts/run_gpt2_layered_probe.sh --dtype fp16 --device-iterations 1 \
+  --output-dir ../run_artifacts/gpt2_fp16_hvx/mlirbc
+HEXAGON_MLIR_DUMP_DIR=../run_artifacts/gpt2_fp16_hexkl \
+  scripts/run_gpt2_layered_probe.sh --dtype fp16 --enable-hexkl \
+  --device-iterations 1 --output-dir ../run_artifacts/gpt2_fp16_hexkl/mlirbc
+
+HEXAGON_MLIR_DUMP_DIR=../run_artifacts/clip_fp16_hvx \
+  scripts/run_clip_layered_probe.sh --dtype fp16 --device-iterations 1 \
+  --output-dir ../run_artifacts/clip_fp16_hvx/mlirbc
+HEXAGON_MLIR_DUMP_DIR=../run_artifacts/clip_fp16_hexkl \
+  scripts/run_clip_layered_probe.sh --dtype fp16 --enable-hexkl \
+  --device-iterations 1 --output-dir ../run_artifacts/clip_fp16_hexkl/mlirbc
+
+HEXAGON_MLIR_DUMP_DIR=../run_artifacts/smollm2_hvx \
+  scripts/run_smollm2_layered_probe.sh --device-iterations 1 \
+  --output-dir ../run_artifacts/smollm2_hvx/mlirbc
+HEXAGON_MLIR_DUMP_DIR=../run_artifacts/smollm2_hexkl \
+  scripts/run_smollm2_layered_probe.sh --enable-hexkl --device-iterations 1 \
+  --output-dir ../run_artifacts/smollm2_hexkl/mlirbc
+```

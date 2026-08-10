@@ -45,13 +45,13 @@ class CLIPEmbeddingStage(torch.nn.Module):
 
 
 class CLIPSafeLayerStage(torch.nn.Module):
-    def __init__(self, layer: torch.nn.Module, seq_len: int):
+    def __init__(self, layer: torch.nn.Module, seq_len: int, dtype: torch.dtype):
         super().__init__()
         self.layer = layer
         # All-ones tokenizer attention mask contributes zero.  The finite
         # causal sentinel is FP32-softmax equivalent and avoids the HVX
         # -FLT_MAX failure already isolated with full GPT-2.
-        causal = torch.zeros((1, 1, seq_len, seq_len), dtype=torch.float32)
+        causal = torch.zeros((1, 1, seq_len, seq_len), dtype=dtype)
         causal.masked_fill_(
             torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool), diagonal=1),
             -1.0e4,
@@ -92,13 +92,21 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=Path("/tmp/clip-layered"))
     parser.add_argument("--device-iterations", type=int, default=1)
     parser.add_argument("--enable-hexkl", action="store_true")
+    parser.add_argument("--cpu-only", action="store_true")
+    parser.add_argument(
+        "--dtype",
+        choices=("fp32", "fp16"),
+        default="fp32",
+        help="Uniform model and execution dtype; never enables mixed precision.",
+    )
     args = parser.parse_args()
 
     tokenizer = CLIPTokenizer.from_pretrained(SD_MODEL_ID, subfolder="tokenizer")
     config = CLIPTextModel.config_class.from_pretrained(
         SD_MODEL_ID, subfolder="text_encoder"
     )
-    model = CLIPTextModel(config).eval()
+    model_dtype = torch.float16 if args.dtype == "fp16" else torch.float32
+    model = CLIPTextModel(config).to(dtype=model_dtype).eval()
     _patch_gelu_tanh(model)
     seq_len = 77
     input_ids = get_text_inputs(
@@ -107,7 +115,7 @@ def main() -> None:
     attention_mask = torch.ones_like(input_ids, dtype=torch.int64)
     embedding = CLIPEmbeddingStage(model, seq_len).eval()
     layers = [
-        CLIPSafeLayerStage(layer, seq_len).eval()
+        CLIPSafeLayerStage(layer, seq_len, model_dtype).eval()
         for layer in model.text_model.encoder.layers
     ]
     final_norm = CLIPFinalNormStage(model).eval()
@@ -124,10 +132,13 @@ def main() -> None:
     print(
         f"[CLIPLayeredCPU] layers={len(layers)} hidden={config.hidden_size} "
         f"heads={config.num_attention_heads} vocab={config.vocab_size} "
+        f"dtype={args.dtype} "
         f"seq_len={seq_len} max_abs={cpu_max_abs:.9g}"
     )
     if cpu_max_abs > 1.0e-4:
         raise AssertionError("safe staged CLIP differs from the formal CPU model")
+    if args.cpu_only:
+        return
 
     from triton.backends.qcom_hexagon_backend.compiler import HexagonOptions
     from triton.backends.qcom_hexagon_backend.torch_mlir_hexagon_launcher import (

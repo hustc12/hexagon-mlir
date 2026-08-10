@@ -67,7 +67,12 @@ class GPT2BlockStage(torch.nn.Module):
 class GPT2HeadStage(torch.nn.Module):
     def __init__(self, model: GPT2LMHeadModel):
         super().__init__()
-        self.ln_f = model.transformer.ln_f
+        final_norm = model.transformer.ln_f
+        self.ln_f = (
+            GPT2StableLayerNorm(final_norm)
+            if final_norm.weight.dtype == torch.float16
+            else final_norm
+        )
         self.lm_head = model.lm_head
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -86,6 +91,30 @@ class GPT2LayerNormStage(torch.nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.layer_norm(hidden_states)
+
+
+class GPT2StableLayerNorm(torch.nn.Module):
+    """Same-dtype LayerNorm that avoids overflowing f16 reductions."""
+
+    def __init__(self, layer_norm: torch.nn.Module, scale: float = 64.0):
+        super().__init__()
+        self.weight = layer_norm.weight
+        self.bias = layer_norm.bias
+        self.eps = float(layer_norm.eps)
+        self.hidden_size = int(layer_norm.normalized_shape[-1])
+        self.scale = float(scale)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        scaled = hidden_states / self.scale
+        mean_scaled = torch.mean(scaled, dim=-1, keepdim=True)
+        centered_scaled = scaled - mean_scaled
+        variance_scaled = torch.mean(
+            centered_scaled * centered_scaled, dim=-1, keepdim=True
+        )
+        normalized = centered_scaled * torch.rsqrt(
+            variance_scaled + self.eps / (self.scale * self.scale)
+        )
+        return normalized * self.weight + self.bias
 
 
 class GPT2AttentionStage(torch.nn.Module):
@@ -111,9 +140,19 @@ class GPT2AttentionStage(torch.nn.Module):
 class GPT2AttentionPrefixStage(torch.nn.Module):
     """Expose exact eager-attention prefix boundaries for lowering diagnosis."""
 
-    def __init__(self, block: torch.nn.Module, boundary: str):
+    def __init__(
+        self,
+        block: torch.nn.Module,
+        boundary: str,
+        *,
+        stable_layer_norm: bool = False,
+    ):
         super().__init__()
-        self.layer_norm = block.ln_1
+        self.layer_norm = (
+            GPT2StableLayerNorm(block.ln_1)
+            if stable_layer_norm
+            else block.ln_1
+        )
         self.c_attn = block.attn.c_attn
         self.c_proj = block.attn.c_proj
         # Keep this a plain tensor attribute. Registering it as a buffer adds a
@@ -179,9 +218,15 @@ class GPT2SafeBlockStage(torch.nn.Module):
     def __init__(self, block: torch.nn.Module):
         super().__init__()
         self.attention = GPT2AttentionPrefixStage(
-            block, "attention_projection_safe_mask"
+            block,
+            "attention_projection_safe_mask",
+            stable_layer_norm=block.ln_1.weight.dtype == torch.float16,
         )
-        self.layer_norm_2 = block.ln_2
+        self.layer_norm_2 = (
+            GPT2StableLayerNorm(block.ln_2)
+            if block.ln_2.weight.dtype == torch.float16
+            else block.ln_2
+        )
         self.mlp = block.mlp
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -245,6 +290,12 @@ def main() -> None:
     parser.add_argument("--enable-hexkl", action="store_true")
     parser.add_argument("--device-iterations", type=int, default=1)
     parser.add_argument(
+        "--dtype",
+        choices=("fp32", "fp16"),
+        default="fp32",
+        help="Uniform checkpoint and execution dtype; never enables mixed precision.",
+    )
+    parser.add_argument(
         "--skip-full-export",
         action="store_true",
         help="Validate the full staged CPU graph but export only the selected probe.",
@@ -254,11 +305,12 @@ def main() -> None:
         raise ValueError("--seq-len must be positive")
 
     model_name = "openai-community/gpt2"
+    model_dtype = torch.float16 if args.dtype == "fp16" else torch.float32
     tokenizer = GPT2Tokenizer.from_pretrained(model_name)
     config = GPT2Config.from_pretrained(model_name)
     config.use_cache = False
     model = GPT2LMHeadModel.from_pretrained(
-        model_name, config=config, torch_dtype=torch.float32
+        model_name, config=config, torch_dtype=model_dtype
     ).eval()
     freeze_gpt2_attn_bias_buffers(model, seq_len=args.seq_len)
 
@@ -279,9 +331,11 @@ def main() -> None:
     )
     print(
         f"[LayeredCPU] layers={len(blocks)} seq_len={args.seq_len} "
+        f"dtype={args.dtype} "
         f"max_abs={max_abs:.9g} last_token_top1_match={exact_top1}"
     )
-    if max_abs > 1.0e-5 or not exact_top1:
+    cpu_tolerance = 0.5 if model_dtype == torch.float16 else 1.0e-5
+    if max_abs > cpu_tolerance or not exact_top1:
         raise AssertionError("staged GPT-2 does not match the original model")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -364,12 +418,22 @@ def main() -> None:
                 stage_max_abs = float(
                     (stage_actual.float() - stage_expected.float()).abs().max()
                 )
+                expected_scale = float(stage_expected.float().abs().max())
+                stage_tolerance = (
+                    max(0.2, expected_scale * 0.02)
+                    if model_dtype == torch.float16
+                    else 0.03
+                )
                 print(
                     f"[LayeredDeviceStage] end={label} finite="
                     f"{bool(torch.isfinite(stage_actual).all())} "
-                    f"max_abs={stage_max_abs:.9g}"
+                    f"expected_abs_max={expected_scale:.9g} "
+                    f"max_abs={stage_max_abs:.9g} tolerance={stage_tolerance:.9g}"
                 )
-                if not torch.isfinite(stage_actual).all() or stage_max_abs > 0.03:
+                if (
+                    not torch.isfinite(stage_actual).all()
+                    or stage_max_abs > stage_tolerance
+                ):
                     raise AssertionError(f"device stage {label} failed correctness")
                 return stage_actual.detach()
 
@@ -390,7 +454,12 @@ def main() -> None:
                 f"{bool(torch.isfinite(device_logits).all())} "
                 f"max_abs={final_max_abs:.9g} last_token_top1_match={final_top1}"
             )
-            if not final_top1 or final_max_abs > 0.2:
+            final_tolerance = (
+                max(0.5, float(reference.float().abs().max()) * 0.1)
+                if model_dtype == torch.float16
+                else 0.2
+            )
+            if not final_top1 or final_max_abs > final_tolerance:
                 raise AssertionError("full staged GPT-2 failed correctness gate")
             return
 
