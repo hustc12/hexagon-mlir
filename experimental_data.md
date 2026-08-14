@@ -1,6 +1,6 @@
 # OmniFetch Experimental Data Consolidation
 
-Last consolidated: 2026-08-13
+Last consolidated: 2026-08-14
 
 This document consolidates measured latency data scattered across the project
 Markdown files. It preserves historical results instead of replacing them with
@@ -47,7 +47,51 @@ rather than completed measurements. They were inspected but are not turned
 into experimental rows. Likewise, projected/target CSV values are excluded;
 this file records measured values documented as device results.
 
-## 2. Required cross-product matrix for the two prefetch baselines
+## 2. Complete-model parameter and arithmetic-compute census
+
+This table describes the **same 15 full-structure runners** used by the
+complete-model corpus below; it is not a count for a debug/reduced graph.
+`Runner parameters` is the exact sum of `model.parameters()` in the structure
+compiled by the runner (including its deployed prediction head where present).
+`Model-card / published parameters` is deliberately retained as a separate
+public, usually rounded, reference.  It can differ because a card may count a
+pre-training/task head, use a different checkpoint revision, or round the
+value.  In particular, the SD card describes the whole diffusion pipeline, so
+it is not a valid published parameter count for the CLIP text-encoder component
+used here.
+
+`MACs` are the major dense/conv arithmetic operation count measured with
+PyTorch `FlopCounterMode` on meta tensors; `FLOPs = 2 x MACs` (one multiply plus
+one add).  These counts include `linear`/matrix multiply, batched matrix
+multiply and convolution, but exclude elementwise activation, normalization,
+softmax, indexing and data movement.  They therefore provide a reproducible
+arithmetic-workload indicator rather than a claim about every DSP instruction.
+They are independent of FP16/FP32 storage precision.
+
+| Domain | Complete model | Runner input / decoding scope | Runner parameters (exact; M) | Model-card / published parameters | MACs (G) | FLOPs (G) |
+|---|---|---|---:|---:|---:|---:|
+| Language/text | GPT-2 | B=1, 32 tokens, full vocabulary logits | 124,439,808; 124.44 | [124M](https://huggingface.co/openai-community/gpt2) | 3.97 | 7.94 |
+| Language/text | SD/CLIP text encoder | B=1, 77 tokens | 123,060,480; 123.06 | N/A (SD card is whole pipeline) | 6.65 | 13.30 |
+| Language/text | Qwen2.5-0.5B | B=1, 32 tokens, full vocabulary logits | 494,032,768; 494.03 | [0.49B](https://huggingface.co/Qwen/Qwen2.5-0.5B) | 15.85 | 31.70 |
+| Language/text | TinyLlama-1.1B | B=1, 32 tokens, full vocabulary logits | 1,100,048,384; 1,100.05 | [1.1B](https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0) | 33.19 | 66.39 |
+| Language/text | SmolLM2-1.7B | B=1, 32 tokens, full vocabulary logits | 1,711,376,384; 1,711.38 | [1.7B](https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B) | 54.86 | 109.72 |
+| Vision | Swin Transformer (tiny) | B=1, 3x224x224 | 28,288,354; 28.29 | [28.3M](https://huggingface.co/microsoft/swin-tiny-patch4-window7-224) | 4.49 | 8.98 |
+| Vision | SegFormer MiT-B0 | B=1, 3x224x224 | 3,576,392; 3.58 | [3.7M](https://arxiv.org/abs/2105.15203) | 0.45 | 0.90 |
+| Vision | DeiT-small | B=1, 3x224x224 | 22,051,432; 22.05 | [22M](https://huggingface.co/facebook/deit-small-patch16-224) | 4.62 | 9.25 |
+| Vision | BEiT-base | B=1, 3x224x224 | 86,530,984; 86.53 | [87M](https://huggingface.co/microsoft/beit-base-patch16-224) | 17.56 | 35.13 |
+| Vision | DINOv2-small | B=1, 3x224x224 | 22,825,192; 22.83 | [22.1M](https://huggingface.co/facebook/dinov2-small) | 6.12 | 12.25 |
+| Speech | Whisper-tiny | B=1, 80x3000 mel; 32 decoder tokens | 37,760,640; 37.76 | [39M](https://huggingface.co/openai/whisper-tiny) | 21.29 | 42.58 |
+| Speech | HuBERT-base | B=1, 20,560 waveform samples | 94,396,320; 94.40 | [94.7M](https://www.isca-archive.org/interspeech_2023/zaiem23b_interspeech.pdf) | 9.00 | 17.99 |
+| Speech | Wav2Vec2-base | B=1, 20,560 waveform samples | 94,396,320; 94.40 | [95M](https://arxiv.org/abs/2006.11477) | 9.00 | 17.99 |
+| Speech | UniSpeech-base | B=1, 20,560 waveform samples | 94,396,320; 94.40 | [94.68M](https://www.microsoft.com/en-us/research/wp-content/uploads/2022/05/UniSpeech_SAT.pdf) | 9.00 | 17.99 |
+| Speech | UniSpeech-SAT-base | B=1, 20,560 waveform samples | 94,396,320; 94.40 | [94.68M](https://www.microsoft.com/en-us/research/wp-content/uploads/2022/05/UniSpeech_SAT.pdf) | 9.00 | 17.99 |
+
+The five language-model counts include the full-token logits projection; they
+are thus forward-pass counts, not one-token autoregressive decode counts.  The
+audio runners intentionally benchmark the representation encoder and omit an
+ASR/pre-training head, matching the current Hexagon-MLIR benchmark topology.
+
+## 3. Required cross-product matrix for the two prefetch baselines
 
 The following table expands the current **15 complete-model corpus plus the
 ViT-Base external-baseline vehicle** across the requested policy-by-engine
@@ -103,7 +147,7 @@ Native Hexagon-MLIR HVX (HexKL off) are real timing differences but are not clea
 because merely enabling HexKL changes lowering even when it reports zero HMX
 rewrites.
 
-## 3. Chronological experimental record
+## 4. Chronological experimental record
 
 ### 2026-07-23 — first Phase-1/2 and model three-way measurements
 
@@ -482,7 +526,7 @@ otherwise-default layout-aware and adaptive options. They do not delete any
 implementation; the explicitly named cumulative and no-item4 ablation scripts
 remain available to reproduce the historical combination rows.
 
-## 4. Supersession and paper-use guidance
+## 5. Supersession and paper-use guidance
 
 1. Use the **2026-08-08+ uniform-FP16 15-model table** for the current native
    HVX-versus-HexKL full-model corpus. Do not combine it with the much slower
