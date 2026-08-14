@@ -161,7 +161,7 @@ class TorchMlirHexagonWrapperGenerator(HexagonWrapperGenerator):
             return ""
         return super().generate_update_tensor_calls()
 
-    def generate_l2_scheduler_report(self):
+    def generate_l2_scheduler_report(self, exec_dir):
         if not self._uses_l2_scheduler():
             return ""
         return """
@@ -169,38 +169,59 @@ uint64_t l2_scheduler_counts = __omni_fetch_l2_scheduler_counts();
 uint64_t l2_scheduler_limits = __omni_fetch_l2_scheduler_limits();
 uint64_t l2_requested_bytes = __omni_fetch_l2_requested_bytes();
 uint64_t l2_issued_bytes = __omni_fetch_l2_issued_bytes();
-FILE *l2_scheduler_report = fopen("perf.txt", "a");
+uint64_t l2_policy_suppressed = __omni_fetch_l2_policy_suppressed();
+FILE *l2_scheduler_report = fopen("{exec_dir}/perf.txt", "a");
 if (l2_scheduler_report) {
   fprintf(l2_scheduler_report,
           "OmniFetchL2Scheduler: issued=%u busy_suppressed=%u "
           "page_clipped=%u unsupported=%u requested_bytes=%llu "
-          "issued_bytes=%llu\\n",
+          "issued_bytes=%llu budget_suppressed=%u "
+          "duplicate_suppressed=%u\\n",
           (unsigned)(l2_scheduler_counts >> 32),
           (unsigned)l2_scheduler_counts,
           (unsigned)(l2_scheduler_limits >> 32),
           (unsigned)l2_scheduler_limits,
           (unsigned long long)l2_requested_bytes,
-          (unsigned long long)l2_issued_bytes);
+          (unsigned long long)l2_issued_bytes,
+          (unsigned)(l2_policy_suppressed >> 32),
+          (unsigned)l2_policy_suppressed);
   fclose(l2_scheduler_report);
 }
-"""
+""".replace("{exec_dir}", exec_dir)
 
     def _uses_l2_scheduler(self):
         return any(
             self.options.get(option, False)
             for option in (
                 "enableOmniFetchVDAE",
+                "enableOmniFetchKvCachePrefetch",
                 "enablePrefetchKernelHX",
                 "enableAPTGetHX",
             )
         )
 
-    def generate_benchmarking_and_reporting(self, function_call):
+    def generate_benchmarking_and_reporting(self, function_call, exec_dir):
         if not self.options.get("enableOmniFetchPersistentWhCache", False):
-            return (
-                super().generate_benchmarking_and_reporting(function_call)
-                + self.generate_l2_scheduler_report()
+            benchmarking = super().generate_benchmarking_and_reporting(
+                function_call, exec_dir
             )
+            if any(
+                self.options.get(option, False)
+                for option in (
+                    "enableOmniFetchVDAE",
+                    "enableOmniFetchKvCachePrefetch",
+                )
+            ):
+                benchmarking = (
+                    "__omni_fetch_l2_configure(4096u, UINT64_C(8388608), 64u);\n"
+                    + benchmarking
+                )
+            # TestReport already uses exec_dir, but the additive percentile
+            # block in the shared template still opens a relative perf.txt.
+            benchmarking = benchmarking.replace(
+                'fopen("perf.txt", "a")', f'fopen("{exec_dir}/perf.txt", "a")'
+            )
+            return benchmarking + self.generate_l2_scheduler_report(exec_dir)
         context = int.from_bytes(
             hashlib.sha256(self.func_name.encode("utf-8")).digest()[:8], "little"
         )
@@ -223,9 +244,10 @@ uint64_t invalidated_time_us = benchmark_time_us(1, [&]() {{
     {function_call}
 }});
 uint64_t invalidated_stats = __omni_fetch_wh_cache_stats();
-TestReport tr("{self.func_name}", warm_time_us, "us", Result::Pass);
+TestReport tr("{self.func_name}", warm_time_us, "us", Result::Pass,
+              "{exec_dir}/perf.txt");
 tr.save();
-FILE *wh_cache_report = fopen("perf.txt", "a");
+FILE *wh_cache_report = fopen("{exec_dir}/perf.txt", "a");
 if (wh_cache_report) {{
   fprintf(wh_cache_report,
           "OmniFetchWHCache: cold_us=%llu warm_avg_us=%llu "
@@ -240,7 +262,7 @@ if (wh_cache_report) {{
           (unsigned)(invalidated_stats >> 32), (unsigned)invalidated_stats);
   fclose(wh_cache_report);
 }}
-FILE *w8_cache_report = fopen("perf.txt", "a");
+FILE *w8_cache_report = fopen("{exec_dir}/perf.txt", "a");
 if (w8_cache_report) {{
   fprintf(w8_cache_report,
           "OmniFetchW8Cache: cold_hits=%u cold_misses=%u "
@@ -250,11 +272,11 @@ if (w8_cache_report) {{
   fclose(w8_cache_report);
 }}
 {{
-  FILE *__warm_perf_fp = fopen("perf.txt", "a");
+  FILE *__warm_perf_fp = fopen("{exec_dir}/perf.txt", "a");
   report_percentiles("{self.func_name}", __warm_samples, __warm_perf_fp);
   if (__warm_perf_fp) fclose(__warm_perf_fp);
 }}
-""" + self.generate_l2_scheduler_report()
+""" + self.generate_l2_scheduler_report(exec_dir)
 
     def generate_input_wrapper_struct_def(self):
         """Generates template for input wrapper structs"""
@@ -294,6 +316,10 @@ extern "C" __attribute__((weak)) uint64_t
 __omni_fetch_l2_requested_bytes(void) { return 0; }
 extern "C" __attribute__((weak)) uint64_t
 __omni_fetch_l2_issued_bytes(void) { return 0; }
+extern "C" __attribute__((weak)) uint64_t
+__omni_fetch_l2_policy_suppressed(void) { return 0; }
+extern "C" __attribute__((weak)) void
+__omni_fetch_l2_configure(uint32_t, uint64_t, uint32_t) {}
 """
 
         code_define = self.common_strings.code_define.format(
@@ -449,7 +475,13 @@ class TorchMLIRHexagonLauncher(HexagonLauncherBase):
                 )
                 print("==> Wrapper generator correctly instanciated")
 
-                exec_dir = "." if hexec.exec_mode == "device" else local_dir
+                # FastRPC's reverse file service requires the explicit Android
+                # execution directory.  A relative "." can be opened by the
+                # DSP process but the file is not reliably visible to the
+                # subsequent adb pull after the unsigned PD exits.
+                exec_dir = hexec.get_Executable_Path()
+                if not exec_dir:
+                    exec_dir = local_dir
 
                 # Generating and writing the wrapper to disk
                 cpp_wrapper_path = self.generate_and_dump_wrapper(

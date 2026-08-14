@@ -324,6 +324,7 @@ def hexagon_options_phase4(
     prefetch_baseline_distance: int = 1,
     apt_get_hx_manual_candidate_ids: str = "",
     enable_omnifetch_kv_cache_prefetch: bool = False,
+    disable_omnifetch_persistent_wh_cache: bool = False,
 ):
     from triton.backends.qcom_hexagon_backend.compiler import HexagonOptions
 
@@ -430,7 +431,9 @@ def hexagon_options_phase4(
         enable_omnifetch_vdae or cumulative_level >= 3
     )
     options["enableOmniFetchAdaptive"] = bool(enable_omnifetch_adaptive)
-    options["enableOmniFetchPersistentWhCache"] = cumulative_level >= 4
+    options["enableOmniFetchPersistentWhCache"] = bool(
+        cumulative_level >= 4 and not disable_omnifetch_persistent_wh_cache
+    )
     options["enableOmniFetchTwoDimPipeline"] = cumulative_level >= 5
     options["enableOmniFetchVtcmColoring"] = cumulative_level >= 6
     # Item 7 covers page-aware prefetch of compiler-identified attention K/V
@@ -511,6 +514,14 @@ def add_phase4_args(parser):
         "--enable-omnifetch-kv-cache-prefetch",
         action="store_true",
         help="Enable isolated item-7 attention K/V stream prefetch.",
+    )
+    parser.add_argument(
+        "--disable-omnifetch-persistent-wh-cache",
+        action="store_true",
+        help=(
+            "Ablation: keep later cumulative items enabled but disable item 4 "
+            "persistent-WH caching and its cold/warm/invalidated protocol."
+        ),
     )
     parser.add_argument(
         "--enable-omnifetch-kv-vtcm",

@@ -35,8 +35,12 @@ run_case() {
   )
 
   case "${scheme}" in
-    omnifetch-items-1-7)
-      args+=(--enable-omnifetch-items-1-7)
+    omnifetch-item7-only)
+      args+=(
+        --enable-omnifetch-kv-cache-prefetch
+        --disable-layout-aware
+        --disable-omnifetch-adaptive
+      )
       ;;
     apt-get-hx)
       args+=(
@@ -84,21 +88,21 @@ run_case() {
     echo "[SerialRun] failed: ${log}" >&2
     return 1
   fi
-  if [[ "${scheme}" != omnifetch-items-1-7 && ( -z "${hints}" || "${hints}" == 0 ) ]]; then
+  if [[ "${scheme}" != omnifetch-item7-only && ( -z "${hints}" || "${hints}" == 0 ) ]]; then
     echo "[SerialRun] invalid zero-hint baseline: ${log}" >&2
     return 1
   fi
-  if [[ -z "${issued}" || "${issued}" == 0 ]]; then
+  if [[ "${scheme}" != omnifetch-item7-only && ( -z "${issued}" || "${issued}" == 0 ) ]]; then
     echo "[SerialRun] invalid zero-issued prefetch row: ${log}" >&2
     return 1
   fi
 }
 
 # Intentionally no background jobs: each model/scheme completes before the next.
-for scheme in omnifetch-items-1-7 apt-get-hx prefetch-kernel-hx; do
+for scheme in omnifetch-item7-only apt-get-hx prefetch-kernel-hx; do
   run_case dinov2-debug benchmark_models/debug_running/run_dinov2-small_debug.py "${dino_ids}" "${scheme}"
 done
-for scheme in omnifetch-items-1-7 apt-get-hx prefetch-kernel-hx; do
+for scheme in omnifetch-item7-only apt-get-hx prefetch-kernel-hx; do
   run_case vit-debug benchmark_models/debug_running/run_vit_debug.py "${vit_ids}" "${scheme}"
 done
 

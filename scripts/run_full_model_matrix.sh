@@ -41,7 +41,7 @@ all_models=(
   unispeech-sat-base
 )
 models=()
-configs=(hvx hexkl hexkl_omnifetch_1_7)
+configs=(hvx hexkl hexkl_omnifetch_item7)
 
 runner_for() {
   case "$1" in
@@ -96,7 +96,7 @@ Options:
   --dsp-heap-mb N   QuRT heap reservation for full graphs (default: ${DSP_HEAP_MB})
   --device-iterations N
                     Serial in-process measured calls (screening default: ${DEVICE_ITERATIONS})
-  --config NAME     Run hvx, hexkl, hexkl_omnifetch_1_7, or hvx_kv_prefetch
+  --config NAME     Run hvx, hexkl, hexkl_omnifetch_item7, or hvx_kv_prefetch
   --native-only     Run only strict upstream HVX and HexKL configurations
   --output-dir DIR  Result directory (default: ${OUT})
   --runtime-root DIR
@@ -127,7 +127,7 @@ while (($#)); do
     --device-iterations) DEVICE_ITERATIONS=$2; shift 2 ;;
     --config)
       case "$2" in
-        hvx|hexkl|hexkl_omnifetch_1_7|hvx_kv_prefetch)
+        hvx|hexkl|hexkl_omnifetch_item7|hvx_kv_prefetch)
           configs=("$2")
           CONFIG_EXPLICIT=1
           ;;
@@ -281,11 +281,13 @@ config_args_for() {
   case "$1" in
     hvx) ;;
     hexkl) printf '%s\n' --enable-hexkl ;;
-    hexkl_omnifetch_1_7)
-      printf '%s\n' --enable-hexkl --enable-omnifetch-items-1-7
+    hexkl_omnifetch_item7)
+      printf '%s\n' --enable-hexkl --enable-omnifetch-kv-cache-prefetch \
+        --disable-layout-aware --disable-omnifetch-adaptive
       ;;
     hvx_kv_prefetch)
-      printf '%s\n' --enable-omnifetch-kv-cache-prefetch
+      printf '%s\n' --enable-omnifetch-kv-cache-prefetch \
+        --disable-layout-aware --disable-omnifetch-adaptive
       ;;
   esac
 }
@@ -335,7 +337,7 @@ run_one() {
   # that is consistent with cold_us + warm + invalidated_us and the enclosing
   # ADB wall time.  Some long V73 runs return a corrupted outer warm_avg timer,
   # so do not use that duplicate for the combination row.
-  if [[ "${config}" == hexkl_omnifetch_1_7 ]] && \
+  if [[ "${config}" == hexkl_omnifetch_item7 ]] && \
       grep -q '^OmniFetchWHCache:' "${log}"; then
     perf_p50_us=$(awk -F: '/^[[:space:]]*PerfP50:/{gsub(/[[:space:]]/,"",$2);v=$2}END{print v}' "${log}")
     if [[ -n "${perf_p50_us}" ]]; then
@@ -391,8 +393,8 @@ write_summary() {
     hm=$(awk -F, -v m="${model}" '$1==m&&$4=="hvx"{v=$8}END{print v}' "${CSV}")
     ks=$(awk -F, -v m="${model}" '$1==m&&$4=="hexkl"{v=$6}END{print v}' "${CSV}")
     km=$(awk -F, -v m="${model}" '$1==m&&$4=="hexkl"{v=$8}END{print v}' "${CSV}")
-    cs=$(awk -F, -v m="${model}" '$1==m&&$4=="hexkl_omnifetch_1_7"{v=$6}END{print v}' "${CSV}")
-    cm=$(awk -F, -v m="${model}" '$1==m&&$4=="hexkl_omnifetch_1_7"{v=$8}END{print v}' "${CSV}")
+    cs=$(awk -F, -v m="${model}" '$1==m&&$4=="hexkl_omnifetch_item7"{v=$6}END{print v}' "${CSV}")
+    cm=$(awk -F, -v m="${model}" '$1==m&&$4=="hexkl_omnifetch_item7"{v=$8}END{print v}' "${CSV}")
     [[ -n "${hs}${ks}${cs}" ]] || continue
     speedup=NA
     if [[ "${ks}" == PASS && "${cs}" == PASS && "${km}" != NA && "${cm}" != NA ]]; then

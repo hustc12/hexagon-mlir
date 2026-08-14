@@ -116,6 +116,12 @@ def run(args: argparse.Namespace) -> None:
         prefetch_baseline=args.prefetch_baseline,
         prefetch_baseline_distance=args.prefetch_baseline_distance,
         apt_get_hx_manual_candidate_ids=args.apt_get_hx_manual_candidate_ids,
+        enable_omnifetch_kv_cache_prefetch=(
+            args.enable_omnifetch_kv_cache_prefetch
+        ),
+        disable_omnifetch_persistent_wh_cache=(
+            args.disable_omnifetch_persistent_wh_cache
+        ),
     )
     output = hex_execution(
         module,

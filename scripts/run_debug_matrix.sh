@@ -217,8 +217,9 @@ config_args_for() {
   case "$1" in
     hvx) ;;
     hexkl) printf '%s\n' '--enable-hexkl' ;;
-    hexkl_omnifetch_1_7)
-      printf '%s\n' '--enable-hexkl' '--enable-omnifetch-items-1-7'
+    hexkl_omnifetch_item7)
+      printf '%s\n' '--enable-hexkl' '--enable-omnifetch-kv-cache-prefetch' \
+        '--disable-layout-aware' '--disable-omnifetch-adaptive'
       ;;
   esac
 }
@@ -368,21 +369,21 @@ write_summary() {
   for model in "${all_models[@]}"; do
     hvx_status=$(last_result_field "${model}" hvx 4)
     hexkl_status=$(last_result_field "${model}" hexkl 4)
-    combo_status=$(last_result_field "${model}" hexkl_omnifetch_1_7 4)
+    combo_status=$(last_result_field "${model}" hexkl_omnifetch_item7 4)
     [[ -n "${hvx_status}${hexkl_status}${combo_status}" ]] || continue
     hvx_ms=$(last_result_field "${model}" hvx 6)
     hexkl_ms=$(last_result_field "${model}" hexkl 6)
-    combo_ms=$(last_result_field "${model}" hexkl_omnifetch_1_7 6)
+    combo_ms=$(last_result_field "${model}" hexkl_omnifetch_item7 6)
     hvx_over_hexkl=$(speedup "${hvx_status}" "${hvx_ms}" "${hexkl_status}" "${hexkl_ms}")
     hexkl_over_combo=$(speedup "${hexkl_status}" "${hexkl_ms}" "${combo_status}" "${combo_ms}")
     hvx_over_combo=$(speedup "${hvx_status}" "${hvx_ms}" "${combo_status}" "${combo_ms}")
-    prefetch_sites=$(last_result_field "${model}" hexkl_omnifetch_1_7 8)
-    in_situ_ops=$(last_result_field "${model}" hexkl_omnifetch_1_7 9)
-    async_choices=$(last_result_field "${model}" hexkl_omnifetch_1_7 10)
-    persistent_choices=$(last_result_field "${model}" hexkl_omnifetch_1_7 11)
-    vtcm_saved_bytes=$(last_result_field "${model}" hexkl_omnifetch_1_7 12)
-    kv_prefetch_sites=$(last_result_field "${model}" hexkl_omnifetch_1_7 13)
-    eager_kv_inferred=$(last_result_field "${model}" hexkl_omnifetch_1_7 14)
+    prefetch_sites=$(last_result_field "${model}" hexkl_omnifetch_item7 8)
+    in_situ_ops=$(last_result_field "${model}" hexkl_omnifetch_item7 9)
+    async_choices=$(last_result_field "${model}" hexkl_omnifetch_item7 10)
+    persistent_choices=$(last_result_field "${model}" hexkl_omnifetch_item7 11)
+    vtcm_saved_bytes=$(last_result_field "${model}" hexkl_omnifetch_item7 12)
+    kv_prefetch_sites=$(last_result_field "${model}" hexkl_omnifetch_item7 13)
+    eager_kv_inferred=$(last_result_field "${model}" hexkl_omnifetch_item7 14)
     printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
       "${model}" "${hvx_status:-NA}" "${hvx_ms:-NA}" \
       "${hexkl_status:-NA}" "${hexkl_ms:-NA}" \
@@ -401,7 +402,7 @@ echo "SOURCE_ROOT=${ROOT}"
 echo "RUNTIME_ROOT=${RUNTIME_ROOT}"
 echo "RESULTS=${OUT}"
 for model in "${models[@]}"; do
-  for config in hvx hexkl hexkl_omnifetch_1_7; do
+  for config in hvx hexkl hexkl_omnifetch_item7; do
     run_one "${model}" "${config}"
   done
 done

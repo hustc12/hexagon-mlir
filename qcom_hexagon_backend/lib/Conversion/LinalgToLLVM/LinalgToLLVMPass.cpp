@@ -506,8 +506,13 @@ public:
       // dealloc to the block terminator, keeping all buffers live at once and
       // exhausting DSP VTLB mappings. Sink each dealloc to right after its
       // buffer's last user to bound the peak concurrent working set.
-      pm.addNestedPass<func::FuncOp>(
-          bufferization::createOptimizeAllocationLivenessPass());
+      // Allocation-lifetime shortening is an OmniFetch memory-planning
+      // optimization, not part of either external prefetch baseline.  Keep
+      // the native/Prefetch-Kernel-HX/APT-GET-HX rows on the upstream
+      // ownership path so their output ABI and latency are not confounded.
+      if (enablePrefetch)
+        pm.addNestedPass<func::FuncOp>(
+            bufferization::createOptimizeAllocationLivenessPass());
 
       // The Hexagon backend miscompiles the by-value memref (sret) return for
       // large monolithic single-block functions: the return epilogue writes
@@ -518,6 +523,11 @@ public:
       // buffer so no copy is introduced for static output shapes.
       if (enableBufferResultsToOutParams) {
         bufferization::BufferResultsToOutParamsPassOptions outParamsOpts;
+        // Full-model entry points are public.  The upstream pass preserves
+        // public ABIs unless explicitly requested, while the generated host
+        // wrapper already uses caller-owned trailing output descriptors.
+        // Transform both sides together to avoid an ABI mismatch on device.
+        outParamsOpts.modifyPublicFunctions = true;
         outParamsOpts.hoistStaticAllocs = true;
         pm.addPass(
             bufferization::createBufferResultsToOutParamsPass(outParamsOpts));

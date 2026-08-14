@@ -102,6 +102,36 @@ static unsigned omni_l2_page_clipped = 0;
 static unsigned omni_l2_unsupported = 0;
 static uint64_t omni_l2_requested_bytes = 0;
 static uint64_t omni_l2_issued_bytes = 0;
+static unsigned omni_l2_budget_suppressed = 0;
+static unsigned omni_l2_duplicate_suppressed = 0;
+static unsigned omni_l2_max_commands = 0;
+static uint64_t omni_l2_max_bytes = 0;
+#define OMNI_L2_RECENT_REQUESTS 64
+static uint64_t omni_l2_recent_requests[OMNI_L2_RECENT_REQUESTS];
+static unsigned omni_l2_recent_count = 0;
+static unsigned omni_l2_recent_cursor = 0;
+
+/* Configure a per-invocation traffic envelope for OmniFetch. Zero limits keep
+ * the legacy/unbounded behavior used by external prefetch baselines. */
+void __omni_fetch_l2_configure(uint32_t max_commands, uint64_t max_bytes,
+                               uint32_t recent_requests) {
+  omni_l2_max_commands = max_commands;
+  omni_l2_max_bytes = max_bytes;
+  omni_l2_recent_count = recent_requests < OMNI_L2_RECENT_REQUESTS
+                             ? recent_requests
+                             : OMNI_L2_RECENT_REQUESTS;
+  omni_l2_recent_cursor = 0;
+  for (unsigned i = 0; i < OMNI_L2_RECENT_REQUESTS; ++i)
+    omni_l2_recent_requests[i] = 0;
+  __atomic_store_n(&omni_l2_issued, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&omni_l2_busy_suppressed, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&omni_l2_page_clipped, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&omni_l2_unsupported, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&omni_l2_requested_bytes, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&omni_l2_issued_bytes, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&omni_l2_budget_suppressed, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&omni_l2_duplicate_suppressed, 0, __ATOMIC_RELAXED);
+}
 
 uint64_t __omni_fetch_l2_scheduler_counts(void) {
   uint64_t issued = __atomic_load_n(&omni_l2_issued, __ATOMIC_RELAXED);
@@ -124,6 +154,14 @@ uint64_t __omni_fetch_l2_requested_bytes(void) {
 
 uint64_t __omni_fetch_l2_issued_bytes(void) {
   return __atomic_load_n(&omni_l2_issued_bytes, __ATOMIC_RELAXED);
+}
+
+uint64_t __omni_fetch_l2_policy_suppressed(void) {
+  uint64_t budget =
+      __atomic_load_n(&omni_l2_budget_suppressed, __ATOMIC_RELAXED);
+  uint64_t duplicate =
+      __atomic_load_n(&omni_l2_duplicate_suppressed, __ATOMIC_RELAXED);
+  return (budget << 32) | (duplicate & UINT64_C(0xffffffff));
 }
 
 /* Item 8: generation-safe compressed weight stream.  Each entry keeps one
@@ -1029,6 +1067,40 @@ static void omni_l2fetch_2d(const void *ptr, uint32_t width, uint32_t height,
   if (safeWidth == 0 || safeHeight == 0) {
     __atomic_fetch_add(&omni_l2_unsupported, 1, __ATOMIC_RELAXED);
     return;
+  }
+
+  uint64_t safeBytes = (uint64_t)safeWidth * (uint64_t)safeHeight;
+  unsigned issued = __atomic_load_n(&omni_l2_issued, __ATOMIC_RELAXED);
+  uint64_t issuedBytes =
+      __atomic_load_n(&omni_l2_issued_bytes, __ATOMIC_RELAXED);
+  uint64_t remainingBytes = issuedBytes < omni_l2_max_bytes
+                                ? omni_l2_max_bytes - issuedBytes
+                                : 0;
+  if ((omni_l2_max_commands && issued >= omni_l2_max_commands) ||
+      (omni_l2_max_bytes && safeBytes > remainingBytes)) {
+    __atomic_fetch_add(&omni_l2_budget_suppressed, 1, __ATOMIC_RELAXED);
+    return;
+  }
+
+  /* Coalesce only identical recent hardware requests. Distinct offsets on one
+   * page may cover distinct demand lines and therefore remain independent. */
+  if (omni_l2_recent_count) {
+    uint64_t requestKey = ((uint64_t)((uintptr_t)ptr >> 7) *
+                           UINT64_C(0x9e3779b97f4a7c15)) ^
+                          ((uint64_t)safeWidth << 48) ^
+                          ((uint64_t)safeHeight << 32) ^ (uint64_t)stride;
+    if (requestKey == 0)
+      requestKey = 1;
+    for (unsigned i = 0; i < omni_l2_recent_count; ++i) {
+      if (omni_l2_recent_requests[i] == requestKey) {
+        __atomic_fetch_add(&omni_l2_duplicate_suppressed, 1,
+                           __ATOMIC_RELAXED);
+        return;
+      }
+    }
+    omni_l2_recent_requests[omni_l2_recent_cursor] = requestKey;
+    omni_l2_recent_cursor =
+        (omni_l2_recent_cursor + 1) % omni_l2_recent_count;
   }
 
   /* Do not overwrite a useful V73 command.  This is deliberately a

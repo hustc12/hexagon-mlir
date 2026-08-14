@@ -101,6 +101,8 @@ struct KvCachePrefetchStats {
   int64_t directLayoutSites = 0;
   int64_t vtcmStages = 0;
   int64_t asyncStages = 0;
+  int64_t hoistedSites = 0;
+  int64_t rejectedProducedSites = 0;
 };
 
 static Operation *findLastDpsWriterBefore(Value buffer,
@@ -873,6 +875,19 @@ insertKvCachePrefetchHints(func::FuncOp func, int64_t kvCachePageTokens,
         !isa<FloatType>(srcType.getElementType()))
       continue;
 
+    // Item 7 is a future-data optimization only for K/V state that already
+    // exists when this invocation starts (for example decode past_key_values).
+    // Eager prefill K/V is produced inside this same function immediately
+    // before attention consumes it: prefetching after production is redundant,
+    // while moving the hint before production is causally invalid. Admit only
+    // entry-block arguments until an explicit decode-cache ABI/metadata marks
+    // other storage as persistent.
+    auto blockArg = dyn_cast<BlockArgument>(src);
+    if (!blockArg || blockArg.getOwner() != &func.getBody().front()) {
+      ++stats.rejectedProducedSites;
+      continue;
+    }
+
     // A tiled contraction can contain several reads of the same base stream.
     // One prefetch before its first read is sufficient and avoids turning
     // item 7 into per-vector request spam.
@@ -975,6 +990,39 @@ insertKvCachePrefetchHints(func::FuncOp func, int64_t kvCachePageTokens,
       continue;
     }
 
+    // Vectorization can leave the semantic attention consumer inside several
+    // strip-mined loops. Inserting at that consumer turns one logical K/V
+    // prefetch into a command on every dynamic vector tile. Hoist across every
+    // loop for which the recovered base buffer is invariant; this gives each
+    // (buffer, role) pair one preheader issue. If the source is produced inside
+    // a loop, stop at that loop rather than moving the hint before its data is
+    // available.
+    Operation *hintAnchor = consumer;
+    Operation *scope = consumer;
+    while (auto loop = scope->getParentOfType<scf::ForOp>()) {
+      if (!loop.isDefinedOutsideOfLoop(src))
+        break;
+      hintAnchor = loop;
+      scope = loop;
+    }
+    if (hintAnchor != consumer) {
+      b.setInsertionPoint(hintAnchor);
+      ++stats.hoistedSites;
+    }
+
+    // V73 l2fetch cannot generate across the 4-KiB page containing its start
+    // address. A whole [sequence, head_dim] stream therefore degenerates into
+    // a clipped command (and large strided geometries have caused DSP faults
+    // on full vector graphs). Warm only the first aligned demand line here.
+    // Subsequent pages require a future loop-progress-aware scheduler rather
+    // than pretending that one preheader command can cover the full stream.
+    constexpr int64_t kKvHintBudgetBytes = 128;
+    int64_t budgetHeadDim =
+        std::min(headDim, kKvHintBudgetBytes / elemBytes);
+    if (budgetHeadDim <= 0)
+      continue;
+    constexpr int64_t budgetSeqTokens = 1;
+
     for (int64_t linearStream = 0; linearStream < streams; ++linearStream) {
       SmallVector<OpFoldResult> offsets(rank, b.getIndexAttr(0));
       SmallVector<OpFoldResult> sizes;
@@ -984,14 +1032,14 @@ insertKvCachePrefetchHints(func::FuncOp func, int64_t kvCachePageTokens,
         offsets[0] = b.getIndexAttr(linearStream / shape[2]);
         offsets[2] = b.getIndexAttr(linearStream % shape[2]);
         sizes.push_back(b.getIndexAttr(1));
-        sizes.push_back(b.getIndexAttr(seqTokens));
+        sizes.push_back(b.getIndexAttr(budgetSeqTokens));
         sizes.push_back(b.getIndexAttr(1));
-        sizes.push_back(b.getIndexAttr(headDim));
+        sizes.push_back(b.getIndexAttr(budgetHeadDim));
       } else if (isShd) {
         offsets[1] = b.getIndexAttr(linearStream);
-        sizes.push_back(b.getIndexAttr(seqTokens));
+        sizes.push_back(b.getIndexAttr(budgetSeqTokens));
         sizes.push_back(b.getIndexAttr(1));
-        sizes.push_back(b.getIndexAttr(headDim));
+        sizes.push_back(b.getIndexAttr(budgetHeadDim));
       } else {
         int64_t remaining = linearStream;
         for (int64_t dim = rank - 3; dim >= 0; --dim) {
@@ -1000,8 +1048,8 @@ insertKvCachePrefetchHints(func::FuncOp func, int64_t kvCachePageTokens,
         }
         for (int64_t dim = 0; dim < rank - 2; ++dim)
           sizes.push_back(b.getIndexAttr(1));
-        sizes.push_back(b.getIndexAttr(seqTokens));
-        sizes.push_back(b.getIndexAttr(headDim));
+        sizes.push_back(b.getIndexAttr(budgetSeqTokens));
+        sizes.push_back(b.getIndexAttr(budgetHeadDim));
       }
 
       Value stream = b.create<memref::SubViewOp>(
@@ -1015,13 +1063,11 @@ insertKvCachePrefetchHints(func::FuncOp func, int64_t kvCachePageTokens,
     consumer->setAttr("omni_fetch.kv_pages",
                       b.getI64IntegerAttr(streams * pagesPerStream));
     consumer->setAttr("omni_fetch.kv_layout",
-                      b.getStringAttr((isBshd || isShd)
-                                          ? "direct_shd_strided_2d"
-                                          : "direct_sequence_head_dim"));
+                      b.getStringAttr("budgeted_first_demand_line"));
     ++stats.sites;
     ++stats.directLayoutSites;
     stats.pages += streams * pagesPerStream;
-    stats.bytes += streams * seqTokens * headDim * elemBytes;
+    stats.bytes += streams * budgetSeqTokens * budgetHeadDim * elemBytes;
   }
 
   Builder b(func.getContext());
@@ -1039,11 +1085,17 @@ insertKvCachePrefetchHints(func::FuncOp func, int64_t kvCachePageTokens,
                 b.getI64IntegerAttr(stats.vtcmStages));
   func->setAttr("omni_fetch.kv_async_stages",
                 b.getI64IntegerAttr(stats.asyncStages));
+  func->setAttr("omni_fetch.kv_hoisted_sites",
+                b.getI64IntegerAttr(stats.hoistedSites));
+  func->setAttr("omni_fetch.kv_rejected_produced_sites",
+                b.getI64IntegerAttr(stats.rejectedProducedSites));
   llvm::errs() << "[KVCachePrefetch] function=" << func.getName()
                << " sites=" << stats.sites << " hints=" << stats.hints
                << " pages=" << stats.pages << " bytes=" << stats.bytes
                << " vtcm_stages=" << stats.vtcmStages
                << " async_stages=" << stats.asyncStages
+               << " hoisted_sites=" << stats.hoistedSites
+               << " rejected_produced_sites=" << stats.rejectedProducedSites
                << " page_tokens=" << kvCachePageTokens << "\n";
   return stats;
 }

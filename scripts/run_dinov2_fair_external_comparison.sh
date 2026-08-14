@@ -26,8 +26,9 @@ run_hexagon_case() {
 
 run_hexagon_case hvx
 run_hexagon_case hexkl --enable-hexkl
-run_hexagon_case hexkl_omnifetch_1_7 \
-  --enable-hexkl --enable-omnifetch-items-1-7
+run_hexagon_case hexkl_omnifetch_item7 \
+  --enable-hexkl --enable-omnifetch-kv-cache-prefetch \
+  --disable-layout-aware --disable-omnifetch-adaptive
 
 echo "===== qnn: serial ${iterations}-iteration run ====="
 QNN_ITERATIONS="${iterations}" \
@@ -46,7 +47,7 @@ ANDROID_SERIAL="${device_serial}" \
   2>&1 | tee "${result_root}/litert.log"
 
 echo "===== Summary (microseconds) ====="
-for name in hvx hexkl hexkl_omnifetch_1_7; do
+for name in hvx hexkl hexkl_omnifetch_item7; do
   value="$(
     awk '/Perf:/{gsub(/[^0-9.]/, "", $0); print $0; exit}' \
       "${result_root}/${name}.log"

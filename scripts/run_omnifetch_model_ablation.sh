@@ -125,7 +125,8 @@ if [[ "${HVX_ITEM7_ONLY}" -eq 1 ]]; then
   fi
   run_case hvx_vector_item7 \
     --enable-hvx-vector \
-    --enable-omnifetch-kv-cache-prefetch
+    --enable-omnifetch-kv-cache-prefetch \
+    --disable-layout-aware --disable-omnifetch-adaptive
   exit 0
 fi
 
