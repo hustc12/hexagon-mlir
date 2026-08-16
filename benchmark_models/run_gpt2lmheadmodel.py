@@ -410,6 +410,7 @@ def gpt2lmheadmodel(
     prefetch_baseline: str = "none",
     prefetch_baseline_distance: int = 1,
     apt_get_hx_manual_candidate_ids: str = "",
+    enable_omnifetch_kv_cache_prefetch: bool = False,
 ):
 
     upstream_strict = os.environ.get("HEXAGON_BASELINE_MODE") == "upstream-strict"
@@ -506,7 +507,13 @@ def gpt2lmheadmodel(
             enableVectorization=enable_hvx_vector,
             enableVTCMTiling=enable_vtcm_tiling,
             enableConvertToHexagonmem=True,
-            enablePrefetch=enable_omnifetch_vdae or cumulative,
+            lowerConstantsInSeparateSharedObjects=True,
+            enableBufferResultsToOutParams=True,
+            enablePrefetch=(
+                enable_omnifetch_vdae
+                or cumulative
+                or enable_omnifetch_kv_cache_prefetch
+            ),
             enableOmniFetchLayoutAware=enable_omnifetch_layout_aware,
             omniFetchLookahead=omnifetch_lookahead,
             enableOmniFetchVDAE=enable_omnifetch_vdae or cumulative,
@@ -514,7 +521,9 @@ def gpt2lmheadmodel(
             enableOmniFetchPersistentWhCache=cumulative,
             enableOmniFetchTwoDimPipeline=cumulative,
             enableOmniFetchVtcmColoring=cumulative,
-            enableOmniFetchKvCachePrefetch=cumulative,
+            enableOmniFetchKvCachePrefetch=(
+                cumulative or enable_omnifetch_kv_cache_prefetch
+            ),
             enableOmniFetchDmaToVtcm=enable_omnifetch_dma_to_vtcm,
             enableOmniFetchWeightPrepack=enable_omnifetch_weight_prepack,
             enableOmniFetchDualThreadDae=enable_omnifetch_dual_thread_dae,
@@ -552,11 +561,18 @@ def gpt2lmheadmodel(
         )
     else:
         options = HexagonOptions().__dict__
+        options["lowerConstantsInSeparateSharedObjects"] = True
+        if "enableBufferResultsToOutParams" in options:
+            options["enableBufferResultsToOutParams"] = True
         options["enableVectorization"] = bool(enable_hvx_vector)
         options["enableHexKL"] = False
         options["enableVTCMTiling"] = enable_vtcm_tiling
         options["enableConvertToHexagonmem"] = enable_convert_to_hexagonmem
-        options["enablePrefetch"] = enable_omnifetch_vdae or cumulative
+        options["enablePrefetch"] = bool(
+            enable_omnifetch_vdae
+            or cumulative
+            or enable_omnifetch_kv_cache_prefetch
+        )
         options["enableOmniFetchLayoutAware"] = enable_omnifetch_layout_aware
         options["omniFetchLookahead"] = omnifetch_lookahead
         options["enableOmniFetchVDAE"] = enable_omnifetch_vdae or cumulative
@@ -564,7 +580,9 @@ def gpt2lmheadmodel(
         options["enableOmniFetchPersistentWhCache"] = cumulative
         options["enableOmniFetchTwoDimPipeline"] = cumulative
         options["enableOmniFetchVtcmColoring"] = cumulative
-        options["enableOmniFetchKvCachePrefetch"] = cumulative
+        options["enableOmniFetchKvCachePrefetch"] = bool(
+            cumulative or enable_omnifetch_kv_cache_prefetch
+        )
         options["enableOmniFetchDmaToVtcm"] = enable_omnifetch_dma_to_vtcm
         options["enableOmniFetchWeightPrepack"] = enable_omnifetch_weight_prepack
         options["enableOmniFetchDualThreadDae"] = enable_omnifetch_dual_thread_dae
@@ -651,6 +669,11 @@ if __name__ == "__main__":
     parser.add_argument("--prefetch-baseline-distance", type=int, default=1)
     parser.add_argument("--apt-get-hx-manual-candidate-ids", default="")
     parser.add_argument(
+        "--enable-omnifetch-kv-cache-prefetch",
+        action="store_true",
+        help="Enable isolated item-7 attention K/V stream propagation/prefetch.",
+    )
+    parser.add_argument(
         "--enable-omnifetch-dma-to-vtcm",
         action="store_true",
         help="DMA-pack OmniFetch weight tiles into VTCM staging "
@@ -716,4 +739,7 @@ if __name__ == "__main__":
         prefetch_baseline=args.prefetch_baseline,
         prefetch_baseline_distance=args.prefetch_baseline_distance,
         apt_get_hx_manual_candidate_ids=args.apt_get_hx_manual_candidate_ids,
+        enable_omnifetch_kv_cache_prefetch=(
+            args.enable_omnifetch_kv_cache_prefetch
+        ),
     )

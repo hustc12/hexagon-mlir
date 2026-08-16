@@ -134,6 +134,10 @@ def default_options(
     omnifetch_lookahead: int = 2,
     enable_omnifetch_adaptive: bool = True,
     enable_omnifetch_items_1_7: bool = False,
+    enable_omnifetch_kv_cache_prefetch: bool = False,
+    prefetch_baseline: str = "none",
+    prefetch_baseline_distance: int = 1,
+    apt_get_hx_manual_candidate_ids: str = "",
 ) -> dict:
     """Phase-4 options. HexKL off by default for fair HVX baseline."""
     opts = HexagonOptions().__dict__
@@ -143,7 +147,11 @@ def default_options(
     opts["enableHexKL"] = bool(enable_hexkl)
     opts["enableConvertToHexagonmem"] = bool(enable_hexkl)
     cumulative = bool(enable_omnifetch_items_1_7)
-    opts["enablePrefetch"] = bool(enable_omnifetch_vdae or cumulative)
+    opts["enablePrefetch"] = bool(
+        enable_omnifetch_vdae
+        or cumulative
+        or enable_omnifetch_kv_cache_prefetch
+    )
     opts["enableOmniFetchLayoutAware"] = bool(enable_omnifetch_layout_aware)
     opts["omniFetchLookahead"] = int(omnifetch_lookahead)
     opts["enableOmniFetchVDAE"] = bool(enable_omnifetch_vdae or cumulative)
@@ -151,7 +159,14 @@ def default_options(
     opts["enableOmniFetchPersistentWhCache"] = cumulative
     opts["enableOmniFetchTwoDimPipeline"] = cumulative
     opts["enableOmniFetchVtcmColoring"] = cumulative
-    opts["enableOmniFetchKvCachePrefetch"] = cumulative
+    opts["enableOmniFetchKvCachePrefetch"] = bool(
+        cumulative or enable_omnifetch_kv_cache_prefetch
+    )
+    opts["enablePrefetchKernelHX"] = prefetch_baseline == "prefetch-kernel-hx"
+    opts["prefetchKernelHxDistance"] = int(prefetch_baseline_distance)
+    opts["enableAPTGetHX"] = prefetch_baseline == "apt-get-hx"
+    opts["aptGetHxDistance"] = int(prefetch_baseline_distance)
+    opts["aptGetHxManualCandidateIds"] = apt_get_hx_manual_candidate_ids
     if cumulative:
         print(
             "[OmniFetchItems1To7] enabled: layout/cost/fusion + "
@@ -176,6 +191,14 @@ def add_phase4_cli(parser):
         action="store_true",
         help="Enable the cumulative innovation items 1 through 7.",
     )
+    parser.add_argument("--enable-omnifetch-kv-cache-prefetch", action="store_true")
+    parser.add_argument(
+        "--prefetch-baseline",
+        choices=("none", "prefetch-kernel-hx", "apt-get-hx"),
+        default="none",
+    )
+    parser.add_argument("--prefetch-baseline-distance", type=int, default=1)
+    parser.add_argument("--apt-get-hx-manual-candidate-ids", default="")
     parser.add_argument("--device-iterations", type=int, default=1)
     return parser
 
@@ -191,6 +214,14 @@ def options_from_args(args, enablelwp: bool = None):
         enable_omnifetch_adaptive=not getattr(args, "disable_omnifetch_adaptive", False),
         enable_omnifetch_items_1_7=getattr(
             args, "enable_omnifetch_items_1_7", False
+        ),
+        enable_omnifetch_kv_cache_prefetch=getattr(
+            args, "enable_omnifetch_kv_cache_prefetch", False
+        ),
+        prefetch_baseline=getattr(args, "prefetch_baseline", "none"),
+        prefetch_baseline_distance=getattr(args, "prefetch_baseline_distance", 1),
+        apt_get_hx_manual_candidate_ids=getattr(
+            args, "apt_get_hx_manual_candidate_ids", ""
         ),
     )
 

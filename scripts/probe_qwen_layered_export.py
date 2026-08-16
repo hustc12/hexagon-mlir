@@ -10,6 +10,8 @@ from torch_mlir import fx
 from torch_mlir.compiler_utils import OutputType
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
+from layered_hvx_options import add_layered_hvx_args, make_layered_hvx_options
+
 
 torch.set_num_threads(1)
 
@@ -264,7 +266,7 @@ def main() -> None:
     parser.add_argument("--model-name", default="Qwen/Qwen2.5-0.5B")
     parser.add_argument("--output-dir", type=Path, default=Path("/tmp/qwen-layered"))
     parser.add_argument("--device-iterations", type=int, default=1)
-    parser.add_argument("--enable-hexkl", action="store_true")
+    add_layered_hvx_args(parser)
     parser.add_argument("--cpu-only", action="store_true")
     parser.add_argument("--start-layer", type=int, default=0)
     parser.add_argument(
@@ -350,21 +352,12 @@ def main() -> None:
         return
 
     from hexkl_utils import patch_full_model_dsp_heap
-    from triton.backends.qcom_hexagon_backend.compiler import HexagonOptions
     from triton.backends.qcom_hexagon_backend.torch_mlir_hexagon_launcher import (
         TorchMLIRHexagonLauncher,
     )
 
     patch_full_model_dsp_heap()
-    options = HexagonOptions().__dict__.copy()
-    options["enableVectorization"] = True
-    options["enableHexKL"] = bool(args.enable_hexkl)
-    options["enableVTCMTiling"] = False
-    options["enableConvertToHexagonmem"] = bool(args.enable_hexkl)
-    options["enableConversionToFp16"] = False
-    options["lowerConstantsInSeparateSharedObjects"] = True
-    if "enableBufferResultsToOutParams" in options:
-        options["enableBufferResultsToOutParams"] = True
+    options = make_layered_hvx_options(args)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     launcher = TorchMLIRHexagonLauncher()

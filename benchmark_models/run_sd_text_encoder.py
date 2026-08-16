@@ -71,9 +71,14 @@ def test_text_encoder(
     omnifetch_lookahead: int = 2,
     enable_omnifetch_adaptive: bool = True,
     enable_omnifetch_items_1_7: bool = False,
+    enable_omnifetch_kv_cache_prefetch: bool = False,
     device_iterations: int = 1,
+    prefetch_baseline: str = "none",
+    prefetch_baseline_distance: int = 1,
+    apt_get_hx_manual_candidate_ids: str = "",
 ):
     print("\n=== Stable Diffusion — Text Encoder ===")
+    torch.manual_seed(613)
 
     tokenizer = CLIPTokenizer.from_pretrained(SD_MODEL_ID, subfolder="tokenizer")
     config = CLIPTextModel.config_class.from_pretrained(
@@ -130,6 +135,10 @@ def test_text_encoder(
     args.omnifetch_lookahead = omnifetch_lookahead
     args.disable_omnifetch_adaptive = not enable_omnifetch_adaptive
     args.enable_omnifetch_items_1_7 = enable_omnifetch_items_1_7
+    args.enable_omnifetch_kv_cache_prefetch = enable_omnifetch_kv_cache_prefetch
+    args.prefetch_baseline = prefetch_baseline
+    args.prefetch_baseline_distance = prefetch_baseline_distance
+    args.apt_get_hx_manual_candidate_ids = apt_get_hx_manual_candidate_ids
     options = options_from_args(args)
 
     print("Running Text Encoder on Hexagon NPU …")
@@ -162,5 +171,11 @@ if __name__ == "__main__":
         omnifetch_lookahead=args.omnifetch_lookahead,
         enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
         enable_omnifetch_items_1_7=args.enable_omnifetch_items_1_7,
+        enable_omnifetch_kv_cache_prefetch=(
+            args.enable_omnifetch_kv_cache_prefetch
+        ),
         device_iterations=args.device_iterations,
+        prefetch_baseline=args.prefetch_baseline,
+        prefetch_baseline_distance=args.prefetch_baseline_distance,
+        apt_get_hx_manual_candidate_ids=args.apt_get_hx_manual_candidate_ids,
     )

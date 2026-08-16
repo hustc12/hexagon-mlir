@@ -95,9 +95,18 @@ def swin_transformer(
     prefetch_baseline: str = "none",
     prefetch_baseline_distance: int = 1,
     apt_get_hx_manual_candidate_ids: str = "",
+    enable_lwp: bool = False,
+    lwp_loop_depth: int = 1,
+    disable_lwp_loop: bool = False,
+    omnifetch_items_through: int = 0,
+    enable_omnifetch_kv_cache_prefetch: bool = False,
+    disable_omnifetch_persistent_wh_cache: bool = False,
 ):
     # Full 28M-parameter graph exceeds the Debug runner's 256 MiB heap.
     patch_full_model_dsp_heap()
+    # Keep random full-structure weights and inputs identical across the five
+    # separately launched configurations.
+    torch.manual_seed(211)
     model_name = "microsoft/swin-tiny-patch4-window7-224"
 
     config = SwinConfig.from_pretrained(model_name)
@@ -151,6 +160,14 @@ def swin_transformer(
         prefetch_baseline=prefetch_baseline,
         prefetch_baseline_distance=prefetch_baseline_distance,
         apt_get_hx_manual_candidate_ids=apt_get_hx_manual_candidate_ids,
+        enable_lwp=enable_lwp,
+        lwp_loop_depth=lwp_loop_depth,
+        disable_lwp_loop=disable_lwp_loop,
+        omnifetch_items_through=omnifetch_items_through,
+        enable_omnifetch_kv_cache_prefetch=enable_omnifetch_kv_cache_prefetch,
+        disable_omnifetch_persistent_wh_cache=(
+            disable_omnifetch_persistent_wh_cache
+        ),
     )
     inputs = rel_pos_indices + [pixel_values]
     hex_outputs = hex_execution(
@@ -196,4 +213,14 @@ if __name__ == "__main__":
         prefetch_baseline=args.prefetch_baseline,
         prefetch_baseline_distance=args.prefetch_baseline_distance,
         apt_get_hx_manual_candidate_ids=args.apt_get_hx_manual_candidate_ids,
+        enable_lwp=args.enable_lwp,
+        lwp_loop_depth=args.lwp_loop_depth,
+        disable_lwp_loop=args.disable_lwp_loop,
+        omnifetch_items_through=args.omnifetch_items_through,
+        enable_omnifetch_kv_cache_prefetch=(
+            args.enable_omnifetch_kv_cache_prefetch
+        ),
+        disable_omnifetch_persistent_wh_cache=(
+            args.disable_omnifetch_persistent_wh_cache
+        ),
     )

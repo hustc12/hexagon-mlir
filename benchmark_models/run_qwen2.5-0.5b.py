@@ -344,13 +344,17 @@ def qwen2_5_0_5b(
     omnifetch_lookahead: int = 2,
     enable_omnifetch_adaptive: bool = True,
     enable_omnifetch_items_1_7: bool = False,
+    enable_omnifetch_kv_cache_prefetch: bool = False,
     seq_len: Optional[int] = None,
     device_iterations: int = 1,
+    model_name: str = "Qwen/Qwen2.5-0.5B",
+    prefetch_baseline: str = "none",
+    prefetch_baseline_distance: int = 1,
+    apt_get_hx_manual_candidate_ids: str = "",
 ):
     # User-PD: 1GB heap reservation can fault; GPT-2 HexKL uses 256MB.
     _patch_dsp_heap_256mb()
 
-    model_name = "Qwen/Qwen2.5-0.5B"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     prompt = "Hi"
 
@@ -461,7 +465,11 @@ def qwen2_5_0_5b(
     options["enableHexKL"] = bool(enable_hexkl)
     options["enableConvertToHexagonmem"] = bool(enable_hexkl)
     cumulative = bool(enable_omnifetch_items_1_7)
-    options["enablePrefetch"] = bool(enable_omnifetch_vdae or cumulative)
+    options["enablePrefetch"] = bool(
+        enable_omnifetch_vdae
+        or cumulative
+        or enable_omnifetch_kv_cache_prefetch
+    )
     options["enableOmniFetchLayoutAware"] = bool(enable_omnifetch_layout_aware)
     options["omniFetchLookahead"] = int(omnifetch_lookahead)
     options["enableOmniFetchVDAE"] = bool(enable_omnifetch_vdae or cumulative)
@@ -469,7 +477,14 @@ def qwen2_5_0_5b(
     options["enableOmniFetchPersistentWhCache"] = cumulative
     options["enableOmniFetchTwoDimPipeline"] = cumulative
     options["enableOmniFetchVtcmColoring"] = cumulative
-    options["enableOmniFetchKvCachePrefetch"] = cumulative
+    options["enableOmniFetchKvCachePrefetch"] = bool(
+        cumulative or enable_omnifetch_kv_cache_prefetch
+    )
+    options["enablePrefetchKernelHX"] = prefetch_baseline == "prefetch-kernel-hx"
+    options["prefetchKernelHxDistance"] = int(prefetch_baseline_distance)
+    options["enableAPTGetHX"] = prefetch_baseline == "apt-get-hx"
+    options["aptGetHxDistance"] = int(prefetch_baseline_distance)
+    options["aptGetHxManualCandidateIds"] = apt_get_hx_manual_candidate_ids
 
     # No inv_freq / RoPE buffers in the ABI after _ConstRope.
     inputs = [input_ids, attention_mask, position_ids]
@@ -526,6 +541,14 @@ if __name__ == "__main__":
     parser.add_argument("--omnifetch-lookahead", type=int, default=2)
     parser.add_argument("--disable-omnifetch-adaptive", action="store_true")
     parser.add_argument("--enable-omnifetch-items-1-7", action="store_true")
+    parser.add_argument("--enable-omnifetch-kv-cache-prefetch", action="store_true")
+    parser.add_argument(
+        "--prefetch-baseline",
+        choices=("none", "prefetch-kernel-hx", "apt-get-hx"),
+        default="none",
+    )
+    parser.add_argument("--prefetch-baseline-distance", type=int, default=1)
+    parser.add_argument("--apt-get-hx-manual-candidate-ids", default="")
     parser.add_argument("--device-iterations", type=int, default=1)
     parser.add_argument(
         "--seq-len",
@@ -533,6 +556,7 @@ if __name__ == "__main__":
         default=None,
         help="Fixed content-filled seq length (HexKL defaults to 32).",
     )
+    parser.add_argument("--model-name", default="Qwen/Qwen2.5-0.5B")
     args = parser.parse_args()
     qwen2_5_0_5b(
         enable_hexkl=args.enable_hexkl,
@@ -542,6 +566,13 @@ if __name__ == "__main__":
         omnifetch_lookahead=args.omnifetch_lookahead,
         enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
         enable_omnifetch_items_1_7=args.enable_omnifetch_items_1_7,
+        enable_omnifetch_kv_cache_prefetch=(
+            args.enable_omnifetch_kv_cache_prefetch
+        ),
         seq_len=args.seq_len,
         device_iterations=args.device_iterations,
+        model_name=args.model_name,
+        prefetch_baseline=args.prefetch_baseline,
+        prefetch_baseline_distance=args.prefetch_baseline_distance,
+        apt_get_hx_manual_candidate_ids=args.apt_get_hx_manual_candidate_ids,
     )

@@ -96,28 +96,54 @@ ASR/pre-training head, matching the current Hexagon-MLIR benchmark topology.
 The following table expands the current **15 complete-model corpus plus the
 ViT-Base external-baseline vehicle** across the requested policy-by-engine
 dimensions. `HMLIR` means native/no-prefetch Hexagon-MLIR and `OF` means
-OmniFetch. All values are device latency in ms. The PK/APT columns contain only
-the two complete models actually measured with those policies; every untested
-combination is explicitly `NA`.
+OmniFetch. All values are device latency in ms. As of 2026-08-16, PK/APT and
+item7-only have been measured on all 15 complete models in the primary corpus;
+every still-untested processor/policy combination is explicitly `NA`.
 
 | Date / scope | Model | PK Scalar | PK HVX | PK HMX | APT Scalar | APT HVX | APT HMX | HMLIR Scalar | HMLIR HVX | HMLIR HMX | OF Scalar | OF HVX | OF HMX | Notes |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| 2026-08-13 strict rerun | DINOv2-small | NA | 10,596.72 (1.78x) | NA | NA | 10,591.11 (1.78x) | NA | 1,281,514.12‡ | 30,031.10 Native Hexagon-MLIR HVX, HexKL off (5.04x); 10,035.87 HexKL pipeline/0-HMX-rewrite HVX (1.69x) | NA | 300,484.16‡ | **5,953.59 item7-only (1.00x)** | NA | Ratios are row latency / item7 latency. Items 1–6 are explicitly disabled; all current rows pass correctness. |
-| 2026-08-13 strict rerun | ViT-Base | NA | 21,489.53 (1.52x) | NA | NA | 20,915.64 (1.48x) | NA | NA | 129,979.04 Native Hexagon-MLIR HVX, HexKL off (9.21x); 20,088.50 HexKL pipeline/0-HMX-rewrite HVX (1.42x) | NA | NA | **14,115.92 item7-only (1.00x)** | NA | Ratios are row latency / item7 latency. Items 1–6 are explicitly disabled; all current rows pass correctness. |
-| 2026-08-08+ | DeiT-small | NA | NA | NA | NA | NA | NA | 913,419.276†‡ | 24,075.094 | 8,342.079* | 266,291.591†‡ | NA | NA | Old monolithic rows had zero HMX rewrites and NaN outputs, so they are placed under scalar rather than HMX. |
-| 2026-08-08+ | SegFormer MiT-B0 | NA | NA | NA | NA | NA | NA | NA | 27,488.063 | 9,349.189* | NA | NA | 19,785.205‡ | Historical full OF passed and reported eight HexKL rewrites; different compiler/timing generation. |
-| 2026-08-08+ | Swin Transformer | NA | NA | NA | NA | NA | NA | NA | 122,531.193 | 73,079.566* | NA | NA | 206,326.114‡ | Historical full OF passed; baselines from that old monolithic run failed. |
-| 2026-08-08+ | BEiT-base | NA | NA | NA | NA | NA | NA | NA | 129,376.464 | 13,495.335* | NA | NA | NA | No valid complete-model OF latency. |
-| 2026-08-08+ | Whisper-tiny | NA | NA | NA | NA | NA | NA | NA | 160,182.939 | 112,048.671* | NA | NA | 1,093,076.414‡ | Historical full OF passed and reported 32 HexKL rewrites; not the same revision/timing protocol as the current native rows. |
-| 2026-08-08+ | HuBERT-base | NA | NA | NA | NA | NA | NA | NA | 216,665.328 | 190,385.382* | NA | 620,050.837‡ | NA | OF is the earlier matched true-HVX full result; its exact native HVX control was 212,074.277 ms. |
-| 2026-08-08+ | Wav2Vec2-base | NA | NA | NA | NA | NA | NA | NA | 216,404.775 | 174,978.035* | NA | NA | NA | No complete-model OF latency. |
-| 2026-08-08+ | UniSpeech-base | NA | NA | NA | NA | NA | NA | NA | 215,996.232 | 174,108.521* | NA | NA | NA | No complete-model OF latency. |
-| 2026-08-08+ | UniSpeech-SAT-base | NA | NA | NA | NA | NA | NA | NA | 215,612.362 | 174,006.382* | NA | NA | NA | No complete-model OF latency. |
-| 2026-08-08+ | GPT-2, full 12L FP16 | NA | NA | NA | NA | NA | NA | 24,027†‡ | 21,324.308 | 3,359.199* | NA | NA | 11,673†‡ | Old scalar/HMX+OF monolithic rows produced NaN logits; do not compare them directly with the corrected staged FP16 rows. |
-| 2026-08-08+ | SD/CLIP text encoder | NA | NA | NA | NA | NA | NA | NA | 244,487.748 | 5,440.120* | NA | NA | NA | Full structure, random weights; no current full OF row. |
-| 2026-08-08+ | Qwen2.5-0.5B | NA | NA | NA | NA | NA | NA | NA | 412,891.312 | 13,537.873* | NA | NA | NA | No current full OF row. |
-| 2026-08-08+ | TinyLlama-1.1B | NA | NA | NA | NA | NA | NA | NA | 975,472.962 | 32,908.259* | NA | NA | NA | No current full OF row. |
-| 2026-08-08+ | SmolLM2-1.7B | NA | NA | NA | NA | NA | NA | NA | 1,549,937.550 | 42,315.577* | NA | NA | NA | No current full OF row. |
+| 2026-08-13 strict rerun | DINOv2-small | NA | 10,596.72 (1.78x) | NA | NA | 10,591.11 (1.78x) | NA | 1,281,514.12‡ | 30,031.10 HMLIR HVX (HexKL Off) (5.04x); 10,035.87 HMLIR HVX (HexKL On; 0 HMX rewrites) (1.69x) | NA | 300,484.16‡ | **5,953.59 item7-only (1.00x)** | NA | Ratios are row latency / item7 latency. Items 1–6 are explicitly disabled; all current rows pass correctness. |
+| 2026-08-13 strict rerun | ViT-Base | NA | 21,489.53 (1.52x) | NA | NA | 20,915.64 (1.48x) | NA | NA | 129,979.04 HMLIR HVX (HexKL Off) (9.21x); 20,088.50 HMLIR HVX (HexKL On; 0 HMX rewrites) (1.42x) | NA | NA | **14,115.92 item7-only (1.00x)** | NA | Ratios are row latency / item7 latency. Items 1–6 are explicitly disabled; all current rows pass correctness. |
+| 2026-08-08+ / 2026-08-15 strict rerun | DeiT-small | NA | 9,203.05 (1.74x) | NA | NA | 8,850.23 (1.67x) | NA | 913,419.276†‡ | 23,188.05 HMLIR HVX (HexKL Off) (4.38x); 8,495.38 HMLIR HVX (HexKL On; 0 HMX rewrites) (1.61x) | NA | 266,291.591†‡ | **5,290.50 item7-only (1.00x)** | NA | Ratios are row latency / item7 latency. Current V73 HVX rows used CDSP 1,478.40 MHz and MEMNOC 2,000 MHz, ran strictly serially, and all pass correctness. PK admitted 334 sites; APT consumed that allowlist. Item7 propagated/tiled 12 K/V pairs but emitted zero runtime L2-scheduler hints; old scalar rows remain invalid NaN history (†‡). |
+| 2026-08-08+ / 2026-08-15 strict rerun | SegFormer MiT-B0 | NA | 9,413.14 (1.04x) | NA | NA | 9,393.78 (1.04x) | NA | NA | 27,189.70 HMLIR HVX (HexKL Off) (3.01x); 9,417.02 HMLIR HVX (HexKL On; 8 rewrites) (1.04x) | NA | NA | **9,025.85 item7-only (1.00x)** | NA | Current five HVX rows are strictly serial and pass correctness. PK admitted 171 sites; APT consumed that allowlist. Item7 identified two K/V pairs but emitted zero runtime L2-scheduler hints. Current strict rows supersede the older mixed-generation 27,488.063/9,349.189/19,785.205‡ values. |
+| 2026-08-08+ / 2026-08-15 strict rerun | Swin Transformer | NA | 77,737.95 (1.52x) | NA | NA | 73,318.92 (1.43x) | NA | NA | 121,829.86 HMLIR HVX (HexKL Off) (2.38x); 73,457.69 HMLIR HVX (HexKL On; 4 rewrites) (1.43x) | NA | NA | **51,221.83 item7-only (1.00x)** | NA | Current five HVX rows ran strictly serially and each passed its CPU correctness gate. PK admitted 310 sites; APT consumed that allowlist. Item7 identified 12 K/V pairs but emitted zero runtime L2-scheduler hints. Current strict rows supersede the older mixed-generation values. |
+| 2026-08-08+ / 2026-08-15 strict rerun | BEiT-base | NA | 15,804.82 (1.08x) | NA | NA | 15,837.16 (1.08x) | NA | NA | 132,908.25 HMLIR HVX (HexKL Off) (9.07x); 14,737.02 HMLIR HVX (HexKL On; 0 HMX rewrites) (1.01x) | NA | NA | **14,656.99 item7-only (1.00x)** | NA | Current five HVX rows ran strictly serially and pass correctness. PK admitted 382 sites; APT consumed that allowlist. Item7 identified 12 K/V pairs but emitted zero runtime L2-scheduler hints; its gain over HexKL On is only 1.01x. |
+| 2026-08-08+ / 2026-08-15 strict rerun | Whisper-tiny | NA | 115,763.93 (1.66x) | NA | NA | 115,908.13 (1.66x) | NA | NA | 161,702.15 HMLIR HVX (HexKL Off) (2.32x); 115,663.98 HMLIR HVX (HexKL On; 32 rewrites) (1.66x) | NA | NA | **69,743.50 item7-only (1.00x)** | NA | Current five HVX rows ran strictly serially and pass correctness. PK admitted 283 sites; APT consumed that allowlist. Item7 identified eight K/V pairs but emitted zero runtime L2-scheduler hints. Current strict rows supersede the older mixed-generation rows, including the invalid 1,093,076.414‡ result. |
+| 2026-08-08+ / 2026-08-15 strict rerun | HuBERT-base | NA | 174,798.20 (1.01x) | NA | NA | 176,416.16 (1.02x) | NA | NA | 216,965.03 HMLIR HVX (HexKL Off) (1.25x); 176,744.13 HMLIR HVX (HexKL On; 74 rewrites) (1.02x) | NA | NA | **173,783.08 item7-only (1.00x)** | NA | Current five HVX rows ran strictly serially and pass correctness. PK admitted 387 sites; APT consumed that allowlist. Item7 identified 12 K/V pairs but emitted zero runtime L2-scheduler hints; its gain over HexKL On is only 1.02x. |
+| 2026-08-08+ / 2026-08-15 strict rerun | Wav2Vec2-base | NA | 191,710.61 (1.03x) | NA | NA | 174,880.18 (0.94x) | NA | NA | 216,862.85 HMLIR HVX (HexKL Off) (1.17x); 177,055.12 HMLIR HVX (HexKL On; 74 rewrites) (0.96x) | NA | NA | **185,248.95 item7-only (1.00x)** | NA | Current five HVX rows ran strictly serially and pass correctness. PK admitted 387 sites; APT consumed that allowlist. Item7 identified 12 K/V pairs but emitted zero runtime L2-scheduler hints. Ratios below 1.00x mean item7 is slower than that comparison; it regresses versus HexKL On here. |
+| 2026-08-08+ / 2026-08-15 strict rerun | UniSpeech-base | NA | 174,208.93 (0.93x) | NA | NA | 174,355.22 (0.93x) | NA | NA | 217,191.90 HMLIR HVX (HexKL Off) (1.16x); 178,052.40 HMLIR HVX (HexKL On; 74 rewrites) (0.95x) | NA | NA | **186,487.32 item7-only (1.00x)** | NA | Current five HVX rows ran strictly serially and pass correctness. PK admitted 387 sites; APT consumed that allowlist. Item7 identified 12 K/V pairs but emitted zero runtime L2-scheduler hints. Ratios below 1.00x expose an item7 regression. |
+| 2026-08-08+ / 2026-08-15 strict rerun | UniSpeech-SAT-base | NA | 175,383.30 (0.93x) | NA | NA | 173,985.61 (0.92x) | NA | NA | 216,746.78 HMLIR HVX (HexKL Off) (1.15x); 174,227.26 HMLIR HVX (HexKL On; 74 rewrites) (0.93x) | NA | NA | **188,149.68 item7-only (1.00x)** | NA | Current five HVX rows ran strictly serially and pass correctness. PK admitted 387 sites; APT consumed that allowlist. Item7 identified 12 K/V pairs but emitted zero runtime L2-scheduler hints. Ratios below 1.00x expose an item7 regression. |
+| 2026-08-15--16 strict staged FP16 rerun | GPT-2, full 12L | NA | 3,714.22 (0.97x) | NA | NA | 3,808.27 (0.99x) | NA | 24,027†‡ | 20,771.46 HMLIR HVX (HexKL Off) (5.43x); 3,705.82 HMLIR HVX (HexKL On) (0.97x) | 3,359.199*‡ | NA | **3,827.61 item7-only (1.00x)** | 11,673†‡ | Uniform FP16; sum of embedding + 12 blocks + full-vocabulary head device Perf. All five current rows are finite and preserve last-token Top-1. Ratios below 1.00x show that item7 regresses slightly versus PK/APT/HexKL On. The earlier monolithic OOM and invalid scalar rows remain history only. |
+| 2026-08-15--16 strict staged FP16 rerun | SD/CLIP text encoder | NA | 4,118.21 (1.06x) | NA | NA | 4,106.20 (1.06x) | NA | NA | 243,370.18 HMLIR HVX (HexKL Off) (62.57x); 3,963.37 HMLIR HVX (HexKL On) (1.02x) | 5,440.120*‡ | NA | **3,889.70 item7-only (1.00x)** | NA | Uniform FP16; sum of embedding + 12 encoder layers + final norm device Perf. All rows are finite; item7 max abs is 0.015625. Item7 improves only 1.02x over the matched HexKL-On control. |
+| 2026-08-15--16 strict staged FP16 rerun | Qwen2.5-0.5B | NA | 10,989.09 (1.88x) | NA | NA | 10,994.89 (1.88x) | NA | NA | 414,934.20 HMLIR HVX (HexKL Off) (70.81x); 10,929.40 HMLIR HVX (HexKL On) (1.87x) | 13,537.873*‡ | NA | **5,859.60 item7-only (1.00x)** | NA | Uniform FP16; sum of embedding + 24 complete blocks + full-vocabulary head device Perf. All rows are finite and preserve last-token Top-5. This is a clean 1.87x item7 gain over matched HexKL On. |
+| 2026-08-15--16 strict staged FP16 rerun | TinyLlama-1.1B | NA | 27,611.75 (1.62x) | NA | NA | 27,406.97 (1.61x) | NA | NA | 976,720.43 HMLIR HVX (HexKL Off) (57.32x); 27,228.38 HMLIR HVX (HexKL On) (1.60x) | 32,908.259*‡ | NA | **17,038.99 item7-only (1.00x)** | NA | Uniform FP16; sum of embedding + 22 complete blocks + full-vocabulary head device Perf. All rows are finite and preserve last-token Top-5; item7 is 1.60x faster than matched HexKL On. |
+| 2026-08-15--16 strict staged FP16 rerun | SmolLM2-1.7B | NA | 39,463.94 (1.40x) | NA | NA | 39,396.33 (1.39x) | NA | NA | 1,559,447.10 HMLIR HVX (HexKL Off) (55.18x); 39,348.33 HMLIR HVX (HexKL On) (1.39x) | 42,315.577*‡ | NA | **28,262.23 item7-only (1.00x)** | NA | Uniform FP16; sum of embedding + 24 complete blocks + full-vocabulary head device Perf. All rows are finite and preserve last-token Top-5; item7 is 1.39x faster than matched HexKL On. |
+
+The five 2026-08-15--16 language/text rows use matched host-staged execution
+because monolithic MLIR-to-LLVM code generation exceeds the 15-GiB host memory
+limit. Every policy compiles and runs the identical uniform-FP16 embedding,
+complete transformer layers, and final norm/head boundaries. The reported
+latency is the sum of every stage's device `Perf`; compilation, ADB transfer,
+and host round trips are excluded symmetrically. These are complete-model
+device-kernel sums, not single-executable end-to-end latency.
+
+| Model | PK runtime issued / bytes | APT runtime issued / bytes | Item7 compiler K/V pairs / runtime sites | Item7 vs HexKL On |
+|---|---:|---:|---:|---:|
+| GPT-2 | 27,200 / 6,494,272 | 27,200 / 6,494,272 | 1 / 0 | 0.97x (regression) |
+| SD/CLIP | 3,388 / 433,664 | 3,388 / 433,664 | 1 / 0 | 1.02x |
+| Qwen2.5-0.5B | 77,632 / 19,398,912 | 77,632 / 19,398,912 | 1 / 0 | **1.87x** |
+| TinyLlama-1.1B | 19,968 / 4,652,544 | 19,968 / 4,652,544 | 1 / 0 | **1.60x** |
+| SmolLM2-1.7B | 28,544 / 6,805,504 | 28,544 / 6,805,504 | 1 / 0 | **1.39x** |
+
+Item7 emitted no runtime L2-scheduler prefetch sites in these staged runs.
+Consequently, the observed Qwen/TinyLlama/SmolLM2 latency changes are real
+matched measurements but must not yet be attributed to executed hardware
+prefetch commands; an IR/object-level differential audit is required to locate
+the responsible code-generation change. PK and APT again issue identical
+traffic because APT consumes the exact PK-admitted per-stage candidate union.
+The complete generated corpus and logs are stored on `nano` under
+`/home/huzq85/2-working/working_set/full_hvx_five_way_20260815_layered_fp16`;
+the local `/tmp` tree retains only logs, status, CSV, and Markdown summaries.
 
 `*` denotes a measured HexKL-enabled full-model latency placed in the HMX-route
 column because that is the repository's available HMX lowering route. The
@@ -134,7 +160,7 @@ must not be used as a matched speedup against the 2026-08-08+ native corpus.
 
 Important comparison rule: the 2026-08-13 prefetch-baseline builds enabled
 HexKL but produced zero rewrites. Their closest no-prefetch control is therefore
-the `HexKL-on/0-rewrite` HVX row, not the much slower Native Hexagon-MLIR HVX
+the `HMLIR HVX (HexKL On; 0 HMX rewrites)` row, not the much slower `HMLIR HVX (HexKL Off)`
 (HexKL-off) compilation.
 Both are retained because the large difference proves that the flag changed
 other lowering/code-generation behavior even without HMX coverage.
@@ -143,9 +169,15 @@ With the strict item-7-only policy, DINOv2-small is 1.78x faster than
 Prefetch-Kernel-HX, 1.78x faster than APT-GET-HX, and 1.69x faster than the
 matched HexKL-on/zero-rewrite control. ViT-Base is respectively 1.52x,
 1.48x, and 1.42x faster. The much larger 5.04x and 9.21x ratios against
-Native Hexagon-MLIR HVX (HexKL off) are real timing differences but are not clean OmniFetch attribution,
+HMLIR HVX (HexKL Off) are real timing differences but are not clean OmniFetch attribution,
 because merely enabling HexKL changes lowering even when it reports zero HMX
 rewrites.
+
+For the matched uniform-FP16 staged language rows, item7 is 1.87x faster than
+HexKL On on Qwen2.5-0.5B, 1.60x on TinyLlama-1.1B, and 1.39x on
+SmolLM2-1.7B. It is only 1.02x faster on SD/CLIP and 0.97x on GPT-2. The much
+larger 5.43--70.81x ratios against HexKL Off primarily expose HexKL/HMX-path
+acceleration and must not be claimed as OmniFetch speedup.
 
 ## 4. Chronological experimental record
 
@@ -489,7 +521,7 @@ conclusion.
 
 | Full model | Configuration | Latency | Runtime issued | Issued bytes | Correctness |
 |---|---|---:|---:|---:|---|
-| DINOv2-small | Native Hexagon-MLIR HVX (HexKL off) | 29,885.944 | 0 | 0 | Pass. |
+| DINOv2-small | HMLIR HVX (HexKL Off) | 29,885.944 | 0 | 0 | Pass. |
 | DINOv2-small | Matched HexKL-on/zero-rewrite HVX control | 10,090.480 | 0 | 0 | Pass. |
 | DINOv2-small | Item7-only | 5,960.990 | 0 | 0 | Pass. |
 | DINOv2-small | Items 1–3 | 10,305.507 | 186,624 | 41,840,640 | Pass. |
@@ -497,7 +529,7 @@ conclusion.
 | DINOv2-small | Items 1–6, item4 off | 9,543.607 | 186,624 | 41,840,640 | Pass. |
 | DINOv2-small | Items 1–7, item4 off | 5,669.315 | 186,624 | 41,171,328 | Pass. |
 | DINOv2-small | Items 1–7, item4 off, bounded traffic (historical combination) | 5,558.501 | 4,096 | 903,872 | Pass; 1.815x over matched control. |
-| ViT-Base | Native Hexagon-MLIR HVX (HexKL off) | 132,967.479 | 0 | 0 | Pass. |
+| ViT-Base | HMLIR HVX (HexKL Off) | 132,967.479 | 0 | 0 | Pass. |
 | ViT-Base | Matched HexKL-on/zero-rewrite HVX control | 19,959.873 | 0 | 0 | Pass. |
 | ViT-Base | Item7-only | **13,872.472** | 0 | 0 | Pass; 1.439x over matched control. |
 | ViT-Base | Items 1–3 | 19,979.337 | 0 | 0 | Pass. |

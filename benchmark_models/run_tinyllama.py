@@ -344,8 +344,12 @@ def tinyllama_1_1b(
     omnifetch_lookahead: int = 2,
     enable_omnifetch_adaptive: bool = True,
     enable_omnifetch_items_1_7: bool = False,
+    enable_omnifetch_kv_cache_prefetch: bool = False,
     seq_len: Optional[int] = None,
     device_iterations: int = 1,
+    prefetch_baseline: str = "none",
+    prefetch_baseline_distance: int = 1,
+    apt_get_hx_manual_candidate_ids: str = "",
 ):
     _patch_dsp_heap_256mb()
 
@@ -451,7 +455,11 @@ def tinyllama_1_1b(
     options["enableHexKL"] = bool(enable_hexkl)
     options["enableConvertToHexagonmem"] = bool(enable_hexkl)
     cumulative = bool(enable_omnifetch_items_1_7)
-    options["enablePrefetch"] = bool(enable_omnifetch_vdae or cumulative)
+    options["enablePrefetch"] = bool(
+        enable_omnifetch_vdae
+        or cumulative
+        or enable_omnifetch_kv_cache_prefetch
+    )
     options["enableOmniFetchLayoutAware"] = bool(enable_omnifetch_layout_aware)
     options["omniFetchLookahead"] = int(omnifetch_lookahead)
     options["enableOmniFetchVDAE"] = bool(enable_omnifetch_vdae or cumulative)
@@ -459,7 +467,14 @@ def tinyllama_1_1b(
     options["enableOmniFetchPersistentWhCache"] = cumulative
     options["enableOmniFetchTwoDimPipeline"] = cumulative
     options["enableOmniFetchVtcmColoring"] = cumulative
-    options["enableOmniFetchKvCachePrefetch"] = cumulative
+    options["enableOmniFetchKvCachePrefetch"] = bool(
+        cumulative or enable_omnifetch_kv_cache_prefetch
+    )
+    options["enablePrefetchKernelHX"] = prefetch_baseline == "prefetch-kernel-hx"
+    options["prefetchKernelHxDistance"] = int(prefetch_baseline_distance)
+    options["enableAPTGetHX"] = prefetch_baseline == "apt-get-hx"
+    options["aptGetHxDistance"] = int(prefetch_baseline_distance)
+    options["aptGetHxManualCandidateIds"] = apt_get_hx_manual_candidate_ids
     options["enableOmniFetchActivationMulticast"] = bool(
         enable_omnifetch_activation_multicast
     )
@@ -516,6 +531,14 @@ if __name__ == "__main__":
     parser.add_argument("--omnifetch-lookahead", type=int, default=2)
     parser.add_argument("--disable-omnifetch-adaptive", action="store_true")
     parser.add_argument("--enable-omnifetch-items-1-7", action="store_true")
+    parser.add_argument("--enable-omnifetch-kv-cache-prefetch", action="store_true")
+    parser.add_argument(
+        "--prefetch-baseline",
+        choices=("none", "prefetch-kernel-hx", "apt-get-hx"),
+        default="none",
+    )
+    parser.add_argument("--prefetch-baseline-distance", type=int, default=1)
+    parser.add_argument("--apt-get-hx-manual-candidate-ids", default="")
     parser.add_argument("--device-iterations", type=int, default=1)
     parser.add_argument(
         "--seq-len",
@@ -535,6 +558,12 @@ if __name__ == "__main__":
         omnifetch_lookahead=args.omnifetch_lookahead,
         enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
         enable_omnifetch_items_1_7=args.enable_omnifetch_items_1_7,
+        enable_omnifetch_kv_cache_prefetch=(
+            args.enable_omnifetch_kv_cache_prefetch
+        ),
         seq_len=args.seq_len,
         device_iterations=args.device_iterations,
+        prefetch_baseline=args.prefetch_baseline,
+        prefetch_baseline_distance=args.prefetch_baseline_distance,
+        apt_get_hx_manual_candidate_ids=args.apt_get_hx_manual_candidate_ids,
     )

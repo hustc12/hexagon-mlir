@@ -20,6 +20,10 @@ from run_sd_text_encoder import (  # noqa: E402
     _patch_gelu_tanh,
     get_text_inputs,
 )
+from layered_hvx_options import (  # noqa: E402
+    add_layered_hvx_args,
+    make_layered_hvx_options,
+)
 
 
 torch.set_num_threads(1)
@@ -91,7 +95,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", type=Path, default=Path("/tmp/clip-layered"))
     parser.add_argument("--device-iterations", type=int, default=1)
-    parser.add_argument("--enable-hexkl", action="store_true")
+    add_layered_hvx_args(parser)
     parser.add_argument("--cpu-only", action="store_true")
     parser.add_argument(
         "--dtype",
@@ -140,21 +144,12 @@ def main() -> None:
     if args.cpu_only:
         return
 
-    from triton.backends.qcom_hexagon_backend.compiler import HexagonOptions
     from triton.backends.qcom_hexagon_backend.torch_mlir_hexagon_launcher import (
         TorchMLIRHexagonLauncher,
     )
 
     patch_full_model_dsp_heap()
-    options = HexagonOptions().__dict__.copy()
-    options["enableVectorization"] = True
-    options["enableHexKL"] = bool(args.enable_hexkl)
-    options["enableVTCMTiling"] = False
-    options["enableConvertToHexagonmem"] = bool(args.enable_hexkl)
-    options["enableConversionToFp16"] = False
-    options["lowerConstantsInSeparateSharedObjects"] = True
-    if "enableBufferResultsToOutParams" in options:
-        options["enableBufferResultsToOutParams"] = True
+    options = make_layered_hvx_options(args)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     launcher = TorchMLIRHexagonLauncher()

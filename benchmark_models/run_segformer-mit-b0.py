@@ -77,8 +77,21 @@ def run(args: argparse.Namespace) -> None:
         args.enable_omnifetch_items_1_7,
         lower_constants_separate=True,
         backend_profile=args.backend_profile,
+        enable_lwp=args.enable_lwp,
+        lwp_loop_depth=args.lwp_loop_depth,
+        disable_lwp_loop=args.disable_lwp_loop,
+        omnifetch_items_through=args.omnifetch_items_through,
         enable_omnifetch_m_pad_hmx=args.enable_omnifetch_m_pad_hmx,
         enable_out_params=args.enable_out_params,
+        prefetch_baseline=args.prefetch_baseline,
+        prefetch_baseline_distance=args.prefetch_baseline_distance,
+        apt_get_hx_manual_candidate_ids=args.apt_get_hx_manual_candidate_ids,
+        enable_omnifetch_kv_cache_prefetch=(
+            args.enable_omnifetch_kv_cache_prefetch
+        ),
+        disable_omnifetch_persistent_wh_cache=(
+            args.disable_omnifetch_persistent_wh_cache
+        ),
     )
     output = hex_execution(
         module,
