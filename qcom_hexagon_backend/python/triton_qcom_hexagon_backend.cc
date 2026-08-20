@@ -76,6 +76,18 @@ void init_triton_hexagon_translation(py::module &m) {
     hexagon_backend::loadDialects(context);
   });
 
+  // Triton's Python MLIR context is intentionally constructed with threading
+  // disabled.  Torch-MLIR full-model compilation, however, benefits from the
+  // MLIR pass manager's operation-level parallelism when a module contains
+  // multiple independent functions.  Keep this opt-in and in the Hexagon
+  // plugin so downstream users do not need to patch the Triton submodule.
+  m.def("enable_context_multithreading", [](mlir::MLIRContext &context) {
+    context.enableMultithreading();
+  });
+  m.def("get_context_num_threads", [](mlir::MLIRContext &context) {
+    return context.getNumThreads();
+  });
+
   m.def(
       "parse_mlir_module_from_file",
       [](std::string &module_str, mlir::MLIRContext &context) {

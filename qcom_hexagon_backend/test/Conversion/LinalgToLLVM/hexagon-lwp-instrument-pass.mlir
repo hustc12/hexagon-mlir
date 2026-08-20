@@ -17,9 +17,7 @@ module {
   }
 }
 
-// CHECK: llvm.mlir.global internal constant @handler_name("lwp_handler\00") {addr_space = 0 : i32}
-// CHECK: llvm.func @llvm.hexagon.instrprof.custom(!llvm.ptr, i32)
+// CHECK: llvm.func @lwp_handler(i32)
 // CHECK: %[[MARKER:.*]] = llvm.mlir.constant(1 : i32) : i32
-// CHECK: %[[ADDR:.*]] = llvm.getelementptr {{.*}} : (!llvm.ptr) -> !llvm.ptr, !llvm.array<12 x i8>
-// CHECK: llvm.call @llvm.hexagon.instrprof.custom(%[[ADDR]], %[[MARKER]]) : (!llvm.ptr, i32) -> ()
-// CHECK: llvm.call @llvm.hexagon.instrprof.custom(%[[ADDR]], %[[MARKER]]) : (!llvm.ptr, i32) -> ()
+// CHECK: llvm.call @lwp_handler(%[[MARKER]]) : (i32) -> ()
+// CHECK: llvm.call @lwp_handler(%[[MARKER]]) : (i32) -> ()

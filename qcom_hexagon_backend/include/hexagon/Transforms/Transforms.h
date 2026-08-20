@@ -148,6 +148,21 @@ std::unique_ptr<InterfacePass<FunctionOpInterface>>
 createPrefetchKernelHXPass(
     const PrefetchKernelHXOptions &options = PrefetchKernelHXOptions());
 
+/// ALPS P1: analysis-only future-representation and physical-movement ledger.
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createAlpsMovementLedgerPass(
+    const AlpsMovementLedgerOptions &options = AlpsMovementLedgerOptions());
+
+/// ALPS P2a: absorb provably equivalent attention layout chains into consumer
+/// indexing maps, eliminating physical transpose materializations.
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createAlpsZeroCopyAttentionPass();
+
+/// ALPS P2b: make eligible attention elementwise producers write their final
+/// contiguous head-major consumer representation directly.
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createAlpsProducerDirectAttentionPass();
+
 /// V-DAE: decouples Memory Access and Compute Execution using semaphores.
 std::unique_ptr<InterfacePass<FunctionOpInterface>>
 createOmniFetchVDAEInsertPass(

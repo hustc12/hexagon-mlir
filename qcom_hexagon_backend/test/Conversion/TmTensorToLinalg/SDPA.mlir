@@ -1,4 +1,8 @@
 // RUN: linalg-hexagon-opt -pass-pipeline='builtin.module(func.func(hexagon-lower-tm-tensor{emit-kv-cache-metadata=true}))' %s | FileCheck %s
+// RUN: linalg-hexagon-opt -pass-pipeline='builtin.module(func.func(hexagon-lower-tm-tensor{emit-kv-cache-metadata=true emit-kv-fusion-boundary=true}))' %s | FileCheck %s --check-prefix=BOUNDARY
+// RUN: linalg-hexagon-opt -pass-pipeline='builtin.module(func.func(hexagon-lower-tm-tensor{emit-kv-cache-metadata=true emit-kv-elementwise-fusion-boundary=true}))' %s | FileCheck %s --check-prefix=P0B-ELEMENTWISE
+// RUN: linalg-hexagon-opt -pass-pipeline='builtin.module(func.func(hexagon-lower-tm-tensor{emit-kv-cache-metadata=true emit-kv-multi-use-fusion-boundary=true}))' %s | FileCheck %s --check-prefix=P0B-MULTI
+// RUN: linalg-hexagon-opt -pass-pipeline='builtin.module(func.func(hexagon-lower-tm-tensor{emit-kv-cache-metadata=true emit-kv-split-reduction-boundary=true}))' %s | FileCheck %s --check-prefix=P0B-SPLIT
 // RUN: linalg-hexagon-opt -pass-pipeline='builtin.module(func.func(hexagon-lower-tm-tensor))' %s | FileCheck %s --check-prefix=NO-KV
 
 func.func @SDPA(%arg0: tensor<2x4x8xf32>, %arg1: tensor<2x4x8xf32>,
@@ -15,6 +19,7 @@ func.func @SDPA(%arg0: tensor<2x4x8xf32>, %arg1: tensor<2x4x8xf32>,
 }
 
 // CHECK-LABEL: func.func @SDPA
+// CHECK-NOT: alps.kv_fusion_boundary
 // CHECK: %[[CST:.*]] = arith.constant 0xFF800000 : f32
 // CHECK: %[[CST_0:.*]] = arith.constant 0.353553385 : f32
 // CHECK: %[[CST_1:.*]] = arith.constant 0.000000e+00 : f32
@@ -62,6 +67,28 @@ func.func @SDPA(%arg0: tensor<2x4x8xf32>, %arg1: tensor<2x4x8xf32>,
 // CHECK-SAME:                ins(%[[SOFTMAX]], %arg2 : tensor<2x4x4xf32>, tensor<2x4x8xf32>)
 // CHECK-SAME:                outs(%{{.*}} : tensor<2x4x8xf32>) -> tensor<2x4x8xf32>
 // CHECK: return %[[RESULT]] : tensor<2x4x8xf32>
+
+// BOUNDARY-LABEL: func.func @SDPA
+// BOUNDARY-COUNT-2: alps.kv_fusion_boundary
+// BOUNDARY: return
+
+// P0B-ELEMENTWISE-LABEL: func.func @SDPA
+// P0B-ELEMENTWISE-COUNT-2: alps.kv_elementwise_fusion_boundary
+// P0B-ELEMENTWISE-NOT: alps.kv_multi_use_fusion_boundary
+// P0B-ELEMENTWISE-NOT: alps.kv_split_reduction_boundary
+// P0B-ELEMENTWISE: return
+
+// P0B-MULTI-LABEL: func.func @SDPA
+// P0B-MULTI-COUNT-2: alps.kv_multi_use_fusion_boundary
+// P0B-MULTI-NOT: alps.kv_elementwise_fusion_boundary
+// P0B-MULTI-NOT: alps.kv_split_reduction_boundary
+// P0B-MULTI: return
+
+// P0B-SPLIT-LABEL: func.func @SDPA
+// P0B-SPLIT-COUNT-2: alps.kv_split_reduction_boundary
+// P0B-SPLIT-NOT: alps.kv_elementwise_fusion_boundary
+// P0B-SPLIT-NOT: alps.kv_multi_use_fusion_boundary
+// P0B-SPLIT: return
 
 // NO-KV-LABEL: func.func @SDPA
 // NO-KV-NOT: omni_fetch.kv_cache_role

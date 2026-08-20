@@ -94,6 +94,44 @@ public:
     auto moduleOp = getOperation();
     MLIRContext *context = moduleOp.getContext();
 
+    // ALPS P0 causal split.  The legacy OmniFetch item-7 option remains an
+    // umbrella alias so archived scripts reproduce their original topology.
+    const bool alpsKvFusionPolicy =
+        enableOmniFetchKvCachePrefetch || enableAlpsKvFusionPolicy;
+    const bool alpsKvElementwiseFusionPolicy =
+        alpsKvFusionPolicy || enableAlpsKvElementwiseFusionPolicy;
+    const bool alpsKvMultiUseFusionPolicy =
+        alpsKvFusionPolicy || enableAlpsKvMultiUseFusionPolicy;
+    const bool alpsKvSplitReductionPolicy =
+        alpsKvFusionPolicy || enableAlpsKvSplitReductionPolicy;
+    const bool alpsKvSlicingPolicy =
+        enableOmniFetchKvCachePrefetch || enableAlpsKvSlicingPolicy;
+    const bool alpsKvRuntimePrefetch =
+        enableOmniFetchKvCachePrefetch || enableAlpsKvRuntimePrefetch;
+    const bool alpsKvSemanticTracking =
+        enableOmniFetchKvCachePrefetch || enableAlpsKvSemanticTracking ||
+        alpsKvElementwiseFusionPolicy || alpsKvMultiUseFusionPolicy ||
+        alpsKvSplitReductionPolicy || alpsKvSlicingPolicy ||
+        alpsKvRuntimePrefetch;
+    const bool alpsPrefetchPipeline = enablePrefetch || alpsKvRuntimePrefetch;
+
+    Builder alpsBuilder(context);
+    moduleOp->setAttr("alps.p0.kv_semantic_tracking",
+                      alpsBuilder.getBoolAttr(alpsKvSemanticTracking));
+    moduleOp->setAttr("alps.p0.kv_fusion_policy",
+                      alpsBuilder.getBoolAttr(alpsKvFusionPolicy));
+    moduleOp->setAttr(
+        "alps.p0b.kv_elementwise_fusion_policy",
+        alpsBuilder.getBoolAttr(alpsKvElementwiseFusionPolicy));
+    moduleOp->setAttr("alps.p0b.kv_multi_use_fusion_policy",
+                      alpsBuilder.getBoolAttr(alpsKvMultiUseFusionPolicy));
+    moduleOp->setAttr("alps.p0b.kv_split_reduction_policy",
+                      alpsBuilder.getBoolAttr(alpsKvSplitReductionPolicy));
+    moduleOp->setAttr("alps.p0.kv_slicing_policy",
+                      alpsBuilder.getBoolAttr(alpsKvSlicingPolicy));
+    moduleOp->setAttr("alps.p0.kv_runtime_prefetch",
+                      alpsBuilder.getBoolAttr(alpsKvRuntimePrefetch));
+
     if (enablePrefetchKernelHX && enableAPTGetHX) {
       moduleOp.emitError(
           "Prefetch-Kernel-HX and APT-GET-HX are independent baselines and "
@@ -161,6 +199,13 @@ public:
     auto setLWP = [&](auto passOption) {
       passOption.disableLWPLoop = disableLWPLoop;
       passOption.LWPloopDepth = LWPloopDepth;
+      return passOption;
+    };
+
+    auto setAlpsLedger = [&](auto passOption, StringRef phase) {
+      passOption.phase = phase.str();
+      passOption.pageBytes = alpsLedgerPageBytes;
+      passOption.vtcmBudgetBytes = alpsLedgerVtcmBudgetBytes;
       return passOption;
     };
     auto setOmniFetchVDAE = [&](auto passOption) {
@@ -231,6 +276,20 @@ public:
     lowerTmOpts.emitKvCacheMetadata = false;
     pm.addNestedPass<func::FuncOp>(
         createHexagonLowerTmTensorPass(lowerTmOpts));
+
+    // P2b must run at the first stable tensor-Linalg boundary.  The initial
+    // model IR still exposes projection bias-add -> expand -> transpose as a
+    // proven, single-use chain; subsequent rank reduction/canonicalization can
+    // legally fold that producer shape and make the opportunity invisible.
+    // Rewriting only the add's result layout does not alter the upstream named
+    // matmul, so the later HexKL conversion retains the same eligibility.
+    if (enableAlpsProducerDirectAttention) {
+      pm.addNestedPass<func::FuncOp>(
+          createAlpsProducerDirectAttentionPass());
+      pm.addPass(createCanonicalizerPass());
+      pm.addPass(createCSEPass());
+    }
+
     pm.addNestedPass<func::FuncOp>(createReduceContractionRankPass());
     pm.addPass(createLinalgFoldUnitExtentDimsPass());
     pm.addPass(createCanonicalizerPass());
@@ -271,6 +330,15 @@ public:
       pm.addPass(createCanonicalizerPass());
     }
 
+    // P2a runs after HexKL has claimed every eligible named contraction. The
+    // remaining matched QK batch matmuls are HVX-bound attention shapes, so
+    // absorbing their head-layout transposes cannot reduce HMX coverage.
+    if (enableAlpsZeroCopyAttention) {
+      pm.addNestedPass<func::FuncOp>(createAlpsZeroCopyAttentionPass());
+      pm.addPass(createCanonicalizerPass());
+      pm.addPass(createCSEPass());
+    }
+
     // enableMatmulToConv and enableSeedLayoutConversions are supposed to be set
     // for unit test only. They are not supposed to run on Full models
     if (enableMatmulToConv && enableSeedLayoutConversions) {
@@ -295,9 +363,16 @@ public:
     // Recover semantic K/V identity while eager attention is still expressed
     // as named batch_matmul + explicit transpose. ScheduleMatmulForHVX copies
     // these attributes to its replacement generic op.
-    if (enableOmniFetchKvCachePrefetch) {
+    if (alpsKvSemanticTracking) {
       HexagonLowerTmTensorOptions kvMetadataOpts{};
       kvMetadataOpts.emitKvCacheMetadata = true;
+      kvMetadataOpts.emitKvFusionBoundary = alpsKvFusionPolicy;
+      kvMetadataOpts.emitKvElementwiseFusionBoundary =
+          enableAlpsKvElementwiseFusionPolicy;
+      kvMetadataOpts.emitKvMultiUseFusionBoundary =
+          enableAlpsKvMultiUseFusionPolicy;
+      kvMetadataOpts.emitKvSplitReductionBoundary =
+          enableAlpsKvSplitReductionPolicy;
       pm.addNestedPass<func::FuncOp>(
           createHexagonLowerTmTensorPass(kvMetadataOpts));
     }
@@ -320,9 +395,16 @@ public:
     // The generic Linalg generalizer rebuilds named contractions and does not
     // preserve arbitrary attributes. Re-identify K/V immediately, while the
     // unfused attention dataflow and indexing maps are still available.
-    if (enableOmniFetchKvCachePrefetch) {
+    if (alpsKvSemanticTracking) {
       HexagonLowerTmTensorOptions kvMetadataOpts{};
       kvMetadataOpts.emitKvCacheMetadata = true;
+      kvMetadataOpts.emitKvFusionBoundary = alpsKvFusionPolicy;
+      kvMetadataOpts.emitKvElementwiseFusionBoundary =
+          enableAlpsKvElementwiseFusionPolicy;
+      kvMetadataOpts.emitKvMultiUseFusionBoundary =
+          enableAlpsKvMultiUseFusionPolicy;
+      kvMetadataOpts.emitKvSplitReductionBoundary =
+          enableAlpsKvSplitReductionPolicy;
       pm.addNestedPass<func::FuncOp>(
           createHexagonLowerTmTensorPass(kvMetadataOpts));
     }
@@ -339,6 +421,10 @@ public:
       pm.addNestedPass<func::FuncOp>(createFormSCFThreadsPass());
     }
 
+    if (enableAlpsMovementLedger)
+      pm.addNestedPass<func::FuncOp>(createAlpsMovementLedgerPass(
+          setAlpsLedger(AlpsMovementLedgerOptions{}, "pre-fusion")));
+
     if (fusion)
       pm.addNestedPass<func::FuncOp>(
           createHexagonFusionPass(setFusion(HexagonFusionOptions{})));
@@ -350,17 +436,28 @@ public:
     // Recover K/V identity from the final, fused contraction shapes.  This
     // keeps the normal HVX fusion pipeline intact while providing stable
     // metadata to the later bufferized prefetch insertion pass.
-    if (enableOmniFetchKvCachePrefetch) {
+    if (alpsKvSemanticTracking) {
       HexagonLowerTmTensorOptions kvMetadataOpts{};
       kvMetadataOpts.emitKvCacheMetadata = true;
+      kvMetadataOpts.emitKvFusionBoundary = alpsKvFusionPolicy;
+      kvMetadataOpts.emitKvElementwiseFusionBoundary =
+          enableAlpsKvElementwiseFusionPolicy;
+      kvMetadataOpts.emitKvMultiUseFusionBoundary =
+          enableAlpsKvMultiUseFusionPolicy;
+      kvMetadataOpts.emitKvSplitReductionBoundary =
+          enableAlpsKvSplitReductionPolicy;
       pm.addNestedPass<func::FuncOp>(
           createHexagonLowerTmTensorPass(kvMetadataOpts));
     }
 
+    if (enableAlpsMovementLedger)
+      pm.addNestedPass<func::FuncOp>(createAlpsMovementLedgerPass(
+          setAlpsLedger(AlpsMovementLedgerOptions{}, "post-fusion")));
+
     // Full-size attention slicing currently rebuilds the contraction without
     // copying semantic K/V attributes. Keep the marked boundary intact for
     // item-7; ordinary HVX/HexKL configurations retain the existing slicing.
-    if (enableSlicing && !enableOmniFetchKvCachePrefetch)
+    if (enableSlicing && !alpsKvSlicingPolicy)
       pm.addPass(createHexagonSlicingPass(
           setOpSlicingFactor(HexagonSlicingOptions{})));
 
@@ -379,9 +476,16 @@ public:
     // Slicing may rebuild the contraction and drop semantic attributes.
     // Recover them at the last tensor-Linalg boundary so Hexagon tiling can
     // propagate K/V identity into the vector transfer reads.
-    if (enableOmniFetchKvCachePrefetch) {
+    if (alpsKvSemanticTracking) {
       HexagonLowerTmTensorOptions kvMetadataOpts{};
       kvMetadataOpts.emitKvCacheMetadata = true;
+      kvMetadataOpts.emitKvFusionBoundary = alpsKvFusionPolicy;
+      kvMetadataOpts.emitKvElementwiseFusionBoundary =
+          enableAlpsKvElementwiseFusionPolicy;
+      kvMetadataOpts.emitKvMultiUseFusionBoundary =
+          enableAlpsKvMultiUseFusionPolicy;
+      kvMetadataOpts.emitKvSplitReductionBoundary =
+          enableAlpsKvSplitReductionPolicy;
       pm.addNestedPass<func::FuncOp>(
           createHexagonLowerTmTensorPass(kvMetadataOpts));
     }
@@ -532,6 +636,11 @@ public:
         pm.addPass(
             bufferization::createBufferResultsToOutParamsPass(outParamsOpts));
       }
+
+      if (enableAlpsMovementLedger)
+        pm.addNestedPass<func::FuncOp>(createAlpsMovementLedgerPass(
+            setAlpsLedger(AlpsMovementLedgerOptions{},
+                          "post-bufferization")));
     }
 
     if (enableConvertToHexagonmem)
@@ -596,14 +705,21 @@ public:
     // any component has emitted such ops (i.e. whenever enablePrefetch is true).
 
     // --- Component 1: Prefetch Insertion ---
-    if (enablePrefetch) {
+    if (alpsPrefetchPipeline) {
       // Tiling, vectorization, and one-shot bufferization may replace the
       // contraction operation after the earlier post-fusion annotation.
       // Re-infer item-7 metadata on the final bufferized Linalg operations so
       // the prefetch pass never depends on attributes surviving rewrites.
-      if (enableOmniFetchKvCachePrefetch) {
+      if (alpsKvRuntimePrefetch) {
         HexagonLowerTmTensorOptions kvMetadataOpts{};
         kvMetadataOpts.emitKvCacheMetadata = true;
+        kvMetadataOpts.emitKvFusionBoundary = alpsKvFusionPolicy;
+        kvMetadataOpts.emitKvElementwiseFusionBoundary =
+            enableAlpsKvElementwiseFusionPolicy;
+        kvMetadataOpts.emitKvMultiUseFusionBoundary =
+            enableAlpsKvMultiUseFusionPolicy;
+        kvMetadataOpts.emitKvSplitReductionBoundary =
+            enableAlpsKvSplitReductionPolicy;
         pm.addNestedPass<func::FuncOp>(
             createHexagonLowerTmTensorPass(kvMetadataOpts));
       }
@@ -619,12 +735,12 @@ public:
       prefetchOptions.enableTwoDimPipeline =
           enableOmniFetchTwoDimPipeline;
       prefetchOptions.enableKvCachePrefetch =
-          enableOmniFetchKvCachePrefetch;
+          alpsKvRuntimePrefetch;
       // An independently enabled item-7 has no other OmniFetch components.
       // Keep that experiment causal by excluding ordinary loop prefetch;
       // cumulative items 1-7 still execute the complete pipeline.
       prefetchOptions.kvCacheOnly =
-          enableOmniFetchKvCachePrefetch && !enableOmniFetchVDAE &&
+          alpsKvRuntimePrefetch && !enableOmniFetchVDAE &&
           !enableOmniFetchPersistentWhCache &&
           !enableOmniFetchTwoDimPipeline && !enableOmniFetchVtcmColoring;
       prefetchOptions.enableDequantReshape =
@@ -641,7 +757,7 @@ public:
 
     // --- Component 2: Layout Ops Elimination (In-Situ Reshape partner) ---
     // Only meaningful when both Prefetch and Layout-Aware are active.
-    if (enablePrefetch && enableOmniFetchLayoutAware) {
+    if (alpsPrefetchPipeline && enableOmniFetchLayoutAware) {
       pm.addNestedPass<func::FuncOp>(
           hexagon::createLayoutOpsEliminationPass());
     }
@@ -700,7 +816,7 @@ public:
     // Lower omni_fetch dialect ops to extern-C runtime calls.
     // Required whenever Prefetch (Component 1) has emitted prefetch_in_situ ops,
     // or when weight prepack emitted prefetch_in_situ copies in DecomposeHexKL.
-    if (enablePrefetch || enableOmniFetchWeightPrepack ||
+    if (alpsPrefetchPipeline || enableOmniFetchWeightPrepack ||
         enablePrefetchKernelHX || enableAPTGetHX) {
       mlir::omni_fetch::OmniFetchToLLVMOptions ofOpts{};
       ofOpts.enableDualThreadDae =

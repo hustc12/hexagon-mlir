@@ -134,6 +134,9 @@ int main(int argc, char **argv) {
   mlir::hexagon::registerSCFLoopUnrollPass();
   mlir::hexagon::registerPrefetchInsertPass();
   mlir::hexagon::registerPrefetchKernelHXPass();
+  mlir::hexagon::registerAlpsMovementLedgerPass();
+  mlir::hexagon::registerAlpsZeroCopyAttentionPass();
+  mlir::hexagon::registerAlpsProducerDirectAttentionPass();
   mlir::hexagon::registerOmniFetchVDAEInsertPass();
   mlir::hexagon::registerLayoutOpsEliminationPass();
 

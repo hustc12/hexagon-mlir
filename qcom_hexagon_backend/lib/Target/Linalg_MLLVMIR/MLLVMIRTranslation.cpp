@@ -188,6 +188,66 @@ void setLinalgToLLVMOptions(
         (it != arch_kwargs.end() && !it->second.compare(TRUE));
   }
   {
+    auto it = arch_kwargs.find("enableAlpsKvSemanticTracking");
+    options.enableAlpsKvSemanticTracking =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsKvFusionPolicy");
+    options.enableAlpsKvFusionPolicy =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsKvElementwiseFusionPolicy");
+    options.enableAlpsKvElementwiseFusionPolicy =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsKvMultiUseFusionPolicy");
+    options.enableAlpsKvMultiUseFusionPolicy =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsKvSplitReductionPolicy");
+    options.enableAlpsKvSplitReductionPolicy =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsKvSlicingPolicy");
+    options.enableAlpsKvSlicingPolicy =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsKvRuntimePrefetch");
+    options.enableAlpsKvRuntimePrefetch =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsMovementLedger");
+    options.enableAlpsMovementLedger =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsZeroCopyAttention");
+    options.enableAlpsZeroCopyAttention =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsProducerDirectAttention");
+    options.enableAlpsProducerDirectAttention =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("alpsLedgerPageBytes");
+    if (it != arch_kwargs.end())
+      options.alpsLedgerPageBytes = std::stoll(it->second);
+  }
+  {
+    auto it = arch_kwargs.find("alpsLedgerVtcmBudgetBytes");
+    if (it != arch_kwargs.end())
+      options.alpsLedgerVtcmBudgetBytes = std::stoll(it->second);
+  }
+  {
     auto it = arch_kwargs.find("enableOmniFetchKvCachePrefetch");
     options.enableOmniFetchKvCachePrefetch =
         (it != arch_kwargs.end() && !it->second.compare(TRUE));

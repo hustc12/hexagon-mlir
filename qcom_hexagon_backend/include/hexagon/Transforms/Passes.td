@@ -165,7 +165,19 @@ def HexagonLowerTmTensor :
   let options = [
     Option<"emitKvCacheMetadata", "emit-kv-cache-metadata", "bool",
            /*default=*/"false",
-           "Attach semantic K/V stream metadata for item-7 page-aware prefetch.">,
+           "Attach semantic K/V stream metadata for ALPS analysis/prefetch.">,
+    Option<"emitKvFusionBoundary", "emit-kv-fusion-boundary", "bool",
+           /*default=*/"false",
+           "Compatibility umbrella for every ALPS K/V topology boundary.">,
+    Option<"emitKvElementwiseFusionBoundary", "emit-kv-elementwise-fusion-boundary", "bool",
+           /*default=*/"false",
+           "Protect K/V elementwise and reshape fusion boundaries.">,
+    Option<"emitKvMultiUseFusionBoundary", "emit-kv-multi-use-fusion-boundary", "bool",
+           /*default=*/"false",
+           "Protect K/V boundaries from function-wide multi-use fusion.">,
+    Option<"emitKvSplitReductionBoundary", "emit-kv-split-reduction-boundary", "bool",
+           /*default=*/"false",
+           "Protect K/V contractions from split reduction.">,
   ];
   let constructor = "hexagon::createHexagonLowerTmTensorPass()";
 }
@@ -787,6 +799,42 @@ def PrefetchKernelHX :
 }
 
 //===----------------------------------------------------------------------===//
+// ALPS P1: analysis-only representation and physical-movement ledger
+//===----------------------------------------------------------------------===//
+
+def AlpsMovementLedger :
+    InterfacePass<"alps-movement-ledger", "mlir::FunctionOpInterface"> {
+  let summary = "Report representation demands and physical data movement without changing IR";
+  let description = [{
+    Emits machine-readable ALPS P1 ledger records for shaped values, K/V
+    representation candidates, descriptor-only views, layout transforms,
+    allocations, and copies.  The pass is analysis-only: it never adds
+    attributes, rewrites values, or changes code generation.  Running it at
+    pre-fusion, post-fusion, and post-bufferization provides a causal view of
+    which logical representation demands become physical movement.
+  }];
+  let options = [
+    Option<"phase", "phase", "std::string",
+           /*default=*/"\"unspecified\"",
+           "Pipeline observation point written into every ledger record.">,
+    Option<"pageBytes", "page-bytes", "int64_t",
+           /*default=*/"4096",
+           "Page size used only for static page-footprint estimates.">,
+    Option<"vtcmBudgetBytes", "vtcm-budget-bytes", "int64_t",
+           /*default=*/"2097152",
+           "Conservative per-candidate VTCM-fit threshold for legal-action reporting.">,
+  ];
+  let constructor = "hexagon::createAlpsMovementLedgerPass()";
+  let dependentDialects = [
+    "mlir::func::FuncDialect",
+    "mlir::linalg::LinalgDialect",
+    "mlir::memref::MemRefDialect",
+    "mlir::tensor::TensorDialect",
+    "mlir::vector::VectorDialect",
+  ];
+}
+
+//===----------------------------------------------------------------------===//
 // Omni-Fetch: V-DAE (Virtual Decoupled Access-Execute) pass
 //===----------------------------------------------------------------------===//
 
@@ -882,6 +930,45 @@ def LayoutOpsElimination :
     "mlir::omni_fetch::OmniFetchDialect",
     "mlir::linalg::LinalgDialect",
     "mlir::memref::MemRefDialect",
+    "mlir::tensor::TensorDialect",
+  ];
+}
+
+//===----------------------------------------------------------------------===//
+// ALPS P2a: strict zero-copy attention layout absorption
+//===----------------------------------------------------------------------===//
+
+def AlpsZeroCopyAttention :
+    InterfacePass<"alps-zero-copy-attention", "mlir::FunctionOpInterface"> {
+  let summary = "Absorb proven attention transpose chains into consumer maps";
+  let description = [{
+    Rewrites only statically proven batch-one QK attention chains of the form
+    expand -> transpose -> collapse -> batch_matmul into an equivalent
+    linalg.generic contraction whose affine input maps directly address the
+    producer layout. Descriptor-only views are not counted as saved bytes; only
+    the two eliminated physical transpose results are reported.
+  }];
+  let constructor = "hexagon::createAlpsZeroCopyAttentionPass()";
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::linalg::LinalgDialect",
+    "mlir::tensor::TensorDialect",
+  ];
+}
+
+def AlpsProducerDirectAttention :
+    InterfacePass<"alps-producer-direct-attention", "mlir::FunctionOpInterface"> {
+  let summary = "Write proven attention head layouts directly from producers";
+  let description = [{
+    Fuses a sole-use projection bias-add with a statically proven
+    expand/transpose chain. The replacement producer writes contiguous BHMD or
+    BHDM directly, eliminating the canonical BMC materialization while keeping
+    consumer access contiguous.
+  }];
+  let constructor = "hexagon::createAlpsProducerDirectAttentionPass()";
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::linalg::LinalgDialect",
     "mlir::tensor::TensorDialect",
   ];
 }

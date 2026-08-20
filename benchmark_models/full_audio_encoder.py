@@ -178,6 +178,7 @@ def run_full_audio_encoder(
         disable_omnifetch_persistent_wh_cache=(
             args.disable_omnifetch_persistent_wh_cache
         ),
+        alps_p0_mode=args.alps_p0_mode,
     )
     output = hex_execution(
         module,

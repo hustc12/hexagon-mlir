@@ -103,7 +103,10 @@ static LogicalResult applyTiling(IRRewriter &rewriter, linalg::LinalgOp op,
   }
   for (StringRef name :
        {"omni_fetch.kv_cache_role", "omni_fetch.kv_cache_operand",
-        "omni_fetch.kv_cache_layout"})
+        "omni_fetch.kv_cache_layout", "alps.kv_fusion_boundary",
+        "alps.kv_elementwise_fusion_boundary",
+        "alps.kv_multi_use_fusion_boundary",
+        "alps.kv_split_reduction_boundary"})
     if (Attribute attr = op->getAttr(name)) {
       tiledOp->op->setAttr(name, attr);
       // SCF survives vectorization and one-shot bufferization even when the
@@ -274,7 +277,8 @@ struct HexagonTilingPass : public ::impl::HexagonTilingBase<HexagonTilingPass> {
       bool appliedSplitReduction = false;
       IRRewriter rewriter(&getContext());
       if (enableSplitReduction &&
-          !op->hasAttr("omni_fetch.kv_cache_role") &&
+          !op->hasAttr("alps.kv_fusion_boundary") &&
+          !op->hasAttr("alps.kv_split_reduction_boundary") &&
           isa<linalg::GenericOp>(op) &&
           IsSplitReductionCandidate(op)) {
         if ((op.getNumLoops() >= 1) &&

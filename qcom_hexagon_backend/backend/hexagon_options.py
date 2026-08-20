@@ -91,6 +91,24 @@ class HexagonOptions:
     enableOmniFetchPersistentWhCache: bool = False
     enableOmniFetchTwoDimPipeline: bool = False
     enableOmniFetchVtcmColoring: bool = False
+    # ALPS P0 causal controls.  The legacy OmniFetch item-7 switch below is
+    # retained as an umbrella alias that enables all four controls.
+    enableAlpsKvSemanticTracking: bool = False
+    # Coarse P0 umbrella retained for reproduction; P0b controls below isolate
+    # the three topology effects that it historically coupled.
+    enableAlpsKvFusionPolicy: bool = False
+    enableAlpsKvElementwiseFusionPolicy: bool = False
+    enableAlpsKvMultiUseFusionPolicy: bool = False
+    enableAlpsKvSplitReductionPolicy: bool = False
+    enableAlpsKvSlicingPolicy: bool = False
+    enableAlpsKvRuntimePrefetch: bool = False
+    # P1 analysis-only representation/physical-movement ledger.  It prints
+    # auditable records but never mutates IR or changes code generation.
+    enableAlpsMovementLedger: bool = False
+    enableAlpsZeroCopyAttention: bool = False
+    enableAlpsProducerDirectAttention: bool = False
+    alpsLedgerPageBytes: int = 4096
+    alpsLedgerVtcmBudgetBytes: int = 2 * 1024 * 1024
     enableOmniFetchKvCachePrefetch: bool = False
     enableOmniFetchWeightStationary: bool = False
     enableOmniFetchActivationMulticast: bool = False

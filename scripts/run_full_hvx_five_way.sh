@@ -17,8 +17,15 @@ output_dir=${OUTPUT_DIR:-${parent_dir}/run_artifacts/full_hvx_five_way_$(date +%
 remote_dir=${REMOTE_RESULTS_DIR:-/home/huzq85/2-working/working_set/full_hvx_five_way_$(date +%Y%m%d_%H%M%S)}
 iterations=${DEVICE_ITERATIONS:-1}
 seq_len=${OMNIFETCH_SEQ_LEN:-32}
+compile_threads=${HEXAGON_MLIR_COMPILE_THREADS:-auto}
 reuse_valid=${REUSE_VALID_LOGS:-1}
 list_only=0
+alps_p0=0
+alps_p0b=0
+alps_p1=0
+alps_p1_profile=0
+alps_p2a=0
+alps_p2b=0
 models=()
 
 all_models=(
@@ -51,10 +58,18 @@ Runs complete (non-Debug) models strictly serially with no timeout:
 
 Options:
   --list                  List supported models and runners
+  --alps-p0               Run the six-way ALPS P0 causal matrix instead
+  --alps-p0b              Run the five-way ALPS P0b topology matrix instead
+  --alps-p1               Run P1 control/elementwise analysis-only ledgers
+  --alps-p1-profile       Add loop-level LWP to P1 (monolithic models only)
+  --alps-p2a              Run P2a elementwise + zero-copy attention candidate
+  --alps-p2b              Run P2b producer-direct + P2a cumulative candidate
   --output-dir DIR        Local working/result directory
   --remote-dir DIR        nano working_set destination
   --device-iterations N   Device samples per configuration (default: ${iterations})
   --seq-len N             Full LLM prefill length (default: ${seq_len})
+  --compile-threads N     CPU cores for the one active model compile
+                          (default: auto; memory-aware, capped at 4)
   --no-reuse              Recompile passing configurations
   -h, --help
 
@@ -130,10 +145,19 @@ known_model() {
 while (($#)); do
   case "$1" in
     --list) list_only=1; shift ;;
+    --alps-p0) alps_p0=1; shift ;;
+    --alps-p0b) alps_p0=1; alps_p0b=1; shift ;;
+    --alps-p1) alps_p0=1; alps_p1=1; shift ;;
+    --alps-p1-profile)
+      alps_p0=1; alps_p1=1; alps_p1_profile=1; shift
+      ;;
+    --alps-p2a) alps_p0=1; alps_p2a=1; shift ;;
+    --alps-p2b) alps_p0=1; alps_p2a=1; alps_p2b=1; shift ;;
     --output-dir) output_dir=$2; shift 2 ;;
     --remote-dir) remote_dir=$2; shift 2 ;;
     --device-iterations) iterations=$2; shift 2 ;;
     --seq-len) seq_len=$2; shift 2 ;;
+    --compile-threads) compile_threads=$2; shift 2 ;;
     --no-reuse) reuse_valid=0; shift ;;
     -h|--help) usage; exit 0 ;;
     -*) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -141,11 +165,39 @@ while (($#)); do
   esac
 done
 
+if ((alps_p2b)); then
+  schemes=(alps-elementwise-producer-direct)
+elif ((alps_p2a)); then
+  schemes=(alps-elementwise-zero-copy)
+elif ((alps_p1)); then
+  schemes=(hmlir-hvx-hexkl-on alps-elementwise-fusion)
+elif ((alps_p0b)); then
+  schemes=(hmlir-hvx-hexkl-on alps-elementwise-fusion alps-multi-use-fusion alps-split-reduction alps-fusion)
+elif ((alps_p0)); then
+  schemes=(hmlir-hvx-hexkl-on alps-semantic alps-fusion alps-slicing alps-runtime alps-legacy-all)
+fi
+
 [[ "${iterations}" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid iterations" >&2; exit 2; }
 [[ "${seq_len}" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid sequence length" >&2; exit 2; }
+if [[ "${compile_threads}" == auto ]]; then
+  available_kib=$(awk '/MemAvailable:/{print $2}' /proc/meminfo)
+  cpu_count=$(getconf _NPROCESSORS_ONLN)
+  # Full-model lowering can consume several GiB per simultaneously active pass.
+  # Preserve 4 GiB for the OS/toolchain and budget 2 GiB per compile thread.
+  memory_threads=$((available_kib > 4194304 ? (available_kib - 4194304) / 2097152 : 1))
+  ((memory_threads < 1)) && memory_threads=1
+  compile_threads=${cpu_count}
+  ((compile_threads > 4)) && compile_threads=4
+  ((compile_threads > memory_threads)) && compile_threads=${memory_threads}
+fi
+[[ "${compile_threads}" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid compile thread count" >&2; exit 2; }
 if ((${#models[@]} == 0)); then models=("${all_models[@]}"); fi
 for model in "${models[@]}"; do
   known_model "${model}" || { echo "Unknown model: ${model}" >&2; exit 2; }
+  if ((alps_p1_profile)) && [[ "$(cli_style_for "${model}")" == layered-fp16 ]]; then
+    echo "P1 LWP profiling currently supports monolithic models only: ${model}" >&2
+    exit 2
+  fi
 done
 
 if ((list_only)); then
@@ -176,8 +228,19 @@ export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
 export TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
 export PYTHONUNBUFFERED=1
 export HEXAGON_RUN_RETRIES=1
+export HEXAGON_MLIR_COMPILE_THREADS=${compile_threads}
+echo "HOST_COMPILE threads=${compile_threads} online_cpus=$(getconf _NPROCESSORS_ONLN) mem_available_kib=$(awk '/MemAvailable:/{print $2}' /proc/meminfo)"
 
 mkdir -p "${output_dir}"
+# A tool/session interruption does not necessarily terminate its child process.
+# Hold one advisory lock for the complete serial matrix so a resumed dialogue
+# cannot accidentally launch a duplicate compiler against the same case tree.
+runner_lock=${output_dir}/.runner.lock
+exec {runner_lock_fd}>"${runner_lock}"
+if ! flock --nonblock "${runner_lock_fd}"; then
+  echo "Another full-model runner still owns ${runner_lock}; refusing duplicate run" >&2
+  exit 75
+fi
 ssh nano "mkdir -p '${remote_dir}'"
 results=${output_dir}/results.csv
 if [[ ! -f "${results}" ]]; then
@@ -201,6 +264,80 @@ cleanup_case_generated() {
   for generated in "${case_dir}/artifacts" "${case_dir}/mlirbc"; do
     [[ -e "${generated}" ]] && rm -rf -- "${generated}"
   done
+}
+
+move_case_to_remote() {
+  local model=$1 scheme=$2 case_dir=$3
+  sync_case "${model}" "${scheme}" "${case_dir}"
+  # ALPS P0 can generate many full-model objects. The remote copy is the
+  # authoritative result: after rsync succeeds, remove the complete local case
+  # rather than retaining a second "backup" on the constrained local disk.
+  if ((alps_p0)); then
+    [[ -n "${output_dir}" && "${case_dir}" == "${output_dir}/"* ]] || {
+      echo "Refusing case removal outside output_dir: ${case_dir}" >&2
+      return 2
+    }
+    rm -rf -- "${case_dir}"
+  else
+    cleanup_case_generated "${case_dir}"
+  fi
+}
+
+audit_case_codegen() {
+  local case_dir=$1 object_dir
+  local csv=${case_dir}/codegen.csv
+  local -a object_dirs=()
+  mapfile -t object_dirs < <(
+    find "${case_dir}/artifacts" -type f -name '_mlir_ciface_*.o' \
+      ! -name '*-consts-*.o' -printf '%h\n' 2>/dev/null | sort -u
+  )
+  for object_dir in "${object_dirs[@]}"; do
+    "${repo_root}/scripts/audit_hexagon_codegen.sh" "${object_dir}" "${csv}" \
+      >>"${case_dir}/codegen.log" 2>&1 || {
+        echo "WARN: codegen audit failed for ${object_dir}" >>"${case_dir}/codegen.log"
+      }
+  done
+}
+
+extract_alps_p1_ledger() {
+  local case_dir=$1 log=${case_dir}/run.log
+  ((alps_p1 || alps_p2a || alps_p2b)) || return 0
+  grep '^\[ALPS-P1-' "${log}" >"${case_dir}/alps_p1_ledger.log" || true
+  "${venv}/bin/python" "${repo_root}/scripts/summarize_alps_movement_ledger.py" \
+    "${case_dir}/alps_p1_ledger.log" \
+    --csv "${case_dir}/alps_p1_summary.csv" \
+    --markdown "${case_dir}/alps_p1_summary.md" \
+    --sites-csv "${case_dir}/alps_p1_sites.csv" \
+    --sites-markdown "${case_dir}/alps_p1_sites.md"
+}
+
+collect_alps_p1_profile() {
+  local case_dir=$1
+  ((alps_p1_profile)) || return 0
+  local info_dump=${case_dir}/lwp_infodump.txt
+  [[ -f /tmp/lwp_infodump.txt ]] || {
+    echo "Missing /tmp/lwp_infodump.txt after LWP run" >&2
+    return 2
+  }
+  cp -- /tmp/lwp_infodump.txt "${info_dump}"
+  "${venv}/bin/python" "${repo_root}/scripts/summarize_alps_lwp.py" \
+    --artifact-root "${case_dir}/artifacts" \
+    --info-dump "${info_dump}" \
+    --ledger "${case_dir}/alps_p1_ledger.log" \
+    --csv "${case_dir}/alps_p1_lwp_regions.csv" \
+    --markdown "${case_dir}/alps_p1_lwp_regions.md"
+}
+
+collect_runner_intermediates() {
+  local case_dir=$1 marker=$2 generated
+  local destination=${case_dir}/runner_intermediates
+  while IFS= read -r -d '' generated; do
+    mkdir -p "${destination}"
+    mv -- "${generated}" "${destination}/"
+  done < <(
+    find "${repo_root}/benchmark_models" -maxdepth 1 -type f \
+      -name '*_f16matmul.mlir' -newer "${marker}" -print0
+  )
 }
 
 extract_admitted_ids() {
@@ -227,6 +364,9 @@ base_args_for() {
   elif [[ "$(cli_style_for "${model}")" != layered-fp16 ]]; then
     printf '%s\n' --enable-hvx-vector
   fi
+  if ((alps_p1_profile)); then
+    printf '%s\n' --enable-lwp --lwp-loop-depth 1
+  fi
   printf '%s\n' --device-iterations "${iterations}"
   extra_args_for "${model}"
 }
@@ -249,6 +389,19 @@ scheme_args_for() {
       printf '%s\n' --enable-hexkl --enable-omnifetch-kv-cache-prefetch \
         --disable-layout-aware --disable-omnifetch-adaptive
       ;;
+    alps-semantic|alps-fusion|alps-elementwise-fusion|alps-multi-use-fusion|alps-split-reduction|alps-slicing|alps-runtime|alps-legacy-all)
+      printf '%s\n' --enable-hexkl \
+        --alps-p0-mode "${scheme#alps-}" \
+        --disable-layout-aware --disable-omnifetch-adaptive
+      ;;
+    alps-elementwise-zero-copy)
+      printf '%s\n' --enable-hexkl --alps-p0-mode elementwise-fusion \
+        --disable-layout-aware --disable-omnifetch-adaptive
+      ;;
+    alps-elementwise-producer-direct)
+      printf '%s\n' --enable-hexkl --alps-p0-mode elementwise-fusion \
+        --disable-layout-aware --disable-omnifetch-adaptive
+      ;;
   esac
 }
 
@@ -260,7 +413,7 @@ passing_log() {
 
 upsert_result() {
   local model=$1 scheme=$2 status=$3 log=$4
-  local perf_us latency compile_s hints issued issued_bytes kv_pairs kv_sites correctness
+  local perf_us latency compile_s hints issued issued_bytes kv_pairs kv_sites correctness recorded_log
   # Monolithic runners emit one Perf line. Layered language runners emit one
   # per embedding/block/head stage; their complete-model metric is the sum.
   perf_us=$(awk -F: '/^[[:space:]]*Perf:/{gsub(/[[:space:]]/,"",$2);s+=$2;n++}END{if(n)printf "%.0f",s}' "${log}")
@@ -279,12 +432,16 @@ upsert_result() {
   if [[ -z "${correctness}" ]]; then
     correctness=$(awk '/\[(LayeredDeviceFullCompare|CLIPDeviceFullCompare|QwenDeviceFullCompare)\]/{v=$0}END{gsub(/,/,";",v);print v}' "${log}")
   fi
+  recorded_log=${log}
+  if ((alps_p0)); then
+    recorded_log=${remote_dir}/${model}/${scheme}/run.log
+  fi
   awk -F, -v m="${model}" -v s="${scheme}" 'NR==1 || !($1==m && $3==s)' "${results}" > "${results}.tmp"
   printf '%s,%s,%s,%s,%s,%s,NA,%s,%s,%s,%s,%s,%s,%s,%s\n' \
     "${model}" "$(domain_for "${model}")" "${scheme}" "${status}" \
     "${perf_us:-NA}" "${latency}" "${compile_s:-NA}" "${hints}" \
     "${issued}" "${issued_bytes}" "${kv_pairs}" "${kv_sites}" \
-    "${correctness}" "${log}" >> "${results}.tmp"
+    "${correctness}" "${recorded_log}" >> "${results}.tmp"
   mv "${results}.tmp" "${results}"
 }
 
@@ -293,6 +450,7 @@ run_case() {
   local runner=${repo_root}/$(runner_for "${model}")
   local case_dir=${output_dir}/${model}/${scheme}
   local log=${case_dir}/run.log status_file=${case_dir}/status.txt
+  local marker=${case_dir}/.case-started
   local -a args=()
   mkdir -p "${case_dir}/artifacts"
   if ((reuse_valid)) && passing_log "${log}" "${status_file}"; then
@@ -300,46 +458,65 @@ run_case() {
     upsert_result "${model}" "${scheme}" PASS "${log}"
     return 0
   fi
+  touch "${marker}"
   mapfile -t args < <(base_args_for "${model}"; scheme_args_for "${scheme}" "${candidate_ids}")
   if [[ "$(cli_style_for "${model}")" == layered-fp16 ]]; then
     args+=(--output-dir "${case_dir}/mlirbc")
   fi
   echo "START model=${model} scheme=${scheme} $(date --iso-8601=seconds)"
   set +e
-  HEXAGON_MLIR_DUMP_DIR="${case_dir}/artifacts" \
+  ALPS_ENABLE_MOVEMENT_LEDGER="$([[ ${alps_p1} -eq 1 || ${alps_p2a} -eq 1 || ${alps_p2b} -eq 1 ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_ZERO_COPY_ATTENTION="$([[ ${scheme} == alps-elementwise-zero-copy || ${scheme} == alps-elementwise-producer-direct ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_PRODUCER_DIRECT_ATTENTION="$([[ ${scheme} == alps-elementwise-producer-direct ]] && echo 1 || echo 0)" \
+    HEXAGON_MLIR_DUMP_DIR="${case_dir}/artifacts" \
     "${venv}/bin/python" "${runner}" "${args[@]}" >"${log}" 2>&1
   rc=$?
   set -e
+  collect_runner_intermediates "${case_dir}" "${marker}"
+  rm -f -- "${marker}"
   if ((rc == 0)) && grep -q '^[[:space:]]*Perf:' "${log}"; then
     printf '%s\n' PASS > "${status_file}"
     upsert_result "${model}" "${scheme}" PASS "${log}"
   else
+    failure_rc=${rc}
+    ((failure_rc != 0)) || failure_rc=1
     printf 'FAIL_%s\n' "${rc}" > "${status_file}"
     upsert_result "${model}" "${scheme}" "FAIL_${rc}" "${log}"
-    sync_case "${model}" "${scheme}" "${case_dir}"
-    cleanup_case_generated "${case_dir}"
+    extract_alps_p1_ledger "${case_dir}"
+    collect_alps_p1_profile "${case_dir}" || true
+    audit_case_codegen "${case_dir}"
+    move_case_to_remote "${model}" "${scheme}" "${case_dir}"
     echo "FAIL model=${model} scheme=${scheme} rc=${rc} log=${log}" >&2
-    return "${rc:-1}"
+    return "${failure_rc}"
   fi
-  sync_case "${model}" "${scheme}" "${case_dir}"
-  cleanup_case_generated "${case_dir}"
+  extract_alps_p1_ledger "${case_dir}"
+  collect_alps_p1_profile "${case_dir}"
+  audit_case_codegen "${case_dir}"
+  move_case_to_remote "${model}" "${scheme}" "${case_dir}"
   echo "DONE model=${model} scheme=${scheme}"
 }
 
 write_ratios() {
-  "${venv}/bin/python" - "${results}" "${output_dir}/summary.md" <<'PY'
+  "${venv}/bin/python" - "${results}" "${output_dir}/summary.md" "${alps_p0}" "${alps_p0b}" "${alps_p1}" "${alps_p2a}" "${alps_p2b}" <<'PY'
 import csv
 import pathlib
 import sys
 
-csv_path, md_path = map(pathlib.Path, sys.argv[1:])
+csv_path = pathlib.Path(sys.argv[1])
+md_path = pathlib.Path(sys.argv[2])
+alps_p0 = bool(int(sys.argv[3]))
+alps_p0b = bool(int(sys.argv[4]))
+alps_p1 = bool(int(sys.argv[5]))
+alps_p2a = bool(int(sys.argv[6]))
+alps_p2b = bool(int(sys.argv[7]))
 with csv_path.open(newline="", encoding="utf-8") as handle:
     rows = list(csv.DictReader(handle))
 by_model = {}
 for row in rows:
     by_model.setdefault(row["model"], {})[row["scheme"]] = row
 for model_rows in by_model.values():
-    item = model_rows.get("item7-only", {})
+    reference_name = "alps-elementwise-producer-direct" if alps_p2b else ("alps-elementwise-zero-copy" if alps_p2a else ("alps-elementwise-fusion" if alps_p1 else ("alps-fusion" if alps_p0b else ("alps-legacy-all" if alps_p0 else "item7-only"))))
+    item = model_rows.get(reference_name, {})
     try:
         denominator = float(item["latency_ms"])
     except (KeyError, TypeError, ValueError):
@@ -353,9 +530,24 @@ with csv_path.open("w", newline="", encoding="utf-8") as handle:
     writer = csv.DictWriter(handle, fieldnames=rows[0].keys())
     writer.writeheader()
     writer.writerows(rows)
-lines = ["# Full-model HVX five-way comparison", "", "| Model | Scheme | Latency (item7 = 1.00x) |", "|---|---|---:|"]
+reference_name = "alps-elementwise-producer-direct" if alps_p2b else ("alps-elementwise-zero-copy" if alps_p2a else ("alps-elementwise-fusion" if alps_p1 else ("alps-fusion" if alps_p0b else ("alps-legacy-all" if alps_p0 else "item7-only"))))
+title = "ALPS P2b producer-direct attention" if alps_p2b else ("ALPS P2a zero-copy attention" if alps_p2a else ("ALPS P1 movement-ledger comparison" if alps_p1 else ("ALPS P0b topology comparison" if alps_p0b else ("ALPS P0 causal comparison" if alps_p0 else "Full-model HVX five-way comparison"))))
+schemes = (
+    ("alps-elementwise-producer-direct",)
+    if alps_p2b else
+    ("alps-elementwise-zero-copy",)
+    if alps_p2a else
+    ("hmlir-hvx-hexkl-on", "alps-elementwise-fusion")
+    if alps_p1 else
+    ("hmlir-hvx-hexkl-on", "alps-elementwise-fusion", "alps-multi-use-fusion", "alps-split-reduction", "alps-fusion")
+    if alps_p0b else
+    ("hmlir-hvx-hexkl-on", "alps-semantic", "alps-fusion", "alps-slicing", "alps-runtime", "alps-legacy-all")
+    if alps_p0 else
+    ("pk-hvx", "apt-hvx", "hmlir-hvx-hexkl-off", "hmlir-hvx-hexkl-on", "item7-only")
+)
+lines = [f"# {title}", "", f"| Model | Scheme | Latency ({reference_name} = 1.00x) |", "|---|---|---:|"]
 for model in by_model:
-    for scheme in ("pk-hvx", "apt-hvx", "hmlir-hvx-hexkl-off", "hmlir-hvx-hexkl-on", "item7-only"):
+    for scheme in schemes:
         row = by_model[model].get(scheme)
         if not row:
             continue
@@ -368,19 +560,25 @@ PY
 }
 
 for model in "${models[@]}"; do
-  candidate_file=${output_dir}/${model}/apt-candidate-ids.txt
-  run_case "${model}" pk-hvx
-  candidate_ids=$(extract_admitted_ids "${output_dir}/${model}/pk-hvx/run.log")
-  [[ -n "${candidate_ids}" ]] || {
-    echo "No PK admitted IDs for ${model}; APT cannot be configured fairly" >&2
-    exit 3
-  }
-  printf '%s\n' "${candidate_ids}" > "${candidate_file}"
-  rsync -a --partial "${candidate_file}" "nano:${remote_dir}/${model}/"
-  run_case "${model}" apt-hvx "${candidate_ids}"
-  run_case "${model}" hmlir-hvx-hexkl-off
-  run_case "${model}" hmlir-hvx-hexkl-on
-  run_case "${model}" item7-only
+  if ((alps_p0)); then
+    for scheme in "${schemes[@]}"; do
+      run_case "${model}" "${scheme}"
+    done
+  else
+    candidate_file=${output_dir}/${model}/apt-candidate-ids.txt
+    run_case "${model}" pk-hvx
+    candidate_ids=$(extract_admitted_ids "${output_dir}/${model}/pk-hvx/run.log")
+    [[ -n "${candidate_ids}" ]] || {
+      echo "No PK admitted IDs for ${model}; APT cannot be configured fairly" >&2
+      exit 3
+    }
+    printf '%s\n' "${candidate_ids}" > "${candidate_file}"
+    rsync -a --partial "${candidate_file}" "nano:${remote_dir}/${model}/"
+    run_case "${model}" apt-hvx "${candidate_ids}"
+    run_case "${model}" hmlir-hvx-hexkl-off
+    run_case "${model}" hmlir-hvx-hexkl-on
+    run_case "${model}" item7-only
+  fi
   write_ratios
 done
 

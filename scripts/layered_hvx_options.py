@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 
 
 def add_layered_hvx_args(parser: argparse.ArgumentParser) -> None:
@@ -17,7 +18,17 @@ def add_layered_hvx_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--enable-omnifetch-kv-cache-prefetch",
         action="store_true",
-        help="Enable isolated OmniFetch item 7; items 1-6 remain disabled.",
+        help="Legacy umbrella alias for the complete historical item-7 policy.",
+    )
+    parser.add_argument(
+        "--alps-p0-mode",
+        choices=(
+            "none", "semantic", "fusion", "elementwise-fusion",
+            "multi-use-fusion", "split-reduction", "slicing", "runtime",
+            "legacy-all",
+        ),
+        default="none",
+        help="ALPS P0 causal K/V policy; non-none modes imply semantic tracking.",
     )
     # Accepted explicitly so the unified driver uses exactly the same item-7
     # command line for monolithic and layered model families.
@@ -31,11 +42,17 @@ def make_layered_hvx_options(args: argparse.Namespace) -> dict:
     if args.prefetch_baseline_distance <= 0:
         raise ValueError("prefetch baseline distance must be positive")
     item7 = bool(args.enable_omnifetch_kv_cache_prefetch)
-    if args.prefetch_baseline != "none" and item7:
-        raise ValueError("external prefetch baselines cannot be combined with item7")
-    if item7 and not (args.disable_layout_aware and args.disable_omnifetch_adaptive):
+    alps_mode = str(args.alps_p0_mode)
+    if item7 and alps_mode != "none":
+        raise ValueError("legacy item7 and --alps-p0-mode are mutually exclusive")
+    alps_enabled = alps_mode != "none"
+    if args.prefetch_baseline != "none" and (item7 or alps_enabled):
+        raise ValueError("external prefetch baselines cannot be combined with ALPS")
+    if (item7 or alps_enabled) and not (
+        args.disable_layout_aware and args.disable_omnifetch_adaptive
+    ):
         raise ValueError(
-            "item7-only requires --disable-layout-aware and "
+            "ALPS P0 requires --disable-layout-aware and "
             "--disable-omnifetch-adaptive"
         )
 
@@ -59,7 +76,8 @@ def make_layered_hvx_options(args: argparse.Namespace) -> dict:
     options["aptGetHxDistance"] = int(args.prefetch_baseline_distance)
     options["aptGetHxManualCandidateIds"] = args.apt_get_hx_manual_candidate_ids
 
-    options["enablePrefetch"] = item7
+    runtime_prefetch = alps_mode in ("runtime", "legacy-all")
+    options["enablePrefetch"] = item7 or runtime_prefetch
     options["enableOmniFetchLayoutAware"] = False
     options["enableOmniFetchVDAE"] = False
     options["enableOmniFetchAdaptive"] = False
@@ -67,6 +85,28 @@ def make_layered_hvx_options(args: argparse.Namespace) -> dict:
     options["enableOmniFetchTwoDimPipeline"] = False
     options["enableOmniFetchVtcmColoring"] = False
     options["enableOmniFetchKvCachePrefetch"] = item7
+    options["enableAlpsKvSemanticTracking"] = alps_enabled
+    options["enableAlpsKvFusionPolicy"] = alps_mode in ("fusion", "legacy-all")
+    options["enableAlpsKvElementwiseFusionPolicy"] = (
+        alps_mode == "elementwise-fusion"
+    )
+    options["enableAlpsKvMultiUseFusionPolicy"] = (
+        alps_mode == "multi-use-fusion"
+    )
+    options["enableAlpsKvSplitReductionPolicy"] = (
+        alps_mode == "split-reduction"
+    )
+    options["enableAlpsKvSlicingPolicy"] = alps_mode in ("slicing", "legacy-all")
+    options["enableAlpsKvRuntimePrefetch"] = runtime_prefetch
+    options["enableAlpsMovementLedger"] = (
+        os.environ.get("ALPS_ENABLE_MOVEMENT_LEDGER", "0") == "1"
+    )
+    options["enableAlpsZeroCopyAttention"] = (
+        os.environ.get("ALPS_ENABLE_ZERO_COPY_ATTENTION", "0") == "1"
+    )
+    options["enableAlpsProducerDirectAttention"] = (
+        os.environ.get("ALPS_ENABLE_PRODUCER_DIRECT_ATTENTION", "0") == "1"
+    )
     options["enableOmniFetchDmaToVtcm"] = False
     options["enableHexagonmemCopyToDMA"] = False
 
@@ -75,6 +115,7 @@ def make_layered_hvx_options(args: argparse.Namespace) -> dict:
         f"vectorization=1 hexkl={int(options['enableHexKL'])} "
         "uniform_fp16=1 vtcm_tiling=0 conversion_to_fp16=0 "
         f"prefetch_baseline={args.prefetch_baseline} "
-        f"item7_only={int(item7)}"
+        f"legacy_item7={int(item7)} alps_p0_mode={alps_mode} "
+        f"alps_p1_ledger={int(options['enableAlpsMovementLedger'])}"
     )
     return options

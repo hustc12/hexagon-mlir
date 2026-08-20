@@ -57,6 +57,14 @@ LinalgGeneralizePass::GeneralizeOp(IRRewriter &rewriter,
                                    linalg::LinalgOp linalgOp) {
   Attribute kvRole = linalgOp->getAttr("omni_fetch.kv_cache_role");
   Attribute kvOperand = linalgOp->getAttr("omni_fetch.kv_cache_operand");
+  Attribute kvFusionBoundary =
+      linalgOp->getAttr("alps.kv_fusion_boundary");
+  Attribute kvElementwiseFusionBoundary =
+      linalgOp->getAttr("alps.kv_elementwise_fusion_boundary");
+  Attribute kvMultiUseFusionBoundary =
+      linalgOp->getAttr("alps.kv_multi_use_fusion_boundary");
+  Attribute kvSplitReductionBoundary =
+      linalgOp->getAttr("alps.kv_split_reduction_boundary");
   rewriter.setInsertionPoint(linalgOp);
   FailureOr<linalg::GenericOp> generalizedOp =
       linalg::generalizeNamedOp(rewriter, linalgOp);
@@ -65,6 +73,20 @@ LinalgGeneralizePass::GeneralizeOp(IRRewriter &rewriter,
       (*generalizedOp)->setAttr("omni_fetch.kv_cache_role", kvRole);
     if (kvOperand)
       (*generalizedOp)->setAttr("omni_fetch.kv_cache_operand", kvOperand);
+    if (kvFusionBoundary)
+      (*generalizedOp)->setAttr("alps.kv_fusion_boundary", kvFusionBoundary);
+    if (kvElementwiseFusionBoundary)
+      (*generalizedOp)
+          ->setAttr("alps.kv_elementwise_fusion_boundary",
+                    kvElementwiseFusionBoundary);
+    if (kvMultiUseFusionBoundary)
+      (*generalizedOp)
+          ->setAttr("alps.kv_multi_use_fusion_boundary",
+                    kvMultiUseFusionBoundary);
+    if (kvSplitReductionBoundary)
+      (*generalizedOp)
+          ->setAttr("alps.kv_split_reduction_boundary",
+                    kvSplitReductionBoundary);
   }
   return generalizedOp;
 }

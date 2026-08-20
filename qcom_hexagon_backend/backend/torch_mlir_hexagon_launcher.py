@@ -10,6 +10,7 @@
 import os
 import hashlib
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 import time
@@ -195,6 +196,7 @@ if (l2_scheduler_report) {
             for option in (
                 "enableOmniFetchVDAE",
                 "enableOmniFetchKvCachePrefetch",
+                "enableAlpsKvRuntimePrefetch",
                 "enablePrefetchKernelHX",
                 "enableAPTGetHX",
             )
@@ -210,6 +212,7 @@ if (l2_scheduler_report) {
                 for option in (
                     "enableOmniFetchVDAE",
                     "enableOmniFetchKvCachePrefetch",
+                    "enableAlpsKvRuntimePrefetch",
                 )
             ):
                 benchmarking = (
@@ -382,8 +385,41 @@ class TorchMLIRHexagonLauncher(HexagonLauncherBase):
         # will cause issue when we separate torch-mlir workflow from triton.
         # Todo: We need to define the context in hexagon backend.
         context = ir.context()
-        if options.get("lowerConstantsInSeparateSharedObjects", False):
+        compile_threads = int(os.getenv("HEXAGON_MLIR_COMPILE_THREADS", "1"))
+        if compile_threads < 1:
+            raise ValueError("HEXAGON_MLIR_COMPILE_THREADS must be >= 1")
+        if (
+            compile_threads > 1
+            and not options.get("lowerConstantsInSeparateSharedObjects", False)
+        ):
+            original_affinity = None
+            try:
+                if hasattr(os, "sched_getaffinity"):
+                    original_affinity = os.sched_getaffinity(0)
+                    selected_cpus = sorted(original_affinity)[:compile_threads]
+                    os.sched_setaffinity(0, selected_cpus)
+                qcom_hexagon_backend.enable_context_multithreading(context)
+            finally:
+                # Worker threads retain the affinity present when MLIR created
+                # its pool. Restore the launcher/subprocess affinity so export,
+                # linking, and all non-MLIR work are not unnecessarily capped.
+                if original_affinity is not None:
+                    os.sched_setaffinity(0, original_affinity)
+            actual_threads = qcom_hexagon_backend.get_context_num_threads(context)
+            print(
+                f"[HostCompile] MLIR multithreading enabled; "
+                f"requested_cpu_limit={compile_threads} "
+                f"actual_thread_pool_size={actual_threads}",
+                flush=True,
+            )
+        elif options.get("lowerConstantsInSeparateSharedObjects", False):
             context.disable_multithreading()
+            if compile_threads > 1:
+                print(
+                    "[HostCompile] MLIR multithreading disabled because "
+                    "lowerConstantsInSeparateSharedObjects requires it",
+                    flush=True,
+                )
         qcom_hexagon_backend.load_dialects(context)
         mlir_mod = qcom_hexagon_backend.parse_mlir_module_from_file(
             mlir_bytecode_path, context
@@ -438,12 +474,47 @@ class TorchMLIRHexagonLauncher(HexagonLauncherBase):
                 else ""
             ),
         )
+        modules_to_link = [
+            (nb_modules_compiled - 1 - reverse_index, module_bytes)
+            for reverse_index, module_bytes in enumerate(reversed(obj_modules))
+        ]
+
+        # Constants-only shared objects have no wrapper and no dependencies on
+        # one another. Link them concurrently within this one model, then link
+        # the principal module last against the completed constant libraries.
+        # MLIR lowering itself remains serial in separated-constant mode because
+        # LowerConstantsSeparatelyPass is not declared thread-safe.
+        if nb_modules_compiled > 1 and compile_threads > 1:
+            constant_modules = [entry for entry in modules_to_link if entry[0] != 0]
+
+            def link_constant_module(entry: tuple[int, bytes]) -> tuple[int, str]:
+                module_index, object_bytes = entry
+                filename_obj = func_name_with_ciface + "-consts-" + str(module_index)
+                obj_src_path = os.path.join(local_dir, filename_obj + ".o")
+                Path(obj_src_path).write_bytes(object_bytes)
+                return (
+                    module_index,
+                    hexec.generate_shared_object(None, obj_src_path, []),
+                )
+
+            workers = min(compile_threads, len(constant_modules))
+            print(
+                f"[HostCompile] linking {len(constant_modules)} constants-only "
+                f"modules with {workers} workers",
+                flush=True,
+            )
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                linked_constants = dict(executor.map(link_constant_module, constant_modules))
+            paths_to_shared_libs_generated.extend(
+                linked_constants[index]
+                for index, _ in constant_modules
+            )
+            modules_to_link = [entry for entry in modules_to_link if entry[0] == 0]
+
         # Dealing with each object code that has been generated by mlir_to_obj()
         # Note: we reverse obj_modules to start with the "constants-only" modules and to finish with the principal module
         # since the principal one will need some -l annotations
-        for i, kernel_obj_as_bytes in enumerate(reversed(obj_modules)):
-            # Convert the index since we've had to reverse obj_modules to finish with the principal module
-            i = nb_modules_compiled - 1 - i
+        for i, kernel_obj_as_bytes in modules_to_link:
             print("------ Starting work on compiled module number", i + 1, "------")
             # 1 - Writting the object code for the kernel to disk
             # The principal module containg the code will keep the name of the function

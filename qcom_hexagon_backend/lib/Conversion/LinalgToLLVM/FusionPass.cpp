@@ -52,6 +52,11 @@ namespace {
 
 static constexpr unsigned MaxMultiUseFusionIterations = 3;
 
+static bool hasAlpsTopologyBoundary(Operation *op, StringRef specificAttr) {
+  return op && (op->hasAttr("alps.kv_fusion_boundary") ||
+                op->hasAttr(specificAttr));
+}
+
 struct HexagonFusionPass : public ::impl::HexagonFusionBase<HexagonFusionPass> {
   explicit HexagonFusionPass(const HexagonFusionOptions &options)
       : HexagonFusionBase(options) {}
@@ -173,6 +178,16 @@ static FailureOr<unsigned> multiUseFusion(MLIRContext *context,
               !linalg::areElementwiseOpsFusable(&operand)) {
             continue;
           }
+          // The second, multi-use fusion driver bypasses the control callback
+          // used by populateElementwiseOpsFusionPatterns.  Honor the local
+          // elementwise boundary here as well; the independent multi-use
+          // policy below controls whether this driver runs at all.
+          if (hasAlpsTopologyBoundary(
+                  consumer, "alps.kv_elementwise_fusion_boundary") ||
+              hasAlpsTopologyBoundary(
+                  producer, "alps.kv_elementwise_fusion_boundary")) {
+            continue;
+          }
           if (producer.getNumLoops() != producer.getNumParallelLoops() ||
               consumer.getNumLoops() != producer.getNumLoops()) {
             continue;
@@ -227,12 +242,12 @@ void HexagonFusionPass::runOnOperation() {
 
   auto controlElemwiseFn = [&](OpOperand *operand) {
     Operation *producer = operand->get().getDefiningOp();
-    // Item 7 attaches K/V stream identity to the attention contraction.
-    // Generic elementwise fusion creates a replacement op and currently does
-    // not preserve arbitrary semantic attributes, so keep this small boundary
-    // intact until KV page hints have been inserted after bufferization.
-    if (operand->getOwner()->hasAttr("omni_fetch.kv_cache_role") ||
-        (producer && producer->hasAttr("omni_fetch.kv_cache_role")))
+    // ALPS P0 deliberately separates semantic K/V identity from the optional
+    // topology policy.  Metadata-only experiments must retain native fusion.
+    if (hasAlpsTopologyBoundary(
+            operand->getOwner(), "alps.kv_elementwise_fusion_boundary") ||
+        hasAlpsTopologyBoundary(producer,
+                                "alps.kv_elementwise_fusion_boundary"))
       return false;
     return linalg::areElementwiseOpsFusable(operand) &&
            (producer->hasOneUse() || fusionAllowRecompute);
@@ -243,9 +258,11 @@ void HexagonFusionPass::runOnOperation() {
   linalg::ControlFusionFn fuseByExpansionControlFn =
       [](OpOperand *fusedOperand) {
         Operation *producer = fusedOperand->get().getDefiningOp();
-        if (fusedOperand->getOwner()->hasAttr("omni_fetch.kv_cache_role") ||
-            (producer &&
-             producer->hasAttr("omni_fetch.kv_cache_role")))
+        if (hasAlpsTopologyBoundary(
+                fusedOperand->getOwner(),
+                "alps.kv_elementwise_fusion_boundary") ||
+            hasAlpsTopologyBoundary(
+                producer, "alps.kv_elementwise_fusion_boundary"))
           return false;
         return producer->hasOneUse();
       };
@@ -281,7 +298,8 @@ void HexagonFusionPass::runOnOperation() {
 
   bool hasKvBoundary = false;
   funcOp.walk([&](Operation *op) {
-    hasKvBoundary |= op->hasAttr("omni_fetch.kv_cache_role");
+    hasKvBoundary |= hasAlpsTopologyBoundary(
+        op, "alps.kv_multi_use_fusion_boundary");
   });
   if (fusionDoMultiUse && !hasKvBoundary) {
     unsigned nIter = 0;

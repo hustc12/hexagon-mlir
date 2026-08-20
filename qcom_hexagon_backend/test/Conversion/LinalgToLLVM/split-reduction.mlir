@@ -1,10 +1,20 @@
 // RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(hexagon-tiling{enable-split-reduction=true})' | FileCheck %s
+// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(hexagon-tiling{enable-split-reduction=true})' | FileCheck %s --check-prefix=BOUNDARY
 #map = affine_map<(d0, d1) -> (d0, d1)>
 #map1 = affine_map<(d0, d1) -> (d1, d0)>
 #map2 = affine_map<(d0, d1) -> (d0)>
 #map3 = affine_map<(d0, d1) -> (d1)>
 func.func @split_reduction(%input: tensor<256x64xf32>, %output: tensor<256xf32>) -> tensor<256xf32> {
  %reduced = linalg.generic {indexing_maps = [#map, #map2], iterator_types = ["parallel", "reduction"]} ins(%input : tensor<256x64xf32>) outs(%output : tensor<256xf32>) {
+ ^bb0(%in: f32, %out: f32):
+ %result = arith.addf %in, %out : f32
+ linalg.yield %result : f32
+ } -> tensor<256xf32>
+ return %reduced : tensor<256xf32>
+}
+
+func.func @split_reduction_boundary(%input: tensor<256x64xf32>, %output: tensor<256xf32>) -> tensor<256xf32> {
+ %reduced = linalg.generic {indexing_maps = [#map, #map2], iterator_types = ["parallel", "reduction"], alps.kv_split_reduction_boundary} ins(%input : tensor<256x64xf32>) outs(%output : tensor<256xf32>) {
  ^bb0(%in: f32, %out: f32):
  %result = arith.addf %in, %out : f32
  linalg.yield %result : f32
@@ -30,3 +40,10 @@ func.func @split_reduction(%input: tensor<256x64xf32>, %output: tensor<256xf32>)
 // CHECK: %[[VAL_14:.*]] = arith.addf %[[VAL_11]], %[[VAL_12]] : f32
 // CHECK: linalg.yield %[[VAL_14]] : f32
 // CHECK: return %reduced : tensor<256xf32>
+
+// BOUNDARY-LABEL: func.func @split_reduction_boundary
+// BOUNDARY-NOT: tensor<256x32xf32>
+// BOUNDARY: linalg.generic
+// BOUNDARY-SAME: alps.kv_split_reduction_boundary
+// BOUNDARY-NOT: linalg.reduce
+// BOUNDARY: return

@@ -325,6 +325,7 @@ def hexagon_options_phase4(
     apt_get_hx_manual_candidate_ids: str = "",
     enable_omnifetch_kv_cache_prefetch: bool = False,
     disable_omnifetch_persistent_wh_cache: bool = False,
+    alps_p0_mode: str = "none",
 ):
     from triton.backends.qcom_hexagon_backend.compiler import HexagonOptions
 
@@ -350,6 +351,19 @@ def hexagon_options_phase4(
         raise ValueError(f"unknown prefetch baseline {prefetch_baseline!r}")
     if prefetch_baseline_distance <= 0:
         raise ValueError("prefetch baseline distance must be positive")
+    valid_alps_p0_modes = {
+        "none", "semantic", "fusion", "elementwise-fusion",
+        "multi-use-fusion", "split-reduction", "slicing", "runtime",
+        "legacy-all",
+    }
+    if alps_p0_mode not in valid_alps_p0_modes:
+        raise ValueError(
+            f"unknown ALPS P0 mode {alps_p0_mode!r}; "
+            f"expected one of {sorted(valid_alps_p0_modes)}"
+        )
+    if enable_omnifetch_kv_cache_prefetch and alps_p0_mode != "none":
+        raise ValueError("legacy item7 and ALPS P0 mode are mutually exclusive")
+    alps_p0_enabled = alps_p0_mode != "none"
 
     options["enableLWP"] = bool(enable_lwp)
     options["disableLWPLoop"] = bool(disable_lwp_loop)
@@ -377,6 +391,7 @@ def hexagon_options_phase4(
             or enable_omnifetch_activation_multicast
             or enable_omnifetch_m_pad_hmx
             or enable_omnifetch_kv_cache_prefetch
+            or alps_p0_enabled
             or prefetch_baseline != "none"
         ):
             raise ValueError("upstream-strict baseline cannot enable downstream passes")
@@ -412,9 +427,9 @@ def hexagon_options_phase4(
         )
         return native_options
     if prefetch_baseline != "none" and (
-        enable_omnifetch_vdae or cumulative_level > 0
+        enable_omnifetch_vdae or cumulative_level > 0 or alps_p0_enabled
     ):
-        raise ValueError("external prefetch baselines cannot be combined with OmniFetch")
+        raise ValueError("external prefetch baselines cannot be combined with ALPS")
     options["enablePrefetchKernelHX"] = prefetch_baseline == "prefetch-kernel-hx"
     options["prefetchKernelHxDistance"] = int(prefetch_baseline_distance)
     options["enableAPTGetHX"] = prefetch_baseline == "apt-get-hx"
@@ -424,6 +439,7 @@ def hexagon_options_phase4(
         enable_omnifetch_vdae
         or cumulative_level >= 1
         or enable_omnifetch_kv_cache_prefetch
+        or alps_p0_mode in ("runtime", "legacy-all")
     )
     options["enableOmniFetchLayoutAware"] = bool(enable_omnifetch_layout_aware)
     options["omniFetchLookahead"] = int(omnifetch_lookahead)
@@ -442,6 +458,30 @@ def hexagon_options_phase4(
     # attention K/V tensors.  Both are valid early-data-movement opportunities.
     options["enableOmniFetchKvCachePrefetch"] = bool(
         cumulative_level >= 7 or enable_omnifetch_kv_cache_prefetch
+    )
+    options["enableAlpsKvSemanticTracking"] = alps_p0_enabled
+    options["enableAlpsKvFusionPolicy"] = alps_p0_mode in ("fusion", "legacy-all")
+    options["enableAlpsKvElementwiseFusionPolicy"] = (
+        alps_p0_mode == "elementwise-fusion"
+    )
+    options["enableAlpsKvMultiUseFusionPolicy"] = (
+        alps_p0_mode == "multi-use-fusion"
+    )
+    options["enableAlpsKvSplitReductionPolicy"] = (
+        alps_p0_mode == "split-reduction"
+    )
+    options["enableAlpsKvSlicingPolicy"] = alps_p0_mode in ("slicing", "legacy-all")
+    options["enableAlpsKvRuntimePrefetch"] = alps_p0_mode in (
+        "runtime", "legacy-all"
+    )
+    options["enableAlpsMovementLedger"] = (
+        os.environ.get("ALPS_ENABLE_MOVEMENT_LEDGER", "0") == "1"
+    )
+    options["enableAlpsZeroCopyAttention"] = (
+        os.environ.get("ALPS_ENABLE_ZERO_COPY_ATTENTION", "0") == "1"
+    )
+    options["enableAlpsProducerDirectAttention"] = (
+        os.environ.get("ALPS_ENABLE_PRODUCER_DIRECT_ATTENTION", "0") == "1"
     )
     options["enableOmniFetchActivationMulticast"] = bool(
         enable_omnifetch_activation_multicast
@@ -513,7 +553,20 @@ def add_phase4_args(parser):
     parser.add_argument(
         "--enable-omnifetch-kv-cache-prefetch",
         action="store_true",
-        help="Enable isolated item-7 attention K/V stream prefetch.",
+        help="Legacy umbrella switch reproducing the complete historical item 7.",
+    )
+    parser.add_argument(
+        "--alps-p0-mode",
+        choices=(
+            "none", "semantic", "fusion", "elementwise-fusion",
+            "multi-use-fusion", "split-reduction", "slicing", "runtime",
+            "legacy-all",
+        ),
+        default="none",
+        help=(
+            "ALPS P0 causal K/V mode. fusion, slicing, and runtime each imply "
+            "semantic tracking; legacy-all reproduces historical item 7."
+        ),
     )
     parser.add_argument(
         "--disable-omnifetch-persistent-wh-cache",

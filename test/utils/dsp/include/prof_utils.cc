@@ -12,8 +12,10 @@
 #include <fstream>
 #include <sstream>
 
-// Handler will instrument 1000 unique ID
-#define LWP_COUNTER_SIZE 1000 // Can adjust the number of instrumented loops
+// Full-model ALPS profiling can contain more than 1000 static loop regions.
+// This storage is linked only when LWP is enabled; keep it large enough for
+// monolithic model profiling and match HexagonLWPInstrumentation's hard cap.
+#define LWP_COUNTER_SIZE 8192
 
 // The lwp_buffer can have at max total 200 records (including start, end)
 // associated with each ID. Example: A sibling loop is invoked 100 times-- each

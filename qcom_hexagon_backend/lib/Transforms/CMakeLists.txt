@@ -52,6 +52,9 @@ add_mlir_library(Transforms
   SCFLoopUnrollPass.cpp
   PrefetchInsertPass.cpp
   PrefetchKernelHXPass.cpp
+  AlpsMovementLedgerPass.cpp
+  AlpsProducerDirectAttentionPass.cpp
+  AlpsZeroCopyAttentionPass.cpp
   VDAEDecouplePass.cpp
   LayoutOpsEliminationPass.cpp
 

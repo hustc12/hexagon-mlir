@@ -74,11 +74,37 @@ struct HexagonLowerTmTensorPass
 
 // Pattern to lower tm_tensor.attention to linalg operations
 struct LowerAttentionOp : public OpRewritePattern<AttentionOp> {
-  LowerAttentionOp(MLIRContext *context, bool emitKvCacheMetadata)
+  LowerAttentionOp(MLIRContext *context, bool emitKvCacheMetadata,
+                   bool emitKvFusionBoundary,
+                   bool emitKvElementwiseFusionBoundary,
+                   bool emitKvMultiUseFusionBoundary,
+                   bool emitKvSplitReductionBoundary)
       : OpRewritePattern(context),
-        emitKvCacheMetadata(emitKvCacheMetadata) {}
+        emitKvCacheMetadata(emitKvCacheMetadata),
+        emitKvFusionBoundary(emitKvFusionBoundary),
+        emitKvElementwiseFusionBoundary(emitKvElementwiseFusionBoundary),
+        emitKvMultiUseFusionBoundary(emitKvMultiUseFusionBoundary),
+        emitKvSplitReductionBoundary(emitKvSplitReductionBoundary) {}
 
   bool emitKvCacheMetadata;
+  bool emitKvFusionBoundary;
+  bool emitKvElementwiseFusionBoundary;
+  bool emitKvMultiUseFusionBoundary;
+  bool emitKvSplitReductionBoundary;
+
+  void attachTopologyAttrs(Operation *op, PatternRewriter &rewriter) const {
+    if (emitKvFusionBoundary)
+      op->setAttr("alps.kv_fusion_boundary", rewriter.getUnitAttr());
+    if (emitKvElementwiseFusionBoundary)
+      op->setAttr("alps.kv_elementwise_fusion_boundary",
+                  rewriter.getUnitAttr());
+    if (emitKvMultiUseFusionBoundary)
+      op->setAttr("alps.kv_multi_use_fusion_boundary",
+                  rewriter.getUnitAttr());
+    if (emitKvSplitReductionBoundary)
+      op->setAttr("alps.kv_split_reduction_boundary",
+                  rewriter.getUnitAttr());
+  }
 
   LogicalResult matchAndRewrite(AttentionOp op,
                                 PatternRewriter &rewriter) const final {
@@ -153,6 +179,7 @@ struct LowerAttentionOp : public OpRewritePattern<AttentionOp> {
                     rewriter.getStringAttr("key"));
       qkOp->setAttr("omni_fetch.kv_cache_operand",
                     rewriter.getI64IntegerAttr(1));
+      attachTopologyAttrs(qkOp.getOperation(), rewriter);
     }
     Value qkT = qkOp.getResult(0);
     DBG(" batch-matmul: " << qkT);
@@ -249,6 +276,7 @@ struct LowerAttentionOp : public OpRewritePattern<AttentionOp> {
                     rewriter.getStringAttr("value"));
       avOp->setAttr("omni_fetch.kv_cache_operand",
                     rewriter.getI64IntegerAttr(1));
+      attachTopologyAttrs(avOp.getOperation(), rewriter);
     }
     Value result = avOp.getResult(0);
 
@@ -416,14 +444,34 @@ static bool dependsOnSoftmaxLike(Value value, Operation *consumer,
   });
 }
 
-static int64_t annotateEagerAttentionKvStreams(FunctionOpInterface func) {
+static int64_t annotateEagerAttentionKvStreams(
+    FunctionOpInterface func, bool emitKvFusionBoundary,
+    bool emitKvElementwiseFusionBoundary, bool emitKvMultiUseFusionBoundary,
+    bool emitKvSplitReductionBoundary) {
   int64_t inferred = 0;
   int64_t keys = 0;
   int64_t values = 0;
   DenseMap<Block *, Operation *> pendingSquareKey;
   func.walk([&](linalg::LinalgOp op) {
-    if (op->hasAttr("omni_fetch.kv_cache_role") ||
-        op.getNumReductionLoops() == 0 || op.getDpsInputs().size() < 2 ||
+    // Earlier scheduling/generalization may preserve semantic identity but
+    // intentionally omit the independent topology policy.  Apply the ALPS
+    // fusion marker without re-running shape inference in that case.
+    if (op->hasAttr("omni_fetch.kv_cache_role")) {
+      if (emitKvFusionBoundary)
+        op->setAttr("alps.kv_fusion_boundary",
+                    UnitAttr::get(op.getContext()));
+      if (emitKvElementwiseFusionBoundary)
+        op->setAttr("alps.kv_elementwise_fusion_boundary",
+                    UnitAttr::get(op.getContext()));
+      if (emitKvMultiUseFusionBoundary)
+        op->setAttr("alps.kv_multi_use_fusion_boundary",
+                    UnitAttr::get(op.getContext()));
+      if (emitKvSplitReductionBoundary)
+        op->setAttr("alps.kv_split_reduction_boundary",
+                    UnitAttr::get(op.getContext()));
+      return;
+    }
+    if (op.getNumReductionLoops() == 0 || op.getDpsInputs().size() < 2 ||
         op.getDpsInits().empty())
       return;
 
@@ -547,6 +595,14 @@ static int64_t annotateEagerAttentionKvStreams(FunctionOpInterface func) {
     op->setAttr("omni_fetch.kv_cache_operand",
                 bld.getI64IntegerAttr(operandIndex));
     op->setAttr("omni_fetch.kv_cache_layout", bld.getStringAttr(layout));
+    if (emitKvFusionBoundary)
+      op->setAttr("alps.kv_fusion_boundary", bld.getUnitAttr());
+    if (emitKvElementwiseFusionBoundary)
+      op->setAttr("alps.kv_elementwise_fusion_boundary", bld.getUnitAttr());
+    if (emitKvMultiUseFusionBoundary)
+      op->setAttr("alps.kv_multi_use_fusion_boundary", bld.getUnitAttr());
+    if (emitKvSplitReductionBoundary)
+      op->setAttr("alps.kv_split_reduction_boundary", bld.getUnitAttr());
     if (role == "key")
       pendingSquareKey[op->getBlock()] = op;
     else if (role == "value")
@@ -563,7 +619,10 @@ static int64_t annotateEagerAttentionKvStreams(FunctionOpInterface func) {
 
 void HexagonLowerTmTensorPass::runOnOperation() {
   RewritePatternSet patterns(&getContext());
-  patterns.add<LowerAttentionOp>(patterns.getContext(), emitKvCacheMetadata);
+  patterns.add<LowerAttentionOp>(
+      patterns.getContext(), emitKvCacheMetadata, emitKvFusionBoundary,
+      emitKvElementwiseFusionBoundary, emitKvMultiUseFusionBoundary,
+      emitKvSplitReductionBoundary);
 
   if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
     signalPassFailure();
@@ -571,7 +630,10 @@ void HexagonLowerTmTensorPass::runOnOperation() {
   }
 
   if (emitKvCacheMetadata) {
-    int64_t inferred = annotateEagerAttentionKvStreams(getOperation());
+    int64_t inferred = annotateEagerAttentionKvStreams(
+        getOperation(), emitKvFusionBoundary,
+        emitKvElementwiseFusionBoundary, emitKvMultiUseFusionBoundary,
+        emitKvSplitReductionBoundary);
     llvm::errs() << "[KVCacheMetadata] function="
                  << getOperation()->getName() << " eager_inferred="
                  << inferred << "\n";

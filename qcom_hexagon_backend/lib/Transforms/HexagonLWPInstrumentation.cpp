@@ -29,14 +29,11 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_ostream.h"
 
-#include <string>
-
 #define DEBUG_TYPE "hexagon-lwp-instrumentation"
 
 #define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
 #define DBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
-using namespace std::literals;
 using namespace mlir;
 using namespace mlir::scf;
 using namespace mlir::LLVM;
@@ -46,6 +43,8 @@ using namespace hexagon;
 #include "hexagon/Transforms/Passes.h.inc"
 
 namespace {
+constexpr int kMaxLWPRegionIds = 8192;
+
 struct HexagonLWPPass : public ::impl::HexagonLWPPassBase<HexagonLWPPass> {
 
   explicit HexagonLWPPass(const HexagonLWPPassOptions &options)
@@ -176,78 +175,45 @@ struct HexagonLWPPass : public ::impl::HexagonLWPPassBase<HexagonLWPPass> {
     MLIRContext *ctx = &getContext();
     OpBuilder builder(module.getContext());
 
-    auto i8Ty = IntegerType::get(ctx, 8);
-    auto strType = LLVM::LLVMArrayType::get(i8Ty, 12);
     auto i32Ty = IntegerType::get(ctx, 32);
-    auto i8PtrTy = LLVMPointerType::get(ctx);
 
     static int increment_loopId = 1;
+    static bool capacityWarningEmitted = false;
 
-    // Retrieve an existing LLVM global variable named "handler_name" or
-    // create it to store the string "lwp_handler".
-    auto getOrCreateHandlerGlobal = [&]() -> LLVM::GlobalOp {
-      OpBuilder::InsertionGuard guard(builder);
-      builder.setInsertionPointToStart(module.getBody());
-      auto str = builder.getStringAttr("lwp_handler\0"s);
-
-      auto global = LLVM::GlobalOp::create(builder, module.getLoc(),
-                                           /*type=*/strType,
-                                           /*isConstant=*/true,
-                                           /*linkage=*/LLVM::Linkage::Internal,
-                                           /*name=*/"handler_name",
-                                           /*value=*/str,
-                                           /*alignment=*/0,
-                                           /*addrSpace=*/0,
-                                           /*dsoLocal=*/false,
-                                           /*thread_local=*/false);
-
-      return global;
-    };
-
-    // Retrieve or create the LLVM function 'llvm.hexagon.instrprof.custom'.
+    // Use a normal ABI call instead of llvm.hexagon.instrprof.custom. The
+    // intrinsic only selects when its handler operand survives as a very
+    // specific target-global-address node; full-model optimization can alter
+    // that node and abort code generation. lwp_handler.S already consumes the
+    // region ID in R0 and preserves the registers it touches. Normal calls add
+    // profiling overhead, but P1 uses these cycles for ranking only.
     auto getOrCreateInstrFunc = [&]() {
-      if (!module.lookupSymbol<LLVM::LLVMFuncOp>(
-              "llvm.hexagon.instrprof.custom")) {
+      if (!module.lookupSymbol<LLVM::LLVMFuncOp>("lwp_handler")) {
         OpBuilder::InsertionGuard guard(builder);
         builder.setInsertionPointToStart(module.getBody());
         auto voidTy = LLVM::LLVMVoidType::get(ctx);
         auto funcTy = LLVM::LLVMFunctionType::get(
-            voidTy, ArrayRef<Type>{i8PtrTy, i32Ty}, false);
-        auto func = LLVM::LLVMFuncOp::create(
-            builder, module.getLoc(), "llvm.hexagon.instrprof.custom", funcTy);
+            voidTy, ArrayRef<Type>{i32Ty}, false);
+        LLVM::LLVMFuncOp::create(builder, module.getLoc(), "lwp_handler",
+                                 funcTy);
       }
     };
 
-    // Create the call to the LLVM intrinsic
     auto emitInstrumentationCall = [&](OpBuilder builder, Location loc,
-                                       auto gep, Value id) {
-      auto symbolRef =
-          FlatSymbolRefAttr::get(ctx, "llvm.hexagon.instrprof.custom");
+                                       Value id) {
+      auto symbolRef = FlatSymbolRefAttr::get(ctx, "lwp_handler");
       auto instr = LLVM::CallOp::create(builder, loc, TypeRange{}, symbolRef,
-                                        ValueRange{gep, id});
-    };
-
-    // Get or create pointer to the string data "lwp_handler".
-    LLVM::GEPOp globalGEP;
-    auto getOrCreateGlobalGEP = [&](OpBuilder builder,
-                                    Location loc) -> LLVM::GEPOp {
-      if (globalGEP)
-        return globalGEP;
-
-      // Get the global variable "handler_name".
-      auto global = getOrCreateHandlerGlobal();
-      auto addr = LLVM::AddressOfOp::create(builder, loc, global);
-      auto zero = LLVM::ConstantOp::create(builder, loc, i32Ty,
-                                           builder.getI32IntegerAttr(0));
-      globalGEP = LLVM::GEPOp::create(builder, loc, i8PtrTy, strType, addr,
-                                      ArrayRef<Value>{zero, zero});
-      return globalGEP;
+                                        ValueRange{id});
     };
 
     getOrCreateInstrFunc();
 
     // === Instrument Functions ===
     {
+      if (increment_loopId >= kMaxLWPRegionIds) {
+        func.emitError("LWP region ID capacity exhausted before function instrumentation");
+        signalPassFailure();
+        return;
+      }
       Location loc = func.getLoc();
       std::vector<int> lines = collectLoc(loc);
       printLines(lines, increment_loopId, {});
@@ -257,15 +223,14 @@ struct HexagonLWPPass : public ::impl::HexagonLWPPassBase<HexagonLWPPass> {
       OpBuilder::InsertionGuard guard(builder);
       builder.setInsertionPointToStart(&func.getBody().front());
 
-      auto gep = getOrCreateGlobalGEP(builder, loc);
       auto id = LLVM::ConstantOp::create(
           builder, loc, i32Ty, builder.getI32IntegerAttr(increment_loopId++));
 
-      emitInstrumentationCall(builder, loc, gep, id);
+      emitInstrumentationCall(builder, loc, id);
 
       func.walk([&](func::ReturnOp retOp) {
         builder.setInsertionPoint(retOp);
-        emitInstrumentationCall(builder, loc, gep, id);
+        emitInstrumentationCall(builder, loc, id);
       });
     }
 
@@ -280,6 +245,15 @@ struct HexagonLWPPass : public ::impl::HexagonLWPPassBase<HexagonLWPPass> {
         if (!shouldInstrument)
           return;
 
+        if (increment_loopId >= kMaxLWPRegionIds) {
+          if (!capacityWarningEmitted) {
+            forOp.emitWarning(
+                "LWP region ID capacity reached; remaining loops are not instrumented");
+            capacityWarningEmitted = true;
+          }
+          return;
+        }
+
         Location loc = forOp.getLoc();
         OpBuilder builder(forOp);
 
@@ -288,20 +262,19 @@ struct HexagonLWPPass : public ::impl::HexagonLWPPassBase<HexagonLWPPass> {
 
         printLines(lines, increment_loopId, opNames);
 
-        auto gep = getOrCreateGlobalGEP(builder, loc);
         auto id = LLVM::ConstantOp::create(
             builder, loc, i32Ty, builder.getI32IntegerAttr(increment_loopId++));
 
         {
           OpBuilder::InsertionGuard guard(builder);
           builder.setInsertionPoint(forOp);
-          emitInstrumentationCall(builder, loc, gep, id);
+          emitInstrumentationCall(builder, loc, id);
         }
 
         {
           OpBuilder::InsertionGuard guard(builder);
           builder.setInsertionPointAfter(forOp);
-          emitInstrumentationCall(builder, loc, gep, id);
+          emitInstrumentationCall(builder, loc, id);
         }
       });
     }
