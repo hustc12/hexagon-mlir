@@ -34,7 +34,7 @@ No model results or source files are removed from either legacy repository.
   two-file patch.
 - Removed reproducible Triton build/cache trees and legacy top-level MLIR
   bytecode. `hexagon-mlir-legacy` decreased from 16 GiB to 6.5 GiB and
-  `hexagon-mlir-native` from 3.0 GiB to about 479 MiB.
+  `hexagon-mlir-native` from 3.0 GiB to 1.3 GiB.
 - Repointed `LLVM_DIR_upstream` to the official LLVM GitHub remote, removed its
   stale object-alternate reference to the deleted `LLVM_DIR`, fetched the
   upstream object database, and verified that every object reachable from
