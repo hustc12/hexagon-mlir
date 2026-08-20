@@ -95,5 +95,9 @@ extern "C" uint32_t hexagon_runtime_dma2d_start(
  */
 extern "C" void hexagon_runtime_dma_wait(uint32_t token) { hexDMA.wait(token); }
 
+extern "C" int32_t hexagon_runtime_dma_poll(uint32_t token) {
+  return hexDMA.poll(token) ? 1 : 0;
+}
+
 } // namespace userdma
 } // namespace hexagon

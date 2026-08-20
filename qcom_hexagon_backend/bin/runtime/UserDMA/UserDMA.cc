@@ -171,6 +171,12 @@ void UserDMA::wait(uint32_t token) {
     ; // keep looping till DMA transfer is in progress
 }
 
+bool UserDMA::poll(uint32_t token) {
+  DMADesc2D *dmaDesc = dmaQueue->getDataPtr(token);
+  assert(dmaDesc != nullptr);
+  return !inFlight(dmaDesc);
+}
+
 UserDMA::UserDMA(int fifoLen) {
   // reset DMA engine
   unsigned int status = init();

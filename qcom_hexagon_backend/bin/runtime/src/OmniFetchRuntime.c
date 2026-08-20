@@ -19,6 +19,7 @@
 #include <stddef.h>
 
 #ifdef __hexagon__
+#include "HAP_user_pmu.h"
 /* HexKL micro API — linked via -lhexkl_micro on the final device .so. */
 int hexkl_micro_hmx_rm_to_wh_f16(uint8_t *vtcm_base, uint32_t weight_offset,
                                  const _Float16 *wt_old, uint32_t row_tile,
@@ -53,10 +54,410 @@ int hexkl_micro_hmx_copy_submatrix_to_f16(uint8_t *vtcm_base,
 
 #define OMNI_ERROR_SEM_TIMEOUT       (1u << 0)
 #define OMNI_ERROR_DESCRIPTOR_FULL   (1u << 1)
+#define OMNI_ERROR_DESCRIPTOR_STALE  (1u << 2)
+#define OMNI_ERROR_DESCRIPTOR_STATE  (1u << 3)
+#define OMNI_ERROR_CONTEXT_BUSY      (1u << 4)
 static unsigned omni_error_flags = 0;
 
 uint32_t __omni_fetch_get_and_clear_errors(void) {
   return __atomic_exchange_n(&omni_error_flags, 0, __ATOMIC_ACQ_REL);
+}
+
+/* -------------------------------------------------------------------------
+ * ALPS P3a exact-readiness contexts and descriptors.
+ *
+ * Storage is bounded and runtime-owned, but ownership is never implicit:
+ * every handle carries a generation and every descriptor records the exact
+ * invocation/value-version/tile/layout/tier tuple.  This is deliberately
+ * separate from the legacy process-global async ring.  P3b will attach the
+ * UserDMA token and scout execution to these descriptors.
+ * ------------------------------------------------------------------------- */
+#define ALPS_CONTEXT_SLOTS 4
+#define ALPS_DESCRIPTORS_PER_CONTEXT 8
+#define ALPS_DESCRIPTOR_SLOTS \
+  (ALPS_CONTEXT_SLOTS * ALPS_DESCRIPTORS_PER_CONTEXT)
+
+enum {
+  ALPS_DESC_FREE = 0,
+  ALPS_DESC_LOAD_PENDING = 1,
+  ALPS_DESC_LAYOUT_PENDING = 2,
+  ALPS_DESC_READY = 3,
+  ALPS_DESC_CONSUMING = 4,
+  ALPS_DESC_FAILED = 5
+};
+
+typedef struct {
+  volatile int state;
+  uint32_t generation;
+  uint32_t context_generation;
+  int64_t value_version;
+  int64_t tile;
+  int32_t layout;
+  int32_t source_tier;
+  int32_t destination_tier;
+  uint32_t dma_token;
+  int32_t dma_active;
+  void *dest;
+  const void *src;
+  int32_t tile_row;
+  int32_t tile_col;
+  int32_t source_cols;
+  int32_t weight_offset;
+  int32_t stage_offset;
+  int32_t stage_slot;
+  int32_t dma_credit_owned;
+} AlpsExactDescriptor;
+
+typedef struct {
+  volatile int in_use;
+  uint32_t generation;
+  AlpsExactDescriptor descriptors[ALPS_DESCRIPTORS_PER_CONTEXT];
+} AlpsInvocationContext;
+
+static AlpsInvocationContext alps_contexts[ALPS_CONTEXT_SLOTS];
+static unsigned alps_context_cursor = 0;
+static uint64_t alps_descriptor_acquired = 0;
+static uint64_t alps_descriptor_consumed = 0;
+static uint64_t alps_descriptor_released = 0;
+static uint64_t alps_descriptor_failures = 0;
+static uint64_t alps_exact_dma_kicks = 0;
+static uint64_t alps_exact_dma_completed = 0;
+static uint64_t alps_exact_scout_completed = 0;
+static uint64_t alps_exact_sync_fallbacks = 0;
+static uint64_t alps_exact_consume_waits = 0;
+static uint64_t alps_exact_credit_fallbacks = 0;
+static uint64_t alps_exact_dma_timeouts = 0;
+/* P4A is separately configured by the generated launcher.  It never changes
+ * legality or representation; it only throttles the already-legal P3b DMA
+ * path for subsequent windows. */
+#define ALPS_P4A_WINDOW_COMPLETIONS 64u
+#define ALPS_P4A_PMU_UNAVAILABLE 0u
+#define ALPS_P4A_PMU_AVAILABLE 1u
+#define ALPS_P4A_PMU_READ_FAILED 2u
+static int alps_p4a_enabled = 0;
+static int alps_p4a_dma_allowed = 1;
+static uint64_t alps_p4a_windows = 0;
+static uint64_t alps_p4a_throttle_decisions = 0;
+static uint64_t alps_p4a_hold_decisions = 0;
+static uint64_t alps_p4a_dma_suppressed = 0;
+static uint64_t alps_p4a_window_completions = 0;
+static uint64_t alps_p4a_window_poll_retries = 0;
+static uint64_t alps_p4a_total_poll_retries = 0;
+static uint64_t alps_p4a_issue_cycles = 0;
+static uint64_t alps_p4a_poll_cycles = 0;
+static uint32_t alps_p4a_pmu_status = ALPS_P4A_PMU_UNAVAILABLE;
+static uint32_t alps_p4a_pmu_reads = 0;
+static uint32_t alps_p4a_pmu_delta[4];
+#ifdef __hexagon__
+static HAP_pmu_group_config_t alps_p4a_pmu_group;
+static uint32_t alps_p4a_pmu_previous[4];
+#endif
+
+static uint64_t alps_read_pcycles(void) {
+#ifdef __hexagon__
+  uint64_t value;
+  __asm__ volatile("%[value] = C15:14" : [value] "=r"(value));
+  return value;
+#else
+  return 0;
+#endif
+}
+
+void __omni_fetch_p4a_configure(int32_t enable) {
+  __atomic_store_n(&alps_p4a_enabled, enable ? 1 : 0, __ATOMIC_RELEASE);
+  __atomic_store_n(&alps_p4a_dma_allowed, 1, __ATOMIC_RELEASE);
+  alps_p4a_windows = 0;
+  alps_p4a_throttle_decisions = 0;
+  alps_p4a_hold_decisions = 0;
+  alps_p4a_dma_suppressed = 0;
+  alps_p4a_window_completions = 0;
+  alps_p4a_window_poll_retries = 0;
+  alps_p4a_total_poll_retries = 0;
+  alps_p4a_issue_cycles = 0;
+  alps_p4a_poll_cycles = 0;
+  alps_p4a_pmu_status = ALPS_P4A_PMU_UNAVAILABLE;
+  alps_p4a_pmu_reads = 0;
+  memset(alps_p4a_pmu_delta, 0, sizeof(alps_p4a_pmu_delta));
+#ifdef __hexagon__
+  memset(&alps_p4a_pmu_group, 0, sizeof(alps_p4a_pmu_group));
+  memset(alps_p4a_pmu_previous, 0, sizeof(alps_p4a_pmu_previous));
+  if (!enable)
+    return;
+  /* V73 public events: UDMA active, DMPoll cycles, coherent-read stall, and
+   * VTCM-write stall.  The SDK explicitly denies HAP user PMU in Unsigned PD;
+   * failure is therefore an expected, reportable state, not silently faked. */
+  alps_p4a_pmu_group.num_events = 4;
+  alps_p4a_pmu_group.pmu_events[0] = 0x812f;
+  alps_p4a_pmu_group.pmu_events[1] = 0x8133;
+  alps_p4a_pmu_group.pmu_events[2] = 0x814b;
+  alps_p4a_pmu_group.pmu_events[3] = 0x8150;
+  if (HAP_register_pmu_group(&alps_p4a_pmu_group) == 0 &&
+      HAP_read_pmu_group(&alps_p4a_pmu_group) == 0) {
+    alps_p4a_pmu_status = ALPS_P4A_PMU_AVAILABLE;
+    for (unsigned i = 0; i < 4; ++i)
+      alps_p4a_pmu_previous[i] = alps_p4a_pmu_group.pmu_value[i];
+  }
+#else
+  (void)enable;
+#endif
+}
+
+static void alps_p4a_observe_dma_completion(unsigned poll_retries) {
+  if (!__atomic_load_n(&alps_p4a_enabled, __ATOMIC_ACQUIRE))
+    return;
+  __atomic_fetch_add(&alps_p4a_total_poll_retries, poll_retries,
+                     __ATOMIC_RELAXED);
+  alps_p4a_window_poll_retries += poll_retries;
+  if (++alps_p4a_window_completions < ALPS_P4A_WINDOW_COMPLETIONS)
+    return;
+  ++alps_p4a_windows;
+#ifdef __hexagon__
+  if (alps_p4a_pmu_status == ALPS_P4A_PMU_AVAILABLE) {
+    if (HAP_read_pmu_group(&alps_p4a_pmu_group) == 0) {
+      ++alps_p4a_pmu_reads;
+      for (unsigned i = 0; i < 4; ++i) {
+        uint32_t current = alps_p4a_pmu_group.pmu_value[i];
+        alps_p4a_pmu_delta[i] += current - alps_p4a_pmu_previous[i];
+        alps_p4a_pmu_previous[i] = current;
+      }
+    } else {
+      alps_p4a_pmu_status = ALPS_P4A_PMU_READ_FAILED;
+    }
+  }
+#endif
+  /* Throttle both unproductive extremes.  Zero retries means the whole window
+   * arrived earlier than demand; >=4 retries/completion means demand is still
+   * paying sustained DMPoll pressure.  Only the bounded middle region retains
+   * DMA for the next window.  The threshold is fixed before the second full
+   * run; P4A does not search it per model. */
+  uint64_t average_retries =
+      alps_p4a_window_poll_retries / ALPS_P4A_WINDOW_COMPLETIONS;
+  if (alps_p4a_window_poll_retries == 0 || average_retries >= 4) {
+    __atomic_store_n(&alps_p4a_dma_allowed, 0, __ATOMIC_RELEASE);
+    ++alps_p4a_throttle_decisions;
+  } else {
+    ++alps_p4a_hold_decisions;
+  }
+  alps_p4a_window_completions = 0;
+  alps_p4a_window_poll_retries = 0;
+}
+/* P3b deliberately starts with one retained UserDMA descriptor.  The upstream
+ * UserDMA ring recycles completed hardware descriptors without a consumer
+ * acknowledgement, so allowing multiple exact tokens would make delayed
+ * polls observe a reused slot. */
+static int alps_exact_dma_credit = 0;
+
+static void alps_descriptor_fail(unsigned error) {
+  __atomic_fetch_add(&alps_descriptor_failures, 1, __ATOMIC_RELAXED);
+  __atomic_fetch_or(&omni_error_flags, error, __ATOMIC_RELAXED);
+}
+
+static int alps_decode_context(int32_t handle, unsigned *slot,
+                               uint32_t *generation) {
+  if (handle < 0)
+    return 0;
+  *slot = (unsigned)handle % ALPS_CONTEXT_SLOTS;
+  *generation = (uint32_t)handle / ALPS_CONTEXT_SLOTS;
+  AlpsInvocationContext *context = &alps_contexts[*slot];
+  return __atomic_load_n(&context->in_use, __ATOMIC_ACQUIRE) &&
+         __atomic_load_n(&context->generation, __ATOMIC_ACQUIRE) ==
+             *generation;
+}
+
+static int alps_decode_descriptor(int32_t handle,
+                                  AlpsInvocationContext **context,
+                                  AlpsExactDescriptor **descriptor) {
+  if (handle < 0)
+    return 0;
+  unsigned flat = (unsigned)handle % ALPS_DESCRIPTOR_SLOTS;
+  uint32_t generation = (uint32_t)handle / ALPS_DESCRIPTOR_SLOTS;
+  unsigned context_slot = flat / ALPS_DESCRIPTORS_PER_CONTEXT;
+  unsigned descriptor_slot = flat % ALPS_DESCRIPTORS_PER_CONTEXT;
+  AlpsInvocationContext *candidate_context = &alps_contexts[context_slot];
+  AlpsExactDescriptor *candidate_descriptor =
+      &candidate_context->descriptors[descriptor_slot];
+  if (!__atomic_load_n(&candidate_context->in_use, __ATOMIC_ACQUIRE) ||
+      __atomic_load_n(&candidate_descriptor->generation, __ATOMIC_ACQUIRE) !=
+          generation ||
+      candidate_descriptor->context_generation !=
+          __atomic_load_n(&candidate_context->generation, __ATOMIC_ACQUIRE))
+    return 0;
+  *context = candidate_context;
+  *descriptor = candidate_descriptor;
+  return 1;
+}
+
+int32_t __omni_fetch_invocation_begin(void) {
+  unsigned start = __atomic_fetch_add(&alps_context_cursor, 1,
+                                      __ATOMIC_RELAXED);
+  for (unsigned probe = 0; probe < ALPS_CONTEXT_SLOTS; ++probe) {
+    unsigned slot = (start + probe) % ALPS_CONTEXT_SLOTS;
+    AlpsInvocationContext *context = &alps_contexts[slot];
+    int expected = 0;
+    if (!__atomic_compare_exchange_n(&context->in_use, &expected, 1, 0,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+      continue;
+    uint32_t generation =
+        (__atomic_add_fetch(&context->generation, 1, __ATOMIC_ACQ_REL) &
+         UINT32_C(0x1ffffff));
+    if (generation == 0) {
+      generation = 1;
+      __atomic_store_n(&context->generation, generation, __ATOMIC_RELEASE);
+    }
+    for (unsigned i = 0; i < ALPS_DESCRIPTORS_PER_CONTEXT; ++i)
+      __atomic_store_n(&context->descriptors[i].state, ALPS_DESC_FREE,
+                       __ATOMIC_RELEASE);
+    return (int32_t)(generation * ALPS_CONTEXT_SLOTS + slot);
+  }
+  alps_descriptor_fail(OMNI_ERROR_CONTEXT_BUSY);
+  return -1;
+}
+
+int32_t __omni_fetch_invocation_end(int32_t context_handle) {
+  unsigned slot;
+  uint32_t generation;
+  if (!alps_decode_context(context_handle, &slot, &generation)) {
+    alps_descriptor_fail(OMNI_ERROR_DESCRIPTOR_STALE);
+    return 0;
+  }
+  AlpsInvocationContext *context = &alps_contexts[slot];
+  for (unsigned i = 0; i < ALPS_DESCRIPTORS_PER_CONTEXT; ++i) {
+    if (__atomic_load_n(&context->descriptors[i].state, __ATOMIC_ACQUIRE) !=
+        ALPS_DESC_FREE) {
+      alps_descriptor_fail(OMNI_ERROR_CONTEXT_BUSY);
+      return 0;
+    }
+  }
+  __atomic_store_n(&context->in_use, 0, __ATOMIC_RELEASE);
+  return 1;
+}
+
+int32_t __omni_fetch_descriptor_acquire(
+    int32_t context_handle, int64_t value_version, int64_t tile,
+    int32_t layout, int32_t source_tier, int32_t destination_tier) {
+  unsigned context_slot;
+  uint32_t context_generation;
+  if (!alps_decode_context(context_handle, &context_slot,
+                           &context_generation)) {
+    alps_descriptor_fail(OMNI_ERROR_DESCRIPTOR_STALE);
+    return -1;
+  }
+  AlpsInvocationContext *context = &alps_contexts[context_slot];
+  for (unsigned slot = 0; slot < ALPS_DESCRIPTORS_PER_CONTEXT; ++slot) {
+    AlpsExactDescriptor *descriptor = &context->descriptors[slot];
+    int expected = ALPS_DESC_FREE;
+    if (!__atomic_compare_exchange_n(&descriptor->state, &expected,
+                                     ALPS_DESC_LOAD_PENDING, 0,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+      continue;
+    uint32_t generation =
+        (__atomic_add_fetch(&descriptor->generation, 1, __ATOMIC_ACQ_REL) &
+         UINT32_C(0x3ffffff));
+    if (generation == 0) {
+      generation = 1;
+      __atomic_store_n(&descriptor->generation, generation,
+                       __ATOMIC_RELEASE);
+    }
+    descriptor->context_generation = context_generation;
+    descriptor->value_version = value_version;
+    descriptor->tile = tile;
+    descriptor->layout = layout;
+    descriptor->source_tier = source_tier;
+    descriptor->destination_tier = destination_tier;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_fetch_add(&alps_descriptor_acquired, 1, __ATOMIC_RELAXED);
+    unsigned flat = context_slot * ALPS_DESCRIPTORS_PER_CONTEXT + slot;
+    return (int32_t)(generation * ALPS_DESCRIPTOR_SLOTS + flat);
+  }
+  alps_descriptor_fail(OMNI_ERROR_DESCRIPTOR_FULL);
+  return -1;
+}
+
+int32_t __omni_fetch_descriptor_transition(int32_t descriptor_handle,
+                                           int32_t expected_state,
+                                           int32_t next_state) {
+  AlpsInvocationContext *context;
+  AlpsExactDescriptor *descriptor;
+  if (!alps_decode_descriptor(descriptor_handle, &context, &descriptor)) {
+    (void)context;
+    alps_descriptor_fail(OMNI_ERROR_DESCRIPTOR_STALE);
+    return 0;
+  }
+  int legal = (expected_state == ALPS_DESC_LOAD_PENDING &&
+               next_state == ALPS_DESC_LAYOUT_PENDING) ||
+              (expected_state == ALPS_DESC_LAYOUT_PENDING &&
+               next_state == ALPS_DESC_READY);
+  int expected = (int)expected_state;
+  if (!legal || !__atomic_compare_exchange_n(
+                    &descriptor->state, &expected, (int)next_state, 0,
+                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+    alps_descriptor_fail(OMNI_ERROR_DESCRIPTOR_STATE);
+    return 0;
+  }
+  return 1;
+}
+
+int32_t __omni_fetch_descriptor_consume(
+    int32_t descriptor_handle, int64_t value_version, int64_t tile,
+    int32_t layout, int32_t source_tier, int32_t destination_tier) {
+  AlpsInvocationContext *context;
+  AlpsExactDescriptor *descriptor;
+  if (!alps_decode_descriptor(descriptor_handle, &context, &descriptor)) {
+    (void)context;
+    alps_descriptor_fail(OMNI_ERROR_DESCRIPTOR_STALE);
+    return 0;
+  }
+  __atomic_thread_fence(__ATOMIC_ACQUIRE);
+  if (descriptor->value_version != value_version || descriptor->tile != tile ||
+      descriptor->layout != layout || descriptor->source_tier != source_tier ||
+      descriptor->destination_tier != destination_tier) {
+    alps_descriptor_fail(OMNI_ERROR_DESCRIPTOR_STALE);
+    return 0;
+  }
+  int expected = ALPS_DESC_READY;
+  if (!__atomic_compare_exchange_n(&descriptor->state, &expected,
+                                   ALPS_DESC_CONSUMING, 0,
+                                   __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+    alps_descriptor_fail(OMNI_ERROR_DESCRIPTOR_STATE);
+    return 0;
+  }
+  __atomic_fetch_add(&alps_descriptor_consumed, 1, __ATOMIC_RELAXED);
+  return 1;
+}
+
+int32_t __omni_fetch_descriptor_release(int32_t descriptor_handle) {
+  AlpsInvocationContext *context;
+  AlpsExactDescriptor *descriptor;
+  if (!alps_decode_descriptor(descriptor_handle, &context, &descriptor)) {
+    (void)context;
+    alps_descriptor_fail(OMNI_ERROR_DESCRIPTOR_STALE);
+    return 0;
+  }
+  int expected = ALPS_DESC_CONSUMING;
+  if (!__atomic_compare_exchange_n(&descriptor->state, &expected,
+                                   ALPS_DESC_FREE, 0, __ATOMIC_ACQ_REL,
+                                   __ATOMIC_ACQUIRE)) {
+    alps_descriptor_fail(OMNI_ERROR_DESCRIPTOR_STATE);
+    return 0;
+  }
+  __atomic_fetch_add(&alps_descriptor_released, 1, __ATOMIC_RELAXED);
+  return 1;
+}
+
+uint64_t __omni_fetch_descriptor_counts(void) {
+  uint64_t acquired =
+      __atomic_load_n(&alps_descriptor_acquired, __ATOMIC_RELAXED);
+  uint64_t consumed =
+      __atomic_load_n(&alps_descriptor_consumed, __ATOMIC_RELAXED);
+  return (acquired << 32) | (consumed & UINT64_C(0xffffffff));
+}
+
+uint64_t __omni_fetch_descriptor_release_failures(void) {
+  uint64_t released =
+      __atomic_load_n(&alps_descriptor_released, __ATOMIC_RELAXED);
+  uint64_t failures =
+      __atomic_load_n(&alps_descriptor_failures, __ATOMIC_RELAXED);
+  return (released << 32) | (failures & UINT64_C(0xffffffff));
 }
 
 /* -------------------------------------------------------------------------
@@ -572,6 +973,7 @@ extern uint32_t hexagon_runtime_dma2d_start(
     int bypassCacheDst, int isOrdered, uint32_t cacheAllocationPolicy,
     int *status);
 extern void hexagon_runtime_dma_wait(uint32_t token);
+extern int32_t hexagon_runtime_dma_poll(uint32_t token);
 
 #define OMNI_STAGE_ELEMS (32 * 32)
 #define OMNI_STAGE_SLOTS 4
@@ -638,6 +1040,408 @@ static void omni_pack_weight_tile_to_stage(const _Float16 *src, int32_t tile_row
   __omni_fetch_copy2d(row0, stage, /*elem_bytes=*/2, /*rows=*/32, /*cols=*/32,
                       /*src_row_stride_elems=*/src_cols,
                       /*dst_row_stride_elems=*/32);
+}
+
+/* P3b descriptor-owned staging.  Unlike omni_stage, a slot is addressed by
+ * the exact descriptor and cannot be consumed through a process-global FIFO. */
+static uint16_t alps_exact_stage[ALPS_DESCRIPTOR_SLOTS][OMNI_STAGE_ELEMS];
+
+static int64_t alps_pack_tile_identity(int32_t tile_row, int32_t tile_col) {
+  return (int64_t)(((uint64_t)(uint32_t)tile_row << 32) |
+                   (uint32_t)tile_col);
+}
+
+static int32_t alps_exact_find(int32_t context_handle, int64_t value_version,
+                               int32_t tile_row, int32_t tile_col) {
+  unsigned context_slot;
+  uint32_t context_generation;
+  if (!alps_decode_context(context_handle, &context_slot,
+                           &context_generation))
+    return -1;
+  AlpsInvocationContext *context = &alps_contexts[context_slot];
+  int64_t tile = alps_pack_tile_identity(tile_row, tile_col);
+  for (unsigned slot = 0; slot < ALPS_DESCRIPTORS_PER_CONTEXT; ++slot) {
+    AlpsExactDescriptor *descriptor = &context->descriptors[slot];
+    int state = __atomic_load_n(&descriptor->state, __ATOMIC_ACQUIRE);
+    if (state == ALPS_DESC_FREE ||
+        descriptor->context_generation != context_generation ||
+        descriptor->value_version != value_version ||
+        descriptor->tile != tile || descriptor->layout != LAYOUT_HMX_WEIGHT ||
+        descriptor->source_tier != OMNI_DDR ||
+        descriptor->destination_tier != OMNI_VTCM)
+      continue;
+    uint32_t generation =
+        __atomic_load_n(&descriptor->generation, __ATOMIC_ACQUIRE);
+    unsigned flat = context_slot * ALPS_DESCRIPTORS_PER_CONTEXT + slot;
+    return (int32_t)(generation * ALPS_DESCRIPTOR_SLOTS + flat);
+  }
+  return -1;
+}
+
+static void alps_exact_sync_weight(const void *src, void *dest,
+                                   int32_t tile_row, int32_t tile_col,
+                                   int32_t src_cols, int32_t weight_offset) {
+  if (!src || !dest || tile_row < 0 || tile_col < 0 || src_cols <= 0 ||
+      weight_offset < 0)
+    return;
+#ifdef __hexagon__
+  hexkl_micro_hmx_rm_to_wh_f16((uint8_t *)dest, (uint32_t)weight_offset,
+                               (const _Float16 *)src, (uint32_t)tile_row,
+                               (uint32_t)tile_col, (uint32_t)src_cols);
+#else
+  uint16_t stage[OMNI_STAGE_ELEMS];
+  omni_pack_weight_tile_to_stage((const _Float16 *)src, tile_row, tile_col,
+                                 src_cols, stage);
+  hmx_weight_gather(stage, (char *)dest + weight_offset, 2, 32, 32);
+#endif
+}
+
+static void alps_exact_complete_impl(void *descriptor_handle_as_ptr,
+                                     int completed_by_scout) {
+  int32_t descriptor_handle =
+      (int32_t)(intptr_t)descriptor_handle_as_ptr;
+  AlpsInvocationContext *context;
+  AlpsExactDescriptor *descriptor;
+  if (!alps_decode_descriptor(descriptor_handle, &context, &descriptor))
+    return;
+  (void)context;
+  int expected = ALPS_DESC_LOAD_PENDING;
+  if (!__atomic_compare_exchange_n(&descriptor->state, &expected,
+                                   ALPS_DESC_LAYOUT_PENDING, 0,
+                                   __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+    return;
+#ifdef __hexagon__
+  if (descriptor->dma_active) {
+    int polls = 0;
+    uint64_t poll_start =
+        __atomic_load_n(&alps_p4a_enabled, __ATOMIC_ACQUIRE)
+            ? alps_read_pcycles()
+            : 0;
+    while (!hexagon_runtime_dma_poll(descriptor->dma_token)) {
+      if (++polls >= OMNI_SEM_MAX_SPIN) {
+        __atomic_store_n(&descriptor->state, ALPS_DESC_FAILED,
+                         __ATOMIC_RELEASE);
+        __atomic_fetch_add(&alps_exact_dma_timeouts, 1, __ATOMIC_RELAXED);
+        alps_descriptor_fail(OMNI_ERROR_DESCRIPTOR_STATE);
+        /* Keep the credit retained: the hardware descriptor and VTCM target
+         * may still be live and therefore cannot be safely reused. */
+        return;
+      }
+      __asm__ volatile("pause(#64)");
+    }
+    if (__atomic_load_n(&alps_p4a_enabled, __ATOMIC_ACQUIRE)) {
+      uint64_t poll_end = alps_read_pcycles();
+      __atomic_fetch_add(&alps_p4a_poll_cycles, poll_end - poll_start,
+                         __ATOMIC_RELAXED);
+      alps_p4a_observe_dma_completion((unsigned)polls);
+    }
+    descriptor->dma_active = 0;
+  }
+#endif
+  const _Float16 *stage = NULL;
+  if (descriptor->stage_offset >= 0)
+    stage = (const _Float16 *)((char *)descriptor->dest +
+                              descriptor->stage_offset);
+  else if (descriptor->stage_slot >= 0)
+    stage = (const _Float16 *)alps_exact_stage[descriptor->stage_slot];
+#ifdef __hexagon__
+  if (stage)
+    hexkl_micro_hmx_rm_to_wh_f16(
+        (uint8_t *)descriptor->dest, (uint32_t)descriptor->weight_offset,
+        stage, 0, 0, 32);
+  else
+    alps_exact_sync_weight(descriptor->src, descriptor->dest,
+                           descriptor->tile_row, descriptor->tile_col,
+                           descriptor->source_cols,
+                           descriptor->weight_offset);
+#else
+  if (stage)
+    hmx_weight_gather(stage,
+                      (char *)descriptor->dest + descriptor->weight_offset,
+                      2, 32, 32);
+#endif
+  expected = ALPS_DESC_LAYOUT_PENDING;
+  if (!__atomic_compare_exchange_n(&descriptor->state, &expected,
+                                   ALPS_DESC_READY, 0, __ATOMIC_RELEASE,
+                                   __ATOMIC_ACQUIRE)) {
+    if (descriptor->dma_credit_owned) {
+      descriptor->dma_credit_owned = 0;
+      __atomic_store_n(&alps_exact_dma_credit, 0, __ATOMIC_RELEASE);
+    }
+    alps_descriptor_fail(OMNI_ERROR_DESCRIPTOR_STATE);
+    return;
+  }
+  if (descriptor->dma_credit_owned) {
+    descriptor->dma_credit_owned = 0;
+    __atomic_store_n(&alps_exact_dma_credit, 0, __ATOMIC_RELEASE);
+  }
+  __atomic_fetch_add(&alps_exact_dma_completed, 1, __ATOMIC_RELAXED);
+  if (completed_by_scout)
+    __atomic_fetch_add(&alps_exact_scout_completed, 1, __ATOMIC_RELAXED);
+}
+
+static void alps_exact_complete(void *descriptor_handle_as_ptr) {
+  alps_exact_complete_impl(descriptor_handle_as_ptr, /*completed_by_scout=*/1);
+}
+
+int32_t __omni_fetch_exact_weight_kick(
+    int32_t context_handle, int64_t value_version, const void *src, void *dest,
+    int32_t tile_row, int32_t tile_col, int32_t src_cols,
+    int32_t weight_offset, int32_t stage_offset) {
+  if (!src || !dest || tile_row < 0 || tile_col < 0 || src_cols <= 0 ||
+      weight_offset < 0)
+    return 0;
+  int64_t tile = alps_pack_tile_identity(tile_row, tile_col);
+  int32_t descriptor_handle = __omni_fetch_descriptor_acquire(
+      context_handle, value_version, tile, LAYOUT_HMX_WEIGHT, OMNI_DDR,
+      OMNI_VTCM);
+  AlpsInvocationContext *context;
+  AlpsExactDescriptor *descriptor;
+  if (descriptor_handle < 0 ||
+      !alps_decode_descriptor(descriptor_handle, &context, &descriptor)) {
+    alps_exact_sync_weight(src, dest, tile_row, tile_col, src_cols,
+                           weight_offset);
+    __atomic_fetch_add(&alps_exact_sync_fallbacks, 1, __ATOMIC_RELAXED);
+    return 0;
+  }
+  (void)context;
+  unsigned flat = (unsigned)descriptor_handle % ALPS_DESCRIPTOR_SLOTS;
+  descriptor->dest = dest;
+  descriptor->src = src;
+  descriptor->tile_row = tile_row;
+  descriptor->tile_col = tile_col;
+  descriptor->source_cols = src_cols;
+  descriptor->weight_offset = weight_offset;
+  descriptor->stage_offset = stage_offset;
+  descriptor->stage_slot = stage_offset >= 0 ? -1 : (int32_t)flat;
+  descriptor->dma_token = 0;
+  descriptor->dma_active = 0;
+  descriptor->dma_credit_owned = 0;
+
+  if (__atomic_load_n(&alps_p4a_enabled, __ATOMIC_ACQUIRE) &&
+      !__atomic_load_n(&alps_p4a_dma_allowed, __ATOMIC_ACQUIRE)) {
+    alps_exact_sync_weight(src, dest, tile_row, tile_col, src_cols,
+                           weight_offset);
+    __omni_fetch_descriptor_transition(descriptor_handle,
+                                       ALPS_DESC_LOAD_PENDING,
+                                       ALPS_DESC_LAYOUT_PENDING);
+    __omni_fetch_descriptor_transition(descriptor_handle,
+                                       ALPS_DESC_LAYOUT_PENDING,
+                                       ALPS_DESC_READY);
+    __atomic_fetch_add(&alps_exact_sync_fallbacks, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&alps_p4a_dma_suppressed, 1, __ATOMIC_RELAXED);
+    return 1;
+  }
+
+  int expected_credit = 0;
+  if (!__atomic_compare_exchange_n(&alps_exact_dma_credit, &expected_credit, 1,
+                                   0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+    /* Preserve the exact descriptor lifecycle even when the one DMA credit is
+     * busy.  The fallback produces the demanded WH tile synchronously and
+     * publishes READY, so consume/release counters still close exactly. */
+    alps_exact_sync_weight(src, dest, tile_row, tile_col, src_cols,
+                           weight_offset);
+    __omni_fetch_descriptor_transition(descriptor_handle,
+                                       ALPS_DESC_LOAD_PENDING,
+                                       ALPS_DESC_LAYOUT_PENDING);
+    __omni_fetch_descriptor_transition(descriptor_handle,
+                                       ALPS_DESC_LAYOUT_PENDING,
+                                       ALPS_DESC_READY);
+    __atomic_fetch_add(&alps_exact_sync_fallbacks, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&alps_exact_credit_fallbacks, 1, __ATOMIC_RELAXED);
+    return 1;
+  }
+  descriptor->dma_credit_owned = 1;
+
+  const _Float16 *row0 =
+      (const _Float16 *)src +
+      (size_t)tile_row * 32 * (size_t)src_cols + (size_t)tile_col * 32;
+#ifdef __hexagon__
+  int status = OMNI_DMA_OK;
+  void *stage = stage_offset >= 0
+                    ? (void *)((char *)dest + stage_offset)
+                    : (void *)alps_exact_stage[flat];
+  int dstAS = stage_offset >= 0 ? OMNI_VTCM : OMNI_DDR;
+  uint64_t issue_start =
+      __atomic_load_n(&alps_p4a_enabled, __ATOMIC_ACQUIRE)
+          ? alps_read_pcycles()
+          : 0;
+  descriptor->dma_token = hexagon_runtime_dma2d_start(
+      (void *)row0, OMNI_DDR, stage, dstAS, /*width=*/64, /*height=*/32,
+      (uint32_t)src_cols * 2u, /*dstStride=*/64, /*bypassSrc=*/0,
+      /*bypassDst=*/0, /*isOrdered=*/0, /*cacheAllocationPolicy=*/0, &status);
+  if (__atomic_load_n(&alps_p4a_enabled, __ATOMIC_ACQUIRE))
+    __atomic_fetch_add(&alps_p4a_issue_cycles,
+                       alps_read_pcycles() - issue_start, __ATOMIC_RELAXED);
+  if (status != OMNI_DMA_OK) {
+    descriptor->dma_credit_owned = 0;
+    __atomic_store_n(&alps_exact_dma_credit, 0, __ATOMIC_RELEASE);
+    alps_exact_sync_weight(src, dest, tile_row, tile_col, src_cols,
+                           weight_offset);
+    descriptor->dma_token = 0;
+    __omni_fetch_descriptor_transition(descriptor_handle,
+                                       ALPS_DESC_LOAD_PENDING,
+                                       ALPS_DESC_LAYOUT_PENDING);
+    __omni_fetch_descriptor_transition(descriptor_handle,
+                                       ALPS_DESC_LAYOUT_PENDING,
+                                       ALPS_DESC_READY);
+    __atomic_fetch_add(&alps_exact_sync_fallbacks, 1, __ATOMIC_RELAXED);
+    return 1;
+  }
+  /* Token zero is the first valid UserDMA ring token; status, not the numeric
+   * token value, distinguishes a successfully issued transfer. */
+  descriptor->dma_active = 1;
+#else
+  (void)row0;
+  omni_pack_weight_tile_to_stage((const _Float16 *)src, tile_row, tile_col,
+                                 src_cols, alps_exact_stage[flat]);
+#endif
+  __atomic_thread_fence(__ATOMIC_RELEASE);
+  __atomic_fetch_add(&alps_exact_dma_kicks, 1, __ATOMIC_RELAXED);
+  if (__atomic_load_n(&omni_dual_thread_dae, __ATOMIC_ACQUIRE))
+    hexagon_runtime_scout_enqueue(alps_exact_complete,
+                                  (void *)(intptr_t)descriptor_handle);
+  return 1;
+}
+
+int32_t __omni_fetch_exact_weight_consume(int32_t context_handle,
+                                          int64_t value_version,
+                                          int32_t tile_row,
+                                          int32_t tile_col) {
+  int32_t descriptor_handle =
+      alps_exact_find(context_handle, value_version, tile_row, tile_col);
+  if (descriptor_handle < 0)
+    return 0;
+  AlpsInvocationContext *context;
+  AlpsExactDescriptor *descriptor;
+  if (!alps_decode_descriptor(descriptor_handle, &context, &descriptor))
+    return 0;
+  (void)context;
+  int spins = 0;
+  for (;;) {
+    int state = __atomic_load_n(&descriptor->state, __ATOMIC_ACQUIRE);
+    if (state == ALPS_DESC_READY)
+      break;
+    if (state == ALPS_DESC_FAILED) {
+#ifdef __hexagon__
+      __builtin_trap();
+#endif
+      return 0;
+    }
+    if (state == ALPS_DESC_LOAD_PENDING) {
+      // If the scout has not claimed this descriptor by demand time, steal
+      // the completion work on the consumer.  The LOAD_PENDING CAS in the
+      // implementation makes this race-safe with the queued scout callback.
+      alps_exact_complete_impl((void *)(intptr_t)descriptor_handle,
+                               /*completed_by_scout=*/0);
+      continue;
+    }
+    if (state != ALPS_DESC_LAYOUT_PENDING) {
+      alps_descriptor_fail(OMNI_ERROR_DESCRIPTOR_STATE);
+      return 0;
+    }
+    if (++spins >= OMNI_SEM_MAX_SPIN) {
+      // Never let an experimental P3b run occupy the DSP indefinitely.  A
+      // timed-out layout owner cannot be stolen safely because it may still
+      // write the destination.  Fail loudly on device rather than allowing
+      // HMX to consume a non-READY tile; host contracts report false.
+      alps_descriptor_fail(OMNI_ERROR_DESCRIPTOR_STATE);
+#ifdef __hexagon__
+      __builtin_trap();
+#endif
+      return 0;
+    }
+#ifdef __hexagon__
+    __asm__ volatile("pause(#64)");
+#endif
+  }
+  __atomic_fetch_add(&alps_exact_consume_waits, (uint64_t)spins,
+                     __ATOMIC_RELAXED);
+  return __omni_fetch_descriptor_consume(
+      descriptor_handle, value_version,
+      alps_pack_tile_identity(tile_row, tile_col), LAYOUT_HMX_WEIGHT, OMNI_DDR,
+      OMNI_VTCM);
+}
+
+int32_t __omni_fetch_exact_weight_release(int32_t context_handle,
+                                          int64_t value_version,
+                                          int32_t tile_row,
+                                          int32_t tile_col) {
+  int32_t descriptor_handle =
+      alps_exact_find(context_handle, value_version, tile_row, tile_col);
+  if (descriptor_handle < 0)
+    return 0;
+  return __omni_fetch_descriptor_release(descriptor_handle);
+}
+
+uint64_t __omni_fetch_exact_dma_counts(void) {
+  uint64_t kicks = __atomic_load_n(&alps_exact_dma_kicks, __ATOMIC_RELAXED);
+  uint64_t completed =
+      __atomic_load_n(&alps_exact_dma_completed, __ATOMIC_RELAXED);
+  return (kicks << 32) | (completed & UINT64_C(0xffffffff));
+}
+
+uint64_t __omni_fetch_exact_overlap_counts(void) {
+  uint64_t scout =
+      __atomic_load_n(&alps_exact_scout_completed, __ATOMIC_RELAXED);
+  uint64_t fallback =
+      __atomic_load_n(&alps_exact_sync_fallbacks, __ATOMIC_RELAXED);
+  return (scout << 32) | (fallback & UINT64_C(0xffffffff));
+}
+
+uint64_t __omni_fetch_exact_consume_waits(void) {
+  return __atomic_load_n(&alps_exact_consume_waits, __ATOMIC_RELAXED);
+}
+
+uint64_t __omni_fetch_exact_control_counts(void) {
+  uint64_t credit =
+      __atomic_load_n(&alps_exact_credit_fallbacks, __ATOMIC_RELAXED);
+  uint64_t timeouts =
+      __atomic_load_n(&alps_exact_dma_timeouts, __ATOMIC_RELAXED);
+  return (credit << 32) | (timeouts & UINT64_C(0xffffffff));
+}
+
+uint64_t __omni_fetch_p4a_window_counts(void) {
+  uint64_t windows = __atomic_load_n(&alps_p4a_windows, __ATOMIC_RELAXED);
+  uint64_t suppressed =
+      __atomic_load_n(&alps_p4a_dma_suppressed, __ATOMIC_RELAXED);
+  return (windows << 32) | (suppressed & UINT64_C(0xffffffff));
+}
+
+uint64_t __omni_fetch_p4a_decision_counts(void) {
+  uint64_t throttle =
+      __atomic_load_n(&alps_p4a_throttle_decisions, __ATOMIC_RELAXED);
+  uint64_t hold =
+      __atomic_load_n(&alps_p4a_hold_decisions, __ATOMIC_RELAXED);
+  return (throttle << 32) | (hold & UINT64_C(0xffffffff));
+}
+
+uint64_t __omni_fetch_p4a_pmu_status_counts(void) {
+  uint64_t status = __atomic_load_n(&alps_p4a_pmu_status, __ATOMIC_RELAXED);
+  uint64_t reads = __atomic_load_n(&alps_p4a_pmu_reads, __ATOMIC_RELAXED);
+  return (status << 32) | (reads & UINT64_C(0xffffffff));
+}
+
+uint64_t __omni_fetch_p4a_issue_cycles(void) {
+  return __atomic_load_n(&alps_p4a_issue_cycles, __ATOMIC_RELAXED);
+}
+
+uint64_t __omni_fetch_p4a_poll_cycles(void) {
+  return __atomic_load_n(&alps_p4a_poll_cycles, __ATOMIC_RELAXED);
+}
+
+uint64_t __omni_fetch_p4a_poll_retries(void) {
+  return __atomic_load_n(&alps_p4a_total_poll_retries, __ATOMIC_RELAXED);
+}
+
+uint64_t __omni_fetch_p4a_pmu_values01(void) {
+  return ((uint64_t)alps_p4a_pmu_delta[0] << 32) |
+         (uint64_t)alps_p4a_pmu_delta[1];
+}
+
+uint64_t __omni_fetch_p4a_pmu_values23(void) {
+  return ((uint64_t)alps_p4a_pmu_delta[2] << 32) |
+         (uint64_t)alps_p4a_pmu_delta[3];
 }
 
 static void omni_async_complete(void) {

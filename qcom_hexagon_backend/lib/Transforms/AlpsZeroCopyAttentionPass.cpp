@@ -149,8 +149,26 @@ struct AbsorbQKHeadLayout final
     replacement->setAttr(
         "alps.p2a.eliminated_transpose_materialization_bytes",
         rewriter.getI64IntegerAttr(lhsBytes + rhsBytes));
+    // The replacement op may be erased by later vectorization/bufferization.
+    // Preserve a stable function-level contract for P2d admission and final
+    // audit instead of relying on arbitrary attributes surviving every
+    // downstream rewrite.
+    auto function = op->getParentOfType<FunctionOpInterface>();
+    int64_t sites = 0;
+    int64_t totalBytes = 0;
+    if (auto attr =
+            function->getAttrOfType<IntegerAttr>("alps.p2a.zero_copy_sites"))
+      sites = attr.getInt();
+    if (auto attr = function->getAttrOfType<IntegerAttr>(
+            "alps.p2a.eliminated_transpose_materialization_bytes"))
+      totalBytes = attr.getInt();
+    function->setAttr("alps.p2a.zero_copy_sites",
+                      rewriter.getI64IntegerAttr(sites + 1));
+    function->setAttr(
+        "alps.p2a.eliminated_transpose_materialization_bytes",
+        rewriter.getI64IntegerAttr(totalBytes + lhsBytes + rhsBytes));
     llvm::errs() << "[ALPS-P2A] function="
-                 << op->getParentOfType<FunctionOpInterface>().getName()
+                 << function.getName()
                  << " kind=qk_head_layout_absorption"
                  << " eliminated_transposes=2"
                  << " materialization_bytes=" << lhsBytes + rhsBytes << "\n";

@@ -27,6 +27,34 @@ inline llvm::StringRef getSignalFnName() { return "__omni_fetch_signal"; }
 /// Waits (polls) until the semaphore is posted.
 inline llvm::StringRef getWaitFnName() { return "__omni_fetch_wait"; }
 
+inline llvm::StringRef getInvocationBeginFnName() {
+  return "__omni_fetch_invocation_begin";
+}
+inline llvm::StringRef getInvocationEndFnName() {
+  return "__omni_fetch_invocation_end";
+}
+inline llvm::StringRef getDescriptorAcquireFnName() {
+  return "__omni_fetch_descriptor_acquire";
+}
+inline llvm::StringRef getDescriptorTransitionFnName() {
+  return "__omni_fetch_descriptor_transition";
+}
+inline llvm::StringRef getDescriptorConsumeFnName() {
+  return "__omni_fetch_descriptor_consume";
+}
+inline llvm::StringRef getDescriptorReleaseFnName() {
+  return "__omni_fetch_descriptor_release";
+}
+inline llvm::StringRef getExactWeightKickFnName() {
+  return "__omni_fetch_exact_weight_kick";
+}
+inline llvm::StringRef getExactWeightConsumeFnName() {
+  return "__omni_fetch_exact_weight_consume";
+}
+inline llvm::StringRef getExactWeightReleaseFnName() {
+  return "__omni_fetch_exact_weight_release";
+}
+
 /// Performs a layout-aware prefetch: DDR → VTCM with optional gather-reshape.
 /// Signature (C):
 ///   void __omni_fetch_prefetch_insitu(

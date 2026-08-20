@@ -739,6 +739,15 @@ def PrefetchInsert :
     Option<"enableDequantReshape", "enable-dequant-reshape", "bool",
            /*default=*/"false",
            "Use the W8 compressed cache and fuse dequantization with WH production.">,
+    Option<"enableAlpsFusedTransformTransfer", "enable-alps-fused-transform-transfer", "bool",
+           /*default=*/"false",
+           "ALPS P2c strict mode: process HexKL micro loops only and annotate synchronous fused transform-transfer sites.">,
+    Option<"requireAlpsAdmission", "require-alps-admission", "bool",
+           /*default=*/"false",
+           "Emit a K/V L2 hint only when P2d selected alps.p2d.action=l2_hint.">,
+    Option<"enableAlpsExactOverlap", "enable-alps-exact-overlap", "bool",
+           /*default=*/"false",
+           "ALPS P3b: emit descriptor-bound one-tile HMX weight DMA/scout overlap.">,
     Option<"kvCachePageTokens", "kv-cache-page-tokens", "int",
            /*default=*/"32",
            "Logical K/V cache page size in sequence tokens used for accounting and coalescing.">,
@@ -831,6 +840,73 @@ def AlpsMovementLedger :
     "mlir::memref::MemRefDialect",
     "mlir::tensor::TensorDialect",
     "mlir::vector::VectorDialect",
+  ];
+}
+
+//===----------------------------------------------------------------------===//
+// ALPS P2d: conservative static representation admission
+//===----------------------------------------------------------------------===//
+
+def AlpsMinimalStaticAdmission :
+    InterfacePass<"alps-minimal-static-admission", "mlir::FunctionOpInterface"> {
+  let summary = "Select a conservative movement action and emit an auditable decision ledger";
+  let description = [{
+    Consumes the representation metadata established by ALPS P0/P1/P2 and
+    selects only among native/no-op, page-safe L2 hint, synchronous in-situ,
+    and DMA/VTCM asynchronous actions.  L2 hints may be materialized
+    immediately.  Synchronous in-situ requires proven eliminated physical
+    bytes, while DMA/VTCM remains rejected until P3 provides exact readiness
+    and slot ownership.  The pass never performs a global search and records
+    every admission/rejection as stable operation attributes plus a ledger.
+  }];
+  let options = [
+    Option<"pageBytes", "page-bytes", "int64_t",
+           /*default=*/"4096",
+           "Page size used for page-footprint and safe L2 request accounting.">,
+    Option<"vtcmBudgetBytes", "vtcm-budget-bytes", "int64_t",
+           /*default=*/"2097152",
+           "Conservative per-function VTCM capacity available to admitted tiles.">,
+    Option<"minL2Bytes", "min-l2-bytes", "int64_t",
+           /*default=*/"4096",
+           "Reject L2 hints smaller than this many logical bytes.">,
+    Option<"minDmaBytes", "min-dma-bytes", "int64_t",
+           /*default=*/"4096",
+           "Reject DMA/VTCM candidates smaller than this many bytes.">,
+    Option<"minOverlapOps", "min-overlap-ops", "int64_t",
+           /*default=*/"8",
+           "Minimum static producer-to-consumer/loop window for an early action.">,
+    Option<"enableP3ExactReadiness", "enable-p3-exact-readiness", "bool",
+           /*default=*/"false",
+           "Allow a legal HMX weight candidate to select DMA/VTCM async after P3a.">,
+  ];
+  let constructor = "hexagon::createAlpsMinimalStaticAdmissionPass()";
+  let dependentDialects = [
+    "mlir::func::FuncDialect",
+    "mlir::linalg::LinalgDialect",
+    "mlir::memref::MemRefDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::vector::VectorDialect",
+  ];
+}
+
+//===----------------------------------------------------------------------===//
+// ALPS P3a: exact-readiness descriptor contract
+//===----------------------------------------------------------------------===//
+
+def AlpsExactReadiness :
+    InterfacePass<"alps-exact-readiness", "mlir::FunctionOpInterface"> {
+  let summary = "Audit admitted async prefetches for exact descriptor identity";
+  let description = [{
+    Establishes the compiler half of the P3a contract.  Only a P2d-admitted
+    DMA/VTCM prefetch with an enclosing tile loop and explicit tile operands
+    receives exact-readiness metadata.  Runtime state and lowering are
+    generation-safe; this pass does not start DMA, overlap work, or silently
+    fall back to the legacy process-global descriptor ring.
+  }];
+  let constructor = "hexagon::createAlpsExactReadinessPass()";
+  let dependentDialects = [
+    "mlir::omni_fetch::OmniFetchDialect",
+    "mlir::scf::SCFDialect",
   ];
 }
 

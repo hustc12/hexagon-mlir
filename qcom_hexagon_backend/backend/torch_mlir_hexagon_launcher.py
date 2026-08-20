@@ -165,7 +165,7 @@ class TorchMlirHexagonWrapperGenerator(HexagonWrapperGenerator):
     def generate_l2_scheduler_report(self, exec_dir):
         if not self._uses_l2_scheduler():
             return ""
-        return """
+        report = """
 uint64_t l2_scheduler_counts = __omni_fetch_l2_scheduler_counts();
 uint64_t l2_scheduler_limits = __omni_fetch_l2_scheduler_limits();
 uint64_t l2_requested_bytes = __omni_fetch_l2_requested_bytes();
@@ -189,6 +189,55 @@ if (l2_scheduler_report) {
   fclose(l2_scheduler_report);
 }
 """.replace("{exec_dir}", exec_dir)
+        if self.options.get("enableAlpsExactOverlap", False):
+            report += """
+uint64_t exact_dma = __omni_fetch_exact_dma_counts();
+uint64_t exact_overlap = __omni_fetch_exact_overlap_counts();
+uint64_t exact_waits = __omni_fetch_exact_consume_waits();
+uint64_t exact_control = __omni_fetch_exact_control_counts();
+uint64_t exact_descriptors = __omni_fetch_descriptor_counts();
+uint64_t exact_releases = __omni_fetch_descriptor_release_failures();
+FILE *exact_report = fopen("{exec_dir}/perf.txt", "a");
+if (exact_report) {
+  fprintf(exact_report,
+          "ALPSExactOverlap: kicks=%u completed=%u scout_completed=%u "
+          "sync_fallbacks=%u consume_spins=%llu acquired=%u consumed=%u "
+          "released=%u failures=%u credit_fallbacks=%u dma_timeouts=%u\\n",
+          (unsigned)(exact_dma >> 32), (unsigned)exact_dma,
+          (unsigned)(exact_overlap >> 32), (unsigned)exact_overlap,
+          (unsigned long long)exact_waits,
+          (unsigned)(exact_descriptors >> 32), (unsigned)exact_descriptors,
+          (unsigned)(exact_releases >> 32), (unsigned)exact_releases,
+          (unsigned)(exact_control >> 32), (unsigned)exact_control);
+  fclose(exact_report);
+}
+""".replace("{exec_dir}", exec_dir)
+        if self.options.get("enableAlpsTrafficControl", False):
+            report += """
+uint64_t p4a_windows = __omni_fetch_p4a_window_counts();
+uint64_t p4a_decisions = __omni_fetch_p4a_decision_counts();
+uint64_t p4a_pmu = __omni_fetch_p4a_pmu_status_counts();
+uint64_t p4a_pmu01 = __omni_fetch_p4a_pmu_values01();
+uint64_t p4a_pmu23 = __omni_fetch_p4a_pmu_values23();
+FILE *p4a_report = fopen("{exec_dir}/perf.txt", "a");
+if (p4a_report) {
+  fprintf(p4a_report,
+          "ALPSP4A: windows=%u dma_suppressed=%u throttle=%u hold=%u "
+          "pmu_status=%u pmu_reads=%u issue_cycles=%llu poll_cycles=%llu "
+          "poll_retries=%llu udma_active=%u dmpoll_cycles=%u "
+          "coherent_read_cycles=%u vtcm_write_cycles=%u\\n",
+          (unsigned)(p4a_windows >> 32), (unsigned)p4a_windows,
+          (unsigned)(p4a_decisions >> 32), (unsigned)p4a_decisions,
+          (unsigned)(p4a_pmu >> 32), (unsigned)p4a_pmu,
+          (unsigned long long)__omni_fetch_p4a_issue_cycles(),
+          (unsigned long long)__omni_fetch_p4a_poll_cycles(),
+          (unsigned long long)__omni_fetch_p4a_poll_retries(),
+          (unsigned)(p4a_pmu01 >> 32), (unsigned)p4a_pmu01,
+          (unsigned)(p4a_pmu23 >> 32), (unsigned)p4a_pmu23);
+  fclose(p4a_report);
+}
+""".replace("{exec_dir}", exec_dir)
+        return report
 
     def _uses_l2_scheduler(self):
         return any(
@@ -199,6 +248,7 @@ if (l2_scheduler_report) {
                 "enableAlpsKvRuntimePrefetch",
                 "enablePrefetchKernelHX",
                 "enableAPTGetHX",
+                "enableAlpsExactOverlap",
             )
         )
 
@@ -224,6 +274,8 @@ if (l2_scheduler_report) {
             benchmarking = benchmarking.replace(
                 'fopen("perf.txt", "a")', f'fopen("{exec_dir}/perf.txt", "a")'
             )
+            if self.options.get("enableAlpsTrafficControl", False):
+                benchmarking = "__omni_fetch_p4a_configure(1);\n" + benchmarking
             return benchmarking + self.generate_l2_scheduler_report(exec_dir)
         context = int.from_bytes(
             hashlib.sha256(self.func_name.encode("utf-8")).digest()[:8], "little"
@@ -323,6 +375,42 @@ extern "C" __attribute__((weak)) uint64_t
 __omni_fetch_l2_policy_suppressed(void) { return 0; }
 extern "C" __attribute__((weak)) void
 __omni_fetch_l2_configure(uint32_t, uint64_t, uint32_t) {}
+"""
+        if self.options.get("enableAlpsExactOverlap", False):
+            code_headers += """
+extern "C" __attribute__((weak)) uint64_t
+__omni_fetch_exact_dma_counts(void) { return 0; }
+extern "C" __attribute__((weak)) uint64_t
+__omni_fetch_exact_overlap_counts(void) { return 0; }
+extern "C" __attribute__((weak)) uint64_t
+__omni_fetch_exact_consume_waits(void) { return 0; }
+extern "C" __attribute__((weak)) uint64_t
+__omni_fetch_exact_control_counts(void) { return 0; }
+extern "C" __attribute__((weak)) uint64_t
+__omni_fetch_descriptor_counts(void) { return 0; }
+extern "C" __attribute__((weak)) uint64_t
+__omni_fetch_descriptor_release_failures(void) { return 0; }
+"""
+        if self.options.get("enableAlpsTrafficControl", False):
+            code_headers += """
+extern "C" __attribute__((weak)) void
+__omni_fetch_p4a_configure(int32_t) {}
+extern "C" __attribute__((weak)) uint64_t
+__omni_fetch_p4a_window_counts(void) { return 0; }
+extern "C" __attribute__((weak)) uint64_t
+__omni_fetch_p4a_decision_counts(void) { return 0; }
+extern "C" __attribute__((weak)) uint64_t
+__omni_fetch_p4a_pmu_status_counts(void) { return 0; }
+extern "C" __attribute__((weak)) uint64_t
+__omni_fetch_p4a_issue_cycles(void) { return 0; }
+extern "C" __attribute__((weak)) uint64_t
+__omni_fetch_p4a_poll_cycles(void) { return 0; }
+extern "C" __attribute__((weak)) uint64_t
+__omni_fetch_p4a_poll_retries(void) { return 0; }
+extern "C" __attribute__((weak)) uint64_t
+__omni_fetch_p4a_pmu_values01(void) { return 0; }
+extern "C" __attribute__((weak)) uint64_t
+__omni_fetch_p4a_pmu_values23(void) { return 0; }
 """
 
         code_define = self.common_strings.code_define.format(

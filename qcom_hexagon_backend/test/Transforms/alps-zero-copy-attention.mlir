@@ -1,4 +1,5 @@
 // RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(func.func(alps-zero-copy-attention))' | FileCheck %s
+// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(func.func(alps-zero-copy-attention,alps-minimal-static-admission))' 2>&1 | FileCheck %s --check-prefix=ADMISSION
 
 func.func @qk_layout(%q: tensor<1x3x2x4xf16>,
                      %k: tensor<1x5x2x4xf16>,
@@ -22,6 +23,8 @@ func.func @qk_layout(%q: tensor<1x3x2x4xf16>,
 // CHECK: #[[LHS:.*]] = affine_map<(d0, d1, d2, d3) -> (0, d1, d0, d3)>
 // CHECK: #[[RHS:.*]] = affine_map<(d0, d1, d2, d3) -> (0, d2, d0, d3)>
 // CHECK-LABEL: func.func @qk_layout
+// CHECK-SAME: alps.p2a.eliminated_transpose_materialization_bytes = 128
+// CHECK-SAME: alps.p2a.zero_copy_sites = 1
 // CHECK-NOT: linalg.transpose
 // CHECK-NOT: tensor.collapse_shape
 // CHECK-NOT: linalg.batch_matmul
@@ -30,3 +33,9 @@ func.func @qk_layout(%q: tensor<1x3x2x4xf16>,
 // CHECK: arith.extf
 // CHECK: arith.mulf
 // CHECK: arith.addf
+
+// ADMISSION: [ALPS-P2D-SITE] function=qk_layout ordinal=-1
+// ADMISSION-SAME: kind=zero_copy_representation action=no_op
+// ADMISSION-SAME: reason=p2a_eliminated_transfer
+// ADMISSION-SAME: count=1
+// ADMISSION: [ALPS-P2D-SUMMARY] function=qk_layout candidates=1 no_op=1 native=0

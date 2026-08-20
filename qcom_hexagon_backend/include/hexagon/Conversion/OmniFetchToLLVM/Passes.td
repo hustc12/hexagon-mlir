@@ -24,6 +24,8 @@ def OmniFetchToLLVM : Pass<"omni-fetch-to-llvm", "mlir::ModuleOp"> {
     - `omni_fetch.create_sem`         → `__omni_fetch_create_sem() -> i32`
     - `omni_fetch.signal(%sem)`       → `__omni_fetch_signal(sem: i32)`
     - `omni_fetch.wait(%sem)`         → `__omni_fetch_wait(sem: i32)`
+    - `omni_fetch.invocation_*`       → generation-safe P3 context calls
+    - `omni_fetch.descriptor_*`       → exact-readiness descriptor calls
     - `omni_fetch.prefetch_in_situ`   → `__omni_fetch_prefetch_insitu(
                                             src_ptr, dest_ptr, elem_bytes,
                                             num_elems, layout_kind,

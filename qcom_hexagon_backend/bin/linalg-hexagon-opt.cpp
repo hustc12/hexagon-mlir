@@ -29,7 +29,7 @@
 #include "hexagon/Conversion/HexagonMemToLLVM/Passes.h"
 #include "hexagon/Conversion/LinalgToLLVM/Passes.h"
 #include "hexagon/Dialect/Crouton/IR/CroutonDialect.h"
-#include "hexagon/Conversion/OmniFetchToLLVM/OmniFetchToLLVM.h"
+#include "hexagon/Conversion/OmniFetchToLLVM/Passes.h"
 #include "hexagon/Dialect/HexKL/IR/HexKLDialect.h"
 #include "hexagon/Dialect/HexKL/Transforms/BufferizableOpInterfaceImpl.h"
 #include "hexagon/Dialect/HexagonMem/IR/HexagonMemDialect.h"
@@ -135,10 +135,13 @@ int main(int argc, char **argv) {
   mlir::hexagon::registerPrefetchInsertPass();
   mlir::hexagon::registerPrefetchKernelHXPass();
   mlir::hexagon::registerAlpsMovementLedgerPass();
+  mlir::hexagon::registerAlpsMinimalStaticAdmissionPass();
+  mlir::hexagon::registerAlpsExactReadinessPass();
   mlir::hexagon::registerAlpsZeroCopyAttentionPass();
   mlir::hexagon::registerAlpsProducerDirectAttentionPass();
   mlir::hexagon::registerOmniFetchVDAEInsertPass();
   mlir::hexagon::registerLayoutOpsEliminationPass();
+  mlir::omni_fetch::registerOmniFetchToLLVMPass();
 
   // Register all external models.
   mlir::hexkl::registerBufferizableOpInterfaceExternalModels(registry);

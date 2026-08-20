@@ -110,6 +110,129 @@ def OmniFetch_WaitOp : OmniFetch_Op<"wait",
 }
 
 // ---------------------------------------------------------------------------
+// ALPS P3 exact-readiness descriptor ops
+// ---------------------------------------------------------------------------
+
+def OmniFetch_InvocationBeginOp : OmniFetch_Op<"invocation_begin",
+    [MemoryEffects<[MemWrite]>]> {
+  let summary = "Begin an invocation-local exact-readiness context";
+  let description = [{
+    Acquires a generation-tagged runtime context.  The opaque index result is
+    the only authority under which P3 descriptors may be acquired; it avoids
+    the implicit process-global ownership of the legacy async ring.
+  }];
+  let results = (outs Index:$context);
+  let assemblyFormat = "attr-dict `:` type($context)";
+}
+
+def OmniFetch_InvocationEndOp : OmniFetch_Op<"invocation_end",
+    [MemoryEffects<[MemRead, MemWrite]>]> {
+  let summary = "End an invocation-local exact-readiness context";
+  let arguments = (ins Index:$context);
+  let results = (outs I1:$success);
+  let assemblyFormat = "$context attr-dict `:` type($context) `->` type($success)";
+}
+
+def OmniFetch_DescriptorAcquireOp : OmniFetch_Op<"descriptor_acquire",
+    [MemoryEffects<[MemRead, MemWrite]>]> {
+  let summary = "Acquire one exact tile descriptor in LOAD_PENDING state";
+  let description = [{
+    Binds one runtime slot to the exact tuple (invocation generation, value
+    version, tile, layout, source tier, destination tier).  A negative opaque
+    handle means that bounded descriptor capacity was unavailable and P3b
+    must take its synchronous fallback.
+  }];
+  let arguments = (ins Index:$context, Index:$value_version, Index:$tile,
+                       I32:$layout, I32:$source_tier, I32:$destination_tier);
+  let results = (outs Index:$descriptor);
+  let assemblyFormat = [{
+    $context `,` $value_version `,` $tile `,` $layout `,` $source_tier `,`
+    $destination_tier attr-dict `:` type($context) `,` type($value_version)
+    `,` type($tile) `,` type($layout) `,` type($source_tier) `,`
+    type($destination_tier) `->` type($descriptor)
+  }];
+}
+
+def OmniFetch_DescriptorTransitionOp : OmniFetch_Op<"descriptor_transition",
+    [MemoryEffects<[MemRead, MemWrite]>]> {
+  let summary = "Perform one checked exact-readiness state transition";
+  let arguments = (ins Index:$descriptor, I32:$expected_state,
+                       I32:$next_state);
+  let results = (outs I1:$success);
+  let assemblyFormat = [{
+    $descriptor `,` $expected_state `,` $next_state attr-dict `:`
+    type($descriptor) `,` type($expected_state) `,` type($next_state)
+    `->` type($success)
+  }];
+}
+
+def OmniFetch_DescriptorConsumeOp : OmniFetch_Op<"descriptor_consume",
+    [MemoryEffects<[MemRead, MemWrite]>]> {
+  let summary = "Consume READY only when the complete tile identity matches";
+  let arguments = (ins Index:$descriptor, Index:$value_version, Index:$tile,
+                       I32:$layout, I32:$source_tier, I32:$destination_tier);
+  let results = (outs I1:$success);
+  let assemblyFormat = [{
+    $descriptor `,` $value_version `,` $tile `,` $layout `,` $source_tier `,`
+    $destination_tier attr-dict `:` type($descriptor) `,` type($value_version)
+    `,` type($tile) `,` type($layout) `,` type($source_tier) `,`
+    type($destination_tier) `->` type($success)
+  }];
+}
+
+def OmniFetch_DescriptorReleaseOp : OmniFetch_Op<"descriptor_release",
+    [MemoryEffects<[MemRead, MemWrite]>]> {
+  let summary = "Release a CONSUMING descriptor back to FREE";
+  let arguments = (ins Index:$descriptor);
+  let results = (outs I1:$success);
+  let assemblyFormat = "$descriptor attr-dict `:` type($descriptor) `->` type($success)";
+}
+
+def OmniFetch_ExactWeightKickOp : OmniFetch_Op<"exact_weight_kick",
+    [MemoryEffects<[MemRead, MemWrite]>]> {
+  let summary = "Start descriptor-bound DMA for one future HMX weight tile";
+  let arguments = (ins Index:$context, Index:$value_version,
+                       AnyMemRef:$src, AnyMemRef:$dest,
+                       I32:$tile_row, I32:$tile_col, I32:$source_cols,
+                       I32:$weight_offset, I32:$stage_offset);
+  let results = (outs I1:$scheduled);
+  let assemblyFormat = [{
+    $context `,` $value_version `,` $src `,` $dest `,` $tile_row `,`
+    $tile_col `,` $source_cols `,` $weight_offset `,` $stage_offset
+    attr-dict `:` type($context) `,` type($value_version) `,`
+    qualified(type($src)) `,` qualified(type($dest)) `,` type($tile_row) `,`
+    type($tile_col) `,` type($source_cols) `,` type($weight_offset) `,`
+    type($stage_offset) `->` type($scheduled)
+  }];
+}
+
+def OmniFetch_ExactWeightConsumeOp : OmniFetch_Op<"exact_weight_consume",
+    [MemoryEffects<[MemRead, MemWrite]>]> {
+  let summary = "Wait for and consume the exact READY HMX weight tile";
+  let arguments = (ins Index:$context, Index:$value_version,
+                       I32:$tile_row, I32:$tile_col);
+  let results = (outs I1:$success);
+  let assemblyFormat = [{
+    $context `,` $value_version `,` $tile_row `,` $tile_col attr-dict `:`
+    type($context) `,` type($value_version) `,` type($tile_row) `,`
+    type($tile_col) `->` type($success)
+  }];
+}
+
+def OmniFetch_ExactWeightReleaseOp : OmniFetch_Op<"exact_weight_release",
+    [MemoryEffects<[MemRead, MemWrite]>]> {
+  let summary = "Release the exact weight tile after its HMX consumer";
+  let arguments = (ins Index:$context, Index:$value_version,
+                       I32:$tile_row, I32:$tile_col);
+  let results = (outs I1:$success);
+  let assemblyFormat = [{
+    $context `,` $value_version `,` $tile_row `,` $tile_col attr-dict `:`
+    type($context) `,` type($value_version) `,` type($tile_row) `,`
+    type($tile_col) `->` type($success)
+  }];
+}
+
+// ---------------------------------------------------------------------------
 // Prefetch op
 // ---------------------------------------------------------------------------
 

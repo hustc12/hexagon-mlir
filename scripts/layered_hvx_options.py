@@ -107,6 +107,24 @@ def make_layered_hvx_options(args: argparse.Namespace) -> dict:
     options["enableAlpsProducerDirectAttention"] = (
         os.environ.get("ALPS_ENABLE_PRODUCER_DIRECT_ATTENTION", "0") == "1"
     )
+    options["enableAlpsFusedTransformTransfer"] = (
+        os.environ.get("ALPS_ENABLE_FUSED_TRANSFORM_TRANSFER", "0") == "1"
+    )
+    options["enableAlpsMinimalStaticAdmission"] = (
+        os.environ.get("ALPS_ENABLE_MINIMAL_STATIC_ADMISSION", "0") == "1"
+    )
+    options["enableAlpsExactReadiness"] = (
+        os.environ.get("ALPS_ENABLE_EXACT_READINESS", "0") == "1"
+    )
+    options["enableAlpsExactOverlap"] = (
+        os.environ.get("ALPS_ENABLE_EXACT_OVERLAP", "0") == "1"
+    )
+    options["enableAlpsTrafficControl"] = (
+        os.environ.get("ALPS_ENABLE_TRAFFIC_CONTROL", "0") == "1"
+    )
+    # Keep P3b issuer-owned: UserDMA start/poll must remain on the same
+    # Hexagon hardware thread.  Dual-thread DAE remains an independent switch
+    # for schemes whose completion work is safe to execute on the scout.
     options["enableOmniFetchDmaToVtcm"] = False
     options["enableHexagonmemCopyToDMA"] = False
 
@@ -116,6 +134,10 @@ def make_layered_hvx_options(args: argparse.Namespace) -> dict:
         "uniform_fp16=1 vtcm_tiling=0 conversion_to_fp16=0 "
         f"prefetch_baseline={args.prefetch_baseline} "
         f"legacy_item7={int(item7)} alps_p0_mode={alps_mode} "
-        f"alps_p1_ledger={int(options['enableAlpsMovementLedger'])}"
+        f"alps_p1_ledger={int(options['enableAlpsMovementLedger'])} "
+        f"alps_p2d_admission={int(options['enableAlpsMinimalStaticAdmission'])} "
+        f"alps_p3a_exact={int(options['enableAlpsExactReadiness'])}"
+        f" alps_p3b_overlap={int(options['enableAlpsExactOverlap'])}"
+        f" alps_p4a_traffic={int(options['enableAlpsTrafficControl'])}"
     )
     return options

@@ -53,6 +53,8 @@ add_mlir_library(Transforms
   PrefetchInsertPass.cpp
   PrefetchKernelHXPass.cpp
   AlpsMovementLedgerPass.cpp
+  AlpsMinimalStaticAdmissionPass.cpp
+  AlpsExactReadinessPass.cpp
   AlpsProducerDirectAttentionPass.cpp
   AlpsZeroCopyAttentionPass.cpp
   VDAEDecouplePass.cpp

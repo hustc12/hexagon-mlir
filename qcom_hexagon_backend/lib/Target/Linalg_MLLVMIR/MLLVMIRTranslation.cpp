@@ -238,6 +238,26 @@ void setLinalgToLLVMOptions(
         (it != arch_kwargs.end() && !it->second.compare(TRUE));
   }
   {
+    auto it = arch_kwargs.find("enableAlpsFusedTransformTransfer");
+    options.enableAlpsFusedTransformTransfer =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsMinimalStaticAdmission");
+    options.enableAlpsMinimalStaticAdmission =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsExactReadiness");
+    options.enableAlpsExactReadiness =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsExactOverlap");
+    options.enableAlpsExactOverlap =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
     auto it = arch_kwargs.find("alpsLedgerPageBytes");
     if (it != arch_kwargs.end())
       options.alpsLedgerPageBytes = std::stoll(it->second);

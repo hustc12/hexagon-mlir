@@ -91,6 +91,9 @@ struct TransformStats {
   int64_t persistentCandidates = 0;
   int64_t persistent = 0;
   int64_t dequant = 0;
+  int64_t alpsP2cWeightSites = 0;
+  int64_t alpsP2cActivationSites = 0;
+  int64_t alpsP2cReplacedIrOps = 0;
 };
 
 struct KvCachePrefetchStats {
@@ -227,6 +230,13 @@ static void annotateTransformDecision(Operation *op,
               builder.getI64IntegerAttr(decision.outerReuse));
   if (decision.persistentCandidate)
     op->setAttr("omni_fetch.persistent_candidate", builder.getUnitAttr());
+}
+
+static void annotateAlpsP2c(Operation *op, StringRef kind) {
+  Builder builder(op->getContext());
+  op->setAttr("alps.p2c.fused_transform_transfer", builder.getUnitAttr());
+  op->setAttr("alps.p2c.kind", builder.getStringAttr(kind));
+  op->setAttr("alps.p2c.synchronous", builder.getUnitAttr());
 }
 
 /// Returns true if `op` or any op in its nest uses HMX or HVX compute operations.
@@ -767,7 +777,8 @@ static Value createDdrTileSubview(OpBuilder &b, Location loc, Value src,
 /// page count even when adjacent pages are coalesced into one hint.
 static KvCachePrefetchStats
 insertKvCachePrefetchHints(func::FuncOp func, int64_t kvCachePageTokens,
-                           bool stageInVtcm, bool enableAsyncOverlap) {
+                           bool stageInVtcm, bool enableAsyncOverlap,
+                           bool requireAlpsAdmission) {
   KvCachePrefetchStats stats;
   DenseMap<Value, Value> stagedBuffers;
   if (kvCachePageTokens <= 0) {
@@ -856,6 +867,11 @@ insertKvCachePrefetchHints(func::FuncOp func, int64_t kvCachePageTokens,
         consumer->getAttrOfType<StringAttr>("omni_fetch.kv_cache_layout");
     if (!role)
       continue;
+    if (requireAlpsAdmission) {
+      auto action = consumer->getAttrOfType<StringAttr>("alps.p2d.action");
+      if (!action || action.getValue() != "l2_hint")
+        continue;
+    }
 
     Value src = candidate.src;
     while (true) {
@@ -1113,6 +1129,8 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
                                          bool enablePersistentWhCache,
                                          bool enableTwoDimPipeline,
                                          bool enableDequantReshape,
+                                         bool enableAlpsFusedTransformTransfer,
+                                         bool enableAlpsExactOverlap,
                                          TransformStats &stats) {
   if (!enableLayoutAware) {
     // ----- Phase 1 path: L2 hints only -----
@@ -1181,6 +1199,23 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
     if (auto wh = dyn_cast<hexkl::MicroHMXRmToWhF16Op>(&op))
       whOps.push_back(wh);
 
+  bool hasExactWeight = enableAlpsExactOverlap && llvm::any_of(
+      whOps, [](hexkl::MicroHMXRmToWhF16Op wh) {
+        auto action = wh->getAttrOfType<StringAttr>("alps.p2d.action");
+        return action && action.getValue() == "dma_vtcm_async";
+      });
+  Value exactContext;
+  int64_t exactVersion = 0;
+  if (hasExactWeight) {
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPoint(loop);
+    exactContext = builder.create<InvocationBeginOp>(
+        loop.getLoc(), builder.getIndexType());
+    builder.setInsertionPointAfter(loop);
+    builder.create<InvocationEndOp>(loop.getLoc(), builder.getI1Type(),
+                                    exactContext);
+  }
+
   for (auto wh : whOps) {
     Location loc = wh.getLoc();
     hexkl::MicroHMXMmF16Op mmOp;
@@ -1206,6 +1241,9 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
     TransformDecision decision =
         decideWeightTransform(loop, wtTy, lookahead,
                               enablePersistentWhCache);
+    auto p2dAction = wh->getAttrOfType<StringAttr>("alps.p2d.action");
+    bool exactAdmitted = hasExactWeight && p2dAction &&
+                         p2dAction.getValue() == "dma_vtcm_async";
     // Item 5 composes with item 4: profitable sites use the load/reshape/
     // compute pipeline, while the runtime cache services or populates each
     // pipelined tile using the compiler-assigned site identity.
@@ -1218,6 +1256,9 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
         getStaticTripCount(loop).value_or(0) >= 2 &&
         decision.usefulTiles >= 2)
       decision.mode = TransformMode::AsyncInSitu;
+    if (enableAlpsExactOverlap)
+      decision.mode = exactAdmitted ? TransformMode::AsyncInSitu
+                                    : TransformMode::Native;
     // Item 8 owns a persistent W8 tile cache in the runtime.  Its first
     // implementation keeps production synchronous: a warm hit reads 1 KiB
     // of W8 data, dequantizes directly into a 2 KiB tile, and immediately
@@ -1249,6 +1290,12 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
       Value c2 = b.create<arith::ConstantIntOp>(loc, i32Ty, 2);
       Value c4096 = b.create<arith::ConstantIntOp>(loc, i32Ty, 4096);
       Value neg4096 = b.create<arith::ConstantIntOp>(loc, i32Ty, -4096);
+      Value version;
+      if (exactAdmitted) {
+        OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPoint(loop);
+        version = builder.create<arith::ConstantIndexOp>(loc, exactVersion++);
+      }
 
       Value ub = loop.getUpperBound();
       Value ubI32 = b.create<arith::IndexCastOp>(loc, i32Ty, ub);
@@ -1263,6 +1310,8 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
         stageOff = b.create<arith::MulIOp>(loc, kTilesPlus2, c4096);
         syncParams.push_back(stageOff);
       }
+      if (!stageOff)
+        stageOff = b.create<arith::ConstantIntOp>(loc, i32Ty, -1);
 
       Value hybridSiteId;
       if (enableTwoDimPipeline && enablePersistentWhCache &&
@@ -1293,6 +1342,28 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
             b.create<arith::IndexCastOp>(loc, i32Ty, loop.getLowerBound());
         Value isFirst = b.create<arith::CmpIOp>(
             loc, arith::CmpIPredicate::eq, ktVal, lbI32);
+        if (exactAdmitted) {
+          Value isNotFirst = b.create<arith::CmpIOp>(
+              loc, arith::CmpIPredicate::ne, ktVal, lbI32);
+          b.create<scf::IfOp>(
+              loc, isNotFirst,
+              [&](OpBuilder &thenBuilder, Location thenLoc) {
+                thenBuilder.create<ExactWeightConsumeOp>(
+                    thenLoc, thenBuilder.getI1Type(), exactContext, version,
+                    ktVal, colVal);
+                thenBuilder.create<scf::YieldOp>(thenLoc);
+              });
+          OpBuilder afterMm(mmOp);
+          afterMm.setInsertionPointAfter(mmOp);
+          afterMm.create<scf::IfOp>(
+              loc, isNotFirst,
+              [&](OpBuilder &thenBuilder, Location thenLoc) {
+                thenBuilder.create<ExactWeightReleaseOp>(
+                    thenLoc, thenBuilder.getI1Type(), exactContext, version,
+                    ktVal, colVal);
+                thenBuilder.create<scf::YieldOp>(thenLoc);
+              });
+        }
         b.create<scf::IfOp>(
             loc, isFirst, [&](OpBuilder &thenBuilder, Location thenLoc) {
               emitSyncCurrent(thenBuilder, thenLoc);
@@ -1328,12 +1399,23 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
                     thenLoc, i32Ty, -1));
               asyncParams.push_back(hybridSiteId);
             }
-            auto asyncPrefetch = thenBuilder.create<PrefetchInSituOp>(
-                thenLoc, srcMem, vtcmMem,
-                enableDequantReshape ? LayoutTransform::HMXWeightDequantI8
-                                     : LayoutTransform::HMXWeight,
-                /*lookahead=*/1, DenseI32ArrayAttr{}, asyncParams);
-            annotateTransformDecision(asyncPrefetch, decision);
+            if (exactAdmitted) {
+              auto kick = thenBuilder.create<ExactWeightKickOp>(
+                  thenLoc, thenBuilder.getI1Type(), exactContext, version,
+                  srcMem, vtcmMem, nextKtRaw, colVal, wtCols, nextOff,
+                  stageOff);
+              kick->setAttr("alps.p2d.action",
+                            thenBuilder.getStringAttr("dma_vtcm_async"));
+              kick->setAttr("alps.p3b.lookahead",
+                            thenBuilder.getI64IntegerAttr(1));
+            } else {
+              auto asyncPrefetch = thenBuilder.create<PrefetchInSituOp>(
+                  thenLoc, srcMem, vtcmMem,
+                  enableDequantReshape ? LayoutTransform::HMXWeightDequantI8
+                                       : LayoutTransform::HMXWeight,
+                  /*lookahead=*/1, DenseI32ArrayAttr{}, asyncParams);
+              annotateTransformDecision(asyncPrefetch, decision);
+            }
             thenBuilder.create<scf::YieldOp>(thenLoc);
           });
       ++inserted;
@@ -1367,6 +1449,11 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
           selectedLookahead, DenseI32ArrayAttr{},
           persistentParams);
       annotateTransformDecision(syncPrefetch, decision);
+      if (enableAlpsFusedTransformTransfer) {
+        annotateAlpsP2c(syncPrefetch, "hmx_weight");
+        ++stats.alpsP2cWeightSites;
+        ++stats.alpsP2cReplacedIrOps;
+      }
       ++inserted;
     }
     wh->erase();
@@ -1409,6 +1496,11 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
     activationDecision.score = 100;
     activationDecision.outerReuse = estimateOuterReuse(loop);
     annotateTransformDecision(activationPrefetch, activationDecision);
+    if (enableAlpsFusedTransformTransfer) {
+      annotateAlpsP2c(activationPrefetch, "hmx_activation");
+      ++stats.alpsP2cActivationSites;
+      stats.alpsP2cReplacedIrOps += 2;
+    }
     ++inserted;
     ++stats.sync;
     rmAh->erase();
@@ -1433,6 +1525,8 @@ static void insertPrefetchForLoop(scf::ForOp loop, int lookahead,
                                   bool enablePersistentWhCache,
                                   bool enableTwoDimPipeline,
                                   bool enableDequantReshape,
+                                  bool enableAlpsFusedTransformTransfer,
+                                  bool enableAlpsExactOverlap,
                                   TransformStats &stats) {
   OpBuilder builder(loop);
   Location loc = loop.getLoc();
@@ -1446,7 +1540,10 @@ static void insertPrefetchForLoop(scf::ForOp loop, int lookahead,
                                           lookahead, enableDmaToVtcm,
                                           enablePersistentWhCache,
                                           enableTwoDimPipeline,
-                                          enableDequantReshape, stats);
+                                          enableDequantReshape,
+                                          enableAlpsFusedTransformTransfer,
+                                          enableAlpsExactOverlap,
+                                          stats);
     llvm::errs() << "[PrefetchInsert] Total prefetch sites: " << n
                  << " shadow_kb=0\n";
     return;
@@ -1639,16 +1736,21 @@ struct PrefetchInsertPass
                  << ", enableKvCachePrefetch=" << enableKvCachePrefetch
                  << ", kvCacheOnly=" << kvCacheOnly
                  << ", enableDequantReshape=" << enableDequantReshape
+                 << ", enableAlpsFusedTransformTransfer="
+                 << enableAlpsFusedTransformTransfer
+                 << ", requireAlpsAdmission=" << requireAlpsAdmission
                  << ", kvCachePageTokens=" << kvCachePageTokens
                  << " (forced off in HVX insert for safety)\n";
 
     if (enableKvCachePrefetch)
       insertKvCachePrefetchHints(func, kvCachePageTokens, enableDmaToVtcm,
-                                 enableTwoDimPipeline);
+                                 enableTwoDimPipeline,
+                                 requireAlpsAdmission);
 
     const bool funcHasHexKL = containsHexKLCompute(func);
 
-    if (!kvCacheOnly)
+    if (!kvCacheOnly &&
+        (!enableAlpsFusedTransformTransfer || funcHasHexKL))
       func.walk([&](scf::ForOp loop) {
       bool hasNestedFor = false;
       loop.getBody()->walk([&](scf::ForOp) { hasNestedFor = true; });
@@ -1681,7 +1783,9 @@ struct PrefetchInsertPass
                    << " at " << loop.getLoc() << " ---\n";
       insertPrefetchForLoop(loop, lookahead, enableLayoutAware,
                             enableDmaToVtcm, enablePersistentWhCache,
-                            enableTwoDimPipeline, enableDequantReshape, stats);
+                            enableTwoDimPipeline, enableDequantReshape,
+                            enableAlpsFusedTransformTransfer,
+                            enableAlpsExactOverlap, stats);
     }
 
     Builder builder(func.getContext());
@@ -1699,6 +1803,25 @@ struct PrefetchInsertPass
                   builder.getBoolAttr(enableDequantReshape));
     func->setAttr("omni_fetch.dequant_reshape_sites",
                   builder.getI64IntegerAttr(stats.dequant));
+    func->setAttr("alps.p2c.weight_sites",
+                  builder.getI64IntegerAttr(stats.alpsP2cWeightSites));
+    func->setAttr("alps.p2c.activation_sites",
+                  builder.getI64IntegerAttr(stats.alpsP2cActivationSites));
+    func->setAttr("alps.p2c.replaced_ir_ops",
+                  builder.getI64IntegerAttr(stats.alpsP2cReplacedIrOps));
+    // P2c currently preserves the HexKL runtime's physical WH/AH kernels.
+    // Keep this explicit: replacing syntax is not yet evidence of eliminated
+    // device traffic, and the movement gate must not count these IR ops as
+    // saved bytes.
+    func->setAttr("alps.p2c.proven_eliminated_physical_bytes",
+                  builder.getI64IntegerAttr(0));
+    if (enableAlpsFusedTransformTransfer)
+      llvm::errs() << "[ALPS-P2C] function=" << func.getName()
+                   << " weight_sites=" << stats.alpsP2cWeightSites
+                   << " activation_sites=" << stats.alpsP2cActivationSites
+                   << " replaced_ir_ops=" << stats.alpsP2cReplacedIrOps
+                   << " proven_eliminated_physical_bytes=0"
+                   << " mode=sync_hexkl_micro_only\n";
     llvm::errs() << "[TransformCostModel] function=" << func.getName()
                  << " native=" << stats.native << " sync=" << stats.sync
                  << " async=" << stats.async

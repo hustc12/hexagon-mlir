@@ -1,0 +1,44 @@
+From: local LLVM_DIR recovery snapshot
+Base: 064f02dac0c8 ([VectorCombine] Preserve scoped alias metadata (#153714))
+Date: 2026-08-20
+Purpose: preserve the two uncommitted Hexagon changes before removing the
+         superseded LLVM_DIR checkout.  Apply from an llvm-project root with
+         `git apply llvm-dir-legacy-aligna-20260820.patch`.
+
+diff --git a/llvm/lib/Target/Hexagon/HexagonFrameLowering.cpp b/llvm/lib/Target/Hexagon/HexagonFrameLowering.cpp
+index b3c61e1829bf..f5db0265c8fc 100644
+--- a/llvm/lib/Target/Hexagon/HexagonFrameLowering.cpp
++++ b/llvm/lib/Target/Hexagon/HexagonFrameLowering.cpp
+@@ -750,6 +750,18 @@ void HexagonFrameLowering::insertPrologueInBlock(MachineBasicBlock &MBB,
+       .addReg(SP)
+       .addImm(-int(NumBytes));
+   }
++
++  // PS_aligna is selected before prologue/epilogue insertion. Scheduling can
++  // otherwise leave an aligned-frame access before the pseudo, while this
++  // routine subsequently inserts allocframe at the start of the block. Move
++  // the pseudo back to the prologue boundary so the final order is:
++  // allocframe, stack alignment, AP definition, AP uses.
++  if (MachineInstr *AI =
++          const_cast<MachineInstr *>(getAlignaInstr(MF))) {
++    MachineBasicBlock *AlignB = AI->getParent();
++    MBB.splice(InsertPt, AlignB, AI->getIterator());
++    AI->setFlag(MachineInstr::FrameSetup);
++  }
+ }
+ 
+ void HexagonFrameLowering::insertEpilogueInBlock(MachineBasicBlock &MBB) const {
+diff --git a/llvm/lib/Target/Hexagon/HexagonPseudo.td b/llvm/lib/Target/Hexagon/HexagonPseudo.td
+index c2f38a9ccf5b..dcca44ab3db6 100644
+--- a/llvm/lib/Target/Hexagon/HexagonPseudo.td
++++ b/llvm/lib/Target/Hexagon/HexagonPseudo.td
+@@ -267,7 +267,8 @@ let isPseudo = 1, isCall = 1, isReturn = 1, isBarrier = 1, isPredicable = 0,
+     isTerminator = 1, isCodeGenOnly = 1 in
+ def PS_tailcall_i : Pseudo<(outs), (ins a30_2Imm:$dst), "", []>;
+ 
+-let isCodeGenOnly = 1, isPseudo = 1, Uses = [R30], hasSideEffects = 0 in
++let isCodeGenOnly = 1, isPseudo = 1, Uses = [R30], hasSideEffects = 1,
++    isBarrier = 1, isSolo = 1 in
+ def PS_aligna : Pseudo<(outs IntRegs:$Rd), (ins u32_0Imm:$A), "", []>;
+ 
+ // Generate frameindex addresses. The main reason for the offset operand is

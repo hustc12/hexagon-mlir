@@ -1929,3 +1929,420 @@ nano:/home/huzq85/2-working/working_set/alps_p2b_early_20260820
 ```text
 nano:/home/huzq85/2-working/working_set/alps_p2b_20260820
 ```
+
+### 11.12 P2c：fused transform-transfer 的实现边界与负结果（2026-08-20）
+
+P2c 增加了独立、默认关闭的 `enableAlpsFusedTransformTransfer` 开关，把
+HexKL MicroHMX 中下列相邻操作表示为一个 `prefetch_in_situ`：
+
+```text
+weight:     MicroHMXRmToWhF16          -> HMXWeight prefetch_in_situ
+activation: CopySubmatrix + RmToAh     -> HMXActivation prefetch_in_situ
+```
+
+本阶段只允许同步、`lookahead=0`、HexKL micro-only 路径，不启用 P3 的
+异步 readiness/admission，也不启用 persistent cache、two-dimensional DMA、
+dequant 或 inter-layer prefetch。P2c 与已通过 movement gate 的 P2a 组合，
+不与 P2b 组合。完整模型脚本入口为：
+
+```bash
+scripts/run_full_hvx_five_way.sh --alps-p2c --compile-threads 4 \
+  --output-dir /home/huzq85/2-working/hexagon_npu/run_artifacts/alps_p2c_20260820 \
+  --remote-dir /home/huzq85/2-working/working_set/alps_p2c_20260820 \
+  gpt2
+```
+
+实现审计发现一个必须明确记录的边界：当前同步 runtime lowering 虽然减少
+了上层 IR op 数，但内部仍调用原有物理 kernel。`HMXWeight` 仍调用
+`hexkl_micro_hmx_rm_to_wh_f16`；`HMXActivation` 仍先调用
+`hexkl_micro_hmx_copy_submatrix_to_f16`，再调用
+`hexkl_micro_hmx_rm_to_ah_f16`。因此当前 P2c 是统一的 transform-transfer
+表示和未来异步 lowering 接口，**不是已经消除 intermediate movement 的
+fused physical kernel**。pass 明确记录
+`alps.p2c.proven_eliminated_physical_bytes = 0`，避免把“少了 IR op”误报为
+“少了物理搬动”。
+
+单元测试验证了严格匹配、同步语义和默认关闭行为：一个 weight site 与一个
+activation site 共替换 3 个 IR op，且所有 P2c op 的 lookahead 均为 0。
+增量构建、P2a 回归测试、脚本语法检查和 GPT-2 12-layer 完整 FP16 模型
+正确性均通过。
+
+为避免与历史测量混用，P2c 完成后在相同代码版本、输入、FP16/HVX/HexKL、
+P2a 基础和单次 device measurement 下重新运行了匹配的 P2a 对照：
+
+| 配置 | Latency | 相对 P2a | P2a hits | P2c weight sites | P2c activation sites | Replaced IR ops | Proven eliminated physical bytes |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Elementwise + P2a | **3,180.99 ms** | **1.000x** | 12 | 0 | 0 | 0 | 0 B |
+| Elementwise + P2a + P2c | 3,225.34 ms | 0.986x | 12 | **49** | **49** | **147** | **0 B** |
+
+两者均通过 12-layer device full compare：finite、last-token top-1 match，
+`max_abs=11.875`。P2c latency 比匹配的 P2a 对照回退 **1.39%**；两者的
+post-bufferization movement ledger 相同。每个 transformer block 命中 4 个
+weight 和 4 个 activation site，head 再各命中 1 个，证明路径确实执行，
+但没有产生可验证的 physical-byte reduction。
+
+因此，**P2c 的接口、pass、流水线、测试与完整模型评估已经完成，但 P2c
+physical-movement/performance gate 未通过**。该机制保留为默认关闭的研究
+开关，不进入当前 ALPS 默认候选，也不能在论文中宣称为 fused transfer 的
+性能收益。若后续重新开启，前提是增加真正的 direct DDR/L2-to-AH/WH
+lowering 或新的 HexKL tile API，使 copy 与 layout transform 在同一个物理
+producer 中完成，并由 PMU/ledger 证明 external traffic 或 materialization
+bytes 下降；在此之前不继续对当前 wrapper 做无界调参。
+
+完整产物已移动到远端，本地不保留大文件：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p2a_gpt2_20260820
+nano:/home/huzq85/2-working/working_set/alps_p2c_20260820
+```
+
+### 11.13 P2d：Minimal Static Admission（2026-08-20）
+
+P2d 实现为独立、默认关闭的 `alps-minimal-static-admission` pass，并通过
+顶层 `enableAlpsMinimalStaticAdmission` 和统一脚本 `--alps-p2d` 接入。它不做
+跨 region 全局搜索，也不恢复 P2b/P2c 的失败路径；当前 action set 严格限定为：
+
+```text
+no_op/native | l2_hint | in_situ_sync | dma_vtcm_async
+```
+
+每个候选都记录 `kind/action/reason/legal_actions/tile_bytes/reuse/pages/
+alignment/vtcm_fit/overlap_window/materialize`，函数级 summary 记录各 action
+数量、拒绝数量和 planned bytes。选择规则刻意区分“法律上可用”和“当前可以
+安全执行”：
+
+- P2a 已消除的 representation 选择 `no_op`，不能再对其预取；
+- 只有静态、DDR entry/persistent、达到 byte/window 阈值的 K/V stream 才可
+  选择 page-safe L2 hint；
+- eager producer 在当前 invocation 内生成的 K/V 选择 native，防止在数据生成
+  前发出因果无效的 prefetch；
+- `in_situ_sync` 必须有 eliminated physical bytes 证据。P2c 已证明当前 wrapper
+  为 0 B，因此拒绝；
+- DMA/VTCM 即使满足 capacity、page、alignment 和 overlap 条件，在 P3 建立
+  exact descriptor/readiness/slot ownership 前也不能 materialize；
+- 一个 demand 只能有一个 chosen action，P2d materialization 模式下
+  `PrefetchInsert` 只接受 `alps.p2d.action=l2_hint`，避免同一 demand 同时进入
+  L2 和 DMA 路径。
+
+单元测试覆盖了 persistent K/V 的 L2 接受、produced K/V 的拒绝、HMX
+sync/DMA 候选拒绝、P2a zero-copy 的 stable `no_op` 传播和 admission-gated
+materialization。P1、P2a、P2c 与 P2d 共 4 个回归测试全部通过；增量构建
+成功。
+
+DINOv2-small 完整 FP16/HVX/HexKL 运行使用 P2a 作为稳定 movement reduction
+基础，结果如下：
+
+| 配置 | Latency | 相对 P2a | P2a zero-copy hits | Runtime hints/issued/bytes | 正确性 |
+|---|---:|---:|---:|---:|---|
+| Elementwise + P2a | 5,889.52 ms | 1.000x | 12 | 0 / 0 / 0 B | PASS |
+| Elementwise + P2a + P2d | **5,863.42 ms** | **1.004x** | 12 | 0 / 0 / 0 B | PASS |
+
+P2d 运行识别 36 个 eager K/V stream、72 个 HMX weight transform 和 72 个
+HMX activation transform，共 180 个 transfer candidate，全部选择 native：
+
+- 36 个 K/V：`source_not_entry_persistent`；
+- 72 个 2 KiB weight tile：低于保守的 4 KiB DMA threshold；
+- 72 个 activation tile：当前 sync wrapper 的 proven byte reduction 为 0 B。
+
+因此没有生成 runtime request，正确性为 finite、top-1 match、
+`max_abs_diff=0.0049`。与 P2a 的 0.44% 差异视为测量波动，不能宣称 P2d
+性能收益；P2d 本阶段的贡献是阻止不盈利/不安全 action 引入回退和 request
+storm，并为 P3 输出可审计的候选及拒绝原因。
+
+第一次完整运行时，P2a 的逐 op 属性在 bufferization 后消失，因此 P2d summary
+只列出上述 180 个 transfer candidate，而没有把 12 个已消除 representation
+统计成 `no_op`。随后补充函数级稳定的 P2a site/byte contract，并用组合 IR
+回归证明 P2d 能消费该 contract；该修复只改变 ledger 属性和日志，不改变
+codegen，故没有为此重复运行十分钟级完整模型。后续完整运行的预期 summary
+为 12 个 `no_op` 加 180 个 native/rejected transfer candidate。
+
+P2d gate 据此通过：action 互斥、决定可审计、L2 materialization 有独立测试、
+错误的 sync/async 路径被保守拒绝、完整正例无明显回退。下一阶段进入 P3，
+先为 DMA/VTCM action 建立 invocation-local descriptor 和 exact readiness；
+不能直接复用 process-global ring 来绕过 ownership 证明。
+
+完整模型产物已移动到：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p2d_20260820
+```
+
+### 11.14 P3a：invocation-local descriptor 与 exact readiness（2026-08-20）
+
+P3a 已建立 P3 的安全基础，但刻意没有在本阶段启动 UserDMA 或宣称 overlap
+收益。对现有实现的审计确认，legacy V-DAE 的 semaphore 只表达“某个工作完成”，
+process-global async ring 只按 FIFO 队头消费；两者都没有携带当前 consumer 所需
+的 value version、tile、layout 或 memory tier，因此不能证明“完成的是正确数据”。
+
+新增的 exact-readiness descriptor 保存：
+
+```text
+(invocation generation, value version, tile, layout,
+ source tier, destination tier, slot, slot generation)
+```
+
+其唯一合法生命周期为：
+
+```text
+FREE -> LOAD_PENDING -> LAYOUT_PENDING -> READY -> CONSUMING -> FREE
+```
+
+runtime 使用 4 个 bounded invocation context、每个 context 8 个 descriptor。
+底层 storage 仍是静态 bounded pool，以避免设备端动态分配；但是 ownership 不再
+是隐式 process-global ring：每次 invocation 必须显式 begin/end，context handle
+和 descriptor handle 均携带 generation。stale context/descriptor、错误 tile/
+version/layout/tier、非法状态跳转、未释放 descriptor 的 context end 都会失败并
+设置 error bit。descriptor-full 返回负 handle，为 P3b 保留同步 fallback，而
+不是覆盖仍在使用的 slot。
+
+编译器新增了独立、默认关闭的 `alps-exact-readiness` pass、顶层
+`enableAlpsExactReadiness` 和统一脚本 `--alps-p3a`。P3a 只接受已经由 P2d 选择
+`dma_vtcm_async`、处于明确 tile loop 且带 tile operands 的 prefetch；否则记录
+拒绝原因。dialect 的 invocation/descriptor ops 已完整 lower 到 runtime ABI。
+P3a 不复用 legacy semaphore/ring，也不在没有真实 action 时插入空 descriptor
+调用。
+
+验证结果：
+
+- Hexagon v73 runtime bitcode 与完整增量构建成功；
+- 6 个 P1/P2/P3 定向 lit 回归全部通过；
+- host runtime contract 验证完整状态路径、错误 tile 拒绝和跨 invocation stale
+  handle 拒绝；
+- DINOv2-small 完整 FP16/HVX/HexKL 正确性通过：finite、top-1 match、
+  `max_abs_diff=0.0049`。
+
+| 配置 | Latency | 相对 P2d | P2d async action | P3a exact contract | Runtime hints/issued/bytes |
+|---|---:|---:|---:|---:|---:|
+| P2a + P2d | 5,863.42 ms | 1.000x | 0 | N/A | 0 / 0 / 0 B |
+| P2a + P2d + P3a | 5,871.00 ms | 0.999x | 0 | 0 | 0 / 0 / 0 B |
+
+7.58 ms（0.13%）差异属于测量波动。完整运行中 P2d 正确统计 12 个 P2a no-op
+和 180 个 native/rejected transfer candidate；由于没有批准 DMA，P3a 报告
+`async_candidates=0, exact_contracts=0`，最终 binary 没有执行 descriptor 调用。
+这验证了 P3a 的关键负向 gate：没有 exact identity 的 action 不会暗中进入旧
+global ring。
+
+因此 **P3a 的 ownership/readiness correctness gate 已完成**，但它不是性能
+结果。下一阶段 P3b 必须选择一个真实正例（首先是满足 VTCM fit、tile identity
+和 overlap window 的 HMX weight tile），让 P2d 批准唯一的
+`dma_vtcm_async` action，并把 UserDMA token、layout completion 与 scout 全部
+绑定到该 exact descriptor。只有 PMU/timeline 证明 DMA 与同一 mapping 的 compute
+重叠、consumer 等待的是同一 tile/version、错误/容量 fallback 正确，才能进入
+P3c lookahead。
+
+完整产物已移动到远端，本地仅保留 16 KiB 汇总：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p3a_20260820
+```
+
+### 11.15 P3b：descriptor-bound UserDMA/scout overlap 与失败 gate（2026-08-20）
+
+P3b 已实现独立、默认关闭的 `enableAlpsExactOverlap` / `--alps-p3b`
+路径。P2d 在 P3 exact-readiness 模式下可把满足静态 tile identity、VTCM fit
+和 overlap window 的 2 KiB HMX weight tile 唯一选择为
+`dma_vtcm_async`；decomposition 同时为 P3b 预留不与 HMX working set 混叠的
+VTCM staging bank。编译器对每个获准的 K-loop 生成：
+
+```text
+tile 0: synchronous bootstrap
+iteration i: exact kick(tile i+1, descriptor, UserDMA token, VTCM slot)
+iteration i+1: consume(exact context/version/tile) -> HMX MM -> release
+```
+
+runtime 将 UserDMA token、source/destination、RM tile identity、WH destination、
+VTCM stage 和 scout completion 全部绑定到 P3a descriptor，不再通过 legacy
+process-global FIFO 查找工作。新增 counter 分别记录 kick、DMA completion、
+scout completion、同步 fallback、consumer wait，以及 acquired/consumed/released/
+failure。定向验证包括：完整增量构建、7 个 P1/P2/P3 lit 回归、host
+exact-readiness contract、Python/bash 语法和 LLVM address-space conversion，均
+通过。
+
+第一次 DINOv2-small 完整运行暴露出 pipeline wiring 问题：P3b 同时启用 P2d
+时仍被判为 `kvCacheOnly=1`，导致 72 个已准入 HMX weight site 没有进入
+PrefetchInsert，runtime exact counter 全为 0。该运行 latency 为 5,799.27 ms，
+但它是 P3a 等价 no-op，**不是 P3b 性能结果**。修复后 P3b 明确令
+`kvCacheOnly=0`。
+
+第二次完整运行证明真实路径已物化：
+
+| 指标 | 结果 |
+|---|---:|
+| P2d `dma_vtcm_async` sites | 72 |
+| PrefetchInsert candidate loops | 144 |
+| P3a exact contracts | 72 |
+| Latency | 8,142.30 ms |
+| P3a latency | 5,871.00 ms |
+| 相对 P3a | 0.721x（回退 38.69%） |
+| Exact kicks / completed / scout-completed | 31,552 / 31,552 / 31,552 |
+| Sync fallbacks | 143,408 |
+| Consume spins | 47,364,853 |
+| Descriptor acquired / consumed / released | 31,552 / 31,526 / 31,526 |
+| Descriptor failures | 162,468 |
+| 输出 | finite、top-1 match，max_abs_diff=0.1093 |
+
+该结果不能被当作 exact-readiness 正确性通过：旧 consumer 在有限自旋耗尽后
+仍尝试 consume 非 READY descriptor，26 个 descriptor 未被释放，继而引发
+request storm、同步 fallback 和错误累积。代码随后改为 demand-time work
+stealing：只有仍处于 `LOAD_PENDING` 的 descriptor 可由 consumer 通过 CAS
+领取并完成；已经由 scout 领取的 `LAYOUT_PENDING` descriptor 必须等待 READY。
+
+最终验证中编译于 564.01 s 正常完成，但 DSP kernel 卡在
+`LAYOUT_PENDING`，未产生 latency。现场表明 scout 已取得 descriptor，随后
+阻塞在 UserDMA completion/WH publication；这也说明当前 UserDMA `wait(token)`
+是无限轮询接口，不能满足 P3b 所需的 bounded failure contract。运行已人工
+中止，手机端没有残留 `run_main_on_hexagon` 进程。代码增加 device fail-fast
+watchdog：layout owner 超时后触发明确失败，绝不继续让 HMX 消费非 READY tile，
+也避免再次无限占用 DSP。
+
+因此结论是：**P3b 的 compiler/runtime mechanism、exact identity 和真实正例
+物化已经完成，但 device correctness/performance gate 未通过，不能进入 P3c。**
+阻塞点不是继续调 lookahead，而是先补齐以下有界 runtime substrate：
+
+1. UserDMA nonblocking completion/status 或可超时 wait，能够区分 complete、
+   engine fault 和 token stale；
+2. 单 scout/single-flight admission 与 DMA queue credit，禁止 72 个静态站点形成
+   completion backlog；
+3. timeout 时可安全取消/隔离目标 slot，不能与仍可能写 VTCM 的 owner 竞争；
+4. 重新验证 `acquired == consumed == released`、failures=0，再比较 P3a latency；
+5. 上述条件满足后才实现 P3c adaptive loop-carried lookahead。
+
+三次现场均已保存到 nano，本地大 artifacts 已删除：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p3b_20260820
+nano:/home/huzq85/2-working/working_set/alps_p3b_fix1_20260820
+nano:/home/huzq85/2-working/working_set/alps_p3b_final_20260820
+```
+
+### 11.16 P3b bounded runtime 修复、完整模型结果与阶段决策（2026-08-20）
+
+P3b 的设备卡死根因不是模型规模，而是 runtime ownership：UserDMA 由计算
+hardware thread 启动后，旧实现把 completion poll/WH publication 交给 scout
+thread。V73 UserDMA completion 状态不能被这种跨 hardware-thread owner 模型安全
+解释；scout 取得 descriptor 后会停留在 `LAYOUT_PENDING`。因此修复不是扩大
+watchdog 或重复运行，而是：
+
+- 新增 bounded nonblocking UserDMA `poll(token)`；
+- exact DMA 使用 single-flight credit，禁止 descriptor/queue storm；
+- token 0 按合法首个 ring token 处理，由显式 `dma_active` 判断有效性；
+- start failure 使用同步 fallback；timeout 标记 `FAILED` 并 fail-fast，绝不让 HMX
+  消费未 READY tile；
+- P3b 不再隐式启用 dual-thread DAE。kick 与 completion poll 均由 issuing compute
+  thread 执行；DMA 仍可在 kick 与下一次 consume 之间同 intervening HMX compute
+  重叠。dual-thread DAE 保留为独立开关，只用于 ownership 可证明安全的 action。
+
+按要求不再使用 Debug 模型；修复后直接运行完整 DINOv2-small，结果如下：
+
+| 指标 | 修复后结果 |
+|---|---:|
+| 完整模型 latency | **10,679.04 ms** |
+| P3a matched reference | 5,871.00 ms |
+| P3b / P3a speedup | **0.550x**（回退 81.89%） |
+| P2d DMA/VTCM async static sites | 72 |
+| P3a exact contracts | 72 |
+| Exact kicks / completed | 174,960 / 174,960 |
+| Acquired / consumed / released | 174,960 / 174,960 / 174,960 |
+| Scout completed | 0（设计如此） |
+| Sync / credit fallback | 0 / 0 |
+| Consume spins / DMA timeout / descriptor failure | 0 / 0 / 0 |
+| Correctness | finite、top-1 match、max abs diff 0.0049 |
+
+该结果完成了 P3b 的 device correctness、bounded failure 和 ownership gate：真实
+DMA 路径执行了 174,960 次，descriptor 全闭合，没有 timeout、fallback、错误 slot
+或 exit 13。但 performance gate 明确失败。当前每个 2 KiB weight tile 单独执行
+UserDMA start/poll，再执行 WH transform；虽然 transfer 在逻辑上提前，细粒度 DMA
+command/poll 和 transform publication 成本超过了隐藏的等待时间。它不是继续放大
+lookahead 就能合理解决的问题。
+
+因此不再对 P3b 做无界局部调参，也不立即进入 P3c。P3b 机制和代码保留为独立、
+默认关闭的消融项。下一步直接进入 P4A：用 PMU 可用性探测以及 DMA completion
+cycles、issued bytes、queue credit、wait/compute cycles 等 fallback telemetry 建立
+within-path traffic control。P4A 的第一项任务就是让 controller 能识别这种
+“正确但 command overhead 高于可隐藏 stall”的路径，并在下一 window throttle
+或关闭它。这既利用了本轮负结果，也保持论文的 `movement selection -> V-DAE ->
+monitor/traffic control` 故事线，而不是为了追逐单点 latency 继续修改调度。
+
+完整编译产物和日志已移动到远端，本地只保留 16 KiB 汇总：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p3b_repair_full_20260820
+```
+
+### 11.17 P4A：PMU feasibility 与 within-path traffic closed loop（2026-08-20）
+
+P4A 新增独立、默认关闭的 `enableAlpsTrafficControl`，统一脚本入口为
+`--alps-p4a`。脚本会显式启用其语义依赖 P2d/P3a/P3b，但 P4A 本身可单独关闭，
+关闭后生成代码与 P3b 相同。controller 不改变 representation、HMX mapping 或
+合法 action 集，只在已经由编译器批准的 exact-DMA 路径内选择下一 window 保持
+DMA，还是退回合法同步 transform。
+
+#### PMU feasibility
+
+P4A 按 V73 public event 定义探测以下四项：
+
+- `UDMA_ACTIVE_CYCLES` (`0x812f`)；
+- `UDMA_DMPOLL_CYCLES` (`0x8133`)；
+- `UDMA_COHERENT_RD_CYCLES` (`0x814b`)；
+- `UDMA_VTCM_WR_CYCLES` (`0x8150`)。
+
+当前手机运行于 unsigned PD。Hexagon SDK 6.4 的 `HAP_user_pmu.md` 明确说明
+HAP user PMU 只支持 debug-enabled device，且 **unsigned PD 不可访问**。完整
+DINOv2-small 也实际返回 `pmu_status=0, pmu_reads=0`。因此当前实验不把软件计数
+冒充 hardware PMU；P4A 明确切换到 fallback telemetry：processor pcycles、
+DMStart/poll cycles、poll retry、issued/suppressed commands、descriptor credit、
+wait/failure/timeout。
+
+#### 第一版 controller 负结果
+
+第一版只在一个 64-completion window 的 poll retry 为 0 时认定 transfer 过早并
+throttle。完整模型观测到：
+
+| 指标 | 第一版 P4A |
+|---|---:|
+| Latency | 10,967.47 ms |
+| DMA kicks / completed | 174,960 / 174,960 |
+| Windows hold / throttle | 2,733 / 0 |
+| Total poll retries | 1,064,159（6.08/tile） |
+| Issue / poll pcycles | 29,935,940 / 229,886,261 |
+| Correctness | finite、top-1 match、max abs diff 0.0049 |
+
+这说明“没有 consumer semaphore spin”不等于 transfer 没有 demand-time 成本；
+P3b 的 retry 位于 exact completion 内部。controller 因判据不完整而全部 hold，
+比 P3b 还回退 2.70%。
+
+#### 有界修复与最终闭环
+
+最终固定判据同时抑制两个无收益端点：window retry 为 0 表示全部过早；平均
+retry 大于等于 4 表示 demand 仍在持续支付 DMPoll pressure。只有中间区间保持
+DMA。该阈值在第二次完整运行前固定，不做 per-model 搜索，也不继续调参。
+
+| 指标 | P3a | P3b | P4A final |
+|---|---:|---:|---:|
+| Latency | **5,871.00 ms** | 10,679.04 ms | **6,269.39 ms** |
+| 相对 P3b 加速 | 1.82x | 1.00x | **1.70x** |
+| DMA kicks / completed | 0 / 0 | 174,960 / 174,960 | **64 / 64** |
+| Controller windows: throttle / hold | N/A | N/A | **1 / 0** |
+| DMA suppressed to sync | N/A | 0 | **174,896** |
+| 首 window poll retries | N/A | N/A | 444（6.94/tile） |
+| Acquired / consumed / released | N/A | 全闭合 | **174,960 / 174,960 / 174,960** |
+| Failure / timeout | 0 / 0 | 0 / 0 | **0 / 0** |
+| Correctness | PASS | PASS | **PASS** |
+
+这已经满足最小的 `monitor -> decision -> actuator -> next-window response`：首
+window 的真实 fallback telemetry 触发一次 throttle，随后 DMA command 数从预期
+174,960 降到 64，latency 相对 P3b 恢复 1.70x。它也证明 traffic controller
+不能只调 lookahead；必须能够关闭成本高于被隐藏 stall 的路径。
+
+边界同样必须明确：P4A final 仍比 P3a 慢 6.79%，所以它证明的是动态控制能从
+错误静态 DMA 决策中恢复，而不是在当前 DINO 配置上胜过 oracle-like 静态 off。
+P3b 和 P4A 均继续保持默认关闭、可独立消融；不再为该模型调 threshold。后续
+P5 应把 `static-off/P3b-always/P4A-adaptive` 同列，验证其他结构是否存在 controller
+选择 hold 的正例。
+
+两轮完整运行均已移动到 nano，本地各只保留 16 KiB 汇总：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p4a_full_20260820
+nano:/home/huzq85/2-working/working_set/alps_p4a_final_full_20260820
+```

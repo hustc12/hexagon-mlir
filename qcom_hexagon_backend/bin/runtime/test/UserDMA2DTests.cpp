@@ -107,6 +107,7 @@ TEST(UDMATest2D, FourTensorTileCopy) {
   EXPECT_EQ(status, hexagon::userdma::DMASuccess);
 
   hexDMASmallQCapacity.wait(token0);
+  EXPECT_TRUE(hexDMASmallQCapacity.poll(token0));
   hexDMASmallQCapacity.wait(token1);
   hexDMASmallQCapacity.wait(token2);
   hexDMASmallQCapacity.wait(token3);

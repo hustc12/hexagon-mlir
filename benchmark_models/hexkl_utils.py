@@ -483,6 +483,25 @@ def hexagon_options_phase4(
     options["enableAlpsProducerDirectAttention"] = (
         os.environ.get("ALPS_ENABLE_PRODUCER_DIRECT_ATTENTION", "0") == "1"
     )
+    options["enableAlpsFusedTransformTransfer"] = (
+        os.environ.get("ALPS_ENABLE_FUSED_TRANSFORM_TRANSFER", "0") == "1"
+    )
+    options["enableAlpsMinimalStaticAdmission"] = (
+        os.environ.get("ALPS_ENABLE_MINIMAL_STATIC_ADMISSION", "0") == "1"
+    )
+    options["enableAlpsExactReadiness"] = (
+        os.environ.get("ALPS_ENABLE_EXACT_READINESS", "0") == "1"
+    )
+    options["enableAlpsExactOverlap"] = (
+        os.environ.get("ALPS_ENABLE_EXACT_OVERLAP", "0") == "1"
+    )
+    options["enableAlpsTrafficControl"] = (
+        os.environ.get("ALPS_ENABLE_TRAFFIC_CONTROL", "0") == "1"
+    )
+    # P3b starts and retires UserDMA on the issuing Hexagon hardware thread.
+    # UserDMA completion state is thread-contextual, so exact overlap must not
+    # implicitly move completion polling to the optional scout thread.  The
+    # DMA still overlaps the intervening HMX work between kick and consume.
     options["enableOmniFetchActivationMulticast"] = bool(
         enable_omnifetch_activation_multicast
     )
@@ -509,7 +528,8 @@ def hexagon_options_phase4(
         f"prefetch_distance={prefetch_baseline_distance} "
         f"lwp={int(options['enableLWP'])} "
         f"lwp_loop_depth={options['LWPloopDepth']} "
-        f"lwp_loops_disabled={int(options['disableLWPLoop'])}"
+        f"lwp_loops_disabled={int(options['disableLWPLoop'])} "
+        f"alps_p4a_traffic={int(options['enableAlpsTrafficControl'])}"
     )
     return options
 

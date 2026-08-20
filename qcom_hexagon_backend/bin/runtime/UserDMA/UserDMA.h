@@ -90,6 +90,9 @@ public:
    */
   void wait(uint32_t token);
 
+  /*! \brief Nonblocking completion probe for a DMA token. */
+  bool poll(uint32_t token);
+
 private:
   //! \brief Initializes the Hexagon User DMA engine
   unsigned int init();

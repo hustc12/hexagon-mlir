@@ -26,6 +26,11 @@ alps_p1=0
 alps_p1_profile=0
 alps_p2a=0
 alps_p2b=0
+alps_p2c=0
+alps_p2d=0
+alps_p3a=0
+alps_p3b=0
+alps_p4a=0
 models=()
 
 all_models=(
@@ -64,6 +69,11 @@ Options:
   --alps-p1-profile       Add loop-level LWP to P1 (monolithic models only)
   --alps-p2a              Run P2a elementwise + zero-copy attention candidate
   --alps-p2b              Run P2b producer-direct + P2a cumulative candidate
+  --alps-p2c              Run P2c sync fused transform-transfer + stable P2a
+  --alps-p2d              Run P2d minimal static admission + stable P2a
+  --alps-p3a              Run P3a exact-readiness contract + P2d + stable P2a
+  --alps-p3b              Run P3b descriptor-bound issuer-owned weight DMA overlap
+  --alps-p4a              Run P4A telemetry + within-path DMA traffic control
   --output-dir DIR        Local working/result directory
   --remote-dir DIR        nano working_set destination
   --device-iterations N   Device samples per configuration (default: ${iterations})
@@ -153,6 +163,15 @@ while (($#)); do
       ;;
     --alps-p2a) alps_p0=1; alps_p2a=1; shift ;;
     --alps-p2b) alps_p0=1; alps_p2a=1; alps_p2b=1; shift ;;
+    --alps-p2c) alps_p0=1; alps_p2a=1; alps_p2c=1; shift ;;
+    --alps-p2d) alps_p0=1; alps_p2a=1; alps_p2d=1; shift ;;
+    --alps-p3a) alps_p0=1; alps_p2a=1; alps_p2d=1; alps_p3a=1; shift ;;
+    --alps-p3b)
+      alps_p0=1; alps_p2a=1; alps_p2d=1; alps_p3a=1; alps_p3b=1; shift
+      ;;
+    --alps-p4a)
+      alps_p0=1; alps_p2a=1; alps_p2d=1; alps_p3a=1; alps_p3b=1; alps_p4a=1; shift
+      ;;
     --output-dir) output_dir=$2; shift 2 ;;
     --remote-dir) remote_dir=$2; shift 2 ;;
     --device-iterations) iterations=$2; shift 2 ;;
@@ -165,7 +184,17 @@ while (($#)); do
   esac
 done
 
-if ((alps_p2b)); then
+if ((alps_p4a)); then
+  schemes=(alps-elementwise-traffic-control)
+elif ((alps_p3b)); then
+  schemes=(alps-elementwise-exact-overlap)
+elif ((alps_p3a)); then
+  schemes=(alps-elementwise-exact-readiness)
+elif ((alps_p2d)); then
+  schemes=(alps-elementwise-admission)
+elif ((alps_p2c)); then
+  schemes=(alps-elementwise-fused-transfer)
+elif ((alps_p2b)); then
   schemes=(alps-elementwise-producer-direct)
 elif ((alps_p2a)); then
   schemes=(alps-elementwise-zero-copy)
@@ -301,7 +330,7 @@ audit_case_codegen() {
 
 extract_alps_p1_ledger() {
   local case_dir=$1 log=${case_dir}/run.log
-  ((alps_p1 || alps_p2a || alps_p2b)) || return 0
+  ((alps_p1 || alps_p2a || alps_p2b || alps_p2c || alps_p2d || alps_p3a || alps_p3b || alps_p4a)) || return 0
   grep '^\[ALPS-P1-' "${log}" >"${case_dir}/alps_p1_ledger.log" || true
   "${venv}/bin/python" "${repo_root}/scripts/summarize_alps_movement_ledger.py" \
     "${case_dir}/alps_p1_ledger.log" \
@@ -402,6 +431,14 @@ scheme_args_for() {
       printf '%s\n' --enable-hexkl --alps-p0-mode elementwise-fusion \
         --disable-layout-aware --disable-omnifetch-adaptive
       ;;
+    alps-elementwise-fused-transfer)
+      printf '%s\n' --enable-hexkl --alps-p0-mode elementwise-fusion \
+        --disable-layout-aware --disable-omnifetch-adaptive
+      ;;
+    alps-elementwise-admission|alps-elementwise-exact-readiness|alps-elementwise-exact-overlap|alps-elementwise-traffic-control)
+      printf '%s\n' --enable-hexkl --alps-p0-mode elementwise-fusion \
+        --disable-layout-aware --disable-omnifetch-adaptive
+      ;;
   esac
 }
 
@@ -465,9 +502,14 @@ run_case() {
   fi
   echo "START model=${model} scheme=${scheme} $(date --iso-8601=seconds)"
   set +e
-  ALPS_ENABLE_MOVEMENT_LEDGER="$([[ ${alps_p1} -eq 1 || ${alps_p2a} -eq 1 || ${alps_p2b} -eq 1 ]] && echo 1 || echo 0)" \
-    ALPS_ENABLE_ZERO_COPY_ATTENTION="$([[ ${scheme} == alps-elementwise-zero-copy || ${scheme} == alps-elementwise-producer-direct ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_MOVEMENT_LEDGER="$([[ ${alps_p1} -eq 1 || ${alps_p2a} -eq 1 || ${alps_p2b} -eq 1 || ${alps_p2c} -eq 1 || ${alps_p2d} -eq 1 || ${alps_p3a} -eq 1 || ${alps_p3b} -eq 1 || ${alps_p4a} -eq 1 ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_ZERO_COPY_ATTENTION="$([[ ${scheme} == alps-elementwise-zero-copy || ${scheme} == alps-elementwise-producer-direct || ${scheme} == alps-elementwise-fused-transfer || ${scheme} == alps-elementwise-admission || ${scheme} == alps-elementwise-exact-readiness || ${scheme} == alps-elementwise-exact-overlap || ${scheme} == alps-elementwise-traffic-control ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_PRODUCER_DIRECT_ATTENTION="$([[ ${scheme} == alps-elementwise-producer-direct ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_FUSED_TRANSFORM_TRANSFER="$([[ ${scheme} == alps-elementwise-fused-transfer ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_MINIMAL_STATIC_ADMISSION="$([[ ${scheme} == alps-elementwise-admission || ${scheme} == alps-elementwise-exact-readiness || ${scheme} == alps-elementwise-exact-overlap || ${scheme} == alps-elementwise-traffic-control ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_EXACT_READINESS="$([[ ${scheme} == alps-elementwise-exact-readiness || ${scheme} == alps-elementwise-exact-overlap || ${scheme} == alps-elementwise-traffic-control ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_EXACT_OVERLAP="$([[ ${scheme} == alps-elementwise-exact-overlap || ${scheme} == alps-elementwise-traffic-control ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_TRAFFIC_CONTROL="$([[ ${scheme} == alps-elementwise-traffic-control ]] && echo 1 || echo 0)" \
     HEXAGON_MLIR_DUMP_DIR="${case_dir}/artifacts" \
     "${venv}/bin/python" "${runner}" "${args[@]}" >"${log}" 2>&1
   rc=$?
@@ -497,7 +539,7 @@ run_case() {
 }
 
 write_ratios() {
-  "${venv}/bin/python" - "${results}" "${output_dir}/summary.md" "${alps_p0}" "${alps_p0b}" "${alps_p1}" "${alps_p2a}" "${alps_p2b}" <<'PY'
+  "${venv}/bin/python" - "${results}" "${output_dir}/summary.md" "${alps_p0}" "${alps_p0b}" "${alps_p1}" "${alps_p2a}" "${alps_p2b}" "${alps_p2c}" "${alps_p2d}" "${alps_p3a}" "${alps_p3b}" "${alps_p4a}" <<'PY'
 import csv
 import pathlib
 import sys
@@ -509,13 +551,18 @@ alps_p0b = bool(int(sys.argv[4]))
 alps_p1 = bool(int(sys.argv[5]))
 alps_p2a = bool(int(sys.argv[6]))
 alps_p2b = bool(int(sys.argv[7]))
+alps_p2c = bool(int(sys.argv[8]))
+alps_p2d = bool(int(sys.argv[9]))
+alps_p3a = bool(int(sys.argv[10]))
+alps_p3b = bool(int(sys.argv[11]))
+alps_p4a = bool(int(sys.argv[12]))
 with csv_path.open(newline="", encoding="utf-8") as handle:
     rows = list(csv.DictReader(handle))
 by_model = {}
 for row in rows:
     by_model.setdefault(row["model"], {})[row["scheme"]] = row
 for model_rows in by_model.values():
-    reference_name = "alps-elementwise-producer-direct" if alps_p2b else ("alps-elementwise-zero-copy" if alps_p2a else ("alps-elementwise-fusion" if alps_p1 else ("alps-fusion" if alps_p0b else ("alps-legacy-all" if alps_p0 else "item7-only"))))
+    reference_name = "alps-elementwise-traffic-control" if alps_p4a else ("alps-elementwise-exact-overlap" if alps_p3b else ("alps-elementwise-exact-readiness" if alps_p3a else ("alps-elementwise-admission" if alps_p2d else ("alps-elementwise-fused-transfer" if alps_p2c else ("alps-elementwise-producer-direct" if alps_p2b else ("alps-elementwise-zero-copy" if alps_p2a else ("alps-elementwise-fusion" if alps_p1 else ("alps-fusion" if alps_p0b else ("alps-legacy-all" if alps_p0 else "item7-only")))))))))
     item = model_rows.get(reference_name, {})
     try:
         denominator = float(item["latency_ms"])
@@ -530,9 +577,19 @@ with csv_path.open("w", newline="", encoding="utf-8") as handle:
     writer = csv.DictWriter(handle, fieldnames=rows[0].keys())
     writer.writeheader()
     writer.writerows(rows)
-reference_name = "alps-elementwise-producer-direct" if alps_p2b else ("alps-elementwise-zero-copy" if alps_p2a else ("alps-elementwise-fusion" if alps_p1 else ("alps-fusion" if alps_p0b else ("alps-legacy-all" if alps_p0 else "item7-only"))))
-title = "ALPS P2b producer-direct attention" if alps_p2b else ("ALPS P2a zero-copy attention" if alps_p2a else ("ALPS P1 movement-ledger comparison" if alps_p1 else ("ALPS P0b topology comparison" if alps_p0b else ("ALPS P0 causal comparison" if alps_p0 else "Full-model HVX five-way comparison"))))
+reference_name = "alps-elementwise-traffic-control" if alps_p4a else ("alps-elementwise-exact-overlap" if alps_p3b else ("alps-elementwise-exact-readiness" if alps_p3a else ("alps-elementwise-admission" if alps_p2d else ("alps-elementwise-fused-transfer" if alps_p2c else ("alps-elementwise-producer-direct" if alps_p2b else ("alps-elementwise-zero-copy" if alps_p2a else ("alps-elementwise-fusion" if alps_p1 else ("alps-fusion" if alps_p0b else ("alps-legacy-all" if alps_p0 else "item7-only")))))))))
+title = "ALPS P4A telemetry and within-path traffic control" if alps_p4a else ("ALPS P3b exact issuer-owned DMA overlap" if alps_p3b else ("ALPS P3a exact-readiness contract" if alps_p3a else ("ALPS P2d minimal static admission" if alps_p2d else ("ALPS P2c fused transform-transfer" if alps_p2c else ("ALPS P2b producer-direct attention" if alps_p2b else ("ALPS P2a zero-copy attention" if alps_p2a else ("ALPS P1 movement-ledger comparison" if alps_p1 else ("ALPS P0b topology comparison" if alps_p0b else ("ALPS P0 causal comparison" if alps_p0 else "Full-model HVX five-way comparison")))))))))
 schemes = (
+    ("alps-elementwise-traffic-control",)
+    if alps_p4a else
+    ("alps-elementwise-exact-overlap",)
+    if alps_p3b else
+    ("alps-elementwise-exact-readiness",)
+    if alps_p3a else
+    ("alps-elementwise-admission",)
+    if alps_p2d else
+    ("alps-elementwise-fused-transfer",)
+    if alps_p2c else
     ("alps-elementwise-producer-direct",)
     if alps_p2b else
     ("alps-elementwise-zero-copy",)

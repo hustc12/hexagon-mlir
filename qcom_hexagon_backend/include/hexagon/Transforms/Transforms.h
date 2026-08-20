@@ -153,6 +153,18 @@ std::unique_ptr<InterfacePass<FunctionOpInterface>>
 createAlpsMovementLedgerPass(
     const AlpsMovementLedgerOptions &options = AlpsMovementLedgerOptions());
 
+/// ALPS P2d: choose one conservative representation-supply action per
+/// candidate and record every admission/rejection for later P3 consumption.
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createAlpsMinimalStaticAdmissionPass(
+    const AlpsMinimalStaticAdmissionOptions &options =
+        AlpsMinimalStaticAdmissionOptions());
+
+/// ALPS P3a: require exact invocation/version/tile/layout/tier identity before
+/// an admitted async action may be consumed by P3b.
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createAlpsExactReadinessPass();
+
 /// ALPS P2a: absorb provably equivalent attention layout chains into consumer
 /// indexing maps, eliminating physical transpose materializations.
 std::unique_ptr<InterfacePass<FunctionOpInterface>>

@@ -25,6 +25,11 @@ hexagon_runtime_dma_start(void *src, AddrSpace srcAS, void *dst,
 
 extern "C" void hexagon_runtime_dma_wait(uint32_t token);
 
+// Nonblocking completion probe. Returns 1 once the descriptor is complete and
+// 0 while it is still in flight. Callers must retain token ownership until a
+// completed result is observed.
+extern "C" int32_t hexagon_runtime_dma_poll(uint32_t token);
+
 } // namespace userdma
 } // namespace hexagon
 
