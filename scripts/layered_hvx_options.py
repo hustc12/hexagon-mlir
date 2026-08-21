@@ -107,6 +107,9 @@ def make_layered_hvx_options(args: argparse.Namespace) -> dict:
     options["enableAlpsProducerDirectAttention"] = (
         os.environ.get("ALPS_ENABLE_PRODUCER_DIRECT_ATTENTION", "0") == "1"
     )
+    options["enableAlpsConsumerDrivenLayout"] = (
+        os.environ.get("ALPS_ENABLE_CONSUMER_DRIVEN_LAYOUT", "0") == "1"
+    )
     options["enableAlpsFusedTransformTransfer"] = (
         os.environ.get("ALPS_ENABLE_FUSED_TRANSFORM_TRANSFER", "0") == "1"
     )
@@ -135,6 +138,7 @@ def make_layered_hvx_options(args: argparse.Namespace) -> dict:
         f"prefetch_baseline={args.prefetch_baseline} "
         f"legacy_item7={int(item7)} alps_p0_mode={alps_mode} "
         f"alps_p1_ledger={int(options['enableAlpsMovementLedger'])} "
+        f"alps_p2e_consumer_layout={int(options['enableAlpsConsumerDrivenLayout'])} "
         f"alps_p2d_admission={int(options['enableAlpsMinimalStaticAdmission'])} "
         f"alps_p3a_exact={int(options['enableAlpsExactReadiness'])}"
         f" alps_p3b_overlap={int(options['enableAlpsExactOverlap'])}"

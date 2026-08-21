@@ -238,6 +238,11 @@ void setLinalgToLLVMOptions(
         (it != arch_kwargs.end() && !it->second.compare(TRUE));
   }
   {
+    auto it = arch_kwargs.find("enableAlpsConsumerDrivenLayout");
+    options.enableAlpsConsumerDrivenLayout =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
     auto it = arch_kwargs.find("enableAlpsFusedTransformTransfer");
     options.enableAlpsFusedTransformTransfer =
         (it != arch_kwargs.end() && !it->second.compare(TRUE));

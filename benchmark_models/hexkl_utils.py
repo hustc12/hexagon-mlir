@@ -483,6 +483,9 @@ def hexagon_options_phase4(
     options["enableAlpsProducerDirectAttention"] = (
         os.environ.get("ALPS_ENABLE_PRODUCER_DIRECT_ATTENTION", "0") == "1"
     )
+    options["enableAlpsConsumerDrivenLayout"] = (
+        os.environ.get("ALPS_ENABLE_CONSUMER_DRIVEN_LAYOUT", "0") == "1"
+    )
     options["enableAlpsFusedTransformTransfer"] = (
         os.environ.get("ALPS_ENABLE_FUSED_TRANSFORM_TRANSFER", "0") == "1"
     )
@@ -529,6 +532,7 @@ def hexagon_options_phase4(
         f"lwp={int(options['enableLWP'])} "
         f"lwp_loop_depth={options['LWPloopDepth']} "
         f"lwp_loops_disabled={int(options['disableLWPLoop'])} "
+        f"alps_p2e_consumer_layout={int(options['enableAlpsConsumerDrivenLayout'])} "
         f"alps_p4a_traffic={int(options['enableAlpsTrafficControl'])}"
     )
     return options

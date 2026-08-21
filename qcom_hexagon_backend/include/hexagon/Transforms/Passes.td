@@ -1049,4 +1049,22 @@ def AlpsProducerDirectAttention :
   ];
 }
 
+def AlpsConsumerDrivenLayout :
+    InterfacePass<"alps-consumer-driven-layout", "mlir::FunctionOpInterface"> {
+  let summary = "Form a consumer-required layout directly in a proven producer";
+  let description = [{
+    Builds an auditable future-representation contract for physical transpose
+    results and their terminal HVX/HMX consumers.  The first conservative
+    rewrite retargets a sole-use, all-parallel tensor producer directly to the
+    consumer-required permutation only when the innermost contiguous dimension
+    is preserved.  Unsupported, mixed-engine, dynamic, or ambiguous cases are
+    retained as native layout materializations.
+  }];
+  let constructor = "hexagon::createAlpsConsumerDrivenLayoutPass()";
+  let dependentDialects = [
+    "mlir::linalg::LinalgDialect",
+    "mlir::tensor::TensorDialect",
+  ];
+}
+
 #endif

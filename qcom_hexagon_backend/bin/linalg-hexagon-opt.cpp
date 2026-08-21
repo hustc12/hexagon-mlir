@@ -139,6 +139,7 @@ int main(int argc, char **argv) {
   mlir::hexagon::registerAlpsExactReadinessPass();
   mlir::hexagon::registerAlpsZeroCopyAttentionPass();
   mlir::hexagon::registerAlpsProducerDirectAttentionPass();
+  mlir::hexagon::registerAlpsConsumerDrivenLayoutPass();
   mlir::hexagon::registerOmniFetchVDAEInsertPass();
   mlir::hexagon::registerLayoutOpsEliminationPass();
   mlir::omni_fetch::registerOmniFetchToLLVMPass();

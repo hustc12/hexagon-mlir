@@ -142,6 +142,8 @@ public:
                       alpsBuilder.getBoolAttr(alpsKvRuntimePrefetch));
     moduleOp->setAttr("alps.p2d.minimal_static_admission",
                       alpsBuilder.getBoolAttr(alpsMinimalStaticAdmission));
+    moduleOp->setAttr("alps.p2e.consumer_driven_layout",
+                      alpsBuilder.getBoolAttr(enableAlpsConsumerDrivenLayout));
     moduleOp->setAttr("alps.p3a.exact_readiness",
                       alpsBuilder.getBoolAttr(alpsExactReadiness));
     moduleOp->setAttr("alps.p3b.exact_overlap",
@@ -310,6 +312,16 @@ public:
     if (enableAlpsProducerDirectAttention) {
       pm.addNestedPass<func::FuncOp>(
           createAlpsProducerDirectAttentionPass());
+      pm.addPass(createCanonicalizerPass());
+      pm.addPass(createCSEPass());
+    }
+
+    // P2e consumes explicit transpose results while their tensor-level
+    // producer and terminal consumer contracts are both still visible.  It is
+    // independent from the attention-only P2a/P2b patterns and remains
+    // default-off for matched ablation.
+    if (enableAlpsConsumerDrivenLayout) {
+      pm.addNestedPass<func::FuncOp>(createAlpsConsumerDrivenLayoutPass());
       pm.addPass(createCanonicalizerPass());
       pm.addPass(createCSEPass());
     }

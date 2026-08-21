@@ -175,6 +175,11 @@ createAlpsZeroCopyAttentionPass();
 std::unique_ptr<InterfacePass<FunctionOpInterface>>
 createAlpsProducerDirectAttentionPass();
 
+/// ALPS P2e: infer terminal consumer representation contracts and make a
+/// strictly eligible producer form the required contiguous layout directly.
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createAlpsConsumerDrivenLayoutPass();
+
 /// V-DAE: decouples Memory Access and Compute Execution using semaphores.
 std::unique_ptr<InterfacePass<FunctionOpInterface>>
 createOmniFetchVDAEInsertPass(

@@ -2346,3 +2346,74 @@ P5 应把 `static-off/P3b-always/P4A-adaptive` 同列，验证其他结构是否
 nano:/home/huzq85/2-working/working_set/alps_p4a_full_20260820
 nano:/home/huzq85/2-working/working_set/alps_p4a_final_full_20260820
 ```
+
+### 11.18 P2e：Consumer-Driven In-Situ Layout Formation（2026-08-20）
+
+P2a/P2b 的 attention-only pattern 之后，新增了独立且默认关闭的 P2e：
+`enableAlpsConsumerDrivenLayout`，统一脚本入口为 `--alps-p2e`。它不从某个
+预取原语反向猜 layout，而是从 physical transpose 的终端 consumer 收集
+representation demand，再决定 producer 是否可以直接形成目标 layout。
+
+第一版 legality gate 刻意保守：只接受静态 rank 2--4、唯一 producer chain、
+全 parallel tensor `linalg.generic`、identity producer output map、单一已知 engine
+consumer，并要求 permutation 保持最内连续维。它同时支持
+`producer -> transpose` 和完整模型常见的
+`producer -> expand_shape -> transpose`。后者把 expand reassociation 严格展开为
+affine source map，使 producer 直接写 transpose output；无法证明、multi-engine、
+动态或会破坏最内 unit-stride 的情况保持 native。native op 不携带诊断属性，
+contract 只写 function-level summary/日志，避免观测属性影响 canonicalization。
+
+定向测试覆盖了 immediate producer、expanded producer 以及 innermost-stride
+负例。完整 DINOv2-small 初始 IR 中共发现 122 个 demand，其中 121 个终端
+consumer 为 HVX-bound Linalg；36 个 Q/K/V producer chain 通过 gate，86 个
+保持 native。tensor-level contract 估计消除 7,105,536 B canonical
+materialization。
+
+同一代码、FP16/HVX/HexKL、输入和设备状态下的完整模型 matched 结果：
+
+| 配置 | Latency | 相对 P2e | P2e direct/native | Pre/post-fusion descriptor sites | 正确性 |
+|---|---:|---:|---:|---:|---|
+| HexKL-on matched control | 9,794.41 ms | 1.58x | 0 / N/A | 108 / 121 | PASS |
+| P2e 第一次 | 6,267.24 ms | 1.01x | 36 / 86 | 48 / 58 | PASS |
+| P2e 反向顺序重复 | **6,201.29 ms** | **1.00x** | 36 / 86 | 48 / 58 | PASS |
+
+两次 P2e 相差 1.06%，相对 control 分别为 **1.56x/1.58x**。所有结果均为
+finite、top-1 match、`max_abs_diff=0.0049`。final object 的 control/P2e 总指令
+为 281,871/282,590，HVX-like 为 16,298/16,590，HMX mentions 为 21/20，DMA
+均为 0，因此没有把主要 compute 偷换到另一后端。
+
+边界必须明确：旧 P1 post-bufferization ledger 对两者都报告 133 copies 和
+66,290,754 B static materialization，P2e 甚至为 285 allocs、control 为 284。
+所以目前不能声称已经由该粗粒度 ledger 证明 external physical bytes 下降。
+当前最强的因果证据是 36 个明确 rewrite、tensor layout chain/descriptor sites
+显著减少、matched object mapping 以及重复 latency。下一步需要在 layout
+generic/vector-transfer 层补充 VMEM bytes、stride、address-generation 和 fusion
+region ledger，解释为何相同 copy summary 下 latency 明显变化。
+
+HMX 边界也不能模糊：P2e 当前完成的是 HVX consumer-driven direct formation；
+P2c 虽能表达 HMX WH/AH transform-transfer，但底层仍执行原 copy+transform
+kernel。真正的相邻 HMX MatMul producer-consumer 还需要让前一 MatMul 保留 AH
+output，并让后一 MatMul 直接消费 AH，消除 `AH -> row-major -> AH`；这要求扩展
+HexKL op/layout type 与 micro lowering 的语义，不能仅添加属性或删除转换 op。
+该 HMX 子阶段应作为 P2e-HMX 独立开关，在 exact layout/version、单 consumer、
+tile compatibility 与 fallback 均证明后再做完整模型实验。
+
+#### TODO：P2e-HMX（暂不进入当前 P2e 结论）
+
+- 为 HexKL MatMul 的 AH/WH representation 建立显式、可验证的 layout contract，
+  而不是只在 tensor op 上附加提示属性。
+- 识别 layout/version、tile shape 和唯一 consumer 均兼容的相邻 HMX MatMul，
+  让前一 MatMul 直接保留 AH output、后一 MatMul 直接消费 AH，消除中间的
+  `AH -> row-major -> AH` 往返。
+- 必要时扩展 HexKL op/type、bufferization interface 与 micro lowering；不允许
+  通过删除转换 op 却保留错误物理表示来获得表面加速。
+- 以独立且默认关闭的 `P2e-HMX` 开关实现，所有不满足证明条件的路径严格回退；
+  最终同时用 post-bufferization movement ledger、final object/PMU 和完整模型
+  correctness/latency 验证。
+
+产物已移动到：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p2e_dinov2_20260820
+nano:/home/huzq85/2-working/working_set/alps_p2e_dinov2_v2_20260820
+```

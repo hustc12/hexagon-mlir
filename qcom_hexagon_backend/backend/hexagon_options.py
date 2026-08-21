@@ -107,6 +107,7 @@ class HexagonOptions:
     enableAlpsMovementLedger: bool = False
     enableAlpsZeroCopyAttention: bool = False
     enableAlpsProducerDirectAttention: bool = False
+    enableAlpsConsumerDrivenLayout: bool = False
     enableAlpsFusedTransformTransfer: bool = False
     enableAlpsMinimalStaticAdmission: bool = False
     enableAlpsExactReadiness: bool = False
