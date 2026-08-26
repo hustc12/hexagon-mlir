@@ -243,6 +243,26 @@ void setLinalgToLLVMOptions(
         (it != arch_kwargs.end() && !it->second.compare(TRUE));
   }
   {
+    auto it = arch_kwargs.find("enableAlpsConsumerLayoutPropagation");
+    options.enableAlpsConsumerLayoutPropagation =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsContractDischargeLedger");
+    options.enableAlpsContractDischargeLedger =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsRepresentationSupplyAnalysis");
+    options.enableAlpsRepresentationSupplyAnalysis =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsLayoutSupplyPrefetch");
+    options.enableAlpsLayoutSupplyPrefetch =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
     auto it = arch_kwargs.find("enableAlpsFusedTransformTransfer");
     options.enableAlpsFusedTransformTransfer =
         (it != arch_kwargs.end() && !it->second.compare(TRUE));

@@ -67,6 +67,18 @@ static LogicalResult vectorizeLinalgOp(linalg::LinalgOp op) {
     return failure();
   }
 
+  const bool hasConsumerLayoutContract =
+      op->hasAttr("alps.p2f.consumer_layout_contract");
+  if (hasConsumerLayoutContract) {
+    auto contiguousLoop =
+        op->getAttrOfType<IntegerAttr>("alps.p2f.contiguous_loop");
+    if (!contiguousLoop || contiguousLoop.getInt() != numLoops - 1 ||
+        !op.getIndexingMapsArray().back().isIdentity()) {
+      op.emitWarning("invalid ALPS P2f contract before HVX vectorization");
+      return failure();
+    }
+  }
+
   SmallVector<int64_t> vecSizes(numLoops, 1);
   SmallVector<bool> scalableDims(numLoops, false);
   vecSizes[numLoops - 1] = innerLoopDim;
@@ -101,6 +113,16 @@ static LogicalResult vectorizeLinalgOp(linalg::LinalgOp op) {
       created = created->getNextNode();
     }
   }
+  if (hasConsumerLayoutContract) {
+    Operation *created = previous ? previous->getNextNode()
+                                  : &op->getBlock()->front();
+    while (created && created != op) {
+      if (isa<vector::TransferReadOp, vector::TransferWriteOp>(created))
+        created->setAttr("alps.p2f.consumer_layout_contract",
+                         rewriter.getUnitAttr());
+      created = created->getNextNode();
+    }
+  }
   // Replace the original op with the vectorized op.
   rewriter.replaceOp(op, vectorResults->replacements);
   return success();
@@ -120,15 +142,24 @@ public:
   void runOnOperation() override {
     auto moduleOp = getOperation();
     MLIRContext *context = moduleOp.getContext();
+    int64_t p2fCandidates = 0;
+    int64_t p2fVectorized = 0;
     moduleOp.walk([&](linalg::LinalgOp op) {
       DBG("vectorization candidate: " << op << "\n");
+      bool isP2f = op->hasAttr("alps.p2f.consumer_layout_contract");
+      p2fCandidates += isP2f;
       if (succeeded(vectorizeLinalgOp(op))) {
         DBG(" -> vectorization succeeded.\n");
+        p2fVectorized += isP2f;
       } else {
         DBG(" -> vectorization failed.\n");
       }
       return WalkResult::advance();
     });
+    if (p2fCandidates)
+      llvm::errs() << "[ALPS-P2F] vectorization candidates=" << p2fCandidates
+                   << " succeeded=" << p2fVectorized
+                   << " failed=" << (p2fCandidates - p2fVectorized) << '\n';
   }
 };
 } // namespace

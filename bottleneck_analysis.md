@@ -2417,3 +2417,318 @@ tile compatibility 与 fallback 均证明后再做完整模型实验。
 nano:/home/huzq85/2-working/working_set/alps_p2e_dinov2_20260820
 nano:/home/huzq85/2-working/working_set/alps_p2e_dinov2_v2_20260820
 ```
+
+### 11.19 P2f：Consumer Layout Contract 到 HVX Codegen（2026-08-20）
+
+当前 P2e 的准确定位是 **HVX consumer-driven in-situ layout formation**：它把
+consumer 要求的表示直接编入 producer 的 indexing maps，并删除显式
+expand/transpose materialization。ALPS 的整体范围仍大于 P2e，还包含数据提前
+供给、V-DAE 和 runtime traffic control，不能把整个 ALPS 简化成 layout pass。
+
+为验证显式 contract 继续传播到 tiling/vectorization 是否能进一步提速，新增了
+独立且默认关闭的 P2f：`enableAlpsConsumerLayoutPropagation`，统一脚本入口为
+`--alps-p2f`。P2f 为 P2e admitted op 记录 permutation、连续 loop 和
+`hvx_innermost_unit_stride` contract；Hexagon tiling 会验证 identity output 和
+最内连续 loop、禁止 padded copy-back，并把仍存活的 contract 传播到 tile loop；
+HoistScalarOps 与 vectorizer 也保留并审计该 contract。P2f 必须与 P2e 同时开启，
+否则 pipeline 拒绝编译。
+
+完整 DINOv2-small、同一 FP16/HVX/HexKL、输入和设备状态的串行结果为：
+
+| 配置 | Latency | 相对 P2f | P2e direct/contract | 正确性 |
+|---|---:|---:|---:|---|
+| HexKL-on matched control | 9,805.07 ms | 1.57x | 0 / 0 | PASS |
+| P2e | 6,244.10 ms | 1.00x | 36 / 0 | PASS |
+| P2e + P2f | 6,248.11 ms | 1.00x | 36 / 36 | PASS |
+
+P2f 相对 P2e 慢 0.06%，属于噪声，没有额外加速。所有配置均 finite、top-1
+match、`max_abs_diff=0.0049`。更关键的是，P2f 虽在早期建立 36 个 contract，
+但没有带显式 contract metadata 的 Linalg op 到达 Hexagon tiling/vectorization；P2e/P2f final
+object 的 HVX-like 指令同为 16,590、vector load/store mentions 同为 22,182，
+总指令仅为 282,592/282,587。说明这些 direct producer 在更早的
+fusion/canonicalization 中被吸收，或在语义等价的 op 重建中丢失了 metadata；
+无论是哪种情况，显式 metadata 都没有改变最终 codegen。当前数据不能把所有
+36 个点都进一步归类为“已物理融合”，需要扩展 post-fusion/movement ledger 后
+才能逐点区分 discharged contract 与 metadata loss。
+
+因此当前结论不是“contract propagation 普遍无用”，而是：对 DINOv2 的 36 个
+P2e rewrite，结构化 indexing-map 改写已经决定最终 codegen；额外 metadata
+没有证明存在可优化的剩余对象，也没有新增收益。P2f 保持独立默认关闭，
+不进入当前推荐加速组合；它只适用于后续发现“P2e producer 不能被 fusion、且
+仍存活到 HVX tiling”的模型。当前更优先的是完善 post-bufferization movement
+ledger 和 destination-style bufferization，寻找确实残留的物理 materialization。
+
+结果与完整运行日志已移动到：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p2f_dinov2_20260820
+```
+
+### 11.20 Consumer-Driven In-Situ Layout Formation 与 Prefetch 的统一设计
+
+是的。更准确地说，P2e 的核心逻辑是：
+
+> 从 terminal consumer 的物理访问需求反向推导所需 layout，再判断 producer 能否直接按该 layout 产生结果。
+
+例如原始数据流是：
+
+```text
+Producer
+  → Expand/Reshape
+  → Transpose
+  → Consumer
+```
+
+P2e 在满足安全条件时改写为：
+
+```text
+Producer directly forms consumer layout
+  → Consumer
+```
+
+它不是简单删除 `transpose`，而是把 transpose 的 permutation 合并到 producer 的 indexing maps 中。当前还要求：
+
+- 静态 shape；
+- producer 只有一个结果和唯一使用链；
+- producer 是全 parallel `linalg.generic`；
+- consumer engine 可以确定为 HVX；
+- 不改变最内层连续维；
+- 不产生 mixed-engine 或不明确的 layout ownership。
+
+DINOv2-small 中有 36 条链满足条件，显式的 expand/transpose materialization 被消除或为后续 fusion 创造了机会，最终获得约 `1.57x` 加速。
+
+### Prefetch 能与它结合到什么程度？
+
+从设计上结合程度很高，但当前实测中两者还没有真正形成有效组合。
+
+本轮 P2e：
+
+- DMA mentions 为 `0`；
+- 没有运行时 prefetch issued bytes；
+- `1.57x` 基本来自 in-situ layout formation、数据流变化和后续 fusion；
+- 不能声称该收益来自 prefetch 与 layout 的组合。
+
+最自然的组合方式不是“先 prefetch，再单独 transpose”，而是：
+
+```text
+Consumer layout demand
+        ↓
+Representation-aware prefetch planning
+        ↓
+Prefetch producer inputs into L2/VTCM
+        ↓
+Producer directly computes into final-layout destination
+        ↓
+Consumer directly reads
+```
+
+这样同时做到：
+
+- 提前搬动 producer 所需输入；
+- 不搬动中间 canonical-layout tensor；
+- 不生成单独 transpose buffer；
+- 不把数据先写 DDR、再读回做 layout conversion；
+- consumer 可以直接读取所需表示。
+
+### 最值得实现的三个结合层次
+
+1. Final-layout-aware prefetch
+
+Prefetch planner 不再只记录地址和字节数，还记录：
+
+- consumer 所需 permutation；
+- tile shape；
+- contiguous dimension；
+- memory tier；
+- producer/consumer version。
+
+Prefetch 的对象是“未来即将生成或消费的最终表示”，而不是原始 logical tensor。
+
+2. Prefetch inputs + direct-layout production
+
+这是最适合当前 P2e 的方案：
+
+```text
+DDR input
+  → 提前进入 L2/VTCM
+  → HVX producer 使用预取输入
+  → 直接写最终 consumer layout
+```
+
+UserDMA 本身不会完成任意 transpose，但它可以提前搬入连续 input tile；随后 HVX producer 在计算过程中直接形成目标 layout。这样不会重新引入 layout materialization。
+
+3. Transform-on-arrival
+
+对于无法由 producer 直接形成 layout 的情况，可以采用：
+
+```text
+DMA/load source tile
+  → 在 VTCM staging 中完成有限 shuffle/layout formation
+  → consumer 直接消费
+```
+
+这对应真正的“prefetching + in-situ layout transformation”。但只能接纳满足以下条件的转换：
+
+- tile 可放入 VTCM；
+- DMA 源访问足够连续；
+- HVX shuffle 成本低于 DDR 往返；
+- transformed tile 有足够复用；
+- 不需要再次写回 canonical layout。
+
+### 一个重要原则
+
+不是所有被 P2e 消除的 transpose 都还需要 prefetch。
+
+如果 producer 和 consumer 已经被融合，中间 representation 边界实际上不存在，此时对该中间 tensor 发起 prefetch 反而会：
+
+- 重新制造中间数据；
+- 增加 descriptor 和地址计算；
+- 污染 L2/VTCM；
+- 抵消 P2e 收益。
+
+因此 runtime admission 应当区分：
+
+```text
+Contract discharged by fusion
+    → 不 prefetch 中间值
+
+Direct producer remains
+    → prefetch producer inputs
+
+Physical transform remains
+    → 考虑 transform-on-arrival
+```
+
+所以两者可以形成非常统一的故事线：
+
+> Consumer 决定未来需要的 representation；ALPS 提前供应形成该 representation 所需的数据，并让 producer 或 VTCM staging 在数据到达时直接形成最终 layout，从而同时减少“等待数据”和“搬动错误 layout”的成本。
+
+这比单纯的 data prefetching 更接近论文中的 `prefetching + in-situ layout transformation`，也与 V-DAE 和 runtime traffic control 能自然衔接。
+
+### 11.21 实施计划：Representation-Aware Supply + Direct Formation
+
+计划保持每个阶段独立、默认关闭，并以完整模型串行实验，不使用 Debug/GEMM：
+
+1. **P5a：Contract discharge ledger。** 在 P2e rewrite 时分配稳定 contract ID；
+   在 pre-fusion、post-fusion、post-tiling 和 post-bufferization 四个边界统计
+   `surviving / fused-or-rebuilt / physical-transform-remains`，先区分已消解边界和
+   真正仍需供给的数据，禁止根据已丢失的临时 op attribute 盲目 prefetch。
+2. **P5b：Representation-aware input supply analysis。** 对仍存活的 direct-layout
+   producer 追踪其只读输入，记录 permutation、tile、连续维、memory tier、版本、
+   first-use distance 和预计字节；排除 immediate producer result、动态/跨 block、
+   非连续源、低复用和容量不满足的输入。本阶段只分析、不改变 codegen。
+3. **P5c：L2 input prefetch + direct formation。** 首版仅为静态、连续、只读且
+   有真实提前距离的 producer input 发出有界 L2 hint；producer 仍直接写最终
+   consumer layout，绝不为 prefetch 重新创建 canonical intermediate。P5c 与
+   P2e 独立对比，并记录 hints/issued bytes/correctness/latency。
+4. **P5d：VTCM transform-on-arrival。** 只对 P5b 证明 L2 hint 不足且 tile 可容纳的
+   residual physical transform，建立 ping-pong VTCM tile；DMA 只搬连续 source，
+   HVX 在 staging/compute 中形成目标 layout，consumer 不再读写 canonical DDR。
+5. **P5e：Runtime representation admission。** 将 `contract discharged`、实际
+   wait/poll、VTCM pressure 和 issued/useful bytes 接入 controller，在
+   `no-prefetch / L2 / VTCM-transform-on-arrival` 三种动作间选择。
+6. **实验顺序。** 先在完整 DINOv2-small 做
+   `HexKL-on control / P2e / P2e+P5b / P2e+P5c`，有正收益后再验证完整 ViT/DeiT；
+   P5d 只有在 ledger 证明仍有 residual transform 时才实施，避免为了使用 DMA
+   而重新制造已经消失的数据移动。
+
+### 11.22 P5a/P5b 实施结果：先证明供给对象存在（2026-08-20）
+
+P5a 已实现稳定 contract ID、origin-location fingerprint，并在 pre-fusion、
+post-fusion、post-tiling、post-bufferization 四个边界运行 analysis-only discharge
+ledger。完整 DINOv2-small 的 36 个 P2e direct contract 得到：
+
+| Phase | Explicit | Location carrier | Physical transform | Untraceable |
+|---|---:|---:|---:|---:|
+| pre-fusion | 0 | 36 | 0 | 0 |
+| post-fusion | 0 | 12 | 0 | 24 |
+| post-tiling | 0 | 12 | 0 | 24 |
+| post-bufferization | 0 | 12 | 0 | 24 |
+
+这第一次把 P2f 的“metadata 未到达 vectorizer”细分出来：24 个 contract 在 fusion
+边界后已经消失或无法追踪；12 个仍由等价 location carrier 表示，并持续到
+bufferization。P5a 与紧邻 P2e 的 latency 为 6,190.81/6,223.51 ms，差 0.53%，
+属于噪声；correctness 均通过。因此 ledger 没有造成性能 regression。
+
+P5b 随后只分析这 12 个 residual carrier。第一版只检查 post-bufferization
+Linalg，得到 0 carrier；进一步核对发现该边界上它们已经成为
+`vector.transfer_read`，因此分析器下沉到最终 HVX-facing input stream。最终完整
+模型结果为：
+
+| 模型 | P2e direct | post-fusion residual | vector input | admitted prefetch | P5b latency | 正确性 |
+|---|---:|---:|---:|---:|---:|---|
+| DINOv2-small | 36 | 12 | 12 | **0** | 6,198.85 ms | PASS |
+| DeiT-small | 36 | 12 | 12 | **0** | 5,690.01 ms | PASS |
+
+两个模型的 12 个 vector input 全部为 contiguous 256 B tile，但从最后可用定义到
+读取只有 `lead_ops=1`，且 source 只有一个 use。它们不具备隐藏 latency 的真实
+提前距离；发 L2 hint 只会形成 demand-time hint 或重复读取。因此 P5c admission
+必须返回 no-prefetch，不能为了展示 prefetch issued count 而把阈值从 4 放宽到 1。
+
+该负结果实际上验证了统一设计中的关键原则：P2e 已消解的 representation 不应
+再次被 prefetch。对 DINO/DeiT，当前推荐方案仍是 P2e direct formation；P5c 不
+进入这两个模型的 codegen。下一步将 ledger 扩展到 P2e 保留的 86 个 native
+layout demand，定位 post-fusion 后真正仍执行物理 transform 的子集，再决定哪些
+点可以安全实现 VTCM transform-on-arrival。若 residual transform 也没有提前距离，
+则应转向 tile-loop 内的 next-tile supply，而不是 tensor-op 间的 input hint。
+
+完整产物已移动到：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p5a_dinov2_20260820
+nano:/home/huzq85/2-working/working_set/alps_p5b_vector_dinov2_20260820
+nano:/home/huzq85/2-working/working_set/alps_p5b_deit_20260820
+```
+
+### 11.23 P5c：Next-tile prefetch + direct layout formation（2026-08-20）
+
+在 P5b 之后，ledger 又覆盖了 P2e 保留的 86 个 native layout demand。完整
+DINOv2-small 在 post-bufferization 的结果为：`physical_transform=0`、
+`location_carrier=86`、`untraceable=0`。也就是说，这些 tensor-level native
+transpose 在后续 lowering 中已经被索引/融合表达，并没有以独立 transpose 或
+非 minor-identity vector transfer 的形式残留。因此当前没有证据支持分配 VTCM
+并实施 P5d transform-on-arrival；那样反而可能重新制造一次物理搬动。
+
+由于跨算子供给只有 `lead_ops=1`，P5c 改为实现严格的 loop-local next-tile
+supply。该路径默认关闭且独立可控，只有同时满足以下条件才发出 L2 hint：
+
+- 最终 `vector.transfer_read` 可由稳定 P5a contract location 追踪；
+- read 来自静态、连续、只读 `memref.subview`；
+- backing storage 在被选 loop 外定义，禁止越过 producer 因果边界；
+- 恰好一个 subview offset 是 loop IV，静态 step/tile 可证明下一 tile 边界；
+- 当前 tile 继续由 P2e producer 直接形成 consumer layout，P5c 不创建 canonical
+  intermediate，也不创建 transpose。
+
+定向 IR 测试证明该 pass 能为一个 256 B 的合法 future tile 生成带 bounds guard 的
+`omni_fetch.l2_hint`。完整 DINOv2-small 的 matched HexKL-on 实验得到：
+
+| 配置 | Latency | P2e contracts | P5c matched/admitted | Static tile bytes | 正确性 |
+|---|---:|---:|---:|---:|---|
+| P2e matched control | 6,223.51 ms | 36 | 0 / 0 | 0 | PASS |
+| P5b 最近重复 | 6,186.85 ms | 36 | 12 / 0 | 0 | PASS |
+| **P2e + P5c** | **6,259.22 ms** | 36 | **12 / 12** | **3,072 B** | PASS |
+
+P5c 相对 P2e 慢 0.57%，相对最近 P5b 重复慢 1.17%；`max_abs_diff=0.0049`、
+top-1 match。12 个 site 每个只预取 256 B，且其数据本来就在紧邻的 HVX
+producer/consumer tile 中使用。结果说明机制已经真正组合，但这些 hint 没有足够
+latency window，命令和 bounds-check 开销反而抵消收益。此前一次 26,589.31 ms
+运行是统一脚本漏传 `--enable-hexkl` 的配置错误，已修复并明确排除，不作为性能
+数据。
+
+因此当前 gate 结论是：
+
+1. **P2e direct formation 保留为 DINO/DeiT 的推荐路径。**
+2. **P5c 实现保留、默认关闭，不进入当前推荐组合。** 它只应在其他完整模型出现
+   更大 tile、更长 loop-carried lead 或更高 DDR miss pressure 时由 admission 开启。
+3. **暂不实施 P5d/P5e。** 当前没有 residual physical transform，且 P5c 没有正
+   收益；直接进入 VTCM staging/runtime controller 不符合“先证明搬动对象和收益”
+   的约束。
+4. 下一次模型筛选应先运行 P5a/P5b ledger；只有 `physical_transform>0` 或合法
+   next-tile 的 byte/lead 显著高于本轮 256 B/1-step 时，才运行 P5c/P5d 实验。
+
+完整产物已移动到：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p5d_native_dinov2_20260820
+nano:/home/huzq85/2-working/working_set/alps_p5c_dinov2_hexkl_20260820
+```

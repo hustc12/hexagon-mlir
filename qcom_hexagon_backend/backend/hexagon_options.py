@@ -108,6 +108,10 @@ class HexagonOptions:
     enableAlpsZeroCopyAttention: bool = False
     enableAlpsProducerDirectAttention: bool = False
     enableAlpsConsumerDrivenLayout: bool = False
+    enableAlpsConsumerLayoutPropagation: bool = False
+    enableAlpsContractDischargeLedger: bool = False
+    enableAlpsRepresentationSupplyAnalysis: bool = False
+    enableAlpsLayoutSupplyPrefetch: bool = False
     enableAlpsFusedTransformTransfer: bool = False
     enableAlpsMinimalStaticAdmission: bool = False
     enableAlpsExactReadiness: bool = False

@@ -178,7 +178,22 @@ createAlpsProducerDirectAttentionPass();
 /// ALPS P2e: infer terminal consumer representation contracts and make a
 /// strictly eligible producer form the required contiguous layout directly.
 std::unique_ptr<InterfacePass<FunctionOpInterface>>
-createAlpsConsumerDrivenLayoutPass();
+createAlpsConsumerDrivenLayoutPass(
+    const AlpsConsumerDrivenLayoutOptions &options =
+        AlpsConsumerDrivenLayoutOptions());
+
+/// ALPS P5a: classify stable consumer-layout contracts at a compiler phase.
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createAlpsContractDischargeLedgerPass(
+    const AlpsContractDischargeLedgerOptions &options =
+        AlpsContractDischargeLedgerOptions());
+
+/// ALPS P5c: prefetch a provably future tile while P2e directly forms the
+/// representation demanded by its consumer.
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createAlpsLayoutSupplyPrefetchPass(
+    const AlpsLayoutSupplyPrefetchOptions &options =
+        AlpsLayoutSupplyPrefetchOptions());
 
 /// V-DAE: decouples Memory Access and Compute Execution using semaphores.
 std::unique_ptr<InterfacePass<FunctionOpInterface>>

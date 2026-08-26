@@ -110,6 +110,18 @@ def make_layered_hvx_options(args: argparse.Namespace) -> dict:
     options["enableAlpsConsumerDrivenLayout"] = (
         os.environ.get("ALPS_ENABLE_CONSUMER_DRIVEN_LAYOUT", "0") == "1"
     )
+    options["enableAlpsConsumerLayoutPropagation"] = (
+        os.environ.get("ALPS_ENABLE_CONSUMER_LAYOUT_PROPAGATION", "0") == "1"
+    )
+    options["enableAlpsContractDischargeLedger"] = (
+        os.environ.get("ALPS_ENABLE_CONTRACT_DISCHARGE_LEDGER", "0") == "1"
+    )
+    options["enableAlpsRepresentationSupplyAnalysis"] = (
+        os.environ.get("ALPS_ENABLE_REPRESENTATION_SUPPLY_ANALYSIS", "0") == "1"
+    )
+    options["enableAlpsLayoutSupplyPrefetch"] = (
+        os.environ.get("ALPS_ENABLE_LAYOUT_SUPPLY_PREFETCH", "0") == "1"
+    )
     options["enableAlpsFusedTransformTransfer"] = (
         os.environ.get("ALPS_ENABLE_FUSED_TRANSFORM_TRANSFER", "0") == "1"
     )
@@ -139,6 +151,10 @@ def make_layered_hvx_options(args: argparse.Namespace) -> dict:
         f"legacy_item7={int(item7)} alps_p0_mode={alps_mode} "
         f"alps_p1_ledger={int(options['enableAlpsMovementLedger'])} "
         f"alps_p2e_consumer_layout={int(options['enableAlpsConsumerDrivenLayout'])} "
+        f"alps_p2f_layout_propagation={int(options['enableAlpsConsumerLayoutPropagation'])} "
+        f"alps_p5a_discharge_ledger={int(options['enableAlpsContractDischargeLedger'])} "
+        f"alps_p5b_supply_analysis={int(options['enableAlpsRepresentationSupplyAnalysis'])} "
+        f"alps_p5c_layout_supply={int(options['enableAlpsLayoutSupplyPrefetch'])} "
         f"alps_p2d_admission={int(options['enableAlpsMinimalStaticAdmission'])} "
         f"alps_p3a_exact={int(options['enableAlpsExactReadiness'])}"
         f" alps_p3b_overlap={int(options['enableAlpsExactOverlap'])}"

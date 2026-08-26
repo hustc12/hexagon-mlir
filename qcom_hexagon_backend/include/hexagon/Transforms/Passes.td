@@ -1061,9 +1061,68 @@ def AlpsConsumerDrivenLayout :
     retained as native layout materializations.
   }];
   let constructor = "hexagon::createAlpsConsumerDrivenLayoutPass()";
+  let options = [
+    Option<"propagateCodegenContract", "propagate-codegen-contract", "bool",
+           /*default=*/"false",
+           "ALPS P2f: preserve admitted consumer layout contracts through "
+           "HVX tiling and vectorization">,
+    Option<"emitDischargeContracts", "emit-discharge-contracts", "bool",
+           /*default=*/"false",
+           "ALPS P5a: assign stable IDs and origin fingerprints to admitted "
+           "consumer-layout contracts">,
+  ];
   let dependentDialects = [
     "mlir::linalg::LinalgDialect",
     "mlir::tensor::TensorDialect",
+  ];
+}
+
+def AlpsContractDischargeLedger :
+    InterfacePass<"alps-contract-discharge-ledger", "mlir::FunctionOpInterface"> {
+  let summary = "Audit ALPS layout-contract survival at a pipeline boundary";
+  let description = [{
+    Reads the stable P5a contract table recorded on a function and classifies
+    each contract as explicitly surviving, represented by an operation whose
+    fused location still contains the origin, or no longer traceable at the
+    selected compiler boundary. This pass is analysis-only.
+  }];
+  let constructor = "hexagon::createAlpsContractDischargeLedgerPass()";
+  let options = [
+    Option<"phase", "phase", "std::string", /*default=*/"\"unknown\"",
+           "Pipeline boundary reported by the ledger">,
+    Option<"analyzeInputs", "analyze-inputs", "bool", /*default=*/"false",
+           "ALPS P5b: analyze supply candidates feeding surviving contracts">,
+    Option<"minLeadOps", "min-lead-ops", "int64_t", /*default=*/"4",
+           "Minimum producer-to-consumer operation distance for supply">,
+    Option<"minBytes", "min-bytes", "int64_t", /*default=*/"128",
+           "Minimum static contiguous input bytes for supply">,
+  ];
+}
+
+def AlpsLayoutSupplyPrefetch :
+    InterfacePass<"alps-layout-supply-prefetch", "mlir::FunctionOpInterface"> {
+  let summary = "Prefetch the next tile feeding a discharged layout contract";
+  let description = [{
+    ALPS P5c combines consumer-driven in-situ layout formation with a strictly
+    admitted loop-local supply action. It emits a destination-free L2 hint for
+    the next read-only, contiguous tile only when the final vector read can be
+    traced to a static subview of storage invariant in the selected loop. The
+    current tile remains directly formed in the consumer representation; this
+    pass never recreates a canonical intermediate or a transpose.
+  }];
+  let constructor = "hexagon::createAlpsLayoutSupplyPrefetchPass()";
+  let options = [
+    Option<"distance", "distance", "int64_t", /*default=*/"1",
+           "Number of loop iterations to prefetch ahead">,
+    Option<"maxBytes", "max-bytes", "int64_t", /*default=*/"65535",
+           "Maximum bytes in one admitted tile hint">,
+  ];
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::memref::MemRefDialect",
+    "mlir::omni_fetch::OmniFetchDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::vector::VectorDialect",
   ];
 }
 

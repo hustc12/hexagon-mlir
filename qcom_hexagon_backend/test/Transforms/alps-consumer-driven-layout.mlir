@@ -1,6 +1,9 @@
 // RUN: linalg-hexagon-opt %s \
-// RUN:   -pass-pipeline='builtin.module(func.func(alps-consumer-driven-layout))' \
+// RUN:   -pass-pipeline='builtin.module(func.func(alps-consumer-driven-layout{propagate-codegen-contract=true}))' \
 // RUN:   | FileCheck %s
+// RUN: linalg-hexagon-opt %s \
+// RUN:   -pass-pipeline='builtin.module(func.func(alps-layout-supply-prefetch))' \
+// RUN:   | FileCheck %s --check-prefix=P5C
 
 #id3 = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
 
@@ -43,7 +46,38 @@ func.func @direct_hvx_consumer(%input: tensor<8x16x32xf16>,
 // CHECK-SAME: alps.p2e.eliminated_materialization_bytes = 8192
 // CHECK-SAME: alps.p2e.hvx_consumers = 1
 // CHECK-SAME: alps.p2e.producer_direct = 1
+// CHECK: alps.p2f.consumer_layout_contract = "hvx_innermost_unit_stride"
 // CHECK-NOT: linalg.transpose
+
+func.func @p5c_next_tile(%input: memref<4x128xf16>,
+                         %output: memref<4x128xf16>) attributes {
+    alps.p5a.contracts = [{id = "p5c:0", origin = "p5c_supply"}]
+  } {
+  %c0 = arith.constant 0 : index
+  %c0f = arith.constant 0.0 : f16
+  %c1 = arith.constant 1 : index
+  %c4 = arith.constant 4 : index
+  scf.for %iv = %c0 to %c4 step %c1 {
+    %in_tile = memref.subview %input[%iv, 0] [1, 128] [1, 1]
+      : memref<4x128xf16> to memref<1x128xf16, strided<[128, 1], offset: ?>>
+      loc("p5c_supply")
+    %out_tile = memref.subview %output[%iv, 0] [1, 128] [1, 1]
+      : memref<4x128xf16> to memref<1x128xf16, strided<[128, 1], offset: ?>>
+    %value = vector.transfer_read %in_tile[%c0, %c0], %c0f
+      : memref<1x128xf16, strided<[128, 1], offset: ?>>, vector<1x128xf16>
+      loc("p5c_supply")
+    vector.transfer_write %value, %out_tile[%c0, %c0]
+      : vector<1x128xf16>, memref<1x128xf16, strided<[128, 1], offset: ?>>
+  }
+  return
+}
+
+// P5C-LABEL: func.func @p5c_next_tile
+// P5C-SAME: alps.p5c.admitted = 1
+// P5C-SAME: alps.p5c.matched = 1
+// P5C-SAME: alps.p5c.requested_bytes = 256
+// P5C: scf.if
+// P5C: omni_fetch.l2_hint
 
 // Moving the innermost dimension would turn a unit-stride stream into a
 // strided one.  The contract remains auditable, but native materialization is
@@ -117,5 +151,6 @@ func.func @direct_expanded_hvx_consumer(%input: tensor<1x4x12xf16>,
 // CHECK-LABEL: func.func @direct_expanded_hvx_consumer
 // CHECK-SAME: alps.p2e.eliminated_materialization_bytes = 96
 // CHECK-SAME: alps.p2e.producer_direct = 1
+// CHECK: alps.p2f.consumer_layout_contract = "hvx_innermost_unit_stride"
 // CHECK-NOT: tensor.expand_shape
 // CHECK-NOT: linalg.transpose

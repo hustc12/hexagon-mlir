@@ -29,6 +29,10 @@ alps_p2b=0
 alps_p2c=0
 alps_p2d=0
 alps_p2e=0
+alps_p2f=0
+alps_p5a=0
+alps_p5b=0
+alps_p5c=0
 alps_p3a=0
 alps_p3b=0
 alps_p4a=0
@@ -73,6 +77,10 @@ Options:
   --alps-p2c              Run P2c sync fused transform-transfer + stable P2a
   --alps-p2d              Run P2d minimal static admission + stable P2a
   --alps-p2e              Run consumer-driven layout contracts and direct formation
+  --alps-p2f              Run P2e plus HVX tiling/vectorization contract propagation
+  --alps-p5a              Run P2e plus analysis-only contract discharge ledger
+  --alps-p5b              Run P5a plus representation-aware input supply analysis
+  --alps-p5c              Run P2e plus admitted next-tile layout-supply prefetch
   --alps-p3a              Run P3a exact-readiness contract + P2d + stable P2a
   --alps-p3b              Run P3b descriptor-bound issuer-owned weight DMA overlap
   --alps-p4a              Run P4A telemetry + within-path DMA traffic control
@@ -168,6 +176,10 @@ while (($#)); do
     --alps-p2c) alps_p0=1; alps_p2a=1; alps_p2c=1; shift ;;
     --alps-p2d) alps_p0=1; alps_p2a=1; alps_p2d=1; shift ;;
     --alps-p2e) alps_p0=1; alps_p2e=1; shift ;;
+    --alps-p2f) alps_p0=1; alps_p2e=1; alps_p2f=1; shift ;;
+    --alps-p5a) alps_p0=1; alps_p2e=1; alps_p5a=1; shift ;;
+    --alps-p5b) alps_p0=1; alps_p2e=1; alps_p5a=1; alps_p5b=1; shift ;;
+    --alps-p5c) alps_p0=1; alps_p2e=1; alps_p5a=1; alps_p5b=1; alps_p5c=1; shift ;;
     --alps-p3a) alps_p0=1; alps_p2a=1; alps_p2d=1; alps_p3a=1; shift ;;
     --alps-p3b)
       alps_p0=1; alps_p2a=1; alps_p2d=1; alps_p3a=1; alps_p3b=1; shift
@@ -187,12 +199,20 @@ while (($#)); do
   esac
 done
 
-if ((alps_p4a)); then
+if ((alps_p5c)); then
+  schemes=(alps-layout-supply-prefetch)
+elif ((alps_p4a)); then
   schemes=(alps-elementwise-traffic-control)
 elif ((alps_p3b)); then
   schemes=(alps-elementwise-exact-overlap)
 elif ((alps_p3a)); then
   schemes=(alps-elementwise-exact-readiness)
+elif ((alps_p5b)); then
+  schemes=(alps-representation-supply-analysis)
+elif ((alps_p5a)); then
+  schemes=(alps-consumer-driven-layout alps-contract-discharge-ledger)
+elif ((alps_p2f)); then
+  schemes=(hmlir-hvx-hexkl-on alps-consumer-driven-layout alps-consumer-layout-propagation)
 elif ((alps_p2e)); then
   schemes=(hmlir-hvx-hexkl-on alps-consumer-driven-layout)
 elif ((alps_p2d)); then
@@ -440,7 +460,7 @@ scheme_args_for() {
       printf '%s\n' --enable-hexkl --alps-p0-mode elementwise-fusion \
         --disable-layout-aware --disable-omnifetch-adaptive
       ;;
-    alps-consumer-driven-layout)
+    alps-consumer-driven-layout|alps-consumer-layout-propagation|alps-contract-discharge-ledger|alps-representation-supply-analysis|alps-layout-supply-prefetch)
       printf '%s\n' --enable-hexkl --disable-layout-aware --disable-omnifetch-adaptive
       ;;
     alps-elementwise-admission|alps-elementwise-exact-readiness|alps-elementwise-exact-overlap|alps-elementwise-traffic-control)
@@ -513,7 +533,11 @@ run_case() {
     ALPS_ENABLE_MOVEMENT_LEDGER="$([[ ${alps_p1} -eq 1 || ${alps_p2a} -eq 1 || ${alps_p2b} -eq 1 || ${alps_p2c} -eq 1 || ${alps_p2d} -eq 1 || ${alps_p2e} -eq 1 || ${alps_p3a} -eq 1 || ${alps_p3b} -eq 1 || ${alps_p4a} -eq 1 ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_ZERO_COPY_ATTENTION="$([[ ${scheme} == alps-elementwise-zero-copy || ${scheme} == alps-elementwise-producer-direct || ${scheme} == alps-elementwise-fused-transfer || ${scheme} == alps-elementwise-admission || ${scheme} == alps-elementwise-exact-readiness || ${scheme} == alps-elementwise-exact-overlap || ${scheme} == alps-elementwise-traffic-control ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_PRODUCER_DIRECT_ATTENTION="$([[ ${scheme} == alps-elementwise-producer-direct ]] && echo 1 || echo 0)" \
-    ALPS_ENABLE_CONSUMER_DRIVEN_LAYOUT="$([[ ${scheme} == alps-consumer-driven-layout ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_CONSUMER_DRIVEN_LAYOUT="$([[ ${scheme} == alps-consumer-driven-layout || ${scheme} == alps-consumer-layout-propagation || ${scheme} == alps-contract-discharge-ledger || ${scheme} == alps-representation-supply-analysis || ${scheme} == alps-layout-supply-prefetch ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_CONSUMER_LAYOUT_PROPAGATION="$([[ ${scheme} == alps-consumer-layout-propagation ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_CONTRACT_DISCHARGE_LEDGER="$([[ ${scheme} == alps-contract-discharge-ledger ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_REPRESENTATION_SUPPLY_ANALYSIS="$([[ ${scheme} == alps-representation-supply-analysis ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_LAYOUT_SUPPLY_PREFETCH="$([[ ${scheme} == alps-layout-supply-prefetch ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_FUSED_TRANSFORM_TRANSFER="$([[ ${scheme} == alps-elementwise-fused-transfer ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_MINIMAL_STATIC_ADMISSION="$([[ ${scheme} == alps-elementwise-admission || ${scheme} == alps-elementwise-exact-readiness || ${scheme} == alps-elementwise-exact-overlap || ${scheme} == alps-elementwise-traffic-control ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_EXACT_READINESS="$([[ ${scheme} == alps-elementwise-exact-readiness || ${scheme} == alps-elementwise-exact-overlap || ${scheme} == alps-elementwise-traffic-control ]] && echo 1 || echo 0)" \
@@ -548,7 +572,7 @@ run_case() {
 }
 
 write_ratios() {
-  "${venv}/bin/python" - "${results}" "${output_dir}/summary.md" "${alps_p0}" "${alps_p0b}" "${alps_p1}" "${alps_p2a}" "${alps_p2b}" "${alps_p2c}" "${alps_p2d}" "${alps_p2e}" "${alps_p3a}" "${alps_p3b}" "${alps_p4a}" <<'PY'
+  "${venv}/bin/python" - "${results}" "${output_dir}/summary.md" "${alps_p0}" "${alps_p0b}" "${alps_p1}" "${alps_p2a}" "${alps_p2b}" "${alps_p2c}" "${alps_p2d}" "${alps_p2e}" "${alps_p2f}" "${alps_p5a}" "${alps_p5b}" "${alps_p5c}" "${alps_p3a}" "${alps_p3b}" "${alps_p4a}" <<'PY'
 import csv
 import pathlib
 import sys
@@ -563,16 +587,38 @@ alps_p2b = bool(int(sys.argv[7]))
 alps_p2c = bool(int(sys.argv[8]))
 alps_p2d = bool(int(sys.argv[9]))
 alps_p2e = bool(int(sys.argv[10]))
-alps_p3a = bool(int(sys.argv[11]))
-alps_p3b = bool(int(sys.argv[12]))
-alps_p4a = bool(int(sys.argv[13]))
+alps_p2f = bool(int(sys.argv[11]))
+alps_p5a = bool(int(sys.argv[12]))
+alps_p5b = bool(int(sys.argv[13]))
+alps_p5c = bool(int(sys.argv[14]))
+alps_p3a = bool(int(sys.argv[15]))
+alps_p3b = bool(int(sys.argv[16]))
+alps_p4a = bool(int(sys.argv[17]))
+
+def selected_reference():
+    if alps_p5c: return "alps-layout-supply-prefetch"
+    if alps_p4a: return "alps-elementwise-traffic-control"
+    if alps_p3b: return "alps-elementwise-exact-overlap"
+    if alps_p3a: return "alps-elementwise-exact-readiness"
+    if alps_p5b: return "alps-representation-supply-analysis"
+    if alps_p5a: return "alps-contract-discharge-ledger"
+    if alps_p2f: return "alps-consumer-layout-propagation"
+    if alps_p2e: return "alps-consumer-driven-layout"
+    if alps_p2d: return "alps-elementwise-admission"
+    if alps_p2c: return "alps-elementwise-fused-transfer"
+    if alps_p2b: return "alps-elementwise-producer-direct"
+    if alps_p2a: return "alps-elementwise-zero-copy"
+    if alps_p1: return "alps-elementwise-fusion"
+    if alps_p0b: return "alps-fusion"
+    if alps_p0: return "alps-legacy-all"
+    return "item7-only"
 with csv_path.open(newline="", encoding="utf-8") as handle:
     rows = list(csv.DictReader(handle))
 by_model = {}
 for row in rows:
     by_model.setdefault(row["model"], {})[row["scheme"]] = row
 for model_rows in by_model.values():
-    reference_name = "alps-elementwise-traffic-control" if alps_p4a else ("alps-elementwise-exact-overlap" if alps_p3b else ("alps-elementwise-exact-readiness" if alps_p3a else ("alps-consumer-driven-layout" if alps_p2e else ("alps-elementwise-admission" if alps_p2d else ("alps-elementwise-fused-transfer" if alps_p2c else ("alps-elementwise-producer-direct" if alps_p2b else ("alps-elementwise-zero-copy" if alps_p2a else ("alps-elementwise-fusion" if alps_p1 else ("alps-fusion" if alps_p0b else ("alps-legacy-all" if alps_p0 else "item7-only"))))))))))
+    reference_name = selected_reference()
     item = model_rows.get(reference_name, {})
     try:
         denominator = float(item["latency_ms"])
@@ -587,15 +633,23 @@ with csv_path.open("w", newline="", encoding="utf-8") as handle:
     writer = csv.DictWriter(handle, fieldnames=rows[0].keys())
     writer.writeheader()
     writer.writerows(rows)
-reference_name = "alps-elementwise-traffic-control" if alps_p4a else ("alps-elementwise-exact-overlap" if alps_p3b else ("alps-elementwise-exact-readiness" if alps_p3a else ("alps-consumer-driven-layout" if alps_p2e else ("alps-elementwise-admission" if alps_p2d else ("alps-elementwise-fused-transfer" if alps_p2c else ("alps-elementwise-producer-direct" if alps_p2b else ("alps-elementwise-zero-copy" if alps_p2a else ("alps-elementwise-fusion" if alps_p1 else ("alps-fusion" if alps_p0b else ("alps-legacy-all" if alps_p0 else "item7-only"))))))))))
-title = "ALPS P4A telemetry and within-path traffic control" if alps_p4a else ("ALPS P3b exact issuer-owned DMA overlap" if alps_p3b else ("ALPS P3a exact-readiness contract" if alps_p3a else ("ALPS P2e consumer-driven layout" if alps_p2e else ("ALPS P2d minimal static admission" if alps_p2d else ("ALPS P2c fused transform-transfer" if alps_p2c else ("ALPS P2b producer-direct attention" if alps_p2b else ("ALPS P2a zero-copy attention" if alps_p2a else ("ALPS P1 movement-ledger comparison" if alps_p1 else ("ALPS P0b topology comparison" if alps_p0b else ("ALPS P0 causal comparison" if alps_p0 else "Full-model HVX five-way comparison"))))))))))
+reference_name = selected_reference()
+title = "ALPS P5c layout-supply prefetch" if alps_p5c else ("ALPS P5b representation-aware supply analysis" if alps_p5b else ("ALPS P5a contract discharge ledger" if alps_p5a else ("ALPS P2f consumer layout codegen propagation" if alps_p2f else ("ALPS P2e consumer-driven layout" if alps_p2e else "ALPS/full-model comparison"))))
 schemes = (
+    ("alps-layout-supply-prefetch",)
+    if alps_p5c else
     ("alps-elementwise-traffic-control",)
     if alps_p4a else
     ("alps-elementwise-exact-overlap",)
     if alps_p3b else
     ("alps-elementwise-exact-readiness",)
     if alps_p3a else
+    ("alps-representation-supply-analysis",)
+    if alps_p5b else
+    ("alps-consumer-driven-layout", "alps-contract-discharge-ledger")
+    if alps_p5a else
+    ("hmlir-hvx-hexkl-on", "alps-consumer-driven-layout", "alps-consumer-layout-propagation")
+    if alps_p2f else
     ("hmlir-hvx-hexkl-on", "alps-consumer-driven-layout")
     if alps_p2e else
     ("alps-elementwise-admission",)

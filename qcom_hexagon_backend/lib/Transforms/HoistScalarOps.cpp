@@ -294,6 +294,12 @@ linalg::GenericOp HoistScalarOpsPass::buildNewGenericOp(
   auto newGeneric = linalg::GenericOp::create(
       builder, gop.getLoc(), gop->getResultTypes(), newInputs, gop.getOutputs(),
       newMaps, gop.getIteratorTypesArray());
+  for (StringRef name : {"alps.p2f.consumer_layout_contract",
+                         "alps.p2f.permutation",
+                         "alps.p2f.contiguous_loop",
+                         "alps.p5a.contract_id"})
+    if (Attribute attr = gop->getAttr(name))
+      newGeneric->setAttr(name, attr);
 
   // Build the region for the new linalg.generic
   Region &region = newGeneric.getRegion();

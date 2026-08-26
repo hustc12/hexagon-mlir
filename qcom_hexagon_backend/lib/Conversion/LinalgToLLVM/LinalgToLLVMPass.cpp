@@ -112,6 +112,9 @@ public:
         enableAlpsMinimalStaticAdmission;
     const bool alpsExactReadiness = enableAlpsExactReadiness;
     const bool alpsExactOverlap = enableAlpsExactOverlap;
+    const bool alpsContractLedger = enableAlpsContractDischargeLedger ||
+                                    enableAlpsRepresentationSupplyAnalysis ||
+                                    enableAlpsLayoutSupplyPrefetch;
     const bool alpsKvSemanticTracking =
         enableOmniFetchKvCachePrefetch || enableAlpsKvSemanticTracking ||
         alpsKvElementwiseFusionPolicy || alpsKvMultiUseFusionPolicy ||
@@ -144,6 +147,18 @@ public:
                       alpsBuilder.getBoolAttr(alpsMinimalStaticAdmission));
     moduleOp->setAttr("alps.p2e.consumer_driven_layout",
                       alpsBuilder.getBoolAttr(enableAlpsConsumerDrivenLayout));
+    moduleOp->setAttr(
+        "alps.p2f.consumer_layout_propagation",
+        alpsBuilder.getBoolAttr(enableAlpsConsumerLayoutPropagation));
+    moduleOp->setAttr(
+        "alps.p5a.contract_discharge_ledger",
+        alpsBuilder.getBoolAttr(alpsContractLedger));
+    moduleOp->setAttr(
+        "alps.p5b.representation_supply_analysis",
+        alpsBuilder.getBoolAttr(enableAlpsRepresentationSupplyAnalysis));
+    moduleOp->setAttr(
+        "alps.p5c.layout_supply_prefetch",
+        alpsBuilder.getBoolAttr(enableAlpsLayoutSupplyPrefetch));
     moduleOp->setAttr("alps.p3a.exact_readiness",
                       alpsBuilder.getBoolAttr(alpsExactReadiness));
     moduleOp->setAttr("alps.p3b.exact_overlap",
@@ -151,6 +166,15 @@ public:
 
     if (alpsExactReadiness && !alpsMinimalStaticAdmission) {
       moduleOp.emitError("ALPS P3a exact readiness requires P2d admission");
+      return;
+    }
+    if (enableAlpsConsumerLayoutPropagation &&
+        !enableAlpsConsumerDrivenLayout) {
+      moduleOp.emitError("ALPS P2f layout propagation requires P2e");
+      return;
+    }
+    if (alpsContractLedger && !enableAlpsConsumerDrivenLayout) {
+      moduleOp.emitError("ALPS P5a/P5b contract analysis requires P2e");
       return;
     }
     if (alpsExactOverlap && !alpsExactReadiness) {
@@ -232,6 +256,13 @@ public:
       passOption.phase = phase.str();
       passOption.pageBytes = alpsLedgerPageBytes;
       passOption.vtcmBudgetBytes = alpsLedgerVtcmBudgetBytes;
+      return passOption;
+    };
+    auto setAlpsDischargePhase = [&](auto passOption, StringRef phase) {
+      passOption.phase = phase.str();
+      passOption.analyzeInputs =
+          enableAlpsRepresentationSupplyAnalysis &&
+          phase == "post-bufferization";
       return passOption;
     };
     auto setOmniFetchVDAE = [&](auto passOption) {
@@ -321,7 +352,13 @@ public:
     // independent from the attention-only P2a/P2b patterns and remains
     // default-off for matched ablation.
     if (enableAlpsConsumerDrivenLayout) {
-      pm.addNestedPass<func::FuncOp>(createAlpsConsumerDrivenLayoutPass());
+      AlpsConsumerDrivenLayoutOptions p2eOptions{};
+      p2eOptions.propagateCodegenContract =
+          enableAlpsConsumerLayoutPropagation;
+      p2eOptions.emitDischargeContracts =
+          alpsContractLedger;
+      pm.addNestedPass<func::FuncOp>(
+          createAlpsConsumerDrivenLayoutPass(p2eOptions));
       pm.addPass(createCanonicalizerPass());
       pm.addPass(createCSEPass());
     }
@@ -460,6 +497,10 @@ public:
     if (enableAlpsMovementLedger)
       pm.addNestedPass<func::FuncOp>(createAlpsMovementLedgerPass(
           setAlpsLedger(AlpsMovementLedgerOptions{}, "pre-fusion")));
+    if (alpsContractLedger)
+      pm.addNestedPass<func::FuncOp>(createAlpsContractDischargeLedgerPass(
+          setAlpsDischargePhase(AlpsContractDischargeLedgerOptions{},
+                                "pre-fusion")));
 
     if (fusion)
       pm.addNestedPass<func::FuncOp>(
@@ -468,6 +509,11 @@ public:
 
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
+
+    if (alpsContractLedger)
+      pm.addNestedPass<func::FuncOp>(createAlpsContractDischargeLedgerPass(
+          setAlpsDischargePhase(AlpsContractDischargeLedgerOptions{},
+                                "post-fusion")));
 
     // Recover K/V identity from the final, fused contraction shapes.  This
     // keeps the normal HVX fusion pipeline intact while providing stable
@@ -566,6 +612,10 @@ public:
     pm.addPass(createLinalgFoldUnitExtentDimsPass());
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
+    if (alpsContractLedger)
+      pm.addNestedPass<func::FuncOp>(createAlpsContractDischargeLedgerPass(
+          setAlpsDischargePhase(AlpsContractDischargeLedgerOptions{},
+                                "post-tiling")));
     pm.addPass(
         createSmallExponentToMultiplyPass(SmallExponentToMultiplyOptions{}));
     // ===== STEP 1: HOIST SCALAR OPS =====
@@ -613,6 +663,13 @@ public:
       pm.addPass(bufferization::createOneShotBufferizePass(passOpts));
       pm.addPass(createCSEPass());
       pm.addPass(createCanonicalizerPass());
+      if (alpsContractLedger)
+        pm.addNestedPass<func::FuncOp>(createAlpsContractDischargeLedgerPass(
+            setAlpsDischargePhase(AlpsContractDischargeLedgerOptions{},
+                                  "post-bufferization")));
+      if (enableAlpsLayoutSupplyPrefetch)
+        pm.addNestedPass<func::FuncOp>(
+            createAlpsLayoutSupplyPrefetchPass());
 
       if (enableDoubleBuffering) {
         pm.addNestedPass<func::FuncOp>(
@@ -889,7 +946,8 @@ public:
     // Lower omni_fetch dialect ops to extern-C runtime calls.
     // Required whenever Prefetch (Component 1) has emitted prefetch_in_situ ops,
     // or when weight prepack emitted prefetch_in_situ copies in DecomposeHexKL.
-    if (alpsPrefetchPipeline || enableOmniFetchWeightPrepack ||
+    if (alpsPrefetchPipeline || enableAlpsLayoutSupplyPrefetch ||
+        enableOmniFetchWeightPrepack ||
         enablePrefetchKernelHX || enableAPTGetHX) {
       mlir::omni_fetch::OmniFetchToLLVMOptions ofOpts{};
       ofOpts.enableDualThreadDae =

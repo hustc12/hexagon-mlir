@@ -486,6 +486,18 @@ def hexagon_options_phase4(
     options["enableAlpsConsumerDrivenLayout"] = (
         os.environ.get("ALPS_ENABLE_CONSUMER_DRIVEN_LAYOUT", "0") == "1"
     )
+    options["enableAlpsConsumerLayoutPropagation"] = (
+        os.environ.get("ALPS_ENABLE_CONSUMER_LAYOUT_PROPAGATION", "0") == "1"
+    )
+    options["enableAlpsContractDischargeLedger"] = (
+        os.environ.get("ALPS_ENABLE_CONTRACT_DISCHARGE_LEDGER", "0") == "1"
+    )
+    options["enableAlpsRepresentationSupplyAnalysis"] = (
+        os.environ.get("ALPS_ENABLE_REPRESENTATION_SUPPLY_ANALYSIS", "0") == "1"
+    )
+    options["enableAlpsLayoutSupplyPrefetch"] = (
+        os.environ.get("ALPS_ENABLE_LAYOUT_SUPPLY_PREFETCH", "0") == "1"
+    )
     options["enableAlpsFusedTransformTransfer"] = (
         os.environ.get("ALPS_ENABLE_FUSED_TRANSFORM_TRANSFER", "0") == "1"
     )
@@ -533,6 +545,10 @@ def hexagon_options_phase4(
         f"lwp_loop_depth={options['LWPloopDepth']} "
         f"lwp_loops_disabled={int(options['disableLWPLoop'])} "
         f"alps_p2e_consumer_layout={int(options['enableAlpsConsumerDrivenLayout'])} "
+        f"alps_p2f_layout_propagation={int(options['enableAlpsConsumerLayoutPropagation'])} "
+        f"alps_p5a_discharge_ledger={int(options['enableAlpsContractDischargeLedger'])} "
+        f"alps_p5b_supply_analysis={int(options['enableAlpsRepresentationSupplyAnalysis'])} "
+        f"alps_p5c_layout_supply={int(options['enableAlpsLayoutSupplyPrefetch'])} "
         f"alps_p4a_traffic={int(options['enableAlpsTrafficControl'])}"
     )
     return options

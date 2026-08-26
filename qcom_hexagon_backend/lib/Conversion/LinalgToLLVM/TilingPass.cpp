@@ -106,7 +106,9 @@ static LogicalResult applyTiling(IRRewriter &rewriter, linalg::LinalgOp op,
         "omni_fetch.kv_cache_layout", "alps.kv_fusion_boundary",
         "alps.kv_elementwise_fusion_boundary",
         "alps.kv_multi_use_fusion_boundary",
-        "alps.kv_split_reduction_boundary"})
+        "alps.kv_split_reduction_boundary",
+        "alps.p2f.consumer_layout_contract", "alps.p2f.permutation",
+        "alps.p2f.contiguous_loop", "alps.p5a.contract_id"})
     if (Attribute attr = op->getAttr(name)) {
       tiledOp->op->setAttr(name, attr);
       // SCF survives vectorization and one-shot bufferization even when the
@@ -131,6 +133,24 @@ static LogicalResult tileLinalgOp(linalg::LinalgOp op,
   }
 
   linalg::LinalgOp tilingTarget = op;
+  const bool hasConsumerLayoutContract =
+      op->hasAttr("alps.p2f.consumer_layout_contract");
+  if (hasConsumerLayoutContract) {
+    auto contiguousLoop =
+        op->getAttrOfType<IntegerAttr>("alps.p2f.contiguous_loop");
+    if (!contiguousLoop || contiguousLoop.getInt() != numLoops - 1 ||
+        !op.getIndexingMapsArray().back().isIdentity()) {
+      op.emitWarning("dropping invalid ALPS P2f HVX layout contract");
+      op->removeAttr("alps.p2f.consumer_layout_contract");
+      op->removeAttr("alps.p2f.permutation");
+      op->removeAttr("alps.p2f.contiguous_loop");
+      return failure();
+    }
+    // Never introduce a padded copy-back for an admitted direct-layout op.
+    // Splitting preserves the final consumer representation for the main and
+    // remainder ranges independently.
+    splitTilingRange = true;
+  }
   linalg::LinalgTilingOptions tileOption;
   SmallVector<int64_t, 10> tileSizes(numLoops, 1);
   bool needsInterchange = false;
@@ -296,15 +316,20 @@ struct HexagonTilingPass : public ::impl::HexagonTilingBase<HexagonTilingPass> {
       if (!appliedSplitReduction) {
         DBG("tiling candidate: " << op);
         bool isKv = op->hasAttr("omni_fetch.kv_cache_role");
+        bool isP2f = op->hasAttr("alps.p2f.consumer_layout_contract");
         if (succeeded(tileLinalgOp(op, useInterchangeVector,
                                   splitTilingRange))) {
           DBG("-> tiling succeeded.");
           if (isKv)
             llvm::errs() << "[KVPropagation] tiling=succeeded\n";
+          if (isP2f)
+            llvm::errs() << "[ALPS-P2F] tiling=succeeded\n";
         } else {
           DBG("-> tiling failed.");
           if (isKv)
             llvm::errs() << "[KVPropagation] tiling=failed\n";
+          if (isP2f)
+            llvm::errs() << "[ALPS-P2F] tiling=failed\n";
         }
       }
       return WalkResult::advance();
