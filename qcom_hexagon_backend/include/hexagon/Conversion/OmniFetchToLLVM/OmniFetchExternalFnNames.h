@@ -77,8 +77,15 @@ inline llvm::StringRef getPrefetchInSituFnName() {
 ///   void __omni_fetch_l2_hint_2d(
 ///       const void *src, int32_t width_bytes, int32_t height,
 ///       int32_t stride_bytes);
-inline llvm::StringRef getL2Hint2DFnName() {
-  return "__omni_fetch_l2_hint_2d";
+inline llvm::StringRef getL2Hint2DFnName() { return "__omni_fetch_l2_hint_2d"; }
+
+/// Issues one temporally selected physical row for a repeated segmented CRP
+/// site. Signature (C):
+///   void __omni_fetch_l2_hint_segmented(
+///       const void *src, int32_t width_bytes, int32_t rows,
+///       int32_t stride_bytes, int32_t site_id);
+inline llvm::StringRef getL2HintSegmentedFnName() {
+  return "__omni_fetch_l2_hint_segmented";
 }
 
 /// Rank-2 (possibly strided) tile copy used for LAYOUT_NONE prefetches.

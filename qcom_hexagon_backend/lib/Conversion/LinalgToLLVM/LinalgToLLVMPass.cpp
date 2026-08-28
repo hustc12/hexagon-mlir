@@ -17,8 +17,8 @@
 #include "hexagon/Conversion/LinalgToLLVM/Common.h"
 #include "hexagon/Conversion/LinalgToLLVM/LinalgToLLVM.h"
 #include "hexagon/Conversion/LinalgToLLVM/Passes.h"
-#include "hexagon/Dialect/Crouton/IR/CroutonDialect.h"
 #include "hexagon/Conversion/OmniFetchToLLVM/OmniFetchToLLVM.h"
+#include "hexagon/Dialect/Crouton/IR/CroutonDialect.h"
 #include "hexagon/Dialect/HexKL/IR/HexKLDialect.h"
 #include "hexagon/Dialect/HexagonMem/IR/HexagonMemDialect.h"
 #include "hexagon/Dialect/HexagonTPtr/IR/HexagonTPtrDialect.h"
@@ -40,14 +40,20 @@
 #include "mlir/Dialect/Func/Transforms/Passes.h"
 #include "mlir/Dialect/LLVMIR/Transforms/RequestCWrappers.h"
 #include "mlir/Dialect/Linalg/Passes.h"
+#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
+#include "mlir/Dialect/MemRef/Transforms/Transforms.h"
 #include "mlir/Dialect/Quant/IR/Quant.h"
 #include "mlir/Dialect/Quant/Transforms/Passes.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Tensor/Transforms/Transforms.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
+#include "mlir/Transforms/WalkPatternRewriteDriver.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/TargetParser/Triple.h"
 
@@ -63,6 +69,87 @@ using namespace hexagon;
 #include "hexagon/Conversion/LinalgToLLVM/Passes.h.inc"
 
 namespace {
+
+/// Keep P2g-c's rank-4 register formation domain intact while applying the
+/// upstream unit-dimension folding policy to every unrelated operation.  The
+/// stock pass rebuilds linalg.generic without discardable attributes, which
+/// silently erased the register-tile contract before tiling.
+struct AlpsAwareFoldUnitExtentDimsPass
+    : PassWrapper<AlpsAwareFoldUnitExtentDimsPass, OperationPass<>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(AlpsAwareFoldUnitExtentDimsPass)
+
+  void runOnOperation() override {
+    Operation *root = getOperation();
+    MLIRContext *context = root->getContext();
+    linalg::ControlDropUnitDims options;
+    options.controlFn = [](Operation *op) {
+      if (op->hasAttr("alps.p2g.register_tile_contract"))
+        return SmallVector<unsigned>{};
+      if (auto generic = dyn_cast<linalg::GenericOp>(op))
+        return llvm::to_vector(llvm::seq<unsigned>(0, generic.getNumLoops()));
+      if (auto pad = dyn_cast<tensor::PadOp>(op))
+        return llvm::to_vector(
+            llvm::seq<unsigned>(0, pad.getSourceType().getRank()));
+      return SmallVector<unsigned>{};
+    };
+
+    RewritePatternSet foldingPatterns(context);
+    linalg::populateFoldUnitExtentDimsPatterns(foldingPatterns, options);
+    walkAndApplyPatterns(root, std::move(foldingPatterns));
+
+    RewritePatternSet cleanupPatterns(context);
+    linalg::populateMoveInitOperandsToInputPattern(cleanupPatterns);
+    linalg::populateFoldUnitExtentDimsCanonicalizationPatterns(cleanupPatterns,
+                                                               options);
+    if (failed(applyPatternsGreedily(root, std::move(cleanupPatterns))))
+      signalPassFailure();
+  }
+};
+
+/// One-shot bufferization rebuilds vector.transfer_read and intentionally
+/// copies only the operation's semantic attributes.  Preserve P2g-c's
+/// compiler-generated provenance across that boundary with an exact
+/// LocationAttr ledger; P5f-a therefore never has to guess candidates from a
+/// source-location string or admit unrelated traffic.
+struct AlpsRegisterTileMarkerBridgePass
+    : PassWrapper<AlpsRegisterTileMarkerBridgePass,
+                  OperationPass<func::FuncOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(AlpsRegisterTileMarkerBridgePass)
+
+  explicit AlpsRegisterTileMarkerBridgePass(bool restore) : restore(restore) {}
+
+  void runOnOperation() override {
+    constexpr StringLiteral kLedger = "alps.p2g.register_tile_location_ledger";
+    func::FuncOp function = getOperation();
+    Builder builder(function.getContext());
+    if (!restore) {
+      SmallVector<Attribute> locations;
+      function.walk([&](vector::TransferReadOp read) {
+        if (read->hasAttr("alps.p2g.register_tile"))
+          locations.push_back(read->getLoc());
+      });
+      if (!locations.empty())
+        function->setAttr(kLedger, builder.getArrayAttr(locations));
+      return;
+    }
+
+    auto ledger = function->getAttrOfType<ArrayAttr>(kLedger);
+    if (!ledger)
+      return;
+    int64_t restored = 0;
+    function.walk([&](vector::TransferReadOp read) {
+      if (llvm::is_contained(ledger, Attribute(read->getLoc()))) {
+        read->setAttr("alps.p2g.register_tile", builder.getUnitAttr());
+        ++restored;
+      }
+    });
+    function->removeAttr(kLedger);
+    llvm::errs() << "[ALPS-P2G-C] marker_bridge_restored=" << restored << '\n';
+  }
+
+private:
+  bool restore;
+};
 
 struct LinalgToLLVMPass : public ::impl::LinalgToLLVMBase<LinalgToLLVMPass> {
 public:
@@ -84,13 +171,15 @@ public:
   void runOnOperation() override {
     // DEBUG (disabled): pass entry banner and option dump
     // llvm::errs() << "\n[LinalgToLLVM] ========== Pass Starting ==========\n";
-    // llvm::errs() << "[LinalgToLLVM] enableOmniFetchVDAE = " << enableOmniFetchVDAE << "\n";
-    // llvm::errs() << "[LinalgToLLVM] enableHexKL = " << enableHexKL << "\n";
-    // llvm::errs() << "[LinalgToLLVM] omniFetchLookahead = " << omniFetchLookahead << "\n";
-    // llvm::errs() << "[LinalgToLLVM] enableOmniFetchAdaptive = " << enableOmniFetchAdaptive << "\n";
-    // llvm::errs() << "[LinalgToLLVM] enableOmniFetchLayoutAware = " << enableOmniFetchLayoutAware << "\n";
-    // llvm::errs() << "[LinalgToLLVM] ==========================================\n\n";
-    
+    // llvm::errs() << "[LinalgToLLVM] enableOmniFetchVDAE = " <<
+    // enableOmniFetchVDAE << "\n"; llvm::errs() << "[LinalgToLLVM] enableHexKL
+    // = " << enableHexKL << "\n"; llvm::errs() << "[LinalgToLLVM]
+    // omniFetchLookahead = " << omniFetchLookahead << "\n"; llvm::errs() <<
+    // "[LinalgToLLVM] enableOmniFetchAdaptive = " << enableOmniFetchAdaptive <<
+    // "\n"; llvm::errs() << "[LinalgToLLVM] enableOmniFetchLayoutAware = " <<
+    // enableOmniFetchLayoutAware << "\n"; llvm::errs() << "[LinalgToLLVM]
+    // ==========================================\n\n";
+
     auto moduleOp = getOperation();
     MLIRContext *context = moduleOp.getContext();
 
@@ -108,21 +197,22 @@ public:
         enableOmniFetchKvCachePrefetch || enableAlpsKvSlicingPolicy;
     const bool alpsKvRuntimePrefetch =
         enableOmniFetchKvCachePrefetch || enableAlpsKvRuntimePrefetch;
-    const bool alpsMinimalStaticAdmission =
-        enableAlpsMinimalStaticAdmission;
+    const bool alpsMinimalStaticAdmission = enableAlpsMinimalStaticAdmission;
     const bool alpsExactReadiness = enableAlpsExactReadiness;
     const bool alpsExactOverlap = enableAlpsExactOverlap;
     const bool alpsContractLedger = enableAlpsContractDischargeLedger ||
                                     enableAlpsRepresentationSupplyAnalysis ||
                                     enableAlpsLayoutSupplyPrefetch;
+    const bool alpsP2eContracts =
+        alpsContractLedger || enableAlpsContinuityAudit;
     const bool alpsKvSemanticTracking =
         enableOmniFetchKvCachePrefetch || enableAlpsKvSemanticTracking ||
         alpsKvElementwiseFusionPolicy || alpsKvMultiUseFusionPolicy ||
         alpsKvSplitReductionPolicy || alpsKvSlicingPolicy ||
         alpsKvRuntimePrefetch || alpsMinimalStaticAdmission;
-    const bool alpsPrefetchPipeline =
-        enablePrefetch || alpsKvRuntimePrefetch ||
-        enableAlpsFusedTransformTransfer || alpsMinimalStaticAdmission;
+    const bool alpsPrefetchPipeline = enablePrefetch || alpsKvRuntimePrefetch ||
+                                      enableAlpsFusedTransformTransfer ||
+                                      alpsMinimalStaticAdmission;
     const bool alpsLayoutAware = enableOmniFetchLayoutAware ||
                                  enableAlpsFusedTransformTransfer ||
                                  alpsExactOverlap;
@@ -132,9 +222,8 @@ public:
                       alpsBuilder.getBoolAttr(alpsKvSemanticTracking));
     moduleOp->setAttr("alps.p0.kv_fusion_policy",
                       alpsBuilder.getBoolAttr(alpsKvFusionPolicy));
-    moduleOp->setAttr(
-        "alps.p0b.kv_elementwise_fusion_policy",
-        alpsBuilder.getBoolAttr(alpsKvElementwiseFusionPolicy));
+    moduleOp->setAttr("alps.p0b.kv_elementwise_fusion_policy",
+                      alpsBuilder.getBoolAttr(alpsKvElementwiseFusionPolicy));
     moduleOp->setAttr("alps.p0b.kv_multi_use_fusion_policy",
                       alpsBuilder.getBoolAttr(alpsKvMultiUseFusionPolicy));
     moduleOp->setAttr("alps.p0b.kv_split_reduction_policy",
@@ -150,15 +239,62 @@ public:
     moduleOp->setAttr(
         "alps.p2f.consumer_layout_propagation",
         alpsBuilder.getBoolAttr(enableAlpsConsumerLayoutPropagation));
+    moduleOp->setAttr("alps.p2g.continuity_audit",
+                      alpsBuilder.getBoolAttr(enableAlpsContinuityAudit));
     moduleOp->setAttr(
-        "alps.p5a.contract_discharge_ledger",
-        alpsBuilder.getBoolAttr(alpsContractLedger));
+        "alps.p2g.loop_interchanged_direct_formation",
+        alpsBuilder.getBoolAttr(enableAlpsLoopInterchangedDirectFormation));
+    moduleOp->setAttr("alps.p2g.register_tile_formation",
+                      alpsBuilder.getBoolAttr(enableAlpsRegisterTileFormation));
+    moduleOp->setAttr("alps.p5a.contract_discharge_ledger",
+                      alpsBuilder.getBoolAttr(alpsContractLedger));
     moduleOp->setAttr(
         "alps.p5b.representation_supply_analysis",
         alpsBuilder.getBoolAttr(enableAlpsRepresentationSupplyAnalysis));
+    moduleOp->setAttr("alps.p5c.layout_supply_prefetch",
+                      alpsBuilder.getBoolAttr(enableAlpsLayoutSupplyPrefetch));
+    moduleOp->setAttr("alps.p5f_a.crp_supply_analysis",
+                      alpsBuilder.getBoolAttr(enableAlpsCrpSupplyAnalysis));
+    moduleOp->setAttr("alps.p5f_b.crp_supply_prefetch",
+                      alpsBuilder.getBoolAttr(enableAlpsCrpSupplyPrefetch));
+    moduleOp->setAttr("alps.p5f_c.segmented_supply",
+                      alpsBuilder.getBoolAttr(enableAlpsCrpSegmentedSupply));
+    moduleOp->setAttr("alps.p5g_a.vtcm_formation",
+                      alpsBuilder.getBoolAttr(enableAlpsCrpVtcmFormation));
+    moduleOp->setAttr("alps.p5g_b.vtcm_window",
+                      alpsBuilder.getBoolAttr(enableAlpsCrpVtcmWindow));
+    moduleOp->setAttr("alps.p5g_c.vtcm_async_window",
+                      alpsBuilder.getBoolAttr(enableAlpsCrpVtcmAsyncWindow));
     moduleOp->setAttr(
-        "alps.p5c.layout_supply_prefetch",
-        alpsBuilder.getBoolAttr(enableAlpsLayoutSupplyPrefetch));
+        "alps.p5g_d.producer_direct_analysis",
+        alpsBuilder.getBoolAttr(enableAlpsCrpProducerDirectAnalysis));
+    moduleOp->setAttr("alps.p5g_e.producer_direct_vtcm",
+                      alpsBuilder.getBoolAttr(enableAlpsCrpProducerDirectVtcm));
+    moduleOp->setAttr(
+        "alps.p5g_f.producer_direct_head_major",
+        alpsBuilder.getBoolAttr(enableAlpsCrpProducerDirectHeadMajor));
+    moduleOp->setAttr(
+        "alps.p5g_g.producer_loop_formation",
+        alpsBuilder.getBoolAttr(enableAlpsCrpProducerLoopFormation));
+    moduleOp->setAttr(
+        "alps.p5h.attention_destination_formation",
+        alpsBuilder.getBoolAttr(enableAlpsAttentionDestinationFormation));
+    moduleOp->setAttr("alps.p5i.patch_conv_formation",
+                      alpsBuilder.getBoolAttr(enableAlpsPatchConvFormation));
+    moduleOp->setAttr(
+        "alps.p5j.hmx_f16_epilogue_formation",
+        alpsBuilder.getBoolAttr(enableAlpsHmxF16EpilogueFormation));
+    moduleOp->setAttr(
+        "alps.p5k.hmx_direct_output_formation",
+        alpsBuilder.getBoolAttr(enableAlpsHmxDirectOutputFormation));
+    moduleOp->setAttr(
+        "alps.p5l.hmx_f16_bias_epilogue_formation",
+        alpsBuilder.getBoolAttr(enableAlpsHmxF16BiasEpilogueFormation));
+    moduleOp->setAttr(
+        "alps.p5m.hmx_async_drain_analysis",
+        alpsBuilder.getBoolAttr(enableAlpsHmxAsyncDrainAnalysis));
+    moduleOp->setAttr("alps.p5n.hmx_async_drain",
+                      alpsBuilder.getBoolAttr(enableAlpsHmxAsyncDrain));
     moduleOp->setAttr("alps.p3a.exact_readiness",
                       alpsBuilder.getBoolAttr(alpsExactReadiness));
     moduleOp->setAttr("alps.p3b.exact_overlap",
@@ -171,6 +307,15 @@ public:
     if (enableAlpsConsumerLayoutPropagation &&
         !enableAlpsConsumerDrivenLayout) {
       moduleOp.emitError("ALPS P2f layout propagation requires P2e");
+      return;
+    }
+    if (enableAlpsLoopInterchangedDirectFormation &&
+        !enableAlpsConsumerDrivenLayout) {
+      moduleOp.emitError("ALPS P2g-b direct formation requires P2e");
+      return;
+    }
+    if (enableAlpsRegisterTileFormation && !enableAlpsConsumerDrivenLayout) {
+      moduleOp.emitError("ALPS P2g-c register-tile formation requires P2e");
       return;
     }
     if (alpsContractLedger && !enableAlpsConsumerDrivenLayout) {
@@ -186,6 +331,28 @@ public:
       moduleOp.emitError(
           "Prefetch-Kernel-HX and APT-GET-HX are independent baselines and "
           "cannot be enabled in the same compilation");
+      return signalPassFailure();
+    }
+    if ((enableAlpsCrpSupplyAnalysis || enableAlpsCrpSupplyPrefetch ||
+         enableAlpsCrpSegmentedSupply || enableAlpsCrpVtcmFormation ||
+         enableAlpsCrpVtcmWindow || enableAlpsCrpVtcmAsyncWindow ||
+         enableAlpsCrpProducerDirectAnalysis ||
+         enableAlpsCrpProducerDirectVtcm ||
+         enableAlpsCrpProducerDirectHeadMajor ||
+         enableAlpsCrpProducerLoopFormation) &&
+        !enableAlpsRegisterTileFormation) {
+      moduleOp->emitError("ALPS P5f requires P2g-c register-tile formation");
+      return signalPassFailure();
+    }
+    if (enableAlpsCrpSegmentedSupply && !enableAlpsCrpSupplyPrefetch) {
+      moduleOp->emitError(
+          "ALPS P5f-c segmented supply requires P5f-b CRP prefetch");
+      return signalPassFailure();
+    }
+    if (enableAlpsCrpVtcmWindow && enableAlpsCrpVtcmAsyncWindow) {
+      moduleOp->emitError(
+          "ALPS P5g-b synchronous and P5g-c asynchronous VTCM windows are "
+          "independent matched schemes and cannot both be enabled");
       return signalPassFailure();
     }
 
@@ -249,6 +416,7 @@ public:
     auto setLWP = [&](auto passOption) {
       passOption.disableLWPLoop = disableLWPLoop;
       passOption.LWPloopDepth = LWPloopDepth;
+      passOption.instrumentHexKLPhases = instrumentLWPHexKLPhases;
       return passOption;
     };
 
@@ -260,9 +428,8 @@ public:
     };
     auto setAlpsDischargePhase = [&](auto passOption, StringRef phase) {
       passOption.phase = phase.str();
-      passOption.analyzeInputs =
-          enableAlpsRepresentationSupplyAnalysis &&
-          phase == "post-bufferization";
+      passOption.analyzeInputs = enableAlpsRepresentationSupplyAnalysis &&
+                                 phase == "post-bufferization";
       return passOption;
     };
     auto setOmniFetchVDAE = [&](auto passOption) {
@@ -283,6 +450,9 @@ public:
 
     auto setHexKLMode = [&](auto passOption) {
       passOption.mode = hexKLMode;
+      passOption.consumerF16Epilogue = enableAlpsHmxF16EpilogueFormation;
+      passOption.consumerF16BiasEpilogue =
+          enableAlpsHmxF16BiasEpilogueFormation;
       return passOption;
     };
 
@@ -331,8 +501,7 @@ public:
     // Attaching semantic attributes here forces fusion either to preserve
     // every rewrite manually or to disable useful optimization globally.
     lowerTmOpts.emitKvCacheMetadata = false;
-    pm.addNestedPass<func::FuncOp>(
-        createHexagonLowerTmTensorPass(lowerTmOpts));
+    pm.addNestedPass<func::FuncOp>(createHexagonLowerTmTensorPass(lowerTmOpts));
 
     // P2b must run at the first stable tensor-Linalg boundary.  The initial
     // model IR still exposes projection bias-add -> expand -> transpose as a
@@ -341,8 +510,18 @@ public:
     // Rewriting only the add's result layout does not alter the upstream named
     // matmul, so the later HexKL conversion retains the same eligibility.
     if (enableAlpsProducerDirectAttention) {
-      pm.addNestedPass<func::FuncOp>(
-          createAlpsProducerDirectAttentionPass());
+      pm.addNestedPass<func::FuncOp>(createAlpsProducerDirectAttentionPass());
+      pm.addPass(createCanonicalizerPass());
+      pm.addPass(createCSEPass());
+    }
+
+    // P5i recognizes the patch-convolution -> truncate -> token-layout chain
+    // before named convolution generalization destroys the consumer contract.
+    // The rank-2 resource fold makes the weight permutation compile-time only;
+    // no full im2col or runtime weight transpose is introduced.
+    if (enableAlpsPatchConvFormation) {
+      pm.addNestedPass<func::FuncOp>(createAlpsPatchConvFormationPass());
+      pm.addPass(mlir::hexagon::createFoldResourceTransposePass());
       pm.addPass(createCanonicalizerPass());
       pm.addPass(createCSEPass());
     }
@@ -353,10 +532,11 @@ public:
     // default-off for matched ablation.
     if (enableAlpsConsumerDrivenLayout) {
       AlpsConsumerDrivenLayoutOptions p2eOptions{};
-      p2eOptions.propagateCodegenContract =
-          enableAlpsConsumerLayoutPropagation;
-      p2eOptions.emitDischargeContracts =
-          alpsContractLedger;
+      p2eOptions.propagateCodegenContract = enableAlpsConsumerLayoutPropagation;
+      p2eOptions.emitDischargeContracts = alpsP2eContracts;
+      p2eOptions.allowInnermostLoopInterchange =
+          enableAlpsLoopInterchangedDirectFormation;
+      p2eOptions.allowRegisterTileFormation = enableAlpsRegisterTileFormation;
       pm.addNestedPass<func::FuncOp>(
           createAlpsConsumerDrivenLayoutPass(p2eOptions));
       pm.addPass(createCanonicalizerPass());
@@ -364,7 +544,10 @@ public:
     }
 
     pm.addNestedPass<func::FuncOp>(createReduceContractionRankPass());
-    pm.addPass(createLinalgFoldUnitExtentDimsPass());
+    if (enableAlpsRegisterTileFormation)
+      pm.addPass(std::make_unique<AlpsAwareFoldUnitExtentDimsPass>());
+    else
+      pm.addPass(createLinalgFoldUnitExtentDimsPass());
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
 
@@ -498,9 +681,9 @@ public:
       pm.addNestedPass<func::FuncOp>(createAlpsMovementLedgerPass(
           setAlpsLedger(AlpsMovementLedgerOptions{}, "pre-fusion")));
     if (alpsContractLedger)
-      pm.addNestedPass<func::FuncOp>(createAlpsContractDischargeLedgerPass(
-          setAlpsDischargePhase(AlpsContractDischargeLedgerOptions{},
-                                "pre-fusion")));
+      pm.addNestedPass<func::FuncOp>(
+          createAlpsContractDischargeLedgerPass(setAlpsDischargePhase(
+              AlpsContractDischargeLedgerOptions{}, "pre-fusion")));
 
     if (fusion)
       pm.addNestedPass<func::FuncOp>(
@@ -511,9 +694,9 @@ public:
     pm.addPass(createCSEPass());
 
     if (alpsContractLedger)
-      pm.addNestedPass<func::FuncOp>(createAlpsContractDischargeLedgerPass(
-          setAlpsDischargePhase(AlpsContractDischargeLedgerOptions{},
-                                "post-fusion")));
+      pm.addNestedPass<func::FuncOp>(
+          createAlpsContractDischargeLedgerPass(setAlpsDischargePhase(
+              AlpsContractDischargeLedgerOptions{}, "post-fusion")));
 
     // Recover K/V identity from the final, fused contraction shapes.  This
     // keeps the normal HVX fusion pipeline intact while providing stable
@@ -602,20 +785,26 @@ public:
     }
 
     pm.addPass(removeMLProgramPass());
-    pm.addPass(createLinalgFoldUnitExtentDimsPass());
+    if (enableAlpsRegisterTileFormation)
+      pm.addPass(std::make_unique<AlpsAwareFoldUnitExtentDimsPass>());
+    else
+      pm.addPass(createLinalgFoldUnitExtentDimsPass());
     if (enableVectorization) {
       pm.addPass(
           createHexagonTilingPass(setsplitTilingRange(setuseInterchangeVector(
               setenableSplitReduction(HexagonTilingOptions{})))));
     }
 
-    pm.addPass(createLinalgFoldUnitExtentDimsPass());
+    if (enableAlpsRegisterTileFormation)
+      pm.addPass(std::make_unique<AlpsAwareFoldUnitExtentDimsPass>());
+    else
+      pm.addPass(createLinalgFoldUnitExtentDimsPass());
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
     if (alpsContractLedger)
-      pm.addNestedPass<func::FuncOp>(createAlpsContractDischargeLedgerPass(
-          setAlpsDischargePhase(AlpsContractDischargeLedgerOptions{},
-                                "post-tiling")));
+      pm.addNestedPass<func::FuncOp>(
+          createAlpsContractDischargeLedgerPass(setAlpsDischargePhase(
+              AlpsContractDischargeLedgerOptions{}, "post-tiling")));
     pm.addPass(
         createSmallExponentToMultiplyPass(SmallExponentToMultiplyOptions{}));
     // ===== STEP 1: HOIST SCALAR OPS =====
@@ -639,6 +828,9 @@ public:
     if (enableVectorization) {
       pm.addPass(createHexagonVectorizationPass());
     }
+    if (enableAlpsRegisterTileFormation)
+      pm.addNestedPass<func::FuncOp>(
+          std::make_unique<AlpsRegisterTileMarkerBridgePass>(false));
     pm.addPass(createRewriteUBPoisonToZeroPass());
     pm.addPass(createHexagonVectorLoweringPass());
     pm.addPass(createCanonicalizerPass());
@@ -663,13 +855,49 @@ public:
       pm.addPass(bufferization::createOneShotBufferizePass(passOpts));
       pm.addPass(createCSEPass());
       pm.addPass(createCanonicalizerPass());
-      if (alpsContractLedger)
-        pm.addNestedPass<func::FuncOp>(createAlpsContractDischargeLedgerPass(
-            setAlpsDischargePhase(AlpsContractDischargeLedgerOptions{},
-                                  "post-bufferization")));
-      if (enableAlpsLayoutSupplyPrefetch)
+      if (enableAlpsRegisterTileFormation)
         pm.addNestedPass<func::FuncOp>(
-            createAlpsLayoutSupplyPrefetchPass());
+            std::make_unique<AlpsRegisterTileMarkerBridgePass>(true));
+      if (alpsContractLedger)
+        pm.addNestedPass<func::FuncOp>(
+            createAlpsContractDischargeLedgerPass(setAlpsDischargePhase(
+                AlpsContractDischargeLedgerOptions{}, "post-bufferization")));
+      if (enableAlpsContinuityAudit)
+        pm.addNestedPass<func::FuncOp>(createAlpsContinuityAuditPass());
+      if (enableAlpsCrpSupplyAnalysis)
+        pm.addNestedPass<func::FuncOp>(createAlpsCrpSupplyAnalysisPass());
+      if (enableAlpsCrpVtcmFormation)
+        pm.addNestedPass<func::FuncOp>(createAlpsCrpVtcmFormationPass());
+      if (enableAlpsCrpVtcmWindow)
+        pm.addNestedPass<func::FuncOp>(createAlpsCrpVtcmWindowPass());
+      if (enableAlpsCrpProducerDirectAnalysis ||
+          enableAlpsCrpProducerDirectVtcm ||
+          enableAlpsCrpProducerDirectHeadMajor ||
+          enableAlpsCrpProducerLoopFormation) {
+        AlpsCrpProducerDirectAnalysisOptions p5gOptions{};
+        p5gOptions.rewriteEpochVtcm = enableAlpsCrpProducerDirectVtcm &&
+                                      !enableAlpsCrpProducerDirectHeadMajor &&
+                                      !enableAlpsCrpProducerLoopFormation;
+        p5gOptions.rewriteEpochHeadMajorVtcm =
+            enableAlpsCrpProducerDirectHeadMajor ||
+            enableAlpsCrpProducerLoopFormation;
+        p5gOptions.rewriteProducerLoopOrder =
+            enableAlpsCrpProducerLoopFormation;
+        pm.addNestedPass<func::FuncOp>(
+            createAlpsCrpProducerDirectAnalysisPass(p5gOptions));
+      }
+      if (enableAlpsCrpSupplyPrefetch) {
+        AlpsCrpSupplyPrefetchOptions p5fOptions{};
+        p5fOptions.pageSafeSegmented = enableAlpsCrpSegmentedSupply;
+        pm.addNestedPass<func::FuncOp>(
+            createAlpsCrpSupplyPrefetchPass(p5fOptions));
+      }
+      if (enableAlpsLayoutSupplyPrefetch)
+        pm.addNestedPass<func::FuncOp>(createAlpsLayoutSupplyPrefetchPass());
+
+      if (enableAlpsAttentionDestinationFormation)
+        pm.addNestedPass<func::FuncOp>(
+            createAlpsAttentionDestinationFormationPass());
 
       if (enableDoubleBuffering) {
         pm.addNestedPass<func::FuncOp>(
@@ -733,9 +961,17 @@ public:
 
       if (enableAlpsMovementLedger)
         pm.addNestedPass<func::FuncOp>(createAlpsMovementLedgerPass(
-            setAlpsLedger(AlpsMovementLedgerOptions{},
-                          "post-bufferization")));
+            setAlpsLedger(AlpsMovementLedgerOptions{}, "post-bufferization")));
     }
+
+    // P5g-c must be formed only after ownership-based deallocation and copy
+    // canonicalization.  Carrying an asynchronous schedule through those
+    // passes as ordinary store/copy markers loses the marker attributes and
+    // the generic copy-to-DMA path then recreates an immediate start+wait.
+    // The late pass emits real dma_start/dma_wait ops and owns its explicit
+    // ping/pong VTCM lifetime, so the token can span HVX computation.
+    if (enableAlpsCrpVtcmAsyncWindow)
+      pm.addNestedPass<func::FuncOp>(createAlpsCrpVtcmWindowPass());
 
     if (enableConvertToHexagonmem)
       pm.addNestedPass<func::FuncOp>(createConvertToHexagonmemPass());
@@ -762,14 +998,20 @@ public:
       auto decomposeOptions = DecomposeHexKLMatmulOptions{};
       decomposeOptions.enableWeightPrepack = enableOmniFetchWeightPrepack;
       decomposeOptions.enablePersistentVtcm = enableHexKLPersistentVtcm;
-      decomposeOptions.enableVtcmLifetimeColoring =
-          enableOmniFetchVtcmColoring;
+      decomposeOptions.enableVtcmLifetimeColoring = enableOmniFetchVtcmColoring;
       // P3b's descriptor-bound producer must stage the incoming RM tile in
       // VTCM before the scout performs the WH transform.  Enabling this at
       // decomposition time also reserves the extra, non-aliasing VTCM bank;
       // merely changing PrefetchInsert would produce an out-of-budget view.
       decomposeOptions.enableDmaToVtcm =
           alpsExactOverlap || enableOmniFetchDmaToVtcm;
+      decomposeOptions.enableDirectOutputFormation =
+          enableAlpsHmxDirectOutputFormation;
+      decomposeOptions.enableF16BiasEpilogueFormation =
+          enableAlpsHmxF16BiasEpilogueFormation;
+      decomposeOptions.enableAsyncDrainAnalysis =
+          enableAlpsHmxAsyncDrainAnalysis;
+      decomposeOptions.enableAsyncDrain = enableAlpsHmxAsyncDrain;
       pm.addNestedPass<func::FuncOp>(
           createDecomposeHexKLMatmulPass(decomposeOptions));
     }
@@ -796,12 +1038,15 @@ public:
     // ===== Omni-Fetch: Plan-A 3-component architecture =====
     //
     //  Component 1 – Prefetch Insertion   (gate: enablePrefetch)
-    //  Component 2 – In-Situ Reshape      (gate: enablePrefetch && enableOmniFetchLayoutAware)
-    //                Layout Ops Elim      (gate: enablePrefetch && enableOmniFetchLayoutAware)
+    //  Component 2 – In-Situ Reshape      (gate: enablePrefetch &&
+    //  enableOmniFetchLayoutAware)
+    //                Layout Ops Elim      (gate: enablePrefetch &&
+    //                enableOmniFetchLayoutAware)
     //  Component 3 – V-DAE Decouple       (gate: enableOmniFetchVDAE)
     //
-    // OmniFetchToLLVM lowers all omni_fetch dialect ops.  It must run whenever
-    // any component has emitted such ops (i.e. whenever enablePrefetch is true).
+    // OmniFetchToLLVM lowers all omni_fetch dialect ops.  P5f-b emits its
+    // already-admitted CRP hints before this section and therefore requires
+    // lowering, but must not activate the broad legacy PrefetchInsert pass.
 
     // --- Component 1: Prefetch Insertion ---
     if (alpsPrefetchPipeline) {
@@ -846,10 +1091,10 @@ public:
           alpsExactOverlap || enableOmniFetchDmaToVtcm;
       prefetchOptions.enableInterLayerPrefetch =
           enableAlpsFusedTransformTransfer ? false
-                                          : enableOmniFetchInterLayerPrefetch;
+                                           : enableOmniFetchInterLayerPrefetch;
       prefetchOptions.enablePersistentWhCache =
           enableAlpsFusedTransformTransfer ? false
-                                          : enableOmniFetchPersistentWhCache;
+                                           : enableOmniFetchPersistentWhCache;
       prefetchOptions.enableTwoDimPipeline =
           alpsExactOverlap ? true
                            : (enableAlpsFusedTransformTransfer
@@ -862,13 +1107,12 @@ public:
       // cumulative items 1-7 still execute the complete pipeline.
       prefetchOptions.kvCacheOnly =
           (alpsKvRuntimePrefetch || alpsMinimalStaticAdmission) &&
-          !alpsExactOverlap &&
-          !enableOmniFetchVDAE &&
-          !enableOmniFetchPersistentWhCache &&
-          !enableOmniFetchTwoDimPipeline && !enableOmniFetchVtcmColoring;
+          !alpsExactOverlap && !enableOmniFetchVDAE &&
+          !enableOmniFetchPersistentWhCache && !enableOmniFetchTwoDimPipeline &&
+          !enableOmniFetchVtcmColoring;
       prefetchOptions.enableDequantReshape =
           enableAlpsFusedTransformTransfer ? false
-                                          : enableOmniFetchDequantReshape;
+                                           : enableOmniFetchDequantReshape;
       prefetchOptions.enableAlpsFusedTransformTransfer =
           enableAlpsFusedTransformTransfer;
       prefetchOptions.requireAlpsAdmission = alpsMinimalStaticAdmission;
@@ -888,17 +1132,15 @@ public:
     // --- Component 2: Layout Ops Elimination (In-Situ Reshape partner) ---
     // Only meaningful when both Prefetch and Layout-Aware are active.
     if (alpsPrefetchPipeline && alpsLayoutAware) {
-      pm.addNestedPass<func::FuncOp>(
-          hexagon::createLayoutOpsEliminationPass());
+      pm.addNestedPass<func::FuncOp>(hexagon::createLayoutOpsEliminationPass());
     }
 
     // --- Component 3: V-DAE (Virtual Decoupled Access-Execute) ---
     // Adds wait/signal semaphore synchronization around prefetch operations.
     // Requires Component 1 to have already inserted prefetch ops.
     if (enableOmniFetchVDAE) {
-      pm.addNestedPass<func::FuncOp>(
-          hexagon::createOmniFetchVDAEInsertPass(
-              setOmniFetchVDAE(OmniFetchVDAEInsertOptions{})));
+      pm.addNestedPass<func::FuncOp>(hexagon::createOmniFetchVDAEInsertPass(
+          setOmniFetchVDAE(OmniFetchVDAEInsertOptions{})));
       if (mlir::hexagon::isEnvTrue("DUMP_AFTER_VDAE"))
         pm.addPass(createCanonicalizerPass());
     }
@@ -944,15 +1186,15 @@ public:
         setDeviceType(hexagonmem::HexagonMemToLLVMOptions{})));
     pm.addPass(hexkl::createHexKLToLLVMPass());
     // Lower omni_fetch dialect ops to extern-C runtime calls.
-    // Required whenever Prefetch (Component 1) has emitted prefetch_in_situ ops,
-    // or when weight prepack emitted prefetch_in_situ copies in DecomposeHexKL.
-    if (alpsPrefetchPipeline || enableAlpsLayoutSupplyPrefetch ||
-        enableOmniFetchWeightPrepack ||
+    // Required whenever Prefetch (Component 1) has emitted prefetch_in_situ
+    // ops, or when weight prepack emitted prefetch_in_situ copies in
+    // DecomposeHexKL.
+    if (alpsPrefetchPipeline || enableAlpsCrpSupplyPrefetch ||
+        enableAlpsLayoutSupplyPrefetch || enableOmniFetchWeightPrepack ||
         enablePrefetchKernelHX || enableAPTGetHX) {
       mlir::omni_fetch::OmniFetchToLLVMOptions ofOpts{};
-      ofOpts.enableDualThreadDae =
-          enableOmniFetchDualThreadDae &&
-          (enableOmniFetchVDAE || alpsExactOverlap);
+      ofOpts.enableDualThreadDae = enableOmniFetchDualThreadDae &&
+                                   (enableOmniFetchVDAE || alpsExactOverlap);
       pm.addPass(omni_fetch::createOmniFetchToLLVMPass(ofOpts));
     }
 

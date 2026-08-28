@@ -26,6 +26,7 @@
 #include "llvm/Support/Debug.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <optional>
 
 #define DEBUG_TYPE "decompose-hexkl-matmul"
@@ -44,15 +45,24 @@ namespace {
 struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
   DecomposeHexKLMatmul(MLIRContext *ctx, bool enableWeightPrepack,
                        bool enableVtcmLifetimeColoring,
-                       bool enableDmaToVtcm, Value sharedVtcm)
+                       bool enableDmaToVtcm,
+                       bool enableDirectOutputFormation,
+                       bool enableF16BiasEpilogueFormation,
+                       bool enableAsyncDrain, Value sharedVtcm)
       : OpRewritePattern(ctx), enableWeightPrepack(enableWeightPrepack),
         enableVtcmLifetimeColoring(enableVtcmLifetimeColoring),
         enableDmaToVtcm(enableDmaToVtcm),
+        enableDirectOutputFormation(enableDirectOutputFormation),
+        enableF16BiasEpilogueFormation(enableF16BiasEpilogueFormation),
+        enableAsyncDrain(enableAsyncDrain),
         sharedVtcm(sharedVtcm) {}
 
   bool enableWeightPrepack;
   bool enableVtcmLifetimeColoring;
   bool enableDmaToVtcm;
+  bool enableDirectOutputFormation;
+  bool enableF16BiasEpilogueFormation;
+  bool enableAsyncDrain;
   /// Non-null when the pass allocated a function-scoped VTCM arena.
   Value sharedVtcm;
 
@@ -66,6 +76,52 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
     auto lhsType = cast<MemRefType>(lhs.getType());
     auto rhsType = cast<MemRefType>(rhs.getType());
     auto resultType = cast<MemRefType>(result.getType());
+
+    // P5l survives one-shot bufferization as an explicit consumer-contract
+    // op. Allocation-liveness optimization may reuse the same memref for many
+    // sequential matmul/epilogue pairs, so the global SSA user list does not
+    // describe one physical value version. Match the first lexical operation
+    // that touches this matmul's output version instead: only an immediate
+    // bias epilogue is legal. A later matmul starts a new value version and its
+    // users must not reject the current pair.
+    hexkl::F16BiasEpilogueOp biasEpilogue;
+    Value bias;
+    if (enableF16BiasEpilogueFormation &&
+        resultType.getElementType().isF16()) {
+      for (Operation *cursor = op->getNextNode(); cursor;
+           cursor = cursor->getNextNode()) {
+        if (!llvm::is_contained(cursor->getOperands(), result))
+          continue;
+        if (isa<memref::DimOp>(cursor))
+          continue;
+        if (auto candidate = dyn_cast<hexkl::F16BiasEpilogueOp>(cursor);
+            candidate && candidate.getSrc() == result)
+          biasEpilogue = candidate;
+        break;
+      }
+      if (biasEpilogue) {
+        bias = biasEpilogue.getBias();
+        Value final = biasEpilogue.getOuts();
+        auto biasType = dyn_cast<MemRefType>(bias.getType());
+        auto finalType = dyn_cast<MemRefType>(final.getType());
+        if (!biasType || biasType.getRank() != 1 ||
+            !biasType.getElementType().isF16() || !finalType ||
+            finalType.getRank() != 2 || !finalType.getElementType().isF16())
+          biasEpilogue = {};
+        // Never move HMX computation across mutable memref operations merely
+        // to make a late consumer operand dominate.  P5l formation creates
+        // its final destination before the producer; malformed/external IR is
+        // conservatively left unfused.
+        auto isLateSameBlockDef = [&](Value value) {
+          Operation *def = value.getDefiningOp();
+          return def && def->getBlock() == op->getBlock() &&
+                 op->isBeforeInBlock(def);
+        };
+        if (biasEpilogue &&
+            (isLateSameBlockDef(bias) || isLateSameBlockDef(final)))
+          biasEpilogue = {};
+      }
+    }
 
     // Validate rank (must be 2D)
     ArrayRef<int64_t> lhsShape = lhsType.getShape();
@@ -108,6 +164,7 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
     Value i32_0 = rewriter.create<arith::ConstantIntOp>(loc, i32Ty, 0);
     Value i32_1 = rewriter.create<arith::ConstantIntOp>(loc, i32Ty, 1);
     Value i32_2 = rewriter.create<arith::ConstantIntOp>(loc, i32Ty, 2);
+    Value i32_2048 = rewriter.create<arith::ConstantIntOp>(loc, i32Ty, 2048);
     Value i32_32 = rewriter.create<arith::ConstantIntOp>(loc, i32Ty, 32);
     Value i32_4096 = rewriter.create<arith::ConstantIntOp>(loc, i32Ty, 4096);
     Value idx4096 = rewriter.create<arith::ConstantIndexOp>(loc, 4096);
@@ -147,6 +204,8 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
     Value lhsWork = lhs;
     Value rhsWork = rhs;
     Value resultWork = result;
+    if (biasEpilogue)
+      resultWork = biasEpilogue.getOuts();
     Value lhsPadAlloc, rhsPadAlloc, resultPadAlloc;
 
     SmallVector<OpFoldResult> padZeros = {rewriter.getIndexAttr(0),
@@ -211,7 +270,16 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
       rhsWork = rhsPadAlloc;
     }
 
-    if (doMPad || doNPad) {
+    bool formDirectOutput = biasEpilogue ||
+                            (enableDirectOutputFormation && (doMPad || doNPad));
+    bool useAsyncDrain =
+        enableAsyncDrain && !enableWeightPrepack && !biasEpilogue &&
+        resultType.getElementType().isF16() && lhsType.hasStaticShape() &&
+        rhsType.hasStaticShape() && resultType.hasStaticShape() &&
+        resultShape[0] >= 32 &&
+        (((resultShape[0] + 31) / 32) * ((resultShape[1] + 31) / 32) >= 2) &&
+        (!(doMPad || doNPad) || formDirectOutput);
+    if ((doMPad || doNPad) && !formDirectOutput) {
       // Result buffer spans the padded extents; the valid [Morig×Norig] region
       // is copied back after compute.
       int64_t rM = doMPad ? staticMAligned : resultShape[0];
@@ -226,11 +294,22 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
     Value M = rewriter.create<arith::IndexCastOp>(loc, i32Ty, dimM);
     Value K = rewriter.create<arith::IndexCastOp>(loc, i32Ty, dimK);
     Value N = rewriter.create<arith::IndexCastOp>(loc, i32Ty, dimN);
+    Value outputRows =
+        formDirectOutput
+            ? rewriter.create<arith::IndexCastOp>(loc, i32Ty, dimMOrig)
+            : M;
+    Value outputCols =
+        formDirectOutput
+            ? rewriter.create<arith::IndexCastOp>(loc, i32Ty, dimNOrig)
+            : N;
 
     // Calculate numKTiles = (k + 31) / 32
     Value kPlus31 = rewriter.create<arith::AddIOp>(loc, dimK, idx31);
     Value kTiles = rewriter.create<arith::DivUIOp>(loc, kPlus31, idx32);
     Value kTilesI32 = rewriter.create<arith::IndexCastOp>(loc, i32Ty, kTiles);
+    Value nPlus31 = rewriter.create<arith::AddIOp>(loc, dimN, idx31);
+    Value nTiles = rewriter.create<arith::DivUIOp>(loc, nPlus31, idx32);
+    Value nTilesI32 = rewriter.create<arith::IndexCastOp>(loc, i32Ty, nTiles);
 
     // VTCM layout (legacy HexKL reuses scratch as weight ping-pong after act load):
     //   default:  act[0..kTiles) | scratch/w0/w1/flat/acc starting at kTiles
@@ -261,6 +340,18 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
           loc, twoKTiles, rewriter.create<arith::ConstantIndexOp>(loc, 4));
       vtcmTiles = rewriter.create<arith::AddIOp>(
           loc, dataTiles, rewriter.create<arith::ConstantIndexOp>(loc, 3));
+    }
+    Value asyncDrainBase;
+    if (useAsyncDrain) {
+      Value vtcmTilesI32ForDrain =
+          rewriter.create<arith::IndexCastOp>(loc, i32Ty, vtcmTiles);
+      asyncDrainBase = rewriter.create<arith::MulIOp>(
+          loc, vtcmTilesI32ForDrain, i32_4096);
+      // One tile holds the two 2048-byte slots. Keep a second tile after it so
+      // the HexKL config block (defined relative to slab end) cannot overlap
+      // the slots after the descriptor size grows.
+      vtcmTiles = rewriter.create<arith::AddIOp>(
+          loc, vtcmTiles, rewriter.create<arith::ConstantIndexOp>(loc, 2));
     }
     Value vtcmBytes = rewriter.create<arith::MulIOp>(loc, vtcmTiles, idx4096);
 
@@ -388,10 +479,67 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
                       });
 
                   bb.create<hexkl::MicroHMXAccReadF16Op>(loc, vtcm, accOff);
-                  bb.create<hexkl::MicroHMXAhToRmF16Op>(loc, vtcm, flatOff,
-                                                        accOff);
-                  bb.create<hexkl::MicroHMXCopyF16ToF32SubmatrixOp>(
-                      loc, vtcm, flatOff, resultWork, rowTile, colTile, M, N);
+                  if (useAsyncDrain) {
+                    Value rowEnd = bb.create<arith::AddIOp>(loc, row, idx32);
+                    Value fullRow = bb.create<arith::CmpIOp>(
+                        loc, arith::CmpIPredicate::ule, rowEnd, dimMOrig);
+                    Value shortRow = bb.create<arith::CmpIOp>(
+                        loc, arith::CmpIPredicate::ugt, rowEnd, dimMOrig);
+                    Value linearTile = bb.create<arith::AddIOp>(
+                        loc,
+                        bb.create<arith::MulIOp>(loc, rowTile, nTilesI32),
+                        colTile);
+                    Value slot =
+                        bb.create<arith::RemUIOp>(loc, linearTile, i32_2);
+                    Value slotByteOffset = bb.create<arith::MulIOp>(
+                        loc, slot, i32_2048);
+                    Value asyncFlatOff = bb.create<arith::AddIOp>(
+                        loc, asyncDrainBase, slotByteOffset);
+                    bb.create<scf::IfOp>(
+                        loc, fullRow,
+                        [&](OpBuilder &thenBuilder, Location thenLoc) {
+                          thenBuilder
+                              .create<hexkl::MicroHMXAsyncDrainWaitSlotOp>(
+                                  thenLoc, slot);
+                          thenBuilder.create<hexkl::MicroHMXAhToRmF16Op>(
+                              thenLoc, vtcm, asyncFlatOff, accOff);
+                          thenBuilder
+                              .create<hexkl::MicroHMXAsyncDrainStartF16Op>(
+                                  thenLoc, vtcm, asyncFlatOff, resultWork,
+                                  rowTile, colTile, outputRows, outputCols,
+                                  slot);
+                          thenBuilder.create<scf::YieldOp>(thenLoc);
+                        });
+                    bb.create<scf::IfOp>(
+                        loc, shortRow,
+                        [&](OpBuilder &thenBuilder, Location thenLoc) {
+                          thenBuilder.create<hexkl::MicroHMXAhToRmF16Op>(
+                              thenLoc, vtcm, flatOff, accOff);
+                          thenBuilder
+                              .create<hexkl::MicroHMXCopyF16ToSubmatrixOp>(
+                                  thenLoc, vtcm, flatOff, resultWork, rowTile,
+                                  colTile, outputRows, outputCols);
+                          thenBuilder.create<scf::YieldOp>(thenLoc);
+                        });
+                  } else if (biasEpilogue) {
+                    bb.create<hexkl::MicroHMXAhToRmF16Op>(loc, vtcm, flatOff,
+                                                          accOff);
+                    bb.create<hexkl::MicroHMXCopyF16BiasToSubmatrixOp>(
+                        loc, vtcm, flatOff, bias, resultWork, rowTile, colTile,
+                        outputRows, outputCols);
+                  } else if (resultType.getElementType().isF16()) {
+                    bb.create<hexkl::MicroHMXAhToRmF16Op>(loc, vtcm, flatOff,
+                                                          accOff);
+                    bb.create<hexkl::MicroHMXCopyF16ToSubmatrixOp>(
+                        loc, vtcm, flatOff, resultWork, rowTile, colTile,
+                        outputRows, outputCols);
+                  } else {
+                    bb.create<hexkl::MicroHMXAhToRmF16Op>(loc, vtcm, flatOff,
+                                                          accOff);
+                    bb.create<hexkl::MicroHMXCopyF16ToF32SubmatrixOp>(
+                        loc, vtcm, flatOff, resultWork, rowTile, colTile,
+                        outputRows, outputCols);
+                  }
                   bb.create<scf::YieldOp>(loc);
                 });
             b.create<scf::YieldOp>(loc);
@@ -451,10 +599,64 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
                         bbb.create<scf::YieldOp>(loc);
                       });
                   bb.create<hexkl::MicroHMXAccReadF16Op>(loc, vtcm, accOff);
-                  bb.create<hexkl::MicroHMXAhToRmF16Op>(loc, vtcm, flatOff,
-                                                        accOff);
-                  bb.create<hexkl::MicroHMXCopyF16ToF32SubmatrixOp>(
-                      loc, vtcm, flatOff, resultWork, rowTile, colTile, M, N);
+                  if (useAsyncDrain) {
+                    Value rowEnd = bb.create<arith::AddIOp>(loc, row, idx32);
+                    Value fullRow = bb.create<arith::CmpIOp>(
+                        loc, arith::CmpIPredicate::ule, rowEnd, dimMOrig);
+                    Value shortRow = bb.create<arith::CmpIOp>(
+                        loc, arith::CmpIPredicate::ugt, rowEnd, dimMOrig);
+                    Value linearTile = bb.create<arith::AddIOp>(
+                        loc,
+                        bb.create<arith::MulIOp>(loc, rowTile, nTilesI32),
+                        colTile);
+                    Value slot =
+                        bb.create<arith::RemUIOp>(loc, linearTile, i32_2);
+                    Value slotByteOffset = bb.create<arith::MulIOp>(
+                        loc, slot, i32_2048);
+                    Value asyncFlatOff = bb.create<arith::AddIOp>(
+                        loc, asyncDrainBase, slotByteOffset);
+                    bb.create<scf::IfOp>(
+                        loc, fullRow,
+                        [&](OpBuilder &thenBuilder, Location thenLoc) {
+                          thenBuilder
+                              .create<hexkl::MicroHMXAsyncDrainWaitSlotOp>(
+                                  thenLoc, slot);
+                          thenBuilder.create<hexkl::MicroHMXAhToRmF16Op>(
+                              thenLoc, vtcm, asyncFlatOff, accOff);
+                          thenBuilder
+                              .create<hexkl::MicroHMXAsyncDrainStartF16Op>(
+                                  thenLoc, vtcm, asyncFlatOff, resultWork,
+                                  rowTile, colTile, outputRows, outputCols,
+                                  slot);
+                          thenBuilder.create<scf::YieldOp>(thenLoc);
+                        });
+                    bb.create<scf::IfOp>(
+                        loc, shortRow,
+                        [&](OpBuilder &thenBuilder, Location thenLoc) {
+                          thenBuilder.create<hexkl::MicroHMXAhToRmF16Op>(
+                              thenLoc, vtcm, flatOff, accOff);
+                          thenBuilder
+                              .create<hexkl::MicroHMXCopyF16ToSubmatrixOp>(
+                                  thenLoc, vtcm, flatOff, resultWork, rowTile,
+                                  colTile, outputRows, outputCols);
+                          thenBuilder.create<scf::YieldOp>(thenLoc);
+                        });
+                  } else {
+                    bb.create<hexkl::MicroHMXAhToRmF16Op>(loc, vtcm, flatOff,
+                                                          accOff);
+                  if (biasEpilogue)
+                    bb.create<hexkl::MicroHMXCopyF16BiasToSubmatrixOp>(
+                        loc, vtcm, flatOff, bias, resultWork, rowTile, colTile,
+                        outputRows, outputCols);
+                  else if (resultType.getElementType().isF16())
+                    bb.create<hexkl::MicroHMXCopyF16ToSubmatrixOp>(
+                        loc, vtcm, flatOff, resultWork, rowTile, colTile,
+                        outputRows, outputCols);
+                  else
+                    bb.create<hexkl::MicroHMXCopyF16ToF32SubmatrixOp>(
+                        loc, vtcm, flatOff, resultWork, rowTile, colTile,
+                        outputRows, outputCols);
+                  }
                   bb.create<scf::YieldOp>(loc);
                 });
             b.create<scf::YieldOp>(loc);
@@ -464,7 +666,9 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
     // Explicitly deallocate VTCM buffer to avoid relying on ConvertToHexagonmem
     // rewriting of generic memref.dealloc for dynamic VTCM types.
     rewriter.setInsertionPointAfter(outerFor);
-    if (doMPad || doNPad) {
+    if (useAsyncDrain)
+      rewriter.create<hexkl::MicroHMXAsyncDrainFlushOp>(loc);
+    if ((doMPad || doNPad) && !formDirectOutput) {
       // Copy the valid [Morig×Norig] region back into the caller's result and
       // release the padded scratch buffers.
       SmallVector<OpFoldResult> zeros = {rewriter.getIndexAttr(0),
@@ -480,10 +684,65 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
       if (doNPad)
         rewriter.create<memref::DeallocOp>(loc, rhsPadAlloc);
       rewriter.create<memref::DeallocOp>(loc, resultPadAlloc);
+    } else if (formDirectOutput) {
+      if (doMPad)
+        rewriter.create<memref::DeallocOp>(loc, lhsPadAlloc);
+      if (doNPad)
+        rewriter.create<memref::DeallocOp>(loc, rhsPadAlloc);
     }
     if (ownsVtcm)
       rewriter.create<hexagonmem::DeallocOp>(loc, vtcm);
 
+    if (biasEpilogue)
+      rewriter.eraseOp(biasEpilogue);
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+// Lower P5l contracts that cannot be safely fused at the producer point back
+// to their ordinary elementwise semantics.  This is the conservative
+// admission fallback: a late/reused destination never causes HMX computation
+// to move across mutable-buffer lifetimes merely to obtain a fused drain.
+struct DecomposeF16BiasEpilogue final
+    : public OpRewritePattern<hexkl::F16BiasEpilogueOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(hexkl::F16BiasEpilogueOp op,
+                                PatternRewriter &rewriter) const override {
+    auto srcType = dyn_cast<MemRefType>(op.getSrc().getType());
+    auto biasType = dyn_cast<MemRefType>(op.getBias().getType());
+    auto dstType = dyn_cast<MemRefType>(op.getOuts().getType());
+    if (!srcType || !biasType || !dstType || srcType.getRank() != 2 ||
+        biasType.getRank() != 1 || dstType.getRank() != 2 ||
+        !srcType.getElementType().isF16() ||
+        !biasType.getElementType().isF16() ||
+        !dstType.getElementType().isF16())
+      return rewriter.notifyMatchFailure(op, "expected rank-2/rank-1 F16 memrefs");
+
+    Location loc = op.getLoc();
+    Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    Value one = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    Value rows = rewriter.create<memref::DimOp>(loc, op.getSrc(), zero);
+    Value cols = rewriter.create<memref::DimOp>(loc, op.getSrc(), one);
+    rewriter.create<scf::ForOp>(
+        loc, zero, rows, one, ValueRange{},
+        [&](OpBuilder &rowBuilder, Location rowLoc, Value row, ValueRange) {
+          rowBuilder.create<scf::ForOp>(
+              rowLoc, zero, cols, one, ValueRange{},
+              [&](OpBuilder &colBuilder, Location colLoc, Value col,
+                  ValueRange) {
+                Value value = colBuilder.create<memref::LoadOp>(
+                    colLoc, op.getSrc(), ValueRange{row, col});
+                Value bias = colBuilder.create<memref::LoadOp>(
+                    colLoc, op.getBias(), ValueRange{col});
+                Value sum = colBuilder.create<arith::AddFOp>(colLoc, value, bias);
+                colBuilder.create<memref::StoreOp>(
+                    colLoc, sum, op.getOuts(), ValueRange{row, col});
+                colBuilder.create<scf::YieldOp>(colLoc);
+              });
+          rowBuilder.create<scf::YieldOp>(rowLoc);
+        });
     rewriter.eraseOp(op);
     return success();
   }
@@ -550,7 +809,8 @@ static int64_t computeColoredVtcmTiles(int64_t kTiles, bool weightPrepack,
 /// interference graph above to compute the compact peak.
 static std::optional<int64_t>
 estimateVtcmBytes(hexkl::MatmulOp op, bool enableWeightPrepack,
-                  bool enableVtcmLifetimeColoring, bool enableDmaToVtcm) {
+                  bool enableVtcmLifetimeColoring, bool enableDmaToVtcm,
+                  bool enableAsyncDrain) {
   auto lhsType = dyn_cast<MemRefType>(op.getLhs().getType());
   if (!lhsType || !lhsType.hasStaticShape() || lhsType.getRank() != 2)
     return std::nullopt;
@@ -559,22 +819,116 @@ estimateVtcmBytes(hexkl::MatmulOp op, bool enableWeightPrepack,
     return std::nullopt;
   int64_t kTiles = (K + 31) / 32;
   if (enableVtcmLifetimeColoring)
-    return computeColoredVtcmTiles(kTiles, enableWeightPrepack,
-                                   enableDmaToVtcm) *
+    return (computeColoredVtcmTiles(kTiles, enableWeightPrepack,
+                                    enableDmaToVtcm) +
+            (enableAsyncDrain ? 2 : 0)) *
            4096;
   int64_t defBytes = (kTiles * 2 + 4 + 3) * 4096;
   int64_t prepackBytes = (kTiles * 3 + 5) * 4096;
-  return enableWeightPrepack ? prepackBytes : defBytes;
+  return (enableWeightPrepack ? prepackBytes : defBytes) +
+         (enableAsyncDrain ? 8192 : 0);
+}
+
+/// P5m is deliberately analysis-only.  A future implementation may replace
+/// the synchronous HMX result copy with ping-pong 2D UserDMA, but only for the
+/// portion whose descriptor cost can overlap a following HMX tile.  In
+/// particular, a DINO-style M=257 tail is kept synchronous: issuing DMA for a
+/// single 64-byte row would turn prefetch into pure launch overhead.
+struct AsyncDrainLedger {
+  int64_t sites = 0;
+  int64_t admittedSites = 0;
+  int64_t rejectedSites = 0;
+  int64_t drainBytes = 0;
+  int64_t descriptors = 0;
+  int64_t fullTiles = 0;
+  int64_t boundaryTiles = 0;
+  int64_t admittedDescriptors = 0;
+  int64_t admittedBytes = 0;
+  int64_t boundaryBytes = 0;
+  int64_t overlapDescriptors = 0;
+  int64_t overlapBytes = 0;
+  int64_t overlapHmxCalls = 0;
+  int64_t maxDestinationStrideBytes = 0;
+  bool dma2dLegal = true;
+};
+
+static void analyzeAsyncDrain(hexkl::MatmulOp op,
+                              AsyncDrainLedger &ledger) {
+  ++ledger.sites;
+  auto lhsType = dyn_cast<MemRefType>(op.getLhs().getType());
+  auto rhsType = dyn_cast<MemRefType>(op.getRhs().getType());
+  auto outType = dyn_cast<MemRefType>(op.getOuts().getType());
+  if (!lhsType || !rhsType || !outType || lhsType.getRank() != 2 ||
+      rhsType.getRank() != 2 || outType.getRank() != 2 ||
+      !lhsType.hasStaticShape() || !rhsType.hasStaticShape() ||
+      !outType.hasStaticShape() || !lhsType.getElementType().isF16() ||
+      !rhsType.getElementType().isF16() ||
+      !outType.getElementType().isF16()) {
+    ++ledger.rejectedSites;
+    return;
+  }
+
+  int64_t M = outType.getShape()[0];
+  int64_t N = outType.getShape()[1];
+  int64_t K = lhsType.getShape()[1];
+  if (M <= 0 || N <= 0 || K <= 0 || lhsType.getShape()[0] != M ||
+      rhsType.getShape()[0] != K || rhsType.getShape()[1] != N) {
+    ++ledger.rejectedSites;
+    ledger.dma2dLegal = false;
+    return;
+  }
+
+  int64_t mTiles = (M + 31) / 32;
+  int64_t nTiles = (N + 31) / 32;
+  int64_t kTiles = (K + 31) / 32;
+  int64_t siteDescriptors = mTiles * nTiles;
+  int64_t siteFullTiles = (M / 32) * (N / 32);
+  int64_t siteDrainBytes = M * N * 2;
+
+  ledger.drainBytes += siteDrainBytes;
+  ledger.descriptors += siteDescriptors;
+  ledger.fullTiles += siteFullTiles;
+  ledger.boundaryTiles += siteDescriptors - siteFullTiles;
+  ledger.maxDestinationStrideBytes =
+      std::max(ledger.maxDestinationStrideBytes, N * 2);
+
+  // All complete 32-row bands are admitted.  A final short N tile remains a
+  // legal 2D transfer because width shrinks while both strides stay fixed.
+  // Short M tails stay synchronous to avoid tiny-height DMA descriptors.
+  int64_t fullRowBands = M / 32;
+  int64_t siteAdmittedDescriptors = fullRowBands * nTiles;
+  int64_t siteAdmittedBytes = fullRowBands * 32 * N * 2;
+  ledger.admittedDescriptors += siteAdmittedDescriptors;
+  ledger.admittedBytes += siteAdmittedBytes;
+  ledger.boundaryBytes += siteDrainBytes - siteAdmittedBytes;
+
+  // The final admitted descriptor has no independently-proven following HMX
+  // compute in this matmul, so it is never counted as hidden work.
+  if (siteAdmittedDescriptors >= 2) {
+    int64_t lastWidth = (N % 32 == 0) ? 32 : N % 32;
+    int64_t lastDescriptorBytes = 32 * lastWidth * 2;
+    ledger.overlapDescriptors += siteAdmittedDescriptors - 1;
+    ledger.overlapBytes += siteAdmittedBytes - lastDescriptorBytes;
+    ledger.overlapHmxCalls += (siteAdmittedDescriptors - 1) * kTiles;
+    ++ledger.admittedSites;
+  } else {
+    ++ledger.rejectedSites;
+  }
 }
 
 void populateDecomposeHexKLMatmulPatterns(RewritePatternSet &patterns,
                                           bool enableWeightPrepack,
                                           bool enableVtcmLifetimeColoring,
                                           bool enableDmaToVtcm,
+                                          bool enableDirectOutputFormation,
+                                          bool enableF16BiasEpilogueFormation,
+                                          bool enableAsyncDrain,
                                           Value sharedVtcm) {
   patterns.add<DecomposeHexKLMatmul>(
       patterns.getContext(), enableWeightPrepack,
-      enableVtcmLifetimeColoring, enableDmaToVtcm, sharedVtcm);
+      enableVtcmLifetimeColoring, enableDmaToVtcm,
+      enableDirectOutputFormation, enableF16BiasEpilogueFormation,
+      enableAsyncDrain, sharedVtcm);
 }
 
 struct DecomposeHexKLMatmulPass
@@ -592,6 +946,48 @@ struct DecomposeHexKLMatmulPass
     auto func = getOperation();
     Value sharedVtcm;
 
+    if (enableAsyncDrainAnalysis) {
+      AsyncDrainLedger ledger;
+      func.walk([&](hexkl::MatmulOp op) { analyzeAsyncDrain(op, ledger); });
+      Builder b(func.getContext());
+      func->setAttr("alps.p5m.sites", b.getI64IntegerAttr(ledger.sites));
+      func->setAttr("alps.p5m.admitted_sites",
+                    b.getI64IntegerAttr(ledger.admittedSites));
+      func->setAttr("alps.p5m.drain_bytes",
+                    b.getI64IntegerAttr(ledger.drainBytes));
+      func->setAttr("alps.p5m.admitted_bytes",
+                    b.getI64IntegerAttr(ledger.admittedBytes));
+      func->setAttr("alps.p5m.overlap_bytes",
+                    b.getI64IntegerAttr(ledger.overlapBytes));
+      StringRef decision = ledger.admittedSites > 0 ? "admit" : "reject";
+      // Function passes may execute concurrently. Build the record locally
+      // and emit it in one write so individual ledgers cannot interleave.
+      std::string record;
+      llvm::raw_string_ostream os(record);
+      os << "[ALPS-P5M-ANALYSIS] function=" << func.getName()
+         << " sites=" << ledger.sites
+         << " admitted_sites=" << ledger.admittedSites
+         << " rejected_sites=" << ledger.rejectedSites
+         << " drain_bytes=" << ledger.drainBytes
+         << " descriptors=" << ledger.descriptors
+         << " full_tiles=" << ledger.fullTiles
+         << " boundary_tiles=" << ledger.boundaryTiles
+         << " admitted_descriptors=" << ledger.admittedDescriptors
+         << " admitted_bytes=" << ledger.admittedBytes
+         << " boundary_bytes=" << ledger.boundaryBytes
+         << " overlap_descriptors=" << ledger.overlapDescriptors
+         << " overlap_bytes=" << ledger.overlapBytes
+         << " overlap_hmx_calls=" << ledger.overlapHmxCalls
+         // One tile holds two 2 KiB slots. A second tile preserves the HexKL
+         // configuration tail at the end of the enlarged VTCM slab.
+         << " extra_vtcm_bytes=8192"
+         << " max_dst_stride_bytes=" << ledger.maxDestinationStrideBytes
+         << " dma2d_legal=" << (ledger.dma2dLegal ? 1 : 0)
+         << " decision=" << decision << "\n";
+      os.flush();
+      llvm::errs() << record;
+    }
+
     // #4: hoist one max-sized VTCM slab to the function entry when every HexKL
     // matmul has a static K.  Per-matmul alloc/dealloc churn is replaced by a
     // single arena reused sequentially across matmuls.
@@ -603,7 +999,7 @@ struct DecomposeHexKLMatmulPass
       for (hexkl::MatmulOp op : matmuls) {
         auto bytes = estimateVtcmBytes(
             op, enableWeightPrepack, enableVtcmLifetimeColoring,
-            enableDmaToVtcm);
+            enableDmaToVtcm, enableAsyncDrain);
         if (!bytes) {
           allStatic = false;
           break;
@@ -636,10 +1032,10 @@ struct DecomposeHexKLMatmulPass
     func.walk([&](hexkl::MatmulOp op) {
       auto legacy = estimateVtcmBytes(op, enableWeightPrepack,
                                       /*coloring=*/false,
-                                      enableDmaToVtcm);
+                                      enableDmaToVtcm, enableAsyncDrain);
       auto colored = estimateVtcmBytes(op, enableWeightPrepack,
                                        /*coloring=*/true,
-                                       enableDmaToVtcm);
+                                       enableDmaToVtcm, enableAsyncDrain);
       if (!legacy || !colored)
         return;
       legacyPeak = std::max(legacyPeak, *legacy);
@@ -666,9 +1062,30 @@ struct DecomposeHexKLMatmulPass
 
     populateDecomposeHexKLMatmulPatterns(
         patterns, enableWeightPrepack, enableVtcmLifetimeColoring,
-        enableDmaToVtcm, sharedVtcm);
+        enableDmaToVtcm, enableDirectOutputFormation,
+        enableF16BiasEpilogueFormation, enableAsyncDrain, sharedVtcm);
     if (failed(applyPatternsGreedily(func, std::move(patterns)))) {
       return signalPassFailure();
+    }
+
+    if (enableF16BiasEpilogueFormation) {
+      // Give producer fusion the first opportunity.  Only contracts left
+      // after every matmul rewrite has reached a fixed point take the
+      // conservative elementwise fallback.
+      RewritePatternSet fallbackPatterns(&getContext());
+      fallbackPatterns.add<DecomposeF16BiasEpilogue>(&getContext());
+      if (failed(applyPatternsGreedily(func, std::move(fallbackPatterns))))
+        return signalPassFailure();
+
+      int64_t remaining = 0;
+      func.walk([&](hexkl::F16BiasEpilogueOp) { ++remaining; });
+      llvm::errs() << "[ALPS-P5L-DECOMPOSE] function=" << func.getName()
+                   << " remaining_bias_epilogues=" << remaining << "\n";
+      if (remaining != 0) {
+        func.emitError("P5l left an unmatched f16 bias epilogue after HMX "
+                       "decomposition");
+        return signalPassFailure();
+      }
     }
 
     if (sharedVtcm) {

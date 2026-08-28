@@ -212,6 +212,22 @@ if (exact_report) {
   fclose(exact_report);
 }
 """.replace("{exec_dir}", exec_dir)
+        if self.options.get("enableAlpsHmxAsyncDrain", False):
+            report += """
+uint64_t hmx_drain = alps_hmx_async_drain_counts();
+uint64_t hmx_drain_bytes = alps_hmx_async_drain_issued_bytes();
+uint64_t hmx_drain_fallbacks = alps_hmx_async_drain_sync_fallbacks();
+FILE *hmx_drain_report = fopen("{exec_dir}/perf.txt", "a");
+if (hmx_drain_report) {
+  fprintf(hmx_drain_report,
+          "ALPSHMXAsyncDrain: issued=%u completed=%u issued_bytes=%llu "
+          "sync_fallbacks=%llu\\n",
+          (unsigned)(hmx_drain >> 32), (unsigned)hmx_drain,
+          (unsigned long long)hmx_drain_bytes,
+          (unsigned long long)hmx_drain_fallbacks);
+  fclose(hmx_drain_report);
+}
+""".replace("{exec_dir}", exec_dir)
         if self.options.get("enableAlpsTrafficControl", False):
             report += """
 uint64_t p4a_windows = __omni_fetch_p4a_window_counts();
@@ -249,6 +265,9 @@ if (p4a_report) {
                 "enablePrefetchKernelHX",
                 "enableAPTGetHX",
                 "enableAlpsExactOverlap",
+                "enableAlpsCrpSupplyPrefetch",
+                "enableAlpsCrpSegmentedSupply",
+                "enableAlpsHmxAsyncDrain",
             )
         )
 
@@ -263,6 +282,8 @@ if (p4a_report) {
                     "enableOmniFetchVDAE",
                     "enableOmniFetchKvCachePrefetch",
                     "enableAlpsKvRuntimePrefetch",
+                    "enableAlpsCrpSupplyPrefetch",
+                    "enableAlpsCrpSegmentedSupply",
                 )
             ):
                 benchmarking = (
@@ -390,6 +411,15 @@ extern "C" __attribute__((weak)) uint64_t
 __omni_fetch_descriptor_counts(void) { return 0; }
 extern "C" __attribute__((weak)) uint64_t
 __omni_fetch_descriptor_release_failures(void) { return 0; }
+"""
+        if self.options.get("enableAlpsHmxAsyncDrain", False):
+            code_headers += """
+extern "C" __attribute__((weak)) uint64_t
+alps_hmx_async_drain_counts(void) { return 0; }
+extern "C" __attribute__((weak)) uint64_t
+alps_hmx_async_drain_issued_bytes(void) { return 0; }
+extern "C" __attribute__((weak)) uint64_t
+alps_hmx_async_drain_sync_fallbacks(void) { return 0; }
 """
         if self.options.get("enableAlpsTrafficControl", False):
             code_headers += """

@@ -16,6 +16,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace mlir;
@@ -25,6 +26,17 @@ using namespace mlir::hexagon;
 #include "hexagon/Transforms/Passes.h.inc"
 
 namespace {
+
+static std::string locationKey(Location location) {
+  std::string storage;
+  llvm::raw_string_ostream stream(storage);
+  location.print(stream);
+  std::string result = stream.str();
+  if (StringRef(result).starts_with("loc(") &&
+      StringRef(result).ends_with(")"))
+    return result.substr(4, result.size() - 5);
+  return result;
+}
 
 static bool hasPermutation(linalg::TransposeOp op,
                            ArrayRef<int64_t> expected) {
@@ -167,6 +179,25 @@ struct AbsorbQKHeadLayout final
     function->setAttr(
         "alps.p2a.eliminated_transpose_materialization_bytes",
         rewriter.getI64IntegerAttr(totalBytes + lhsBytes + rhsBytes));
+    // P2g-a consumes a stable function-level origin table after the
+    // contraction has been tiled, vectorized, and bufferized. Keeping this
+    // analysis metadata unconditional does not alter code generation and lets
+    // an independently enabled continuity audit inspect P2a without relying
+    // on operation attributes surviving the pipeline.
+    SmallVector<Attribute> contracts;
+    if (auto existing =
+            function->getAttrOfType<ArrayAttr>("alps.p2g.p2a_contracts"))
+      llvm::append_range(contracts, existing);
+    NamedAttrList record;
+    record.set("id", rewriter.getStringAttr(
+                         (Twine(function.getName()) + ":p2a:" + Twine(sites))
+                             .str()));
+    record.set("origin", rewriter.getStringAttr(locationKey(op.getLoc())));
+    record.set("bytes",
+               rewriter.getI64IntegerAttr(lhsBytes + rhsBytes));
+    contracts.push_back(DictionaryAttr::get(rewriter.getContext(), record));
+    function->setAttr("alps.p2g.p2a_contracts",
+                      rewriter.getArrayAttr(contracts));
     llvm::errs() << "[ALPS-P2A] function="
                  << function.getName()
                  << " kind=qk_head_layout_absorption"

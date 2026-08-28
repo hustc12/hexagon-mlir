@@ -191,8 +191,8 @@ struct HexagonLWPPass : public ::impl::HexagonLWPPassBase<HexagonLWPPass> {
         OpBuilder::InsertionGuard guard(builder);
         builder.setInsertionPointToStart(module.getBody());
         auto voidTy = LLVM::LLVMVoidType::get(ctx);
-        auto funcTy = LLVM::LLVMFunctionType::get(
-            voidTy, ArrayRef<Type>{i32Ty}, false);
+        auto funcTy =
+            LLVM::LLVMFunctionType::get(voidTy, ArrayRef<Type>{i32Ty}, false);
         LLVM::LLVMFuncOp::create(builder, module.getLoc(), "lwp_handler",
                                  funcTy);
       }
@@ -210,7 +210,8 @@ struct HexagonLWPPass : public ::impl::HexagonLWPPassBase<HexagonLWPPass> {
     // === Instrument Functions ===
     {
       if (increment_loopId >= kMaxLWPRegionIds) {
-        func.emitError("LWP region ID capacity exhausted before function instrumentation");
+        func.emitError(
+            "LWP region ID capacity exhausted before function instrumentation");
         signalPassFailure();
         return;
       }
@@ -234,6 +235,40 @@ struct HexagonLWPPass : public ::impl::HexagonLWPPassBase<HexagonLWPPass> {
       });
     }
 
+    if (instrumentHexKLPhases) {
+      // Loop-level LWP deliberately treats a complete HexKL tile loop as one
+      // region.  That is sufficient for model hotspot ranking, but it cannot
+      // distinguish HMX compute from rm_to_wh/ah_to_rm formation and
+      // accumulator readback.  This analysis-only mode creates one accumulating
+      // region ID per static HexKL micro operation.  The ID is entered/exited
+      // on every dynamic invocation, preserving its enclosing loop as parent.
+      SmallVector<Operation *> hexKLOps;
+      func.walk([&](Operation *op) {
+        if (op->getName().getStringRef().starts_with("hexkl.micro_hmx_"))
+          hexKLOps.push_back(op);
+      });
+      for (Operation *op : hexKLOps) {
+        if (increment_loopId >= kMaxLWPRegionIds) {
+          op->emitError("LWP region ID capacity exhausted during HexKL phase "
+                        "instrumentation");
+          signalPassFailure();
+          return;
+        }
+        Location loc = op->getLoc();
+        StringRef opName = op->getName().getStringRef();
+        printLines(collectLoc(loc), increment_loopId, {opName.str()});
+
+        OpBuilder before(op);
+        Value id = LLVM::ConstantOp::create(
+            before, loc, i32Ty, before.getI32IntegerAttr(increment_loopId++));
+        emitInstrumentationCall(before, loc, id);
+
+        OpBuilder after(op);
+        after.setInsertionPointAfter(op);
+        emitInstrumentationCall(after, loc, id);
+      }
+    }
+
     if (!disableLWPLoop) {
       // === Instrument Loops ===
       func.walk([&](scf::ForOp forOp) {
@@ -247,8 +282,8 @@ struct HexagonLWPPass : public ::impl::HexagonLWPPassBase<HexagonLWPPass> {
 
         if (increment_loopId >= kMaxLWPRegionIds) {
           if (!capacityWarningEmitted) {
-            forOp.emitWarning(
-                "LWP region ID capacity reached; remaining loops are not instrumented");
+            forOp.emitWarning("LWP region ID capacity reached; remaining loops "
+                              "are not instrumented");
             capacityWarningEmitted = true;
           }
           return;

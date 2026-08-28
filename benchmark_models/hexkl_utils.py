@@ -315,6 +315,7 @@ def hexagon_options_phase4(
     enable_lwp: bool = False,
     lwp_loop_depth: int = 1,
     disable_lwp_loop: bool = False,
+    instrument_lwp_hexkl_phases: bool = False,
     omnifetch_items_through: int = 0,
     enable_omnifetch_kv_vtcm: bool = False,
     enable_omnifetch_activation_multicast: bool = False,
@@ -368,6 +369,7 @@ def hexagon_options_phase4(
     options["enableLWP"] = bool(enable_lwp)
     options["disableLWPLoop"] = bool(disable_lwp_loop)
     options["LWPloopDepth"] = int(lwp_loop_depth)
+    options["instrumentLWPHexKLPhases"] = bool(instrument_lwp_hexkl_phases)
     options["lowerConstantsInSeparateSharedObjects"] = bool(lower_constants_separate)
     options["enableHexKL"] = bool(enable_hexkl)
     if profile == "legacy-scalar":
@@ -418,6 +420,9 @@ def hexagon_options_phase4(
         native_options["enableLWP"] = bool(enable_lwp)
         native_options["disableLWPLoop"] = bool(disable_lwp_loop)
         native_options["LWPloopDepth"] = int(lwp_loop_depth)
+        native_options["instrumentLWPHexKLPhases"] = bool(
+            instrument_lwp_hexkl_phases
+        )
         print(
             "[BackendConfig] profile=upstream-native "
             f"vectorization={int(native_options['enableVectorization'])} "
@@ -489,6 +494,15 @@ def hexagon_options_phase4(
     options["enableAlpsConsumerLayoutPropagation"] = (
         os.environ.get("ALPS_ENABLE_CONSUMER_LAYOUT_PROPAGATION", "0") == "1"
     )
+    options["enableAlpsContinuityAudit"] = (
+        os.environ.get("ALPS_ENABLE_CONTINUITY_AUDIT", "0") == "1"
+    )
+    options["enableAlpsLoopInterchangedDirectFormation"] = (
+        os.environ.get("ALPS_ENABLE_LOOP_INTERCHANGED_DIRECT", "0") == "1"
+    )
+    options["enableAlpsRegisterTileFormation"] = (
+        os.environ.get("ALPS_ENABLE_REGISTER_TILE_FORMATION", "0") == "1"
+    )
     options["enableAlpsContractDischargeLedger"] = (
         os.environ.get("ALPS_ENABLE_CONTRACT_DISCHARGE_LEDGER", "0") == "1"
     )
@@ -497,6 +511,57 @@ def hexagon_options_phase4(
     )
     options["enableAlpsLayoutSupplyPrefetch"] = (
         os.environ.get("ALPS_ENABLE_LAYOUT_SUPPLY_PREFETCH", "0") == "1"
+    )
+    options["enableAlpsCrpSupplyAnalysis"] = (
+        os.environ.get("ALPS_ENABLE_CRP_SUPPLY_ANALYSIS", "0") == "1"
+    )
+    options["enableAlpsCrpSupplyPrefetch"] = (
+        os.environ.get("ALPS_ENABLE_CRP_SUPPLY_PREFETCH", "0") == "1"
+    )
+    options["enableAlpsCrpSegmentedSupply"] = (
+        os.environ.get("ALPS_ENABLE_CRP_SEGMENTED_SUPPLY", "0") == "1"
+    )
+    options["enableAlpsCrpVtcmFormation"] = (
+        os.environ.get("ALPS_ENABLE_CRP_VTCM_FORMATION", "0") == "1"
+    )
+    options["enableAlpsCrpVtcmWindow"] = (
+        os.environ.get("ALPS_ENABLE_CRP_VTCM_WINDOW", "0") == "1"
+    )
+    options["enableAlpsCrpVtcmAsyncWindow"] = (
+        os.environ.get("ALPS_ENABLE_CRP_VTCM_ASYNC_WINDOW", "0") == "1"
+    )
+    options["enableAlpsCrpProducerDirectAnalysis"] = (
+        os.environ.get("ALPS_ENABLE_CRP_PRODUCER_DIRECT_ANALYSIS", "0") == "1"
+    )
+    options["enableAlpsCrpProducerDirectVtcm"] = (
+        os.environ.get("ALPS_ENABLE_CRP_PRODUCER_DIRECT_VTCM", "0") == "1"
+    )
+    options["enableAlpsCrpProducerDirectHeadMajor"] = (
+        os.environ.get("ALPS_ENABLE_CRP_PRODUCER_DIRECT_HEAD_MAJOR", "0") == "1"
+    )
+    options["enableAlpsCrpProducerLoopFormation"] = (
+        os.environ.get("ALPS_ENABLE_CRP_PRODUCER_LOOP_FORMATION", "0") == "1"
+    )
+    options["enableAlpsAttentionDestinationFormation"] = (
+        os.environ.get("ALPS_ENABLE_ATTENTION_DESTINATION_FORMATION", "0") == "1"
+    )
+    options["enableAlpsPatchConvFormation"] = (
+        os.environ.get("ALPS_ENABLE_PATCH_CONV_FORMATION", "0") == "1"
+    )
+    options["enableAlpsHmxF16EpilogueFormation"] = (
+        os.environ.get("ALPS_ENABLE_HMX_F16_EPILOGUE_FORMATION", "0") == "1"
+    )
+    options["enableAlpsHmxDirectOutputFormation"] = (
+        os.environ.get("ALPS_ENABLE_HMX_DIRECT_OUTPUT_FORMATION", "0") == "1"
+    )
+    options["enableAlpsHmxF16BiasEpilogueFormation"] = (
+        os.environ.get("ALPS_ENABLE_HMX_F16_BIAS_EPILOGUE_FORMATION", "0") == "1"
+    )
+    options["enableAlpsHmxAsyncDrainAnalysis"] = (
+        os.environ.get("ALPS_ENABLE_HMX_ASYNC_DRAIN_ANALYSIS", "0") == "1"
+    )
+    options["enableAlpsHmxAsyncDrain"] = (
+        os.environ.get("ALPS_ENABLE_HMX_ASYNC_DRAIN", "0") == "1"
     )
     options["enableAlpsFusedTransformTransfer"] = (
         os.environ.get("ALPS_ENABLE_FUSED_TRANSFORM_TRANSFER", "0") == "1"
@@ -523,7 +588,12 @@ def hexagon_options_phase4(
     options["enableOmniFetchMPadHmx"] = bool(enable_omnifetch_m_pad_hmx)
     options["enableBufferResultsToOutParams"] = bool(enable_out_params)
     options["enableOmniFetchDmaToVtcm"] = bool(enable_omnifetch_kv_vtcm)
-    options["enableHexagonmemCopyToDMA"] = bool(enable_omnifetch_kv_vtcm)
+    options["enableHexagonmemCopyToDMA"] = bool(
+        enable_omnifetch_kv_vtcm
+        or options["enableAlpsCrpVtcmFormation"]
+        or options["enableAlpsCrpVtcmWindow"]
+        or options["enableAlpsCrpVtcmAsyncWindow"]
+    )
     if cumulative_level:
         print(
             f"[OmniFetchCumulative] items_through={cumulative_level}: "
@@ -544,11 +614,32 @@ def hexagon_options_phase4(
         f"lwp={int(options['enableLWP'])} "
         f"lwp_loop_depth={options['LWPloopDepth']} "
         f"lwp_loops_disabled={int(options['disableLWPLoop'])} "
+        f"lwp_hexkl_phases={int(options['instrumentLWPHexKLPhases'])} "
         f"alps_p2e_consumer_layout={int(options['enableAlpsConsumerDrivenLayout'])} "
         f"alps_p2f_layout_propagation={int(options['enableAlpsConsumerLayoutPropagation'])} "
+        f"alps_p2g_continuity_audit={int(options['enableAlpsContinuityAudit'])} "
+        f"alps_p2g_loop_interchanged={int(options['enableAlpsLoopInterchangedDirectFormation'])} "
+        f"alps_p2g_register_tile={int(options['enableAlpsRegisterTileFormation'])} "
         f"alps_p5a_discharge_ledger={int(options['enableAlpsContractDischargeLedger'])} "
         f"alps_p5b_supply_analysis={int(options['enableAlpsRepresentationSupplyAnalysis'])} "
         f"alps_p5c_layout_supply={int(options['enableAlpsLayoutSupplyPrefetch'])} "
+        f"alps_p5f_a_crp_supply={int(options['enableAlpsCrpSupplyAnalysis'])} "
+        f"alps_p5f_b_crp_prefetch={int(options['enableAlpsCrpSupplyPrefetch'])} "
+        f"alps_p5f_c_segmented={int(options['enableAlpsCrpSegmentedSupply'])} "
+        f"alps_p5g_a_vtcm={int(options['enableAlpsCrpVtcmFormation'])} "
+        f"alps_p5g_b_window={int(options['enableAlpsCrpVtcmWindow'])} "
+        f"alps_p5g_c_async={int(options['enableAlpsCrpVtcmAsyncWindow'])} "
+        f"alps_p5g_d_producer_analysis={int(options['enableAlpsCrpProducerDirectAnalysis'])} "
+        f"alps_p5g_e_producer_vtcm={int(options['enableAlpsCrpProducerDirectVtcm'])} "
+        f"alps_p5g_f_head_major={int(options['enableAlpsCrpProducerDirectHeadMajor'])} "
+        f"alps_p5g_g_producer_loop={int(options['enableAlpsCrpProducerLoopFormation'])} "
+        f"alps_p5h_attention_destination={int(options['enableAlpsAttentionDestinationFormation'])} "
+        f"alps_p5i_patch_conv={int(options['enableAlpsPatchConvFormation'])} "
+        f"alps_p5j_hmx_f16_epilogue={int(options['enableAlpsHmxF16EpilogueFormation'])} "
+        f"alps_p5k_hmx_direct_output={int(options['enableAlpsHmxDirectOutputFormation'])} "
+        f"alps_p5l_hmx_f16_bias_epilogue={int(options['enableAlpsHmxF16BiasEpilogueFormation'])} "
+        f"alps_p5m_hmx_async_drain_analysis={int(options['enableAlpsHmxAsyncDrainAnalysis'])} "
+        f"alps_p5n_hmx_async_drain={int(options['enableAlpsHmxAsyncDrain'])} "
         f"alps_p4a_traffic={int(options['enableAlpsTrafficControl'])}"
     )
     return options
@@ -675,6 +766,11 @@ def add_phase4_args(parser):
         action="store_true",
         help="Instrument only the function body, not individual loops.",
     )
+    parser.add_argument(
+        "--lwp-hexkl-phases",
+        action="store_true",
+        help="Profile individual HexKL/HMX compute and representation phases.",
+    )
     parser.add_argument("--seq-len", type=int, default=None)
     parser.add_argument(
         "--interleave-profiles",
@@ -745,6 +841,7 @@ def build_interleave_configs(args, ir: str):
             enable_lwp=args.enable_lwp,
             lwp_loop_depth=args.lwp_loop_depth,
             disable_lwp_loop=args.disable_lwp_loop,
+            instrument_lwp_hexkl_phases=args.lwp_hexkl_phases,
             omnifetch_items_through=args.omnifetch_items_through,
             enable_omnifetch_m_pad_hmx=(
                 spec["enable_hexkl"]

@@ -57,8 +57,8 @@ void setLinalgToLLVMOptions(
     const std::unordered_map<std::string, std::string> &arch_kwargs) {
 
   // DEBUG (disabled): print all options received from Python
-  // llvm::errs() << "\n[setLinalgToLLVMOptions] Received options from Python:\n";
-  // for (const auto &kv : arch_kwargs) {
+  // llvm::errs() << "\n[setLinalgToLLVMOptions] Received options from
+  // Python:\n"; for (const auto &kv : arch_kwargs) {
   //   llvm::errs() << "  " << kv.first << " = " << kv.second << "\n";
   // }
   // llvm::errs() << "\n";
@@ -100,6 +100,8 @@ void setLinalgToLLVMOptions(
   options.convTileSizes = arch_kwargs.at("convTileSizes");
   options.enableLWP = !arch_kwargs.at("enableLWP").compare(TRUE);
   options.disableLWPLoop = !arch_kwargs.at("disableLWPLoop").compare(TRUE);
+  options.instrumentLWPHexKLPhases =
+      !arch_kwargs.at("instrumentLWPHexKLPhases").compare(TRUE);
   options.enableVectorization =
       !arch_kwargs.at("enableVectorization").compare(TRUE);
   options.enableSplitReduceGeneric =
@@ -121,7 +123,7 @@ void setLinalgToLLVMOptions(
     options.enableBufferResultsToOutParams =
         (it != arch_kwargs.end() && !it->second.compare(TRUE));
   }
-  
+
   // OmniFetch options (Plan-A: three independent components)
   {
     auto it = arch_kwargs.find("enablePrefetchKernelHX");
@@ -153,8 +155,7 @@ void setLinalgToLLVMOptions(
     if (it != arch_kwargs.end())
       options.aptGetHxManualCandidateIds = it->second;
   }
-  options.enablePrefetch =
-      !arch_kwargs.at("enablePrefetch").compare(TRUE);
+  options.enablePrefetch = !arch_kwargs.at("enablePrefetch").compare(TRUE);
   options.enableOmniFetchLayoutAware =
       !arch_kwargs.at("enableOmniFetchLayoutAware").compare(TRUE);
   options.omniFetchLookahead = std::stoi(arch_kwargs.at("omniFetchLookahead"));
@@ -248,6 +249,21 @@ void setLinalgToLLVMOptions(
         (it != arch_kwargs.end() && !it->second.compare(TRUE));
   }
   {
+    auto it = arch_kwargs.find("enableAlpsContinuityAudit");
+    options.enableAlpsContinuityAudit =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsLoopInterchangedDirectFormation");
+    options.enableAlpsLoopInterchangedDirectFormation =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsRegisterTileFormation");
+    options.enableAlpsRegisterTileFormation =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
     auto it = arch_kwargs.find("enableAlpsContractDischargeLedger");
     options.enableAlpsContractDischargeLedger =
         (it != arch_kwargs.end() && !it->second.compare(TRUE));
@@ -260,6 +276,91 @@ void setLinalgToLLVMOptions(
   {
     auto it = arch_kwargs.find("enableAlpsLayoutSupplyPrefetch");
     options.enableAlpsLayoutSupplyPrefetch =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsCrpSupplyAnalysis");
+    options.enableAlpsCrpSupplyAnalysis =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsCrpSupplyPrefetch");
+    options.enableAlpsCrpSupplyPrefetch =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsCrpSegmentedSupply");
+    options.enableAlpsCrpSegmentedSupply =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsCrpVtcmFormation");
+    options.enableAlpsCrpVtcmFormation =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsCrpVtcmWindow");
+    options.enableAlpsCrpVtcmWindow =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsCrpVtcmAsyncWindow");
+    options.enableAlpsCrpVtcmAsyncWindow =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsCrpProducerDirectAnalysis");
+    options.enableAlpsCrpProducerDirectAnalysis =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsCrpProducerDirectVtcm");
+    options.enableAlpsCrpProducerDirectVtcm =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsCrpProducerDirectHeadMajor");
+    options.enableAlpsCrpProducerDirectHeadMajor =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsCrpProducerLoopFormation");
+    options.enableAlpsCrpProducerLoopFormation =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsAttentionDestinationFormation");
+    options.enableAlpsAttentionDestinationFormation =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsPatchConvFormation");
+    options.enableAlpsPatchConvFormation =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsHmxF16EpilogueFormation");
+    options.enableAlpsHmxF16EpilogueFormation =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsHmxDirectOutputFormation");
+    options.enableAlpsHmxDirectOutputFormation =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsHmxF16BiasEpilogueFormation");
+    options.enableAlpsHmxF16BiasEpilogueFormation =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsHmxAsyncDrainAnalysis");
+    options.enableAlpsHmxAsyncDrainAnalysis =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsHmxAsyncDrain");
+    options.enableAlpsHmxAsyncDrain =
         (it != arch_kwargs.end() && !it->second.compare(TRUE));
   }
   {
@@ -348,6 +449,38 @@ void setLinalgToLLVMOptions(
 namespace mlir {
 namespace hexagon {
 
+static void configureMLIRPrinting(mlir::PassManager &pm) {
+  auto printingFlags = mlir::OpPrintingFlags();
+  if (mlir::hexagon::isEnvTrue("MLIR_ELIDE_LARGE_CONST_PRINT")) {
+    printingFlags.elideLargeElementsAttrs(1);
+    printingFlags.elideLargeResourceString(1);
+  } else {
+    printingFlags.elideLargeElementsAttrs(16);
+  }
+  SmallVector<StringRef> selectiveDumpPasses;
+  if (const char *value = std::getenv("MLIR_DUMP_ONLY_PASSES"))
+    StringRef(value).split(selectiveDumpPasses, ',', /*MaxSplit=*/-1,
+                           /*KeepEmpty=*/false);
+  // Print the IR after HexagonLWPPass if enabled for debug purpose
+  pm.enableIRPrinting(
+      /*shouldPrintBeforePass=*/nullptr,
+      /*shouldPrintAfterPass=*/
+      [selectiveDumpPasses](mlir::Pass *pass, mlir::Operation *) {
+        StringRef passName = pass->getName();
+        StringRef passArgument = pass->getArgument();
+        bool selected = llvm::any_of(selectiveDumpPasses, [&](StringRef token) {
+          token = token.trim();
+          return passName.contains_insensitive(token) ||
+                 passArgument.contains_insensitive(token);
+        });
+        return mlir::hexagon::isEnvTrue("MLIR_ENABLE_DUMP") || selected ||
+               passName.contains("HexagonLWP");
+      },
+      /*printModuleScope=*/false,
+      /*printAfterOnlyOnChange=*/true,
+      /*printAfterOnlyOnFailure*/ false, llvm::dbgs(), printingFlags);
+}
+
 mlir::ModuleOp translateLinalgToLLVMMLIR(
     mlir::ModuleOp mod,
     const std::unordered_map<std::string, std::string> &arch_kwargs) {
@@ -357,25 +490,7 @@ mlir::ModuleOp translateLinalgToLLVMMLIR(
     llvm::errs() << "failed to apply pass manager CL options\n";
     return nullptr;
   }
-
-  auto printingFlags = mlir::OpPrintingFlags();
-  if (mlir::hexagon::isEnvTrue("MLIR_ELIDE_LARGE_CONST_PRINT")) {
-    printingFlags.elideLargeElementsAttrs(1);
-    printingFlags.elideLargeResourceString(1);
-  } else {
-    printingFlags.elideLargeElementsAttrs(16);
-  }
-  // Print the IR after HexagonLWPPass if enabled for debug purpose
-  pm.enableIRPrinting(
-      /*shouldPrintBeforePass=*/nullptr,
-      /*shouldPrintAfterPass=*/
-      [](mlir::Pass *pass, mlir::Operation *) {
-        return mlir::hexagon::isEnvTrue("MLIR_ENABLE_DUMP") ||
-               llvm::StringRef(pass->getName()).contains("HexagonLWP");
-      },
-      /*printModuleScope=*/false,
-      /*printAfterOnlyOnChange=*/true,
-      /*printAfterOnlyOnFailure*/ false, llvm::dbgs(), printingFlags);
+  configureMLIRPrinting(pm);
 
   // set your enable/disable individual pass options here
   // or funnel to here.
@@ -440,6 +555,7 @@ std::vector<ModuleOp> translateLinalgToMultipleLLVMMLIRModules(
   setLinalgToLLVMOptions(options, arch_kwargs);
 
   CustomPassManager pm(mod->getContext(), options);
+  configureMLIRPrinting(pm);
   if (failed(pm.run(mod))) {
     llvm::errs() << "Custom pass manager for producing multiple modules failed";
     return std::vector<ModuleOp>();

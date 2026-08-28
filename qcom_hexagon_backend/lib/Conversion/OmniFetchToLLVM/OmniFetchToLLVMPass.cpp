@@ -62,8 +62,8 @@ static Value alignedPtrWithOffset(ConversionPatternRewriter &rewriter,
   Value ptr = desc.alignedPtr(rewriter, loc);
   Value offset = desc.offset(rewriter, loc);
   // GEP by element offset.
-  return rewriter.create<LLVM::GEPOp>(
-      loc, ptr.getType(), elementType, ptr, ValueRange{offset});
+  return rewriter.create<LLVM::GEPOp>(loc, ptr.getType(), elementType, ptr,
+                                      ValueRange{offset});
 }
 
 static Value alignedPtr(ConversionPatternRewriter &rewriter, Location loc,
@@ -76,8 +76,8 @@ static Value alignedPtr(ConversionPatternRewriter &rewriter, Location loc,
 static FailureOr<LLVM::LLVMFuncOp>
 getOrInsertCreateSem(ModuleOp module, ConversionPatternRewriter &rewriter) {
   auto i32Ty = IntegerType::get(module.getContext(), 32);
-  return LLVM::lookupOrCreateFn(rewriter, module, getCreateSemFnName(),
-                                {}, i32Ty);
+  return LLVM::lookupOrCreateFn(rewriter, module, getCreateSemFnName(), {},
+                                i32Ty);
 }
 
 /// Get or insert `void __omni_fetch_signal(i32)`.
@@ -85,8 +85,8 @@ static FailureOr<LLVM::LLVMFuncOp>
 getOrInsertSignal(ModuleOp module, ConversionPatternRewriter &rewriter) {
   auto i32Ty = IntegerType::get(module.getContext(), 32);
   auto voidTy = LLVM::LLVMVoidType::get(module.getContext());
-  return LLVM::lookupOrCreateFn(rewriter, module, getSignalFnName(),
-                                {i32Ty}, voidTy);
+  return LLVM::lookupOrCreateFn(rewriter, module, getSignalFnName(), {i32Ty},
+                                voidTy);
 }
 
 /// Get or insert `void __omni_fetch_wait(i32)`.
@@ -94,8 +94,8 @@ static FailureOr<LLVM::LLVMFuncOp>
 getOrInsertWait(ModuleOp module, ConversionPatternRewriter &rewriter) {
   auto i32Ty = IntegerType::get(module.getContext(), 32);
   auto voidTy = LLVM::LLVMVoidType::get(module.getContext());
-  return LLVM::lookupOrCreateFn(rewriter, module, getWaitFnName(),
-                                {i32Ty}, voidTy);
+  return LLVM::lookupOrCreateFn(rewriter, module, getWaitFnName(), {i32Ty},
+                                voidTy);
 }
 
 /// Get or insert the `__omni_fetch_prefetch_insitu` declaration.
@@ -103,14 +103,14 @@ static FailureOr<LLVM::LLVMFuncOp>
 getOrInsertPrefetchInSitu(ModuleOp module,
                           ConversionPatternRewriter &rewriter) {
   MLIRContext *ctx = module.getContext();
-  auto ptrTy  = LLVM::LLVMPointerType::get(ctx);
-  auto i32Ty  = IntegerType::get(ctx, 32);
+  auto ptrTy = LLVM::LLVMPointerType::get(ctx);
+  auto i32Ty = IntegerType::get(ctx, 32);
   auto voidTy = LLVM::LLVMVoidType::get(ctx);
   // (src_ptr, dest_ptr, elem_bytes, num_elems, layout_kind, lookahead,
   //  index_map_ptr, tile_row, tile_col, src_cols, act_off, scr_off, src_rows)
-  SmallVector<Type, 13> argTys = {ptrTy, ptrTy, i32Ty, i32Ty, i32Ty, i32Ty,
-                                  ptrTy, i32Ty, i32Ty, i32Ty, i32Ty, i32Ty,
-                                  i32Ty};
+  SmallVector<Type, 13> argTys = {ptrTy, ptrTy, i32Ty, i32Ty, i32Ty,
+                                  i32Ty, ptrTy, i32Ty, i32Ty, i32Ty,
+                                  i32Ty, i32Ty, i32Ty};
   return LLVM::lookupOrCreateFn(rewriter, module, getPrefetchInSituFnName(),
                                 argTys, voidTy);
 }
@@ -126,12 +126,25 @@ getOrInsertL2Hint2D(ModuleOp module, ConversionPatternRewriter &rewriter) {
                                 {ptrTy, i32Ty, i32Ty, i32Ty}, voidTy);
 }
 
+/// Get or insert `void __omni_fetch_l2_hint_segmented(ptr, i32, i32, i32,
+/// i32)`.
+static FailureOr<LLVM::LLVMFuncOp>
+getOrInsertL2HintSegmented(ModuleOp module,
+                           ConversionPatternRewriter &rewriter) {
+  MLIRContext *ctx = module.getContext();
+  auto ptrTy = LLVM::LLVMPointerType::get(ctx);
+  auto i32Ty = IntegerType::get(ctx, 32);
+  auto voidTy = LLVM::LLVMVoidType::get(ctx);
+  return LLVM::lookupOrCreateFn(rewriter, module, getL2HintSegmentedFnName(),
+                                {ptrTy, i32Ty, i32Ty, i32Ty, i32Ty}, voidTy);
+}
+
 /// Get or insert `void __omni_fetch_copy2d(...)`.
 static FailureOr<LLVM::LLVMFuncOp>
 getOrInsertCopy2D(ModuleOp module, ConversionPatternRewriter &rewriter) {
   MLIRContext *ctx = module.getContext();
-  auto ptrTy  = LLVM::LLVMPointerType::get(ctx);
-  auto i32Ty  = IntegerType::get(ctx, 32);
+  auto ptrTy = LLVM::LLVMPointerType::get(ctx);
+  auto i32Ty = IntegerType::get(ctx, 32);
   auto voidTy = LLVM::LLVMVoidType::get(ctx);
   // (src, dest, elem_bytes, rows, cols, src_row_stride, dst_row_stride)
   SmallVector<Type, 7> argTys = {ptrTy, ptrTy, i32Ty, i32Ty,
@@ -158,8 +171,7 @@ getOrInsertInvocationBegin(ModuleOp module,
 }
 
 static FailureOr<LLVM::LLVMFuncOp>
-getOrInsertInvocationEnd(ModuleOp module,
-                         ConversionPatternRewriter &rewriter) {
+getOrInsertInvocationEnd(ModuleOp module, ConversionPatternRewriter &rewriter) {
   auto i32Ty = IntegerType::get(module.getContext(), 32);
   return LLVM::lookupOrCreateFn(rewriter, module, getInvocationEndFnName(),
                                 {i32Ty}, i32Ty);
@@ -170,9 +182,9 @@ getOrInsertDescriptorAcquire(ModuleOp module,
                              ConversionPatternRewriter &rewriter) {
   auto i32Ty = IntegerType::get(module.getContext(), 32);
   auto i64Ty = IntegerType::get(module.getContext(), 64);
-  return LLVM::lookupOrCreateFn(
-      rewriter, module, getDescriptorAcquireFnName(),
-      {i32Ty, i64Ty, i64Ty, i32Ty, i32Ty, i32Ty}, i32Ty);
+  return LLVM::lookupOrCreateFn(rewriter, module, getDescriptorAcquireFnName(),
+                                {i32Ty, i64Ty, i64Ty, i32Ty, i32Ty, i32Ty},
+                                i32Ty);
 }
 
 static FailureOr<LLVM::LLVMFuncOp>
@@ -189,17 +201,17 @@ getOrInsertDescriptorConsume(ModuleOp module,
                              ConversionPatternRewriter &rewriter) {
   auto i32Ty = IntegerType::get(module.getContext(), 32);
   auto i64Ty = IntegerType::get(module.getContext(), 64);
-  return LLVM::lookupOrCreateFn(
-      rewriter, module, getDescriptorConsumeFnName(),
-      {i32Ty, i64Ty, i64Ty, i32Ty, i32Ty, i32Ty}, i32Ty);
+  return LLVM::lookupOrCreateFn(rewriter, module, getDescriptorConsumeFnName(),
+                                {i32Ty, i64Ty, i64Ty, i32Ty, i32Ty, i32Ty},
+                                i32Ty);
 }
 
 static FailureOr<LLVM::LLVMFuncOp>
 getOrInsertDescriptorRelease(ModuleOp module,
                              ConversionPatternRewriter &rewriter) {
   auto i32Ty = IntegerType::get(module.getContext(), 32);
-  return LLVM::lookupOrCreateFn(rewriter, module,
-                                getDescriptorReleaseFnName(), {i32Ty}, i32Ty);
+  return LLVM::lookupOrCreateFn(rewriter, module, getDescriptorReleaseFnName(),
+                                {i32Ty}, i32Ty);
 }
 
 static FailureOr<LLVM::LLVMFuncOp>
@@ -211,8 +223,7 @@ getOrInsertExactWeightKick(ModuleOp module,
   auto ptrTy = LLVM::LLVMPointerType::get(ctx);
   return LLVM::lookupOrCreateFn(
       rewriter, module, getExactWeightKickFnName(),
-      {i32Ty, i64Ty, ptrTy, ptrTy, i32Ty, i32Ty, i32Ty, i32Ty, i32Ty},
-      i32Ty);
+      {i32Ty, i64Ty, ptrTy, ptrTy, i32Ty, i32Ty, i32Ty, i32Ty, i32Ty}, i32Ty);
 }
 
 static FailureOr<LLVM::LLVMFuncOp>
@@ -220,8 +231,7 @@ getOrInsertExactWeightConsume(ModuleOp module,
                               ConversionPatternRewriter &rewriter) {
   auto i32Ty = IntegerType::get(module.getContext(), 32);
   auto i64Ty = IntegerType::get(module.getContext(), 64);
-  return LLVM::lookupOrCreateFn(rewriter, module,
-                                getExactWeightConsumeFnName(),
+  return LLVM::lookupOrCreateFn(rewriter, module, getExactWeightConsumeFnName(),
                                 {i32Ty, i64Ty, i32Ty, i32Ty}, i32Ty);
 }
 
@@ -230,8 +240,7 @@ getOrInsertExactWeightRelease(ModuleOp module,
                               ConversionPatternRewriter &rewriter) {
   auto i32Ty = IntegerType::get(module.getContext(), 32);
   auto i64Ty = IntegerType::get(module.getContext(), 64);
-  return LLVM::lookupOrCreateFn(rewriter, module,
-                                getExactWeightReleaseFnName(),
+  return LLVM::lookupOrCreateFn(rewriter, module, getExactWeightReleaseFnName(),
                                 {i32Ty, i64Ty, i32Ty, i32Ty}, i32Ty);
 }
 
@@ -248,8 +257,8 @@ static Value integerCast(ConversionPatternRewriter &rewriter, Location loc,
 
 static Value runtimeSuccess(ConversionPatternRewriter &rewriter, Location loc,
                             Value result) {
-  Value zero = rewriter.create<LLVM::ConstantOp>(
-      loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(0));
+  Value zero = rewriter.create<LLVM::ConstantOp>(loc, rewriter.getI32Type(),
+                                                 rewriter.getI32IntegerAttr(0));
   return rewriter.create<LLVM::ICmpOp>(loc, LLVM::ICmpPredicate::ne, result,
                                        zero);
 }
@@ -271,8 +280,7 @@ struct LowerCreateSem : public ConvertOpToLLVMPattern<CreateSemOp> {
       return failure();
 
     // Call the runtime; result is i32 semaphore index.
-    auto call = rewriter.create<LLVM::CallOp>(
-        loc, *fnOrErr, ValueRange{});
+    auto call = rewriter.create<LLVM::CallOp>(loc, *fnOrErr, ValueRange{});
     Value semI32 = call.getResult();
 
     // The dialect op returns `index`; on Hexagon index is i64.
@@ -304,11 +312,10 @@ struct LowerSignal : public ConvertOpToLLVMPattern<SignalOp> {
     // Convert index sem_handle → i32
     // After LLVM lowering, index is already i64, so no IndexCastOp needed.
     Value semI64 = adaptor.getSemHandle();
-    Value semI32 = rewriter.create<LLVM::TruncOp>(
-        loc, rewriter.getI32Type(), semI64);
+    Value semI32 =
+        rewriter.create<LLVM::TruncOp>(loc, rewriter.getI32Type(), semI64);
 
-    rewriter.replaceOpWithNewOp<LLVM::CallOp>(op, *fnOrErr,
-                                              ValueRange{semI32});
+    rewriter.replaceOpWithNewOp<LLVM::CallOp>(op, *fnOrErr, ValueRange{semI32});
     return success();
   }
 };
@@ -330,28 +337,25 @@ struct LowerWait : public ConvertOpToLLVMPattern<WaitOp> {
       return failure();
 
     Value semI64 = adaptor.getSemHandle();
-    Value semI32 = rewriter.create<LLVM::TruncOp>(
-        loc, rewriter.getI32Type(), semI64);
+    Value semI32 =
+        rewriter.create<LLVM::TruncOp>(loc, rewriter.getI32Type(), semI64);
 
-    rewriter.replaceOpWithNewOp<LLVM::CallOp>(op, *fnOrErr,
-                                              ValueRange{semI32});
+    rewriter.replaceOpWithNewOp<LLVM::CallOp>(op, *fnOrErr, ValueRange{semI32});
     return success();
   }
 };
 
-struct LowerInvocationBegin
-    : public ConvertOpToLLVMPattern<InvocationBeginOp> {
+struct LowerInvocationBegin : public ConvertOpToLLVMPattern<InvocationBeginOp> {
   using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
   LogicalResult
   matchAndRewrite(InvocationBeginOp op, OpAdaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto fn = getOrInsertInvocationBegin(op->getParentOfType<ModuleOp>(),
-                                         rewriter);
+    auto fn =
+        getOrInsertInvocationBegin(op->getParentOfType<ModuleOp>(), rewriter);
     if (failed(fn))
       return failure();
-    Value handle =
-        rewriter.create<LLVM::CallOp>(op.getLoc(), *fn, ValueRange{})
-            .getResult();
+    Value handle = rewriter.create<LLVM::CallOp>(op.getLoc(), *fn, ValueRange{})
+                       .getResult();
     Type indexTy = typeConverter->convertType(rewriter.getIndexType());
     auto width = cast<IntegerType>(indexTy).getWidth();
     rewriter.replaceOp(op, integerCast(rewriter, op.getLoc(), handle, width));
@@ -369,10 +373,9 @@ struct LowerInvocationEnd : public ConvertOpToLLVMPattern<InvocationEndOp> {
     if (failed(fn))
       return failure();
     Value handle = integerCast(rewriter, op.getLoc(), adaptor.getContext(), 32);
-    Value result = rewriter
-                       .create<LLVM::CallOp>(op.getLoc(), *fn,
-                                             ValueRange{handle})
-                       .getResult();
+    Value result =
+        rewriter.create<LLVM::CallOp>(op.getLoc(), *fn, ValueRange{handle})
+            .getResult();
     rewriter.replaceOp(op, runtimeSuccess(rewriter, op.getLoc(), result));
     return success();
   }
@@ -384,15 +387,16 @@ struct LowerDescriptorAcquire
   LogicalResult
   matchAndRewrite(DescriptorAcquireOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto fn = getOrInsertDescriptorAcquire(op->getParentOfType<ModuleOp>(),
-                                           rewriter);
+    auto fn =
+        getOrInsertDescriptorAcquire(op->getParentOfType<ModuleOp>(), rewriter);
     if (failed(fn))
       return failure();
     SmallVector<Value> args = {
         integerCast(rewriter, op.getLoc(), adaptor.getContext(), 32),
         integerCast(rewriter, op.getLoc(), adaptor.getValueVersion(), 64),
         integerCast(rewriter, op.getLoc(), adaptor.getTile(), 64),
-        adaptor.getLayout(), adaptor.getSourceTier(),
+        adaptor.getLayout(),
+        adaptor.getSourceTier(),
         adaptor.getDestinationTier()};
     Value handle =
         rewriter.create<LLVM::CallOp>(op.getLoc(), *fn, args).getResult();
@@ -413,14 +417,14 @@ struct LowerDescriptorTransition
                                               rewriter);
     if (failed(fn))
       return failure();
-    Value result = rewriter
-                       .create<LLVM::CallOp>(
-                           op.getLoc(), *fn,
-                           ValueRange{integerCast(rewriter, op.getLoc(),
-                                                  adaptor.getDescriptor(), 32),
-                                      adaptor.getExpectedState(),
-                                      adaptor.getNextState()})
-                       .getResult();
+    Value result =
+        rewriter
+            .create<LLVM::CallOp>(
+                op.getLoc(), *fn,
+                ValueRange{integerCast(rewriter, op.getLoc(),
+                                       adaptor.getDescriptor(), 32),
+                           adaptor.getExpectedState(), adaptor.getNextState()})
+            .getResult();
     rewriter.replaceOp(op, runtimeSuccess(rewriter, op.getLoc(), result));
     return success();
   }
@@ -432,15 +436,16 @@ struct LowerDescriptorConsume
   LogicalResult
   matchAndRewrite(DescriptorConsumeOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto fn = getOrInsertDescriptorConsume(op->getParentOfType<ModuleOp>(),
-                                           rewriter);
+    auto fn =
+        getOrInsertDescriptorConsume(op->getParentOfType<ModuleOp>(), rewriter);
     if (failed(fn))
       return failure();
     SmallVector<Value> args = {
         integerCast(rewriter, op.getLoc(), adaptor.getDescriptor(), 32),
         integerCast(rewriter, op.getLoc(), adaptor.getValueVersion(), 64),
         integerCast(rewriter, op.getLoc(), adaptor.getTile(), 64),
-        adaptor.getLayout(), adaptor.getSourceTier(),
+        adaptor.getLayout(),
+        adaptor.getSourceTier(),
         adaptor.getDestinationTier()};
     Value result =
         rewriter.create<LLVM::CallOp>(op.getLoc(), *fn, args).getResult();
@@ -455,29 +460,27 @@ struct LowerDescriptorRelease
   LogicalResult
   matchAndRewrite(DescriptorReleaseOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto fn = getOrInsertDescriptorRelease(op->getParentOfType<ModuleOp>(),
-                                           rewriter);
+    auto fn =
+        getOrInsertDescriptorRelease(op->getParentOfType<ModuleOp>(), rewriter);
     if (failed(fn))
       return failure();
     Value handle =
         integerCast(rewriter, op.getLoc(), adaptor.getDescriptor(), 32);
-    Value result = rewriter
-                       .create<LLVM::CallOp>(op.getLoc(), *fn,
-                                             ValueRange{handle})
-                       .getResult();
+    Value result =
+        rewriter.create<LLVM::CallOp>(op.getLoc(), *fn, ValueRange{handle})
+            .getResult();
     rewriter.replaceOp(op, runtimeSuccess(rewriter, op.getLoc(), result));
     return success();
   }
 };
 
-struct LowerExactWeightKick
-    : public ConvertOpToLLVMPattern<ExactWeightKickOp> {
+struct LowerExactWeightKick : public ConvertOpToLLVMPattern<ExactWeightKickOp> {
   using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
   LogicalResult
   matchAndRewrite(ExactWeightKickOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto fn = getOrInsertExactWeightKick(op->getParentOfType<ModuleOp>(),
-                                         rewriter);
+    auto fn =
+        getOrInsertExactWeightKick(op->getParentOfType<ModuleOp>(), rewriter);
     if (failed(fn))
       return failure();
     auto srcTy = cast<MemRefType>(op.getSrc().getType());
@@ -496,8 +499,12 @@ struct LowerExactWeightKick
     SmallVector<Value> args = {
         integerCast(rewriter, op.getLoc(), adaptor.getContext(), 32),
         integerCast(rewriter, op.getLoc(), adaptor.getValueVersion(), 64),
-        src, dest, adaptor.getTileRow(), adaptor.getTileCol(),
-        adaptor.getSourceCols(), adaptor.getWeightOffset(),
+        src,
+        dest,
+        adaptor.getTileRow(),
+        adaptor.getTileCol(),
+        adaptor.getSourceCols(),
+        adaptor.getWeightOffset(),
         adaptor.getStageOffset()};
     Value result =
         rewriter.create<LLVM::CallOp>(op.getLoc(), *fn, args).getResult();
@@ -513,11 +520,10 @@ struct LowerExactWeightTerminal : public ConvertOpToLLVMPattern<OpTy> {
   matchAndRewrite(OpTy op, typename OpTy::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     FailureOr<LLVM::LLVMFuncOp> fn =
-        IsRelease
-            ? getOrInsertExactWeightRelease(op->template getParentOfType<ModuleOp>(),
-                                            rewriter)
-            : getOrInsertExactWeightConsume(op->template getParentOfType<ModuleOp>(),
-                                            rewriter);
+        IsRelease ? getOrInsertExactWeightRelease(
+                        op->template getParentOfType<ModuleOp>(), rewriter)
+                  : getOrInsertExactWeightConsume(
+                        op->template getParentOfType<ModuleOp>(), rewriter);
     if (failed(fn))
       return failure();
     SmallVector<Value> args = {
@@ -549,8 +555,7 @@ using LowerExactWeightRelease =
 //       int32_t tile_row, int32_t tile_col, int32_t src_cols,
 //       int32_t act_off, int32_t scr_off, int32_t src_rows);
 //===----------------------------------------------------------------------===//
-struct LowerPrefetchInSitu
-    : public ConvertOpToLLVMPattern<PrefetchInSituOp> {
+struct LowerPrefetchInSitu : public ConvertOpToLLVMPattern<PrefetchInSituOp> {
   using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
 
   LogicalResult
@@ -560,8 +565,8 @@ struct LowerPrefetchInSitu
     ModuleOp module = op->getParentOfType<ModuleOp>();
 
     MLIRContext *ctx = rewriter.getContext();
-    auto i32Ty  = IntegerType::get(ctx, 32);
-    auto ptrTy  = LLVM::LLVMPointerType::get(ctx);
+    auto i32Ty = IntegerType::get(ctx, 32);
+    auto ptrTy = LLVM::LLVMPointerType::get(ctx);
 
     // --- src / dest pointers (aligned + memref offset) ---
     auto srcMemrefTy = cast<MemRefType>(op.getSrc().getType());
@@ -587,7 +592,8 @@ struct LowerPrefetchInSitu
                                      destMemref.getElementType());
     }
 
-    // Cast to generic address space (0) if needed using proper LLVM addrspacecast
+    // Cast to generic address space (0) if needed using proper LLVM
+    // addrspacecast
     if (srcPtr.getType() != ptrTy) {
       srcPtr = LLVM::AddrSpaceCastOp::create(rewriter, loc, ptrTy, srcPtr);
     }
@@ -596,15 +602,14 @@ struct LowerPrefetchInSitu
     }
 
     // --- element byte-size (from dest element type) ---
-    int64_t elemBytes =
-        destMemref.getElementType().getIntOrFloatBitWidth() / 8;
-    Value elemBytesVal =
-        rewriter.create<LLVM::ConstantOp>(loc, i32Ty,
-            rewriter.getI32IntegerAttr(static_cast<int32_t>(elemBytes)));
+    int64_t elemBytes = destMemref.getElementType().getIntOrFloatBitWidth() / 8;
+    Value elemBytesVal = rewriter.create<LLVM::ConstantOp>(
+        loc, i32Ty,
+        rewriter.getI32IntegerAttr(static_cast<int32_t>(elemBytes)));
 
     auto cI32 = [&](int32_t v) {
-      return rewriter.create<LLVM::ConstantOp>(
-          loc, i32Ty, rewriter.getI32IntegerAttr(v));
+      return rewriter.create<LLVM::ConstantOp>(loc, i32Ty,
+                                               rewriter.getI32IntegerAttr(v));
     };
 
     // Rank-2 LAYOUT_NONE: use stride-aware copy2d.  Inner-dim tiles produce
@@ -683,8 +688,7 @@ struct LowerPrefetchInSitu
     Value numElemsVal = cI32(static_cast<int32_t>(numElems));
 
     // --- layout kind ---
-    Value layoutKindVal =
-        cI32(static_cast<int32_t>(op.getLayoutTransform()));
+    Value layoutKindVal = cI32(static_cast<int32_t>(op.getLayoutTransform()));
 
     // --- lookahead ---
     Value lookaheadVal = cI32(op.getLookahead());
@@ -754,8 +758,7 @@ struct LowerL2Hint : public ConvertOpToLLVMPattern<L2HintOp> {
       return rewriter.create<LLVM::ConstantOp>(
           loc, i32Ty, rewriter.getI32IntegerAttr(value));
     };
-    int64_t elemBytes =
-        srcType.getElementType().getIntOrFloatBitWidth() / 8;
+    int64_t elemBytes = srcType.getElementType().getIntOrFloatBitWidth() / 8;
     SmallVector<int64_t> sourceStrides;
     int64_t sourceOffset = 0;
     if (failed(srcType.getStridesAndOffset(sourceStrides, sourceOffset)) ||
@@ -780,6 +783,67 @@ struct LowerL2Hint : public ConvertOpToLLVMPattern<L2HintOp> {
     auto fnOrErr = getOrInsertL2Hint2D(module, rewriter);
     if (failed(fnOrErr))
       return failure();
+
+    // P5f-c preserves the exact physical representation of the admitted CRP
+    // source.  A logical register tile is not necessarily one rectangular
+    // physical stream: flattening it into a 2-D hint made the runtime's 4 KiB
+    // safety policy clip nearly every DINOv2 request. Fully row-major tiles
+    // are issued as one 1-D hint; otherwise one runtime call rotates across
+    // exact physical rows as the same site is revisited. This avoids a static
+    // GEP/call storm while turning measured duplicate executions into useful
+    // cross-row coverage.
+    if (op->hasAttr("alps.p5f_c.page_safe_segmented")) {
+      int64_t totalElements = 1;
+      bool physicallyContiguous = true;
+      int64_t expectedStride = 1;
+      for (int64_t dim = srcType.getRank() - 1; dim >= 0; --dim) {
+        int64_t size = srcType.getDimSize(dim);
+        if (size > 1 && sourceStrides[dim] != expectedStride)
+          physicallyContiguous = false;
+        expectedStride *= size;
+        totalElements *= size;
+      }
+      int64_t totalBytes = totalElements * elemBytes;
+      if (auto requested =
+              op->getAttrOfType<IntegerAttr>("alps.p5f_b.requested_bytes");
+          !requested || requested.getInt() != totalBytes)
+        return rewriter.notifyMatchFailure(
+            op, "P5f-c physical extent disagrees with admitted byte count");
+
+      if (physicallyContiguous) {
+        rewriter.replaceOpWithNewOp<LLVM::CallOp>(
+            op, *fnOrErr,
+            ValueRange{srcPtr, cI32(static_cast<int32_t>(totalBytes)), cI32(1),
+                       cI32(static_cast<int32_t>(totalBytes))});
+        return success();
+      }
+
+      int64_t rowBytes = srcType.getShape().back() * elemBytes;
+      int64_t rows = totalBytes / rowBytes;
+      int64_t rowStride = 0;
+      for (int64_t dim = srcType.getRank() - 2; dim >= 0; --dim) {
+        if (srcType.getDimSize(dim) > 1) {
+          rowStride = sourceStrides[dim] * elemBytes;
+          break;
+        }
+      }
+      auto siteId = op->getAttrOfType<IntegerAttr>("alps.p5f_c.site_id");
+      if (rows <= 0 || rows * rowBytes != totalBytes || rowStride <= 0 ||
+          !siteId)
+        return rewriter.notifyMatchFailure(
+            op, "P5f-c expected a static repeated physical-row site");
+      auto segmentedFn = getOrInsertL2HintSegmented(module, rewriter);
+      if (failed(segmentedFn))
+        return failure();
+      rewriter.replaceOpWithNewOp<LLVM::CallOp>(
+          op, *segmentedFn,
+          ValueRange{srcPtr, cI32(static_cast<int32_t>(rowBytes)),
+                     cI32(static_cast<int32_t>(rows)),
+                     cI32(static_cast<int32_t>(rowStride)),
+                     cI32(static_cast<int32_t>(siteId.getInt()))});
+      return success();
+    }
+
     rewriter.replaceOpWithNewOp<LLVM::CallOp>(
         op, *fnOrErr,
         ValueRange{srcPtr, cI32(static_cast<int32_t>(widthBytes)),
@@ -792,8 +856,7 @@ struct LowerL2Hint : public ConvertOpToLLVMPattern<L2HintOp> {
 //===----------------------------------------------------------------------===//
 // AdaptiveControlOp  →  i32 __omni_fetch_update_distance(i32)
 //===----------------------------------------------------------------------===//
-struct LowerAdaptiveControl
-    : public ConvertOpToLLVMPattern<AdaptiveControlOp> {
+struct LowerAdaptiveControl : public ConvertOpToLLVMPattern<AdaptiveControlOp> {
   using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
 
   LogicalResult
@@ -872,7 +935,8 @@ struct OmniFetchToLLVMPass
           b, module, getSetDualThreadDaeFnName(), {i32Ty}, voidTy);
       if (failed(setFn))
         continue;
-      Value one = b.create<LLVM::ConstantOp>(loc, i32Ty, b.getI32IntegerAttr(1));
+      Value one =
+          b.create<LLVM::ConstantOp>(loc, i32Ty, b.getI32IntegerAttr(1));
       b.create<LLVM::CallOp>(loc, *setFn, ValueRange{one});
       break; // once per module is enough (global runtime flag)
     }

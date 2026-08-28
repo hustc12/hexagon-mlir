@@ -27,7 +27,24 @@ struct FoldResourceTranspose
                   mlir::PatternRewriter &rewriter) const override {
     mlir::Value input = op.getDpsInputOperand(0)->get();
 
-    auto constOp = input.getDefiningOp<mlir::arith::ConstantOp>();
+    // A compile-time linear collapse does not move data.  P5i intentionally
+    // flattens FCHW weights to [OC, IC*KH*KW] before transposing them, so look
+    // through exactly that static view and use its rank-2 shape for the fold.
+    mlir::Value resourceInput = input;
+    if (auto collapse = input.getDefiningOp<mlir::tensor::CollapseShapeOp>()) {
+      auto collapsedType =
+          mlir::dyn_cast<mlir::RankedTensorType>(input.getType());
+      auto sourceType =
+          mlir::dyn_cast<mlir::RankedTensorType>(collapse.getSrcType());
+      if (!collapsedType || collapsedType.getRank() != 2 ||
+          !collapsedType.hasStaticShape() || !sourceType ||
+          !sourceType.hasStaticShape() ||
+          collapsedType.getNumElements() != sourceType.getNumElements())
+        return mlir::failure();
+      resourceInput = collapse.getSrc();
+    }
+
+    auto constOp = resourceInput.getDefiningOp<mlir::arith::ConstantOp>();
     if (!constOp)
       return mlir::failure();
 
@@ -37,8 +54,12 @@ struct FoldResourceTranspose
       return mlir::failure();
 
     // Validate Type Rank 2, F16
-    auto type = mlir::cast<mlir::RankedTensorType>(resourceAttr.getType());
-    if (type.getRank() != 2 || !type.getElementType().isF16())
+    auto resourceType =
+        mlir::cast<mlir::RankedTensorType>(resourceAttr.getType());
+    auto type = mlir::dyn_cast<mlir::RankedTensorType>(input.getType());
+    if (!type || type.getRank() != 2 || !type.getElementType().isF16() ||
+        !resourceType.getElementType().isF16() ||
+        type.getNumElements() != resourceType.getNumElements())
       return mlir::failure();
 
     auto blob = resourceAttr.getRawHandle().getBlob();

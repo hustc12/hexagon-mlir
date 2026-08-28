@@ -26,6 +26,9 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/Support/Debug.h"
 
+#include <map>
+#include <optional>
+
 #define DEBUG_TYPE "matmul-to-hexkl"
 
 using namespace mlir;
@@ -42,12 +45,131 @@ namespace {
 
 struct MatmulToHexKL final : public OpRewritePattern<linalg::MatmulOp> {
   bool isMacroMode;
+  bool consumerF16Epilogue;
+  bool consumerF16BiasEpilogue;
 
-  MatmulToHexKL(MLIRContext *ctx, bool macroMode)
-      : OpRewritePattern(ctx), isMacroMode(macroMode) {}
+  MatmulToHexKL(MLIRContext *ctx, bool macroMode, bool formConsumerF16Epilogue,
+                bool formConsumerF16BiasEpilogue)
+      : OpRewritePattern(ctx), isMacroMode(macroMode),
+        consumerF16Epilogue(formConsumerF16Epilogue),
+        consumerF16BiasEpilogue(formConsumerF16BiasEpilogue) {}
 
   bool isConstantWeight(Value weight) const {
     return weight.getDefiningOp<arith::ConstantOp>() != nullptr;
+  }
+
+  /// Match only the exact representation round trip that the HexKL micro
+  /// implementation already performs internally: HMX accumulates/readbacks
+  /// F16, copies it to an F32 tensor, and the sole identity-layout consumer
+  /// immediately truncates that tensor back to F16.  Keeping this matcher
+  /// deliberately narrow makes P5j a consumer-contract formation, not a
+  /// general mixed-precision rewrite.
+  linalg::GenericOp matchIdentityF16TruncConsumer(linalg::MatmulOp op) const {
+    if (!consumerF16Epilogue || isMacroMode || op->getNumResults() != 1 ||
+        !op->getResult(0).hasOneUse())
+      return {};
+
+    auto generic =
+        dyn_cast<linalg::GenericOp>(*op->getResult(0).getUsers().begin());
+    if (!generic || generic.getNumDpsInputs() != 1 ||
+        generic.getNumDpsInits() != 1 ||
+        generic.getDpsInputOperand(0)->get() != op->getResult(0) ||
+        generic->getNumResults() != 1)
+      return {};
+
+    auto resultType = dyn_cast<RankedTensorType>(generic->getResult(0).getType());
+    auto inputType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+    if (!resultType || !inputType || resultType.getShape() != inputType.getShape() ||
+        !inputType.getElementType().isF32() ||
+        !resultType.getElementType().isF16())
+      return {};
+
+    if (!llvm::all_of(generic.getIteratorTypesArray(),
+                      [](utils::IteratorType iterator) {
+                        return iterator == utils::IteratorType::parallel;
+                      }))
+      return {};
+    for (AffineMap map : generic.getIndexingMapsArray())
+      if (!map.isIdentity())
+        return {};
+
+    Block &body = generic.getRegion().front();
+    if (!llvm::hasSingleElement(body.without_terminator()))
+      return {};
+    auto trunc = dyn_cast<arith::TruncFOp>(body.front());
+    auto yield = dyn_cast<linalg::YieldOp>(body.getTerminator());
+    if (!trunc || !yield || trunc.getIn() != body.getArgument(0) ||
+        !trunc.getIn().getType().isF32() ||
+        !trunc.getOut().getType().isF16() || yield.getValues().size() != 1 ||
+        yield.getValues()[0] != trunc.getOut())
+      return {};
+    return generic;
+  }
+
+  struct BiasConsumer {
+    linalg::GenericOp op;
+    Value bias;
+  };
+
+  /// Strict first-stage P5l contract: C[m,n] + bias[n] -> final[m,n].
+  std::optional<BiasConsumer>
+  matchRank2BroadcastBiasConsumer(linalg::GenericOp trunc) const {
+    if (!consumerF16BiasEpilogue || !trunc || trunc->getNumResults() != 1 ||
+        !trunc->getResult(0).hasOneUse())
+      return std::nullopt;
+    auto generic =
+        dyn_cast<linalg::GenericOp>(*trunc->getResult(0).getUsers().begin());
+    if (!generic || generic.getNumDpsInputs() != 2 ||
+        generic.getNumDpsInits() != 1 || generic->getNumResults() != 1)
+      return std::nullopt;
+    auto resultType = dyn_cast<RankedTensorType>(generic->getResult(0).getType());
+    if (!resultType || resultType.getRank() != 2 ||
+        !resultType.getElementType().isF16())
+      return std::nullopt;
+    if (!llvm::all_of(generic.getIteratorTypesArray(),
+                      [](utils::IteratorType it) {
+                        return it == utils::IteratorType::parallel;
+                      }))
+      return std::nullopt;
+
+    unsigned srcIndex = generic.getDpsInputOperand(0)->get() == trunc->getResult(0)
+                            ? 0
+                            : generic.getDpsInputOperand(1)->get() ==
+                                      trunc->getResult(0)
+                                  ? 1
+                                  : 2;
+    if (srcIndex == 2)
+      return std::nullopt;
+    unsigned biasIndex = 1 - srcIndex;
+    auto biasType = dyn_cast<RankedTensorType>(
+        generic.getDpsInputOperand(biasIndex)->get().getType());
+    if (!biasType || biasType.getRank() != 1 ||
+        !biasType.getElementType().isF16() ||
+        biasType.getShape()[0] != resultType.getShape()[1])
+      return std::nullopt;
+
+    auto maps = generic.getIndexingMapsArray();
+    AffineMap identity = AffineMap::getMultiDimIdentityMap(2, getContext());
+    AffineMap biasMap = AffineMap::get(
+        2, 0, getAffineDimExpr(1, getContext()), getContext());
+    if (maps[srcIndex] != identity || maps[biasIndex] != biasMap ||
+        maps[2] != identity)
+      return std::nullopt;
+
+    Block &body = generic.getRegion().front();
+    if (!llvm::hasSingleElement(body.without_terminator()))
+      return std::nullopt;
+    auto add = dyn_cast<arith::AddFOp>(body.front());
+    auto yield = dyn_cast<linalg::YieldOp>(body.getTerminator());
+    if (!add || !yield || yield.getValues().size() != 1 ||
+        yield.getValues()[0] != add.getResult() ||
+        !((add.getLhs() == body.getArgument(srcIndex) &&
+           add.getRhs() == body.getArgument(biasIndex)) ||
+          (add.getRhs() == body.getArgument(srcIndex) &&
+           add.getLhs() == body.getArgument(biasIndex))))
+      return std::nullopt;
+    return BiasConsumer{generic,
+                        generic.getDpsInputOperand(biasIndex)->get()};
   }
 
   LogicalResult matchAndRewrite(linalg::MatmulOp op,
@@ -191,6 +313,41 @@ struct MatmulToHexKL final : public OpRewritePattern<linalg::MatmulOp> {
 
       rewriter.replaceOp(op, result);
 
+    } else if (linalg::GenericOp truncConsumer =
+                   matchIdentityF16TruncConsumer(op)) {
+      std::optional<BiasConsumer> biasConsumer =
+          matchRank2BroadcastBiasConsumer(truncConsumer);
+      auto f16Type = RankedTensorType::get(cType.getShape(), rewriter.getF16Type());
+      RankedTensorType finalType;
+      Value finalOutput;
+      if (biasConsumer) {
+        finalType =
+            cast<RankedTensorType>(biasConsumer->op->getResult(0).getType());
+        // Establish the consumer-selected destination before its producer.
+        // One-shot bufferization preserves this ordering, so the HMX drain can
+        // form the final representation at the original matmul point without
+        // moving mutable-buffer reads across the epilogue boundary.
+        finalOutput = tensor::EmptyOp::create(
+            rewriter, loc, finalType.getShape(), finalType.getElementType());
+      }
+      Value f16Output = tensor::EmptyOp::create(rewriter, loc, cType.getShape(),
+                                                rewriter.getF16Type());
+      auto hexklMatmul =
+          hexkl::MatmulOp::create(rewriter, loc, f16Type, A, B, f16Output);
+      hexklMatmul->setAttr("alps.p5j.consumer_f16_epilogue",
+                           rewriter.getUnitAttr());
+      if (biasConsumer) {
+        auto epilogue = hexkl::F16BiasEpilogueOp::create(
+            rewriter, loc, finalType, hexklMatmul->getResult(0),
+            biasConsumer->bias, finalOutput);
+        epilogue->setAttr("alps.p5l.consumer_bias_formation",
+                          rewriter.getUnitAttr());
+        rewriter.replaceOp(biasConsumer->op, epilogue->getResult(0));
+        rewriter.eraseOp(truncConsumer);
+      } else {
+        rewriter.replaceOp(truncConsumer, hexklMatmul->getResult(0));
+      }
+      rewriter.eraseOp(op);
     } else {
       Value outputOperand =
           tensor::EmptyOp::create(rewriter, loc, cType.getShape(), cElemType);
@@ -228,12 +385,86 @@ struct MatmulToHexKLPass
                << " mode)\n");
 
     RewritePatternSet patterns(&getContext());
-    patterns.add<MatmulToHexKL>(&getContext(), isMacroMode);
+    patterns.add<MatmulToHexKL>(&getContext(), isMacroMode,
+                                consumerF16Epilogue,
+                                consumerF16BiasEpilogue);
 
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       LLVM_DEBUG(llvm::dbgs()
                  << "[" << DEBUG_TYPE << "] Pattern application failed\n");
       return signalPassFailure();
+    }
+
+    if (consumerF16Epilogue) {
+      int64_t formed = 0;
+      struct ConsumerStats {
+        int64_t sites = 0;
+        int64_t resultBytes = 0;
+      };
+      std::map<std::string, ConsumerStats> consumers;
+      getOperation()->walk([&](hexkl::MatmulOp matmul) {
+        if (!matmul->hasAttr("alps.p5j.consumer_f16_epilogue"))
+          return;
+        ++formed;
+        auto resultType =
+            dyn_cast<RankedTensorType>(matmul->getResult(0).getType());
+        int64_t resultBytes =
+            resultType && resultType.hasStaticShape()
+                ? resultType.getNumElements() *
+                      resultType.getElementType().getIntOrFloatBitWidth() / 8
+                : 0;
+        if (matmul->getResult(0).use_empty()) {
+          auto &stats = consumers["none"];
+          ++stats.sites;
+          stats.resultBytes += resultBytes;
+          return;
+        }
+        for (Operation *user : matmul->getResult(0).getUsers()) {
+          std::string signature = user->getName().getStringRef().str();
+          if (auto generic = dyn_cast<linalg::GenericOp>(user)) {
+            signature += ":inputs=" +
+                         std::to_string(generic.getNumDpsInputs()) + ":body=";
+            bool first = true;
+            for (Operation &bodyOp :
+                 generic.getRegion().front().without_terminator()) {
+              if (!first)
+                signature += "+";
+              first = false;
+              signature += bodyOp.getName().getStringRef().str();
+            }
+            signature += ":maps=";
+            first = true;
+            for (AffineMap map : generic.getIndexingMapsArray()) {
+              if (!first)
+                signature += "/";
+              first = false;
+              std::string mapText;
+              llvm::raw_string_ostream os(mapText);
+              map.print(os);
+              signature += os.str();
+            }
+          }
+          auto &stats = consumers[signature];
+          ++stats.sites;
+          stats.resultBytes += resultBytes;
+        }
+      });
+      llvm::errs() << "[ALPS-P5J] function=" << getOperation().getName()
+                   << " formed_f16_epilogues=" << formed << "\n";
+      for (const auto &[signature, stats] : consumers)
+        llvm::errs() << "[ALPS-P5J-CONSUMER] function="
+                     << getOperation().getName() << " signature=" << signature
+                     << " sites=" << stats.sites
+                     << " result_bytes=" << stats.resultBytes << "\n";
+      if (consumerF16BiasEpilogue) {
+        int64_t biasFormed = 0;
+        getOperation()->walk([&](hexkl::F16BiasEpilogueOp epilogue) {
+          if (epilogue->hasAttr("alps.p5l.consumer_bias_formation"))
+            ++biasFormed;
+        });
+        llvm::errs() << "[ALPS-P5L] function=" << getOperation().getName()
+                     << " formed_rank2_bias_epilogues=" << biasFormed << "\n";
+      }
     }
 
     LLVM_DEBUG(llvm::dbgs()

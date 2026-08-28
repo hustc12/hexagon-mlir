@@ -54,6 +54,34 @@ def HexKL_MatmulOp
   }];
 }
 
+def HexKL_F16BiasEpilogueOp
+  : HexKL_Op<"f16_bias_epilogue",
+      [DestinationStyleOpInterface,MemoryEffects<[MemRead, MemWrite]>]> {
+  let summary = "Consumer contract for an HMX F16 broadcast-bias epilogue";
+  let description = [{
+    Represents a rank-2 F16 result whose sole consumer adds a rank-1 F16 bias
+    along the final dimension.  The op is intentionally retained until HMX
+    decomposition so the accumulator drain can form the consumer's final
+    representation directly, without materializing and rereading an
+    intermediate matmul result.
+  }];
+
+  let arguments = (ins
+    AnyTypeOf<[Non0RankedTensorOf<[F16]>, Non0RankedMemRefOf<[F16]>]>:$src,
+    AnyTypeOf<[Non0RankedTensorOf<[F16]>, Non0RankedMemRefOf<[F16]>]>:$bias,
+    AnyTypeOf<[Non0RankedTensorOf<[F16]>, Non0RankedMemRefOf<[F16]>]>:$outs
+  );
+  let results = (outs Variadic<Non0RankedTensorOf<[F16]>>:$result);
+  let assemblyFormat = [{
+    `ins` `(` $src `,` $bias `:` type($src) `,` type($bias) `)`
+    `outs` `(` $outs `:` type($outs) `)` attr-dict
+    (`->` type($result)^)?
+  }];
+  let extraClassDeclaration = [{
+    MutableOperandRange getDpsInitsMutable() { return getOutsMutable(); }
+  }];
+}
+
 def HexKL_MicroHMXSetupAccReadF16Op
   : HexKL_Op<"micro_hmx_setup_acc_read_f16",
       [MemoryEffects<[MemWrite]>]> {
@@ -260,6 +288,100 @@ def HexKL_MicroHMXCopyF16ToF32SubmatrixOp
 
   let assemblyFormat =
     "`(` $hmx_block `,` $in_offset `,` $dst `,` $tile_row `,` $tile_col `,` $output_rows `,` $output_cols `)` `:` type($hmx_block) `,` type($in_offset) `,` type($dst) `,` type($tile_row) `,` type($tile_col) `,` type($output_rows) `,` type($output_cols) attr-dict";
+}
+
+def HexKL_MicroHMXCopyF16ToSubmatrixOp
+  : HexKL_Op<"micro_hmx_copy_f16_to_submatrix",
+      [MemoryEffects<[MemRead, MemWrite]>]> {
+  let hasVerifier = 1;
+
+  let summary = "Copy F16 to F16 submatrix";
+  let description = [{
+    Copies a 32x32 tile in flat F16 layout from VTCM to DDR as F16.  This is
+    the direct epilogue used when the consumer contract does not require an
+    intermediate F32 tensor.
+  }];
+
+  let arguments = (ins
+    AnyNon0RankedMemRef:$hmx_block,
+    I32:$in_offset,
+    AnyNon0RankedMemRef:$dst,
+    I32:$tile_row,
+    I32:$tile_col,
+    I32:$output_rows,
+    I32:$output_cols
+  );
+
+  let results = (outs);
+
+  let assemblyFormat =
+    "`(` $hmx_block `,` $in_offset `,` $dst `,` $tile_row `,` $tile_col `,` $output_rows `,` $output_cols `)` `:` type($hmx_block) `,` type($in_offset) `,` type($dst) `,` type($tile_row) `,` type($tile_col) `,` type($output_rows) `,` type($output_cols) attr-dict";
+}
+
+def HexKL_MicroHMXCopyF16BiasToSubmatrixOp
+  : HexKL_Op<"micro_hmx_copy_f16_bias_to_submatrix",
+      [MemoryEffects<[MemRead, MemWrite]>]> {
+  let hasVerifier = 1;
+  let summary = "Drain an HMX F16 tile while applying broadcast bias";
+  let description = [{
+    Adds the final-dimension F16 bias while copying a flat 32x32 F16 tile from
+    VTCM directly to its final DDR submatrix.  This removes the separate
+    intermediate result and bias-add traversal.
+  }];
+  let arguments = (ins
+    AnyNon0RankedMemRef:$hmx_block,
+    I32:$in_offset,
+    AnyNon0RankedMemRef:$bias,
+    AnyNon0RankedMemRef:$dst,
+    I32:$tile_row,
+    I32:$tile_col,
+    I32:$output_rows,
+    I32:$output_cols
+  );
+  let results = (outs);
+  let assemblyFormat =
+    "`(` $hmx_block `,` $in_offset `,` $bias `,` $dst `,` $tile_row `,` $tile_col `,` $output_rows `,` $output_cols `)` `:` type($hmx_block) `,` type($in_offset) `,` type($bias) `,` type($dst) `,` type($tile_row) `,` type($tile_col) `,` type($output_rows) `,` type($output_cols) attr-dict";
+}
+
+def HexKL_MicroHMXAsyncDrainWaitSlotOp
+  : HexKL_Op<"micro_hmx_async_drain_wait_slot",
+      [MemoryEffects<[MemRead, MemWrite]>]> {
+  let summary = "Wait until one ALPS HMX async-drain VTCM slot is reusable";
+  let arguments = (ins I32:$slot);
+  let results = (outs);
+  let assemblyFormat = "`(` $slot `)` `:` type($slot) attr-dict";
+}
+
+def HexKL_MicroHMXAsyncDrainStartF16Op
+  : HexKL_Op<"micro_hmx_async_drain_start_f16",
+      [MemoryEffects<[MemRead, MemWrite]>]> {
+  let summary = "Start a 2D UserDMA drain from one F16 VTCM tile to DDR";
+  let description = [{
+    Starts a VTCM-to-DDR 2D transfer after the HMX accumulator has formed a
+    flat F16 tile. The caller must wait for the selected ping-pong slot before
+    overwriting it and flush both slots before the destination escapes.
+  }];
+  let arguments = (ins
+    AnyNon0RankedMemRef:$hmx_block,
+    I32:$in_offset,
+    AnyNon0RankedMemRef:$dst,
+    I32:$tile_row,
+    I32:$tile_col,
+    I32:$output_rows,
+    I32:$output_cols,
+    I32:$slot
+  );
+  let results = (outs);
+  let assemblyFormat =
+    "`(` $hmx_block `,` $in_offset `,` $dst `,` $tile_row `,` $tile_col `,` $output_rows `,` $output_cols `,` $slot `)` `:` type($hmx_block) `,` type($in_offset) `,` type($dst) `,` type($tile_row) `,` type($tile_col) `,` type($output_rows) `,` type($output_cols) `,` type($slot) attr-dict";
+}
+
+def HexKL_MicroHMXAsyncDrainFlushOp
+  : HexKL_Op<"micro_hmx_async_drain_flush",
+      [MemoryEffects<[MemRead, MemWrite]>]> {
+  let summary = "Retire every outstanding ALPS HMX async-drain descriptor";
+  let results = (outs);
+  let assemblyFormat = "attr-dict";
 }
 
 //===----------------------------------------------------------------------===//

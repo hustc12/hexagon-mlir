@@ -62,6 +62,20 @@ def parse_sites(path: Path) -> list[dict[str, object]]:
     return result
 
 
+def parse_accesses(path: Path) -> list[dict[str, object]]:
+    result: list[dict[str, object]] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.startswith("[ALPS-P1-ACCESS]"):
+            continue
+        row: dict[str, object] = dict(re.findall(r"([a-z_]+)=([^ ]+)", line))
+        source = str(row.get("source_lines", "none"))
+        row["_lines"] = {
+            int(value) for value in source.split(",") if value.isdigit()
+        }
+        result.append(row)
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--artifact-root", type=Path, required=True)
@@ -79,6 +93,7 @@ def main() -> None:
     cycles = parse_lwp(json_files[0])
     info = parse_info(args.info_dump)
     sites = parse_sites(args.ledger)
+    accesses = parse_accesses(args.ledger)
     rows = []
     for region_id, timing in cycles.items():
         metadata = info.get(region_id, {"lines": set(), "ops": ""})
@@ -96,10 +111,18 @@ def main() -> None:
             for site in matched
             if site.get("kind") == "representation_candidate"
         ]
+        matched_accesses = [
+            access
+            for access in accesses
+            if access.get("phase") == "post-bufferization"
+            and region_lines & access["_lines"]
+        ]
         rows.append(
             {
                 "id": region_id,
                 "pcycles": int(timing["pcycles"] or 0),
+                "inclusive_pcycles": int(timing["pcycles"] or 0),
+                "exclusive_pcycles": 0,
                 "iterations": int(timing["iterations"] or 0),
                 "parent": (
                     timing["parent"] if timing["parent"] is not None else "-"
@@ -118,13 +141,42 @@ def main() -> None:
                     max(0, int(str(site.get("static_bytes", "-1"))))
                     for site in candidates
                 ),
+                "access_sites": len(matched_accesses),
+                "logical_read_upper_bytes": sum(
+                    max(0, int(str(access.get("logical_read_upper_bytes", "0"))))
+                    for access in matched_accesses
+                ),
+                "logical_write_upper_bytes": sum(
+                    max(0, int(str(access.get("logical_write_upper_bytes", "0"))))
+                    for access in matched_accesses
+                ),
+                "unique_operand_bytes": sum(
+                    max(0, int(str(access.get("unique_operand_bytes", "0"))))
+                    for access in matched_accesses
+                ),
             }
         )
-    rows.sort(key=lambda row: int(row["pcycles"]), reverse=True)
+    by_id = {int(row["id"]): row for row in rows}
+    child_cycles: dict[int, int] = {}
+    for row in rows:
+        parent = row["parent"]
+        if parent is None or parent == "-":
+            continue
+        parent_id = int(parent)
+        child_cycles[parent_id] = child_cycles.get(parent_id, 0) + int(
+            row["inclusive_pcycles"]
+        )
+    for region_id, row in by_id.items():
+        row["exclusive_pcycles"] = max(
+            0, int(row["inclusive_pcycles"]) - child_cycles.get(region_id, 0)
+        )
+    rows.sort(key=lambda row: int(row["exclusive_pcycles"]), reverse=True)
     args.csv.parent.mkdir(parents=True, exist_ok=True)
     columns = (
         "id",
         "pcycles",
+        "inclusive_pcycles",
+        "exclusive_pcycles",
         "iterations",
         "parent",
         "source_lines",
@@ -134,29 +186,68 @@ def main() -> None:
         "physical_sites",
         "physical_materialization_bytes",
         "candidate_static_bytes",
+        "access_sites",
+        "logical_read_upper_bytes",
+        "logical_write_upper_bytes",
+        "unique_operand_bytes",
     )
     with args.csv.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=columns)
         writer.writeheader()
         writer.writerows(rows)
-    total = sum(int(row["pcycles"]) for row in rows)
+    # Inclusive parent/child regions overlap. Exclusive cycles form a true
+    # partition of the instrumented root and are therefore the only valid
+    # denominator for hotspot shares.
+    total = sum(int(row["exclusive_pcycles"]) for row in rows)
     lines = [
         "# ALPS P1 LWP region ranking",
         "",
         "Instrumented pcycles are for ranking only; they do not replace formal latency.",
         "",
-        "| Rank | ID | pcycles | Share | Iterations | Source lines | Candidate sites | Physical sites | Physical bytes | Ops |",
-        "|---:|---:|---:|---:|---:|---|---:|---:|---:|---|",
+        "| Rank | ID | Exclusive pcycles | Inclusive pcycles | Exclusive share | Iterations | Source lines | Physical bytes | Logical R/W upper bytes | Access sites | Ops |",
+        "|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---|",
     ]
     for index, row in enumerate(rows[:30], 1):
-        share = 100.0 * int(row["pcycles"]) / total if total else 0.0
+        share = (
+            100.0 * int(row["exclusive_pcycles"]) / total if total else 0.0
+        )
         ops = str(row["ops"]).replace("|", "/")
         lines.append(
-            f"| {index} | {row['id']} | {row['pcycles']} | {share:.2f}% | "
+            f"| {index} | {row['id']} | {row['exclusive_pcycles']} | "
+            f"{row['inclusive_pcycles']} | {share:.2f}% | "
             f"{row['iterations']} | {row['source_lines']} | "
-            f"{row['candidate_sites']} | {row['physical_sites']} | "
-            f"{row['physical_materialization_bytes']} | {ops} |"
+            f"{row['physical_materialization_bytes']} | "
+            f"{row['logical_read_upper_bytes']}/{row['logical_write_upper_bytes']} | "
+            f"{row['access_sites']} | {ops} |"
         )
+    hexkl_phases: dict[str, dict[str, int]] = {}
+    for row in rows:
+        op_name = str(row["ops"])
+        if not op_name.startswith("hexkl.micro_hmx_") or "," in op_name:
+            continue
+        phase = hexkl_phases.setdefault(op_name, {"cycles": 0, "iterations": 0})
+        phase["cycles"] += int(row["exclusive_pcycles"])
+        phase["iterations"] += int(row["iterations"])
+    if hexkl_phases:
+        lines.extend(
+            [
+                "",
+                "## HexKL/HMX phase aggregate",
+                "",
+                "Analysis-only per-operation LWP; call overhead is included, so use for ranking rather than formal latency.",
+                "",
+                "| Phase | Exclusive pcycles | Root share | Dynamic invocations |",
+                "|---|---:|---:|---:|",
+            ]
+        )
+        for phase_name, values in sorted(
+            hexkl_phases.items(), key=lambda item: item[1]["cycles"], reverse=True
+        ):
+            share = 100.0 * values["cycles"] / total if total else 0.0
+            lines.append(
+                f"| {phase_name} | {values['cycles']} | {share:.2f}% | "
+                f"{values['iterations']} |"
+            )
     args.markdown.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 

@@ -54,6 +54,12 @@ static constexpr unsigned MaxMultiUseFusionIterations = 3;
 
 static bool hasAlpsTopologyBoundary(Operation *op, StringRef specificAttr) {
   return op && (op->hasAttr("alps.kv_fusion_boundary") ||
+                // P2g-c assigns a concrete two-dimensional VRF formation
+                // contract to this op.  Generic elementwise fusion rebuilds
+                // linalg.generic without preserving that contract and may
+                // also change its indexing maps, so retain it as a local
+                // codegen boundary while the feature is enabled.
+                op->hasAttr("alps.p2g.register_tile_contract") ||
                 op->hasAttr(specificAttr));
 }
 

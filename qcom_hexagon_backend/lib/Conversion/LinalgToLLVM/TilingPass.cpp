@@ -108,7 +108,9 @@ static LogicalResult applyTiling(IRRewriter &rewriter, linalg::LinalgOp op,
         "alps.kv_multi_use_fusion_boundary",
         "alps.kv_split_reduction_boundary",
         "alps.p2f.consumer_layout_contract", "alps.p2f.permutation",
-        "alps.p2f.contiguous_loop", "alps.p5a.contract_id"})
+        "alps.p2f.contiguous_loop", "alps.p2g.register_tile_contract",
+        "alps.p2g.register_tile_sizes",
+        "alps.p2g.register_tile_permutation", "alps.p5a.contract_id"})
     if (Attribute attr = op->getAttr(name)) {
       tiledOp->op->setAttr(name, attr);
       // SCF survives vectorization and one-shot bufferization even when the
@@ -135,6 +137,8 @@ static LogicalResult tileLinalgOp(linalg::LinalgOp op,
   linalg::LinalgOp tilingTarget = op;
   const bool hasConsumerLayoutContract =
       op->hasAttr("alps.p2f.consumer_layout_contract");
+  const bool hasRegisterTileContract =
+      op->hasAttr("alps.p2g.register_tile_contract");
   if (hasConsumerLayoutContract) {
     auto contiguousLoop =
         op->getAttrOfType<IntegerAttr>("alps.p2f.contiguous_loop");
@@ -161,14 +165,23 @@ static LogicalResult tileLinalgOp(linalg::LinalgOp op,
   auto dataTileSize = computeDataTileSize(op);
   if (!dataTileSize.has_value())
     return failure();
-
-  tileSizes[numLoops - 1] = dataTileSize.value();
+  int64_t innerTileSize = dataTileSize.value();
+  if (hasRegisterTileContract) {
+    auto requested =
+        op->getAttrOfType<DenseI64ArrayAttr>("alps.p2g.register_tile_sizes");
+    if (numLoops < 2 || !requested || requested.size() != 2)
+      return failure();
+    tileSizes[numLoops - 2] = requested[0];
+    innerTileSize = requested[1];
+    splitTilingRange = true;
+  }
+  tileSizes[numLoops - 1] = innerTileSize;
 
   auto ranges = op.getStaticLoopRanges();
   auto innerLoopRange = ranges[numLoops - 1];
 
   if (!ShapedType::isDynamic(innerLoopRange)) {
-    if (innerLoopRange < dataTileSize) {
+    if (innerLoopRange < innerTileSize) {
       needsInterchange = true;
       // Note that default is false as currently not sure
       // if trade-offs with transpose is right.
@@ -178,13 +191,13 @@ static LogicalResult tileLinalgOp(linalg::LinalgOp op,
         DBG(" -> inner loop not tilable. Needs interchange");
         return failure();
       }
-      if (!computeInterchangeVector(op, dataTileSize.value(),
+      if (!computeInterchangeVector(op, innerTileSize,
                                     interchangeVector)) {
         return failure();
       }
       DBG(" -> inner loop dimension not compatible for vectorization");
       return failure();
-    } else if (innerLoopRange == dataTileSize && op.getNumLoops() == 1) {
+    } else if (innerLoopRange == innerTileSize && op.getNumLoops() == 1) {
       DBG(" -> inner dim is already of data tile size, hence tiling for "
           "vectorization is not required");
       return failure();
@@ -200,10 +213,10 @@ static LogicalResult tileLinalgOp(linalg::LinalgOp op,
 
     // If the innermost loop's range is not a multiple of tile size, we either
     // do padding or split the op into two parts - tileable part and remainder.
-    if (!isPerfectlyTileable(innerLoopRange, dataTileSize.value())) {
+    if (!isPerfectlyTileable(innerLoopRange, innerTileSize)) {
       DBG("Innermost loop range (" << innerLoopRange << ") is not a multiple "
                                    << "of the tile-size ("
-                                   << dataTileSize.value() << ")");
+                                   << innerTileSize << ")");
       // do padding
       if (!splitTilingRange) {
         DBG("Padding the inner-most loop");
@@ -217,7 +230,7 @@ static LogicalResult tileLinalgOp(linalg::LinalgOp op,
         // Pad the dimension corresponding to the most inner loop
         // making it's range a multiple of tile size.
         padDims.push_back(numLoops - 1);
-        padToMultipleOf.push_back(dataTileSize.value());
+        padToMultipleOf.push_back(innerTileSize);
 
         llvm::ArrayRef<int64_t> padDimsRef(padDims.data(), padDims.size());
         paddingOption.setPaddingDimensions(padDimsRef);
@@ -255,7 +268,11 @@ static LogicalResult tileLinalgOp(linalg::LinalgOp op,
         // accross the dimension corresponding to the most inner loop.
         // The firstPart contains the part that is mutiple of tilesize and the
         // secondPart is the remainder.
-        assert(innerLoopRange > dataTileSize.value() &&
+        // Register-tile contracts deliberately override the default
+        // one-dimensional HVX data tile (typically 64 lanes).  Compare with
+        // the effective inner tile, otherwise a valid 17 -> 16 + 1 split
+        // incorrectly trips this assertion against 64.
+        assert(innerLoopRange > innerTileSize &&
                "Splitting a range smaller than the tile size is requested");
         DBG("Splitting the innermost loop to seperate the tileable part from "
             "the remainder part");
@@ -263,10 +280,10 @@ static LogicalResult tileLinalgOp(linalg::LinalgOp op,
         SmallVector<Operation *> firstPart, secondPart;
         unsigned splitDim = numLoops - 1;
         OpFoldResult splitpoint = rewriter.getIndexAttr(
-            innerLoopRange - innerLoopRange % dataTileSize.value());
+            innerLoopRange - innerLoopRange % innerTileSize);
         DBG("Splitting at dimension  "
             << splitDim << " after point "
-            << innerLoopRange % dataTileSize.value());
+            << innerLoopRange % innerTileSize);
 
         std::tie(firstPart.emplace_back(), secondPart.emplace_back()) =
             linalg::splitOp(rewriter, cast<TilingInterface>(op.getOperation()),
@@ -317,6 +334,8 @@ struct HexagonTilingPass : public ::impl::HexagonTilingBase<HexagonTilingPass> {
         DBG("tiling candidate: " << op);
         bool isKv = op->hasAttr("omni_fetch.kv_cache_role");
         bool isP2f = op->hasAttr("alps.p2f.consumer_layout_contract");
+        bool isP2gRegister =
+            op->hasAttr("alps.p2g.register_tile_contract");
         if (succeeded(tileLinalgOp(op, useInterchangeVector,
                                   splitTilingRange))) {
           DBG("-> tiling succeeded.");
@@ -324,12 +343,16 @@ struct HexagonTilingPass : public ::impl::HexagonTilingBase<HexagonTilingPass> {
             llvm::errs() << "[KVPropagation] tiling=succeeded\n";
           if (isP2f)
             llvm::errs() << "[ALPS-P2F] tiling=succeeded\n";
+          if (isP2gRegister)
+            llvm::errs() << "[ALPS-P2G-C] tiling=succeeded\n";
         } else {
           DBG("-> tiling failed.");
           if (isKv)
             llvm::errs() << "[KVPropagation] tiling=failed\n";
           if (isP2f)
             llvm::errs() << "[ALPS-P2F] tiling=failed\n";
+          if (isP2gRegister)
+            llvm::errs() << "[ALPS-P2G-C] tiling=failed\n";
         }
       }
       return WalkResult::advance();

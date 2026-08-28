@@ -182,11 +182,21 @@ createAlpsConsumerDrivenLayoutPass(
     const AlpsConsumerDrivenLayoutOptions &options =
         AlpsConsumerDrivenLayoutOptions());
 
+/// ALPS P5i: directly form non-overlapping patch convolutions in the
+/// contiguous layout required by their token consumer.
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createAlpsPatchConvFormationPass();
+
 /// ALPS P5a: classify stable consumer-layout contracts at a compiler phase.
 std::unique_ptr<InterfacePass<FunctionOpInterface>>
 createAlpsContractDischargeLedgerPass(
     const AlpsContractDischargeLedgerOptions &options =
         AlpsContractDischargeLedgerOptions());
+
+/// ALPS P2g-a: correlate layout contracts with final vector transfers and
+/// report where physical striding remains. This pass is analysis-only.
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createAlpsContinuityAuditPass();
 
 /// ALPS P5c: prefetch a provably future tile while P2e directly forms the
 /// representation demanded by its consumer.
@@ -194,6 +204,43 @@ std::unique_ptr<InterfacePass<FunctionOpInterface>>
 createAlpsLayoutSupplyPrefetchPass(
     const AlpsLayoutSupplyPrefetchOptions &options =
         AlpsLayoutSupplyPrefetchOptions());
+
+/// ALPS P5f-a: analyze only the continuous source tiles feeding P2g-c
+/// register formation. This pass never inserts a prefetch or DMA operation.
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createAlpsCrpSupplyAnalysisPass(
+    const AlpsCrpSupplyAnalysisOptions &options =
+        AlpsCrpSupplyAnalysisOptions());
+
+/// ALPS P5f-b: prefetch only the exact future source tiles admitted by the
+/// P2g-c continuous-register-formation contract.
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createAlpsCrpSupplyPrefetchPass(
+    const AlpsCrpSupplyPrefetchOptions &options =
+        AlpsCrpSupplyPrefetchOptions());
+
+/// ALPS P5g-a: pack an exact strided P2g-c source tile into contiguous VTCM
+/// using the existing 2-D copy/DMA lowering. This matched gate is synchronous.
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createAlpsCrpVtcmFormationPass();
+
+/// ALPS P5g-b: coalesce adjacent narrow CRP source tiles into a reusable,
+/// DMA-legal VTCM supply window.
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createAlpsCrpVtcmWindowPass();
+
+/// ALPS P5g-d: analysis-only proof that the producer of a P2g-c source can
+/// directly form the consumer-required representation in VTCM, eliminating
+/// the intervening DDR materialization.
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createAlpsCrpProducerDirectAnalysisPass(
+    const AlpsCrpProducerDirectAnalysisOptions &options =
+        AlpsCrpProducerDirectAnalysisOptions());
+
+/// ALPS P5h: eliminate the temporary/writeback pair around padded attention
+/// row formation and copy only the untouched tail into the final destination.
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createAlpsAttentionDestinationFormationPass();
 
 /// V-DAE: decouples Memory Access and Compute Execution using semaphores.
 std::unique_ptr<InterfacePass<FunctionOpInterface>>

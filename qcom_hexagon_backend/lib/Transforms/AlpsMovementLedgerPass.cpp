@@ -17,6 +17,8 @@
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Interfaces/ViewLikeInterface.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/MathExtras.h"
@@ -47,6 +49,9 @@ struct LedgerTotals {
   int64_t staticWriteBytes = 0;
   int64_t staticMaterializationBytes = 0;
   int64_t dynamicSites = 0;
+  int64_t accessSites = 0;
+  int64_t logicalReadUpperBytes = 0;
+  int64_t logicalWriteUpperBytes = 0;
 };
 
 static std::optional<int64_t> getStaticBytes(Type type) {
@@ -242,6 +247,75 @@ static int64_t aliasDepth(Value value) {
   return depth;
 }
 
+/// Follow only descriptor-preserving memref/tensor views.  This deliberately
+/// stops at copies and layout-forming operations: P5h needs to distinguish a
+/// second name for the same storage from a genuinely materialized
+/// representation.
+static Value aliasRoot(Value value) {
+  SmallPtrSet<Operation *, 8> visited;
+  while (Operation *def = value.getDefiningOp()) {
+    if (!isDescriptorOnly(def) || def->getNumOperands() == 0 ||
+        !visited.insert(def).second)
+      break;
+    Value next;
+    for (Value operand : def->getOperands()) {
+      if (isa<ShapedType>(operand.getType())) {
+        next = operand;
+        break;
+      }
+    }
+    if (!next)
+      break;
+    value = next;
+  }
+  return value;
+}
+
+static std::string definingOpName(Value value) {
+  if (isa<BlockArgument>(value))
+    return "block_argument";
+  Operation *def = value.getDefiningOp();
+  return def ? def->getName().getStringRef().str() : "none";
+}
+
+static std::string directUserNames(Value value, Operation *exclude = nullptr) {
+  llvm::StringSet<> names;
+  for (Operation *user : value.getUsers())
+    if (user != exclude)
+      names.insert(user->getName().getStringRef());
+  if (names.empty())
+    return "none";
+  SmallVector<StringRef> sorted;
+  sorted.reserve(names.size());
+  for (const auto &entry : names)
+    sorted.push_back(entry.getKey());
+  llvm::sort(sorted);
+  std::string text;
+  llvm::raw_string_ostream os(text);
+  llvm::interleaveComma(sorted, os);
+  return text;
+}
+
+static Value copySource(Operation *op) {
+  if (auto copy = dyn_cast<memref::CopyOp>(op))
+    return copy.getSource();
+  if (auto copy = dyn_cast<linalg::CopyOp>(op))
+    return copy.getInputs().front();
+  if (auto clone = dyn_cast<bufferization::CloneOp>(op))
+    return clone.getInput();
+  return {};
+}
+
+static Value copyDestination(Operation *op) {
+  if (auto copy = dyn_cast<memref::CopyOp>(op))
+    return copy.getTarget();
+  if (auto copy = dyn_cast<linalg::CopyOp>(op))
+    return copy.getOutputs().front();
+  if (auto clone = dyn_cast<bufferization::CloneOp>(op))
+    return clone.getOutput();
+  return {};
+}
+
 static int64_t useDistance(Value value,
                            const DenseMap<Operation *, int64_t> &ordinal,
                            int64_t producerOrdinal, int64_t &lastUse,
@@ -270,6 +344,30 @@ static void addBytes(int64_t &total, std::optional<int64_t> bytes) {
     return;
   if (*bytes <= std::numeric_limits<int64_t>::max() - total)
     total += *bytes;
+}
+
+static std::optional<int64_t> multiplyBytes(int64_t lhs, int64_t rhs) {
+  int64_t result = 0;
+  if (lhs < 0 || rhs < 0 || llvm::MulOverflow(lhs, rhs, result))
+    return std::nullopt;
+  return result;
+}
+
+static std::optional<int64_t> elementBytes(Type type) {
+  auto shaped = dyn_cast<ShapedType>(type);
+  if (!shaped)
+    return std::nullopt;
+  int64_t bits = shaped.getElementTypeBitWidth();
+  if (bits <= 0)
+    return std::nullopt;
+  return llvm::divideCeilSigned(bits, int64_t{8});
+}
+
+static std::string loopRangesString(ArrayRef<int64_t> ranges) {
+  std::string text;
+  llvm::raw_string_ostream os(text);
+  llvm::interleave(ranges, os, "x");
+  return text;
 }
 
 struct AlpsMovementLedgerPass
@@ -356,6 +454,15 @@ struct AlpsMovementLedgerPass
         decision = "capacity_only_not_movement";
       }
 
+      Value source = copy ? copySource(op) : Value();
+      Value destination = copy ? copyDestination(op) : Value();
+      Value sourceRoot = source ? aliasRoot(source) : Value();
+      Value destinationRoot = destination ? aliasRoot(destination) : Value();
+      bool sameType = source && destination &&
+                      source.getType() == destination.getType();
+      bool distinctStorage = sourceRoot && destinationRoot &&
+                             sourceRoot != destinationRoot;
+
       recordStream << "[ALPS-P1-SITE]"
                    << " phase=" << phase << " function=" << function.getName()
                    << " id=" << function.getName() << ':' << site++
@@ -381,9 +488,130 @@ struct AlpsMovementLedgerPass
                    << " last_use_ordinal=" << lastUse
                    << " cross_block_uses=" << crossBlockUses
                    << " alias_depth=" << (primary ? aliasDepth(primary) : 0)
+                   << " source_version="
+                   << (source ? valueVersion(source, ordinal) : "none")
+                   << " source_root_version="
+                   << (sourceRoot ? valueVersion(sourceRoot, ordinal) : "none")
+                   << " source_def="
+                   << (source ? definingOpName(source) : "none")
+                   << " source_root_def="
+                   << (sourceRoot ? definingOpName(sourceRoot) : "none")
+                   << " source_layout="
+                   << (source ? layoutFor(source.getType()) : StringRef("none"))
+                   << " source_space="
+                   << (source ? memorySpace(source.getType()) : -1)
+                   << " source_users="
+                   << (source ? directUserNames(source, op) : "none")
+                   << " destination_version="
+                   << (destination ? valueVersion(destination, ordinal)
+                                   : "none")
+                   << " destination_root_version="
+                   << (destinationRoot
+                           ? valueVersion(destinationRoot, ordinal)
+                           : "none")
+                   << " destination_def="
+                   << (destination ? definingOpName(destination) : "none")
+                   << " destination_root_def="
+                   << (destinationRoot ? definingOpName(destinationRoot)
+                                       : "none")
+                   << " destination_layout="
+                   << (destination ? layoutFor(destination.getType())
+                                   : StringRef("none"))
+                   << " destination_space="
+                   << (destination ? memorySpace(destination.getType()) : -1)
+                   << " destination_users="
+                   << (destination ? directUserNames(destination, op) : "none")
+                   << " copy_same_type=" << sameType
+                   << " copy_distinct_storage=" << distinctStorage
                    << " alignment=" << alignment << " pages=" << pages
                    << " legal_actions=" << actions
                    << " decision=" << decision << '\n';
+    });
+
+    // A materialization ledger alone misses the potentially much larger
+    // volume produced by repeated operand accesses inside compute loops.  For
+    // every statically shaped linalg op, report a scalar-semantic upper bound:
+    // one element access per used block argument per logical iteration and one
+    // output write per iteration.  Tiling, vector registers, caches and HMX may
+    // reduce physical traffic, so these values are deliberately named
+    // `logical_*_upper_bytes`; they are not DDR/PMU measurements.
+    function.walk([&](linalg::LinalgOp linalgOp) {
+      SmallVector<int64_t> ranges = linalgOp.getStaticLoopRanges();
+      int64_t iterations = 1;
+      bool dynamic = ranges.empty();
+      for (int64_t range : ranges) {
+        int64_t product = 0;
+        if (range < 0 || llvm::MulOverflow(iterations, range, product)) {
+          dynamic = true;
+          break;
+        }
+        iterations = product;
+      }
+
+      int64_t readUpper = 0, writeUpper = 0, uniqueBytes = 0;
+      Block &payload = linalgOp->getRegion(0).front();
+      auto blockArguments = payload.getArguments();
+      int64_t argumentIndex = 0;
+      for (OpOperand *input : linalgOp.getDpsInputOperands()) {
+        addBytes(uniqueBytes, getStaticBytes(input->get().getType()));
+        bool used = argumentIndex < static_cast<int64_t>(blockArguments.size())
+                        ? !blockArguments[argumentIndex].use_empty()
+                        : true;
+        if (!dynamic && used) {
+          auto bytes = elementBytes(input->get().getType());
+          addBytes(readUpper,
+                   bytes ? multiplyBytes(iterations, *bytes) : std::nullopt);
+        }
+        ++argumentIndex;
+      }
+      for (Value init : linalgOp.getDpsInits()) {
+        addBytes(uniqueBytes, getStaticBytes(init.getType()));
+        bool read = argumentIndex < static_cast<int64_t>(blockArguments.size())
+                        ? !blockArguments[argumentIndex].use_empty()
+                        : true;
+        if (!dynamic) {
+          auto bytes = elementBytes(init.getType());
+          if (read)
+            addBytes(readUpper,
+                     bytes ? multiplyBytes(iterations, *bytes)
+                           : std::nullopt);
+          addBytes(writeUpper,
+                   bytes ? multiplyBytes(iterations, *bytes) : std::nullopt);
+        }
+        ++argumentIndex;
+      }
+      int64_t logicalTotal = 0;
+      if (!llvm::AddOverflow(readUpper, writeUpper, logicalTotal)) {
+        addBytes(totals.logicalReadUpperBytes, readUpper);
+        addBytes(totals.logicalWriteUpperBytes, writeUpper);
+      }
+      ++totals.accessSites;
+      int64_t reusePermille =
+          uniqueBytes > 0 && logicalTotal <=
+                                 std::numeric_limits<int64_t>::max() / 1000
+              ? logicalTotal * 1000 / uniqueBytes
+              : -1;
+      recordStream << "[ALPS-P1-ACCESS]"
+                   << " phase=" << phase << " function=" << function.getName()
+                   << " ordinal=" << ordinal.lookup(linalgOp)
+                   << " op=" << linalgOp->getName()
+                   << " source_lines=" << sourceLines(linalgOp.getLoc())
+                   << " engine=" << engineFor(linalgOp)
+                   << " loop_ranges="
+                   << (dynamic ? StringRef("dynamic")
+                               : StringRef(loopRangesString(ranges)))
+                   << " logical_iterations=" << (dynamic ? -1 : iterations)
+                   << " logical_read_upper_bytes="
+                   << (dynamic ? -1 : readUpper)
+                   << " logical_write_upper_bytes="
+                   << (dynamic ? -1 : writeUpper)
+                   << " unique_operand_bytes=" << uniqueBytes
+                   << " logical_to_unique_permille="
+                   << (dynamic ? -1 : reusePermille)
+                   << " input_operands=" << linalgOp.getNumDpsInputs()
+                   << " output_operands=" << linalgOp.getNumDpsInits()
+                   << " interpretation=logical_upper_bound_not_physical_ddr"
+                   << '\n';
     });
 
     recordStream << "[ALPS-P1-SUMMARY]"
@@ -398,7 +626,12 @@ struct AlpsMovementLedgerPass
                  << " static_write_bytes=" << totals.staticWriteBytes
                  << " static_materialization_bytes="
                  << totals.staticMaterializationBytes
-                 << " dynamic_sites=" << totals.dynamicSites << '\n';
+                 << " dynamic_sites=" << totals.dynamicSites
+                 << " access_sites=" << totals.accessSites
+                 << " logical_read_upper_bytes="
+                 << totals.logicalReadUpperBytes
+                 << " logical_write_upper_bytes="
+                 << totals.logicalWriteUpperBytes << '\n';
     recordStream.flush();
     // Nested function passes may execute concurrently. Publish one complete
     // function ledger in a serialized write so record fields never interleave.

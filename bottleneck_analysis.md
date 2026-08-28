@@ -2732,3 +2732,1682 @@ latency window，命令和 bounds-check 开销反而抵消收益。此前一次 
 nano:/home/huzq85/2-working/working_set/alps_p5d_native_dinov2_20260820
 nano:/home/huzq85/2-working/working_set/alps_p5c_dinov2_hexkl_20260820
 ```
+
+### 11.24 P5a/P5b 三 domain gate：保持 representation-supply 主线（2026-08-26）
+
+为避免后续实现从“consumer-required representation 的提前供应”发散为任意
+prefetch，本轮只对完整 Qwen2.5-0.5B 和完整 UniSpeech-SAT-base 运行 P5a/P5b
+analysis-only。两者均使用 HexKL-on matched 配置；没有启用 P5c/P5d，也没有放宽
+因果、连续性、同 block 可用性、tile byte 或 lead 条件。
+
+完整 Qwen2.5-0.5B 使用 24 层、FP16、sequence length 32 的 staged full-model
+runner。24 个 stable layer 每层有 12 个 layout demand，其中 2 个由 P2e direct
+formation 消解、10 个保留 native；embedding 没有 demand，head 有 1 个 native
+demand。聚合结果为：
+
+| 指标 | Qwen2.5-0.5B |
+|---|---:|
+| 完整模型 latency | 10,885.49 ms |
+| P2e demand / direct / native | 289 / 48 / 241 |
+| P2e eliminated materialization | 1,572,864 B |
+| post-buffer direct contract carrier / untraceable | 24 / 24 |
+| post-buffer native physical / carrier / untraceable | 0 / 217 / 24 |
+| P5b final input / admitted | 24 / **0** |
+| 正确性 | PASS（24 layers，finite，top-5 match） |
+
+24 个最终 input 全部是 contiguous 256 B vector tile、`lead_ops=1`、single-use。
+它们与 DINOv2 的负例完全同构：在 demand 附近发 hint 不具备隐藏 latency 的窗口。
+因此 Qwen 不进入 P5c；又因为 post-bufferization `physical_transform=0`，也不进入
+P5d。
+
+完整 UniSpeech-SAT-base 的结果为：
+
+| 指标 | UniSpeech-SAT-base |
+|---|---:|
+| 完整模型 latency | 184,866.78 ms |
+| P2e demand / direct / native | 137 / 48 / 89 |
+| P2e eliminated materialization | 4,718,592 B |
+| post-buffer direct contract carrier / untraceable | 24 / 24 |
+| post-buffer native physical / carrier / untraceable | 0 / 76 / 13 |
+| P5b final input / admitted | 36 / **0** |
+| 正确性 | PASS（finite，last-frame top-1 match） |
+
+其中 24 个 input 是 256 B、`lead_ops=1`；另外 12 个是 128 B，线性 ordinal
+显示较大 `lead_ops`，但其 source 没有通过同 basic block 可用性证明。跨 block 的
+ordinal 差不是可执行的 prefetch window，不能越过控制流/producer 边界发 hint。
+因此这些点也必须拒绝，而不是为增加 admitted 数量而放宽条件。UniSpeech 同样没有
+residual physical transform，P5d 不成立。
+
+#### 后续工作的固定边界（anti-divergence guardrail）
+
+后续 ALPS 工作必须继续满足下面的顺序和语义：
+
+1. consumer contract 指定未来 representation；
+2. P2e/P2a/P2b 优先通过 direct formation 或 descriptor/indexing 消除搬动；
+3. P5a 证明 contract 在最终物理 IR 中的位置，P5b 证明 source/version/tile/lead；
+4. 只有合法的 future tile 才允许 P5c L2 supply；只有仍存在物理 transform、且
+   tile 可容纳时才允许 P5d VTCM transform-on-arrival；
+5. runtime/PMU 只能在 compiler 已证明合法的 `none/L2/VTCM` 动作之间选择，不能
+   创造新地址、新 layout 或跨越 producer 因果边界；
+6. 不通过 gate 的模型保留 direct formation，不通过反复调阈值、任意 fusion、
+   混合精度或无关 HMX lowering 来制造收益。
+
+本轮三个 domain 的共同结论是：P2e 能消除一部分 tensor-level materialization，
+但其 residual HVX-facing tile 都没有证明出值得 prefetch 的供给窗口，且没有最终
+物理 transpose。因此当前推荐组合仍是 direct formation，P5c 保留为默认关闭的
+合法机制，P5d/P5e 暂不实施。这是由证据收缩实现范围，不是改变论文故事线。
+
+完整产物已移动到：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p5b_qwen2.5-0.5b_20260826
+nano:/home/huzq85/2-working/working_set/alps_p5b_unispeech-sat-base_20260826
+```
+
+### 11.25 从 strided zero-copy 到连续表示流水线：重新组合 prefetch 与 layout formation
+
+本节回应一个关键判断：普通 data prefetch 单独收益很小，但如果 producer 能按
+consumer 所需的连续 layout 产生数据，是否可以在消除 layout 搬动的同时，为
+prefetch 创造真正有效的连续 stream 和提前窗口？结论是 **可以，而且这比继续增加
+op-local hint 更符合 ALPS 的统一故事线**；但首先必须区分 P2a 与 P2e，不能把两者
+都概括成“producer layout 仍不连续”。
+
+#### P2a 与 P2e 的准确区别
+
+| 路径 | 消除的对象 | 代价可能转移到哪里 | 当前证据 |
+|---|---|---|---|
+| P2a zero-copy attention | 独立 reshape/transpose materialization | consumer contraction 的 affine/strided access、VMEMU、地址计算 | DINO static movement bytes 下降 52.4%，latency 仅改善 0.72% |
+| P2e consumer-driven direct formation | producer→expand/transpose→consumer 的整个临时表示边界 | producer 的输入 indexing、loop/vectorization 与最终 buffer ownership | DINO 36 条链改写，约 1.57–1.58x |
+
+P2a 的确可能把一次显式 transpose 变成 consumer 侧的 strided affine access；它
+消除了完整中间 buffer，却不保证最终 HVX load 是 unit-stride。P2e 则已经对严格
+子集创建 target-shape、row-major destination，并让 `linalg.generic` producer 以
+identity output map 直接写入。因此，对 **P2e 已接纳的链**，producer 的目标写出和
+consumer 的目标读取本身是连续的。
+
+P2e 当前真正的覆盖缺口是：它要求 transpose permutation 不移动最内层连续维。
+若放开该限制，简单 compose indexing map 往往会使 producer 的某个输入变为
+strided/gather stream。也就是说，任意全局 transpose 通常只能把不连续访问从
+consumer 搬到 producer，不能自动让两端都连续。
+
+因此，下一阶段的优化目标应严格定义为：
+
+> 在 tile 粒度联合选择 physical layout、producer loop order、HVX register
+> formation 和 destination ownership，使 producer 的主要输入读取、最终写出及
+> consumer 读取尽可能均为连续访问；随后只对该流水线中仍来自 DDR/L2、且具有真实
+> 提前距离的连续 source tile 做 prefetch。
+
+这里将该机制暂称为 **Contiguous Representation Pipeline（CRP，连续表示
+流水线）**。它不是新的独立故事，而是
+`consumer-driven layout contract → in-situ formation → representation-aware supply`
+的下一层实现。
+
+#### 为什么不能只要求“producer layout 连续”
+
+对 `A[i,j] -> B[j,i]` 一类 permutation，若只是让 producer 按 `B` 的全局
+row-major 顺序写出，则可能需要按列读取 `A`；反过来保持 `A` 的连续读取，又可能
+导致 `B` 的 strided store。真正应优化的是区域总成本：
+
+```text
+C(region) = producer input VMEM/gather
+          + HVX shuffle/permute
+          + destination store
+          + consumer load
+          + materialization/copy
+          + spill and synchronization
+          + exposed memory stall
+```
+
+CRP 只有在该总成本低于 native transpose 链和 P2a strided-consumer 两个候选时才
+接纳。不能用“删除了一个 transpose op”或“producer output type 是连续的”代替
+最终物理证据。
+
+#### 三种按优先级排列的 formation 方案
+
+1. **Loop-interchanged direct formation（低成本路径）**
+
+   对全 parallel、无依赖 producer，依据 consumer contract 交换 producer loop
+   order，并使用 destination-passing style 直接写 target buffer。只有在主要输入和
+   output 都能形成 unit-stride vector transfer 时接纳。这是 P2e 的自然扩展，适合
+   permutation 虽改变逻辑维顺序、但可通过 loop interchange 保持连续的情况。
+
+2. **HVX register-tile formation（核心路径）**
+
+   对无法同时保持全局输入和输出连续的 transpose，把问题缩小到一个 HVX-aligned
+   tile：producer 连续读取 source tile，在 VRF 中完成有限的 transpose/shuffle，
+   再连续写入 consumer-layout tile。这样用寄存器内重排替代
+   `canonical buffer store → transpose read/write → consumer reload`，并避免把
+   strided access 留给 terminal consumer。tile 大小必须由 vector width、VRF
+   pressure、shuffle 数和 tail 比例共同选择。
+
+3. **Blocked/tile-major shared layout（扩大复用路径）**
+
+   当 producer 输出被多个相邻 consumer 重用时，选择一个双方都能按连续小块访问的
+   blocked physical layout，而不是要求任一方的全局 row-major layout。buffer type、
+   subview、vector transfer 和所有 admitted consumer 必须共享同一个 layout/version
+   contract。只有收益覆盖 descriptor/indexing 开销且不会为次要 consumer 重新产生
+   full-tensor conversion 时使用。
+
+这三条路径的共同点是：layout formation 发生在 producer 计算的 epilogue/VRF 或
+原本就不可避免的一次写出中，而不是在 DDR/L2 中再物化一个 canonical tensor。
+
+#### Prefetch 如何与连续 producer 有机结合
+
+正确的预取对象不是刚刚生成的 output，也不是已由 fusion 消失的中间 tensor，而是
+形成下一 consumer-layout tile 所必需的 **未来 source tile**。理想的软件流水线为：
+
+```text
+tile t+1: page-safe prefetch contiguous producer inputs from DDR into L2
+tile t:   HVX producer computes and forms final consumer layout in VRF/destination
+tile t-1: consumer reads the already formed contiguous tile
+```
+
+若 tile 有足够复用且 VTCM 容量允许，可将中间两级改为 bounded ping-pong：
+
+```text
+DDR --DMA/L2 supply--> VTCM source tile
+    --HVX compute + register layout formation--> VTCM/final-layout destination tile
+    --direct consume--> consumer
+```
+
+但这不是无条件使用 VTCM。只有以下条件同时成立时才允许 L2/VTCM supply：
+
+- source 是外部已存在、只读、连续、page-safe 的 future tile；
+- 从 issue 到 first use 有可执行的独立工作，而不只是 IR ordinal 差；
+- tile 足以摊薄 `l2fetch`/DMA、bounds guard 和同步成本；
+- producer 不会在 hint 后重写 source，且 output contract/version 唯一；
+- direct formation 不会为了 prefetch 重新创建 canonical intermediate；
+- PMU 或静态模型预测为 latency-bound，而不是已经 bandwidth-bound。
+
+如果 source 是紧邻的上游 producer 结果，则不发 `l2fetch`；应使用 producer
+scheduling、VRF forwarding 或 VTCM residency 提前“生产”该 representation。这里的
+prefetch 被统一解释为 **future representation supply**，硬件 cache hint 只是其中
+一种动作。
+
+#### 为什么该设计可能比 P5c 更有效
+
+P5c 的负结果不是“prefetch 永远无用”，而是当前候选只有 256 B、`lead_ops=1`，且
+位于已经被 P2e 大幅消解的局部边界。CRP 改变两个前提：
+
+1. 先将 strided/gather 工作变成较大的连续 source/destination tile，降低 VMEMU、
+   cache-line amplification 和 micro-TLB 压力；
+2. 在 tile loop 上把 supply 提前一轮或多轮，使 prefetch 与 producer compute、HVX
+   register formation、consumer compute 真正重叠。
+
+因此预期收益不应被描述为“prefetch latency + layout speedup 简单相加”，而应来自
+一个联合机制：**连续化扩大有效搬运粒度，direct formation 消除冗余物化，software
+pipeline 提供隐藏剩余 compulsory traffic 的时间窗口。**
+
+#### 建议的新实施阶段：P2g / P5f
+
+所有改动继续使用独立、默认关闭的开关，并保持完整模型测试：
+
+1. **P2g-a：Continuity audit（只分析）。** 对 P2a absorbed、P2e admitted/rejected
+   链在 post-bufferization/vector IR 统计 producer input、output、consumer input 的
+   unit-stride/VMEMU、tile bytes、vector width、reuse、materialized bytes；首先证明
+   stride 究竟落在哪一端。
+2. **P2g-b：Loop-interchanged direct formation。** 只处理能证明主要 input/output
+   均连续的全 parallel producer；用 final buffer ownership 和最终
+   `vector.transfer_{read,write}` 证明，而不是 tensor-level estimate。
+3. **P2g-c：Register-tile direct formation。** 覆盖 P2e 当前因移动 innermost dim
+   而拒绝、且 tile shuffle 有界的链；先实现 HVX register tile，再考虑 blocked
+   shared layout。记录 eliminated VMEM bytes、VMEMU、shuffle、spill 和 latency。
+4. **P5f-a：CRP supply analysis（只分析）。** 对 P2g 形成的 tile 找外部连续 source、
+   page footprint 和真实 loop-carried lead；不满足 gate 时保持 no-prefetch。
+5. **P5f-b：Prefetch + CRP software pipeline。** 只对 P5f-a 接纳的 tile 做
+   `prefetch(t+1) / form(t) / consume(t-1)`；先用 L2，只有 reuse/容量/overlap 证据
+   支持时才启用 VTCM ping-pong。
+6. **消融顺序。** 在完整 DINOv2-small 上运行
+   `HexKL-on / P2a / P2e / P2g / P2g+P5f`；随后用 Qwen2.5-0.5B 和
+   UniSpeech-SAT-base 检查跨 domain。必须冻结相同 HexKL/HVX mapping，并报告最终
+   VMEM/VMEMU、物理 copy bytes、prefetch issued/useful bytes、correctness 和 latency。
+
+进入实现前最有价值的第一步不是再发 hint，而是 P2g-a。若 audit 显示 P2a 的收益
+确实被 consumer strided VMEM 抵消，且 P2e rejected 链占据足够热点比例，P2g-b/c
+才有达到显著增量收益的空间；若这些链不在热点，则应保持现有 P2e，不为理论上的
+连续 layout 扩大代码复杂度。
+
+### 11.26 P2g-a 实施与完整 DINOv2 continuity gate（2026-08-26）
+
+P2g-a 已按 11.25 的计划实现为独立、默认关闭、analysis-only 的
+`enableAlpsContinuityAudit` 开关。它在 vectorization 和 one-shot bufferization 之后
+运行，并同时使用：
+
+- P2e direct/native contract 的稳定 ID、transpose origin、terminal-consumer origins、
+  permutation 和 `moves_innermost`；
+- P2a zero-copy contraction 的稳定 function-level origin；
+- 最终 `vector.transfer_read/write` 的 memref stride 与 permutation map。
+
+只有 memref 最内层 stride 为 1 且 transfer permutation 是 minor identity 时才记为
+unit-stride；其余记为 VMEMU risk。该 pass 不插入 hint、不分配 buffer，也不修改
+codegen。定向 LIT 覆盖了 producer read、target write 和 consumer read 都连续的正例，
+增量 v73 构建及测试通过。
+
+完整 DINOv2-small 使用 FP16、真实 HVX vectorization、HexKL-on、P2e+P2g-a，得到：
+
+| 指标 | 结果 |
+|---|---:|
+| Latency | 6,255.62 ms |
+| Correctness | PASS，finite，top-1 match，max abs diff 0.0049 |
+| P2e demand / direct / native | 122 / 36 / 86 |
+| Tensor-level eliminated materialization | 7,105,536 B |
+| P2g contracts / observed | 122 / 50 |
+| Moves-innermost contracts | **86** |
+| Producer reads / unit-stride | 37 / 12 |
+| Consumer reads / unit-stride | 122 / 85 |
+| VMEMU-risk transfers | **62** |
+| Observed static vector tile bytes | 23,720 B |
+
+按 contract 类别进一步聚合：
+
+| Contract | Total | Observed | Moves inner | Risk contracts | Risk transfers |
+|---|---:|---:|---:|---:|---:|
+| P2e direct | 36 | 36 | 0 | 24 | 24 |
+| P2e native | 86 | 14 | **86** | 14 | **38** |
+
+这给出三个比 tensor-level ledger 更强的结论：
+
+1. P2e 拒绝的 86 条链全部移动最内层连续维，不是随机 unsupported case；
+2. 其中最终可追踪的 14 条全部仍有 VMEMU risk，并以 12 层同构模式重复出现；
+3. 即使 P2e direct contract 删除了显式 materialization，terminal consumer 的 fused
+   location 中仍存在 mixed transfer，说明“direct formation”不能仅凭 tensor rewrite
+   数声称整条 region 已连续化。后续必须以 buffer identity/operand role 进一步去除
+   fused-location 的保守过计数，但它不改变 native 链已存在 stride 的正证据。
+
+P2g-a latency 与紧邻的 P2e 重复值 6,259.31 ms 相差 0.06%，符合 analysis-only
+预期。第一次 6,259.31 ms 编译因 phase4 runner 漏传新 P2g option，实际是纯 P2e；
+该配置被保留为 matched repeat，明确不作为 audit 结果。接线已同时补到 layered 和
+phase4 runner。
+
+Gate 判定为 **通过**：DINO 中存在跨 12 层重复、移动 innermost dimension、并在最终
+vector IR 中留下 strided/VMEMU-risk 的热点候选。因此进入 P2g-b；P2g-b 只接纳通过
+loop interchange 后所有主要 producer input 为 unit-stride 或 loop-invariant 的链。
+不能满足该证明的 attention K transpose 等候选不得强行 direct-map，而应进入 P2g-c
+HVX register-tile formation。
+
+有效完整产物已移动到：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p2g_dinov2_20260826_v2
+```
+
+### 11.27 P2g-b 严格 loop-interchange gate（2026-08-26）
+
+P2g-b 已实现为独立、默认关闭的 `enableAlpsLoopInterchangedDirectFormation`
+开关。它只在 permutation 移动最内层维时额外尝试 direct formation，并对 producer
+的每个 input indexing map 与目标 loop order 做 compose；只有每个 input 对新的最内层
+loop **完全 invariant**，或只在 indexing map 的最后一个 result 上以该 loop 的裸
+`AffineDimExpr` 出现时才接纳。output 仍必须是 target-layout identity map。该条件的
+目的不是保守地减少 rewrite 数，而是避免把 terminal consumer 的 stride 转移成
+producer 的 gather/strided VMEM。
+
+定向 LIT 同时证明：
+
+- 一个 input map 在 interchange 后恢复 identity/unit-stride 的正例被接纳；
+- 原有 identity-input、`[0,2,1]` transpose 反例仍被拒绝。
+
+增量 v73 构建和 LIT 均通过。随后在与 P2g-a 完全 matched 的完整
+DINOv2-small（FP16、HVX vectorization、HexKL-on）上运行 P2g-b：
+
+| 指标 | P2g-a | P2g-b |
+|---|---:|---:|
+| Latency | 6,255.62 ms | 6,293.49 ms |
+| Correctness | PASS | PASS，finite，top-1 match，max abs diff 0.0049 |
+| P2e demand / direct / native | 122 / 36 / 86 | 122 / 36 / 86 |
+| Loop-interchanged direct | 0 | **0** |
+| Moves-innermost contracts | 86 | 86 |
+| Producer reads / unit-stride | 37 / 12 | 37 / 12 |
+| Consumer reads / unit-stride | 122 / 85 | 122 / 85 |
+| VMEMU-risk transfers | 62 | 62 |
+
+P2g-b 与 P2g-a 的 0.61% latency 差异没有对应任何 codegen rewrite，属于单次设备
+测量波动，不能归因为 P2g-b。更重要的 gate 结果是：DINO 的 86 个真实
+moves-innermost 候选没有一个能在全局 loop interchange 后同时证明 producer input
+连续。严格证明正确拒绝了它们，不能为了得到非零 rewrite 数而放松条件。
+
+因此 P2g-b 保留为低成本合法路径，但不再针对 DINO 调阈值；下一步进入 P2g-c。
+P2g-c 必须在 tile/VRF 粒度用连续 source read + bounded HVX shuffle/transpose + 连续
+target write 替代这些 native 链，而不是再次生成全局 strided producer。实现和评估仍
+以 post-vectorization 的实际 transfer、shuffle、spill、VMEMU 和 latency 为准。
+
+完整产物已移动到：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p2gb_dinov2_20260826
+```
+
+### 11.28 P2g-c HVX register-tile direct formation（2026-08-26）
+
+P2g-c 已实现为独立、默认关闭的 `enableAlpsRegisterTileFormation` 开关。它只覆盖
+P2e 因 permutation 移动 innermost dimension 而拒绝、且满足严格 cyclic permutation
+与静态 affine legality 的链。实现不是把 stride 从 consumer 搬到 producer，而是：
+
+1. 将 `d1 * extent + d2` 这类可证明的 row-major flattened coordinate 分解为
+   descriptor-only `tensor.expand_shape`；任意 `mod/floordiv`、非线性或重复 loop dim
+   仍拒绝；
+2. 把 producer input map 变成 projected permutation，保持连续 source tile；
+3. 由 Hexagon tiler 创建二维 register tile，vectorizer 在 VRF 中形成 consumer layout；
+4. 将 register-tile contract 穿过 unit-dim folding、fusion、tiling 和 vectorization；
+   feature 关闭时完全保留 upstream pipeline；
+5. 以 v73 的 1024-bit（128 B）HVX vector 为硬预算按元素位宽选择 tile：FP32 为
+   `2×16`，FP16 为 `4×16`，而不是固定 `8×16`。
+
+定向 LIT、增量 v73 构建和 DINOv2 Debug 均通过。Debug 中命中 1 条
+register-tile direct，主 tile 的二维 HVX vectorization 成功，producer 观测到 2 个
+unit-stride reads；设备结果 finite、top-1 match，最大绝对误差 0.0005。
+
+第一次完整 DINOv2 实验使用固定 `8×16` tile：编译成功，但设备返回 exit 13。该
+配置没有重复运行。只读诊断发现 pass 运行时候选仍可为 FP32，`8×16×4 = 512 B`，
+而 Debug 的实际 outer extent 仅为 2，恰好被 clamp 为 128 B；完整模型则超出单个
+native HVX vector。随后将 tile 改为上述 128 B 位宽预算，并使用新的结果目录重新
+验证，完整模型成功运行。
+
+完整 DINOv2-small（FP16 execution、真实 HVX vectorization、HexKL-on）结果：
+
+| 指标 | P2g-a | P2g-b | P2g-c |
+|---|---:|---:|---:|
+| Latency | 6,255.62 ms | 6,293.49 ms | **6,352.15 ms** |
+| Correctness | PASS | PASS | PASS，finite、top-1 match、max abs diff 0.0044 |
+| P2e demand / direct / native | 122 / 36 / 86 | 122 / 36 / 86 | **122 / 48 / 74** |
+| Register-tile direct | 0 | 0 | **12** |
+| Eliminated tensor materialization | 7,105,536 B | 7,105,536 B | **9,474,048 B** |
+| Producer reads / unit-stride | 37 / 12 | 37 / 12 | **37 / 36** |
+| Consumer reads / unit-stride | 122 / 85 | 122 / 85 | 122 / 85 |
+| VMEMU-risk transfers | 62 | 62 | **38** |
+| Main-tile vectorization | NA | NA | **12 / 12 succeeded** |
+
+P2g-c 将 12 条跨层重复链真正变成了连续 producer reads，并将 VMEMU-risk 从 62
+降至 38，说明 CRP formation 的代码生成目标已实现；但延迟相对 P2g-a 慢 1.54%，
+相对 P2g-b 慢 0.93%。因此当前结论是：**连续化本身是必要的供给条件，但不是端到端
+收益的充分条件**。额外二维 tiling、tail（每个逻辑 op 形成 main/remainder 两个
+candidate，其中主 tile 12/12 vectorize、remainder 12/12 保持 scalar）以及未被隐藏
+的 compulsory source traffic 抵消了 movement/VMEMU 改善。
+
+这并不改变原故事线，反而给出进入 P5f 的物理证据：下一步只分析这 12 个已证明
+连续的 register-tile contract，寻找外部只读 source、真实 loop-carried lead、page
+safety 和 tile reuse。只有 P5f-a admission 通过的 source 才允许进入
+`prefetch(t+1) / form(t) / consume(t-1)`；不得恢复全图或 ordinal-only prefetch。
+
+有效完整产物已移动到：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p2gc_dinov2_20260826_v2
+```
+
+首次 exit-13 证据保留在：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p2gc_dinov2_20260826
+```
+
+### 11.29 P5f-a CRP future-supply admission（2026-08-26）
+
+P5f-a 已实现为独立、默认关闭、analysis-only 的
+`enableAlpsCrpSupplyAnalysis` 开关。它不重新扫描全图，也不根据 ordinal 或文本
+location 猜测候选；唯一入口是 P2g-c vectorizer 显式产生的
+`alps.p2g.register_tile` provenance。由于 vector lowering 与 one-shot bufferization 会
+重建 `vector.transfer_read` 并丢弃非语义属性，实现增加了 exact `LocationAttr`
+ledger：在 vectorization 后记录已标记 transfer 的编译器 provenance，bufferization
+后只对同一 provenance 的 read 恢复 marker。该桥接不会扩大候选集合。
+
+对每个显式 marker，P5f-a 只在下列条件同时成立时准入：
+
+1. 最终 memref 最内层 stride 为 1，transfer permutation 为 minor identity；
+2. backing root 定义在循环外，并且循环内没有对同一 root 的 write/copy/DPS init；
+3. `memref.subview` 恰有一个 offset 依赖 induction variable，所有 size/stride 均为
+   静态正值/单位步长，因此 `t+1` 地址可精确构造；
+4. 静态 trip count 大于 lookahead（当前为 1），tile byte size 可知；
+5. 同时报告 4 KiB page 下的 worst-case page footprint 和 root reuse，但 P5f-a 本身
+   不插入 hint、不分配 VTCM、也不改变 codegen。
+
+定向 LIT 使用 128 B、只读、loop-carried unit-stride register tile，证明
+`matched=1 / admitted=1`。DINOv2 Debug 的真实流水线进一步证明 marker bridge
+恢复 2 条 read，P5f-a 准入 2/2（128 B main tile 与 8 B remainder），设备正确性
+通过，最大绝对误差 0.0005。
+
+完整 DINOv2-small（FP16 execution、真实 HVX vectorization、HexKL-on、P2g-c）结果：
+
+| 指标 | P2g-c | P5f-a |
+|---|---:|---:|
+| Latency | 6,352.15 ms | **6,345.65 ms** |
+| Correctness | PASS | PASS，finite、top-1 match、max abs diff 0.0044 |
+| Register-tile direct | 12 | 12 |
+| Marker bridge restored | NA | **24** |
+| P5f-a matched / admitted | NA | **24 / 12** |
+| Admitted bytes（每个静态 site 的 tile bytes 之和） | NA | **1,536 B** |
+| Main tile | 12 × 128 B | **12/12 admitted** |
+| Remainder tile | 12 × 8 B | **0/12 admitted** |
+| Reject reason | NA | **12 address-not-loop-carried** |
+| Reject stride / loop / causal / read-only | NA | **0 / 0 / 0 / 0** |
+
+P5f-a 相对 P2g-c 快 0.10%，但它是 analysis-only，差值属于设备测量噪声，不能
+宣称为加速。真正的 gate 结论是：12 个跨 Transformer block 重复的 128 B 主 tile
+同时满足连续、外部只读、精确 `t+1` 地址和 16 次循环 lead；12 个 remainder read
+虽连续，但没有 loop-carried 地址，因此被严格拒绝。这正好避免了为 tail 发出低价值
+或错误预取。
+
+Gate 判定为 **通过**。下一步 P5f-b 只允许对这 12 个 admitted main-tile source
+生成 `prefetch(t+1)`，并保留 `form(t) / consume(t-1)` 的 CRP 因果关系；实现前必须
+加入 loop bound/page 安全，且通过独立默认关闭开关进行 P2g-c matched A/B。若实际
+hint 不能在 lowering 后保留或引起 latency regression，应关闭 P5f-b，不得通过放宽
+admission 到 remainder/全图来制造命中数。
+
+有效完整产物已移动到：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p5fa_dinov2_20260826
+```
+
+### 11.30 P5f-b：CRP supply prefetch、因果隔离与物理页问题（2026-08-26）
+
+P5f-b 已实现为独立、默认关闭的 `enableAlpsCrpSupplyPrefetch` 开关。它只消费
+P2g-c 显式恢复到 post-bufferization vector read 的
+`alps.p2g.register_tile` provenance，并要求 P5f-a 的外部只读 root、静态循环、精确
+`t+1` 地址、unit-stride inner dimension、future bound、tile byte limit 与 page-footprint
+条件。P5f-b 不接纳 remainder、global constant 或一般 affine 地址猜测。
+
+恢复断线现场时发现两类工程问题，均已修复：
+
+1. 仅重建 `linalg-hexagon-opt` 不会更新完整模型由 Python backend 加载的
+   `triton/_C/libtriton.so`。因此四轮 `6460.28 / 6452.31 / 6775.98 / 6806.68 ms`
+   实际使用 stale plugin，均为 `P5f-b admitted=0`，不能作为 P5f-b 性能数据。
+2. P5f-b 最初被加入统一 `alpsPrefetchPipeline` gate，意外激活通用
+   `PrefetchInsert`。有效 plugin 下的第一轮虽然静态 `P5f-b hints=12`，runtime 却
+   `issued=4096` 并命中命令预算上限；日志还出现 144 个 loop 的 HexKL L2 hint。
+   该轮约 `6404.82 ms` 是混合策略结果，不能归因给 P5f-b。现已将“是否运行通用
+   PrefetchInsert”和“是否运行 OmniFetch dialect lowering”拆开：P5f-b 只触发后者。
+
+同时，wrapper 的 L2 scheduler 白名单原本没有
+`enableAlpsCrpSupplyPrefetch`，导致 runtime counter 不可见且未配置 traffic envelope。
+现已把 P5f-b 接入相同的 4096-command、8 MiB、64-entry duplicate window 配置和
+`OmniFetchL2Scheduler` 报告。增量构建脚本也会在登录环境仍指向已删除
+`LLVM_DIR` 时自动回退到有效的 `LLVM_DIR_upstream`。
+
+隔离后的完整 DINOv2-small（FP16、真实 HVX vectorization、HexKL-on、P2g-c +
+P5f-b）结果为：
+
+| 指标 | P2g-c | P5f-a | P5f-b isolated |
+|---|---:|---:|---:|
+| Latency | 6,352.15 ms | 6,345.65 ms | **6,698.09 ms** |
+| Correctness | PASS | PASS | PASS，finite、top-1 match、max abs diff 0.0044 |
+| P5f matched / admitted | NA | 24 / 12 | **24 / 12** |
+| Static hints | 0 | 0 | **12** |
+| Generic `PrefetchInsert` log sites | 0 | 0 | **0** |
+| Runtime requested / issued calls | 0 / 0 | 0 / 0 | **17,280 / 1,080** |
+| Runtime requested / issued bytes | 0 / 0 | 0 / 0 | **2,211,840 / 27,360 B** |
+| Duplicate suppressed | 0 | 0 | **16,200** |
+| Page clipped | 0 | 0 | **17,280** |
+| Budget / busy / unsupported | 0 | 0 | **0 / 0 / 0** |
+
+P5f-b 相对 P2g-c 慢约 5.45%，因此当前实现不能进入最终加速组合。这里的核心问题
+不是 admission 错误，也不是再次发生全图 prefetch：12 个 admitted main tile 都只有
+一个 IV-dependent subview；另外 12 个 8 B read 来自
+`expand_shape -> subview -> expand_shape -> get_global` 且没有 loop-carried address，
+被正确拒绝。
+
+真正瓶颈是“128 B logical CRP tile”不等价于“128 B physical contiguous region”。
+当前 `L2HintOp` lowering 将最后一维编码为 width、最近的非 1 外层维编码为 height，
+并保留物理 row stride。V73 的 `l2fetch` 只保证起始 4 KiB 页内的生成地址；本轮所有
+动态 2-D 请求都触发 page clipping，最终每个 issued command 平均只有 25.33 B，未能
+为完整 CRP tile 提供有效供给。高 duplicate 数又说明同一 future row 在内层复用中被
+反复请求，当前插入层级仍偏内。
+
+下一步更新为 **P5f-c page-safe segmented CRP supply**，仍保持原统一故事线：
+
+1. 先证明整个 tile 的物理 strides 满足真正 row-major contiguous；只有这种情况才
+   lower 为 `width=128, height=1` 的单请求。
+2. 若只能证明每一物理 row 连续，则按真实 row address 拆为若干单行 page-safe
+   request，不能把逻辑 vector tile 强行 flatten。
+3. 将 hint hoist 到最外层仍改变 future tile address 的循环，目标是每个 future tile
+   每次只请求一次；duplicate suppression 只作为运行时保护，不替代编译期 placement。
+4. gate 先看 `page_clipped/requested`、`issued_bytes/requested_bytes` 和动态请求数，再看
+   latency。若覆盖率修复后仍相对 P2g-c 回归，则默认关闭 P5f-c，保留 P2g-c/P5f-a
+   作为论文中的连续表示与供给分析结果，不通过扩大候选集合制造收益。
+
+有效隔离实验产物已移动到：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p5fb_dinov2_20260826_isolated
+```
+
+### 11.31 P5f-c：物理分段供给的设备安全 gate（2026-08-26）
+
+P5f-c 已实现为独立、默认关闭的 `enableAlpsCrpSegmentedSupply` 开关。它不扩展
+P5f-b 候选集，仍只消费 12 个具有 P2g-c provenance 的 admitted main tile。新增静态
+诊断确认 DINOv2 的 12 个 tile 全部不是整体连续区域，而是：
+
+```text
+shape=memref<16x4xf16, strided<[384, 1], offset: ?>>
+row_bytes=8, physical_rows=16, tile_bytes=128
+```
+
+因此 P5f-b 的“最内层 stride=1”只能证明每行 8 B 连续，不能把逻辑 128 B 当作
+整体连续区。P5f-c 的定向 pass/lowering 测试覆盖了整体连续与分行两条路径，并且
+增量构建和 Python plugin 重链接均通过。
+
+#### V73 runtime 审计发现的独立错误
+
+检查 V73 Programmer's Reference Manual 后发现，runtime 原来用 `USR` bit 3 判断
+prefetch active，而 V73 的 `USR:PFA` 实际是 **bit 31**。这解释了 P5f-b telemetry
+中 `busy_suppressed=0`：代码声称的 single-flight 实际从未生效。现已把
+`OMNI_USR_PFA_BIT` 修正为 31，并在 configure 时重置新增的 segmented-site cursor。
+这是一项独立的 V73 正确性修复，但下面的设备结果证明它不是 P5f-c exception 的
+唯一根因。
+
+#### 三轮完整 DINOv2 gate（取证前暂定判断，已由 11.31.1 修正）
+
+三轮均使用完整 DINOv2-small、HVX vector、HexKL off、P2e + P2g-c + P5f-a/b/c，
+静态候选均为 `matched=24 / admitted=12 / tile bytes=1536`，且均完成 MLIR-to-SO
+编译；失败发生在手机 DSP 执行，FastRPC 报 non-recoverable user-PD exception
+`0x8000040d`，没有产生输出 tensor 或有效 latency：
+
+| 实现 | PFA 位 | lowering | 设备结果 |
+|---|---:|---|---|
+| P5f-c static rows | 3（旧错误） | 每 tile 展开 16 个 GEP/call | FAIL，`0x8000040d` |
+| P5f-c static rows | 31（已修） | 每 tile 展开 16 个 GEP/call | FAIL，`0x8000040d` |
+| P5f-c temporal rows | 31（已修） | 每逻辑 hint 单 call，按 site 轮转物理行 | FAIL，`0x8000040d` |
+
+对应现场均已直接移至 nano：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p5fc_dinov2_20260826
+nano:/home/huzq85/2-working/working_set/alps_p5fc_dinov2_20260826_pfa31
+nano:/home/huzq85/2-working/working_set/alps_p5fc_dinov2_20260826_temporal
+```
+
+这个对照排除了 stale plugin、通用 PrefetchInsert、错误 PFA 位和静态 call storm
+作为唯一原因。三轮共同的新行为是尝试触及 P5f-b 因 4 KiB page clipping 而没有
+覆盖的后续物理行。V73 手册还明确指出：`dcfetch` 遇到无效地址可作为 NOP，但
+`l2fetch` 遇到 virtual-address translation/protection error 会触发 processor
+exception。因此当时的暂定假设是：P5f-a/b 的 `inner stride=1 + static subview +
+read-only root` admission 尚未证明每个生成行地址都属于可 L2-fetch 的合法 DDR
+allocation；descriptor/type 层面的 strided shape 不是充分的硬件地址安全证明。
+11.31.1 的 FARF 取证随后证明三轮均在 SO 装载阶段失败，未执行到这些地址，故该
+假设不能解释本次 `0x8000040d`。
+
+#### Gate 判定与 P5f-d 更新计划
+
+取证前 P5f-c 设备安全 gate 被暂记为 **失败**，开关保持默认关闭。为避免
+无休止设备试验，下一阶段改为 analysis-only 的 **P5f-d physical fetchability
+proof**，在任何新 hint 发射前必须同时证明：
+
+1. 沿完整 view/cast/expand/collapse 链解析到真实 allocation 或函数参数，并证明
+   memory tier 是 DDR/L2-cacheable，而不是 VTCM、scratch 或未知 address space；
+2. 用 root 静态 extent、descriptor offset、future subview offset、每维 physical
+   stride 和 element bytes 计算每个将被 prefetch 的 `[begin,end)`；
+3. 所有行范围均落在 root allocation byte extent 内，且 future loop bound 对地址
+   计算是充分条件；带 mask、动态 extent、未知 alias 或无法证明 tier 的候选拒绝；
+4. analysis-only 在完整 DINOv2 上得到 12 个 site 的逐项证明账本后，才能重新开启
+   一个 physical-row hint；若 admitted 变成 0，则记录为该模型不适合这一 CRP
+   prefetch，而不是放宽安全条件。
+
+这仍与 ALPS 的统一故事线一致：consumer-driven layout formation 给出真实消费
+形状，prefetch admission 必须进一步由物理 memory hierarchy 和 traffic-control
+证据约束；“提前搬动”不能绕过“可安全搬动”的证明。
+
+#### 11.31.1 异常取证后的根因修正与最终 gate
+
+上面的“后续物理行可能不可 fetch”只是当时缺少 DSP dump 权限条件下的假设，不能
+作为最终根因。后续在原失败二进制上启用了 FastRPC PD dump 与 FARF（PD 创建日志
+确认 `PD dump: (Config:Y, Debug:Y)`）；量产手机不允许 `adb root`，但 FARF 已给出
+足够明确的装载器证据：主模型 SO 的三个符号
+`hexkl_micro_hmx_rm_to_wh_f16`、`hexkl_micro_hmx_rm_to_ah_f16` 和
+`hexkl_micro_hmx_copy_submatrix_to_f16` 未解析，`dlopen_ex` 随后失败。未开启 FARF
+时，这个装载失败被 FastRPC 外显为 `0x8000040d`，因此三轮失败实际上都没有进入
+segmented `l2fetch` 执行，不能用于证明物理行地址非法。
+
+根因是 `LinkRuntimeModules` 会在 ALPS/OmniFetch 路径中链接
+`OmniFetchRuntime`，而该 runtime 同时包含可选 HMX layout helper，对
+`libhexkl_micro.a` 有 native link 依赖；旧 `HexagonExecutor` 却只在
+`enableHexKL=true` 时链接 HexKL archive。于是“HVX + ALPS、HexKL off”可以生成
+含未解析 HexKL micro PLT 的 SO。修复后 executor 不再从 pass 开关猜测 native
+依赖，而是用 `hexagon-nm -u` 检查即将链接的 kernel object；只要实际出现
+`hexkl_micro_*` 未定义符号，就自动链接 `libhexkl_micro.a`，缺少 archive 时在 host
+link 阶段明确失败。使用原 1.5 MB kernel object 重链接的回归验证确认修复 SO 不再
+含上述未解析符号，并在同一完整 DINOv2 设备目录成功执行。
+
+真正进入设备执行后，temporal-row 版本为 `26,370.60 / 28,253.53 ms`，并报告
+`issued=4096`、`issued_bytes=32768`。这揭示了与地址安全不同的实际问题：12 个
+候选均为 `row_bytes=8 / rows=16 / tile_bytes=128`；每行 8 B 仍至少占用一个
+128 B L2 cache line，整 tile 的 useful-byte utilization 只有
+`128 / (16 * 128) = 6.25%`。跨调用轮转行还消除了 P5f-b 对首行请求的大量 duplicate
+suppression，导致低价值命令耗尽 command budget。
+
+P5f-c admission 因此新增 cache-line traffic proof：默认按 V73 128 B line 估算每个
+segmented tile 的物理 line-fill bytes，要求 useful-byte utilization 至少 50%；连续
+tile 不受该门槛影响。阈值与 line size均为 pass option，功能仍独立、默认关闭。
+定向测试覆盖连续准入和 `8 B x 16` 稀疏拒绝。完整 DINOv2 得到
+`matched=24 / reject_view=12 / reject_segment_utilization=12 / admitted=0`，不再生成
+任何 hint。
+
+同时还发现统一实验脚本的 HexKL-on ALPS scheme 列表漏掉了
+`alps-crp-segmented-supply`。这解释了为什么早期 P2g-c/P5f-a/P5f-b matched control
+约为 6.35--6.70 s，而 P5f-c 修复后即使 zero hint 仍约为 28.28 s：两者分别是
+HexKL on 与 HexKL off，并非 matched comparison。脚本已修正，最终完整模型结果为：
+
+| 配置 | HexKL | Latency | Static hints | Runtime issued | 正确性 |
+|---|---:|---:|---:|---:|---|
+| P2g-c 历史 matched control | on | 6,352.15 ms | 0 | 0 | PASS |
+| P5f-a 历史 analysis-only | on | 6,345.65 ms | 0 | 0 | PASS |
+| P5f-c（错误配置，仅供诊断） | off | 28,279.79 ms | 0 | 0 | PASS |
+| **P5f-c cache-line admission（最终 matched gate）** | **on** | **6,383.04 ms** | **0** | **0** | **PASS，top-1 match，max abs diff 0.0044** |
+
+最终 P5f-c 相对 P2g-c 仅慢 0.49%，属于单次设备测量量级，原先 4.45x 的表面回归已
+消除。结论必须分开表述：**工程异常已经解决，P5f-c 的安全/流量 admission 也已
+闭环；但 DINOv2 的 12 个 CRP source 物理行过稀，不适合 segmented L2 prefetch，
+所以该模型上 P5f-c 为 zero-hint、无加速，开关继续默认关闭。** 这正是 ALPS
+hierarchical admission 的必要性：只有 layout continuity、地址可证明和 cache-line
+利用率同时成立，prefetch 才能进入 runtime traffic control。
+
+最终有效产物已直接移动到：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p5fc_dinov2_20260826_hexkl_matched_fix
+```
+
+HexKL-off 诊断对照保存在：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p5fc_dinov2_20260826_admission_fix
+```
+
+### 11.32 P5g：从稀疏 L2 hint 转向连续 VTCM supply（2026-08-27）
+
+P5f-c 的最终 gate 证明，DINOv2 的 CRP main tile 虽然逻辑大小为 128 B，但物理上是
+`16 x 8 B`、行 stride 768 B 的稀疏区域；按 128 B cache line 计算的 useful-byte
+utilization 只有 6.25%。继续调低 50% admission 门槛只会重新引入低效 L2 traffic，
+不能修复 producer 物理布局。因此 P5g 改为验证 V73 memory hierarchy 下更合适的
+落点：把 consumer 所需表示形成在 VTCM，并让 HVX 从连续 VTCM tile 消费。
+
+V73 Programmer's Reference Manual 与 HVX Programmer's Reference Manual 对该设计
+给出的直接约束是：VTCM 是面向 vector/DMA 的片上 tightly coupled memory；L2
+prefetch 只改变 cache residency，并不会把 `stride=768 B` 的 8 B 行变成连续 vector
+供给。因此 VTCM 不是简单替换 L2 hint 的另一种 cache，而是 CRP 中 `form` 与
+`consume` 之间的显式物理表示层。
+
+#### P5g-a：exact-tile VTCM formation 的失败证据
+
+P5g-a 首先把每个 `16x4xf16` exact tile 同步 copy 到 VTCM。静态 lowering 确认生成
+12 个 `dma2d_start + dma_wait` call site，参数对应：
+
+```text
+row width = 8 B, height = 16, source stride = 768 B, destination stride = 8 B
+```
+
+该完整 DINOv2 二进制在设备上退出 13。按照实验约定没有重复运行同一配置。更重要
+的是，即使忽略设备失败，每次只搬 8 B 的二维 DMA 行也重复了 P5f-c 已否决的
+cache-line/命令低利用率问题。P5g-a 因而增加保守的 `row_bytes >= 64` legality gate；
+64 B 是当前安全筛选和后续 coalescing 目标，不宣称是硬件全局最优值。
+
+#### P5g-b：coalesced VTCM supply window
+
+P5g-b 是独立、默认关闭的 `enableAlpsCrpVtcmWindow` 开关。它不再为每个 4-channel
+consumer tile 单独搬运，而是在固定 attention head 下把 8 个相邻 channel tile 合成
+一个 `memref<256x32xf16, 1>` 的 16 KiB VTCM window：
+
+```text
+DMA logical elements = 8192 x f16
+row width = 32 x f16 = 64 B
+height = 256
+source stride = 384 x f16 = 768 B
+destination stride = 32 x f16 = 64 B
+```
+
+window 在 channel 0 和 32 处同步更新，并跨 8 个相邻 4-channel consumer iteration
+复用。consumer 不再恢复原稀疏四维 base，而是直接读取
+`memref<16x4xf16, strided<[32,1]>, 1>`。对于 tensor/vector 语义中的 singleton-expanded
+rank，pass 构造 projected permutation map：非 1 维度依次映射 token/channel，其余
+维度映射常量 0。因此 `vector<16x4>`、`vector<16x1x4>` 和
+`vector<1x16x1x4>` 都共享同一连续二维物理供给，而不改变逻辑结果 shape。
+
+定向 pass + DMA lowering gate 已验证一个 16 KiB window、64 B 行宽二维 DMA 和
+连续 VTCM consumer。完整 DINOv2-small（FP16、HVX vector、HexKL on、P2g-c +
+P5g-b）结果为：
+
+| 指标 | P2g-c matched control | P5f-c matched gate | P5g-b VTCM window |
+|---|---:|---:|---:|
+| Latency | 6,352.15 ms | 6,383.04 ms | **6,383.66 ms** |
+| Correctness | PASS | PASS | **PASS，finite、top-1 match、max abs diff 0.0044** |
+| P5g-b matched / formed | NA | NA | **24 / 12** |
+| Static VTCM windows | 0 | 0 | **12 x 16 KiB** |
+| Static DMA start/wait call sites（object relocation） | 0 | 0 | **12 / 12** |
+| L2 hints / runtime issued | 0 / 0 | 0 / 0 | **0 / 0** |
+
+P5g-b 相对 P2g-c 慢 0.50%，与 P5f-c 只差 0.01%，属于单次设备测量量级，不能宣称
+加速。但这个 gate 得到了两个明确结论：
+
+1. **物理连续性问题已真正解决。** HVX consumer 最终读取 stride `[32,1]` 的 VTCM
+   tile；不是 tensor IR 中的预测消除，也不是 zero-hint/no-op matched control。
+2. **同步 staging 没有减少总搬动。** 它把原 DDR strided load 变成 DDR→VTCM DMA
+   加 VTCM→HVX read，并在每个 window 立即 wait。更好的 DMA row utilization 和连续
+   HVX access 被额外 copy、启动/wait 与缺少 overlap 抵消。
+
+因此不能直接从 P5g-b 跳到“多发 DMA”。从减少总搬动的优先级看，下一步原计划是
+producer-direct VTCM supply：沿 12 个 source root 找到真正 producer，证明其输出能否
+直接以 32-channel window layout 写入 VTCM，从而删除 DDR 中间 materialization。
+随后为了回答“同步搬运能否异步化、从而真正体现 prefetch”这一问题，P5g-c 被保留给
+双 buffer 异步 DMA gate；producer-direct 分析顺延为 **P5g-d**。这不改变优先级判断：
+“消除搬动”仍高于“重叠额外搬动”，P5g-c 只是先把 overlap 机制和收益边界测清。
+
+有效 P5g-b 产物已直接移动到：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p5gb_dinov2_20260827
+```
+
+其中早期 `formed=0` 的 6,332.33 / 6,418.67 ms 是 consumer vector-rank 门禁调试轮，
+不是 P5g-b 有效数据，已明确排除；只有 `formed=12` 的 6,383.66 ms 用于上表。
+
+### 11.33 P5g-c：late-formed asynchronous VTCM prefetch（2026-08-27）
+
+P5g-c 把 P5g-b 的同步 `DDR -> VTCM -> wait -> HVX` 改成双 VTCM buffer 的异步
+ping-pong。动态执行顺序为：
+
+```text
+DMA start(window 0)
+wait(window 0)
+DMA start(window 1) -> HVX consumes window 0
+loop backedge
+wait(window 1)
+DMA start(window 0) -> HVX consumes window 1
+```
+
+因此这里的 DMA 不再只是同步 staging：下一份 consumer-required contiguous layout
+在当前 HVX 计算期间提前形成，正是 prefetch 与 in-situ layout formation 的结合。
+两个 VTCM window 是独立的 `memref<256x32xf16, 1>` allocation，并通过
+`memref.distinct_objects` 明确 ping/pong 及 opposing select 后的无别名关系；tag table
+使用 `memref<2xi32>`，每个 slot 的 wait 只约束对应的 DMA transaction。
+
+#### 中断前排除的伪异步路径
+
+实现过程中得到的 6,392.09 ms、6,387.78 ms 和 6,304.90 ms 均不计入 P5g-c
+有效结果。前两版最终 object 的 `dma_start` 与 `dma_wait` 仍相邻；后一版虽然 latency
+较低，但检查 object 后仍是旧同步序列，因而只是设备测量波动，不能宣称异步收益。
+根因有两层：
+
+1. 单 allocation 的动态 ping/pong subview 无法向后端证明当前 HVX source 与下一 DMA
+   destination 不重叠；改为两个 allocation 后，这个 alias 问题才被消除。
+2. 更关键的是，旧 P5g-c 在 buffer ownership/deallocation 之前用普通 store/copy
+   marker 表示异步意图；canonicalization 与 ownership 会重建 copy 并丢失 marker。
+   后续通用 `HexmemCpyToDMA` 对这些 copy 采用的正确保守语义本来就是立即
+   `dma_start + dma_wait`，所以最终仍被串行化。
+
+最终修复不再依赖脆弱 marker：同步 P5g-b 仍在原阶段运行；异步 P5g-c 则移动到
+buffer ownership/deallocation 和 `ConvertBufferizationToMemRef` 之后、
+`ConvertToHexagonmem` 之前，直接形成 `memref.dma_start/dma_wait`。window 的显式
+dealloc 也在该阶段由 P5g-c 自己插入。
+
+#### 最终 object 与完整模型 gate
+
+最终 Hexagon object 静态保留 14 个 `dma2d_start` relocation 和 7 个 `dma_wait`
+relocation（pass 形成 12 个 source site；此处统计的是后续优化后的静态 loop site）。
+首个存活 site 的反汇编顺序为：prologue start `0x2e38`、当前窗口 wait `0x2eb8`、
+下一窗口 start `0x2f30`，随后从约 `0x4da0` 开始执行 HVX vector load/compute，直到
+`0x3cc8` 的 loop backedge 回到 `0x2e80`，下一次动态 wait 才再次到达 `0x2eb8`。
+这证明 next-window DMA 与 current-window HVX work 之间确有真实 overlap，而不是仅在
+高层 IR 中看起来异步。
+
+完整 DINOv2-small（FP16、HVX vector、HexKL on、P2g-c + P5g-c）结果：
+
+| 指标 | P2g-c matched control | P5g-b synchronous VTCM | P5g-c asynchronous VTCM |
+|---|---:|---:|---:|
+| Latency | 6,352.15 ms | 6,383.66 ms | **6,375.10 ms** |
+| 相对 P2g-c | 1.00x | 慢 0.50% | **慢 0.36%** |
+| 相对 P5g-b | NA | 1.00x | **快 0.13%** |
+| Correctness | PASS | PASS | **PASS，finite、top-1 match、max abs diff 0.0044** |
+| matched / formed | 24 / 12 | 24 / 12 | **24 / 12** |
+| formed window bytes | 0 | 196,608 B | **393,216 B（双 buffer）** |
+
+P5g-c 的结论需要严格区分“机制成立”和“性能成立”：**真实异步 prefetch 已经实现并由
+最终 object 证明；但它在完整 DINOv2 上只比同步 staging 快约 0.13%，相对 P2g-c
+仍慢约 0.36%，没有形成有意义的模型级加速。** 这说明当前可隐藏的 DMA transfer
+占比或有效 overlap site 数量不足，而且 DDR 中间 materialization 仍未删除。异步化
+消除了“立即 wait”的主要结构问题，却不能自动抵消额外 staging 的总搬动成本。
+
+下一 gate 因此回到 **P5g-d producer-direct VTCM supply analysis**：先证明 producer
+能否直接生成 consumer 所需的 32-channel contiguous VTCM representation，删除 DDR
+中间写回与再次 DMA；只有在无法删除搬动时，P5g-c 才作为有计算距离的 fallback。
+这个顺序维持 ALPS 的统一故事线：consumer contract 决定 layout formation，优先消除
+搬动，其次才通过 memory-hierarchy-aware asynchronous prefetch 隐藏剩余搬动。
+
+最终完整模型产物与日志已直接移动到：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p5gc_lateasync_dinov2_20260827
+```
+
+### 11.34 P5g-d：producer-direct gate 与 HMX/HVX VTCM layout contract（2026-08-27）
+
+P5g-c 证明了异步 DMA 与 HVX 计算能够真实重叠，但没有删除 DDR
+materialization。P5g-d 因此新增独立、默认关闭的
+`alps-crp-producer-direct-analysis`，在 post-bufferization 阶段沿 P2g-c 的 exact
+consumer tile 追踪 root allocation、alias、writer、reader、footprint 与覆盖关系。定向
+测试中，一个完整 `memref.copy` producer、唯一 CRP reader、196,608 B root 能得到
+`rewrite_ready=1`，且 analysis-only 不修改 IR。
+
+这里必须修正一个过度简化的表述：**V73 上 HVX 与 HMX 都能使用 VTCM，并不代表两者
+能直接消费 VTCM 中相同的字节排布。** HexKL micro API 明确要求 HMX FP16 activation
+使用 AH layout、weight 使用 WH layout，alignment 分别为 2,048 B 与 128 B；HMX
+accumulator read 也先把 AH tile 写入 VTCM。HVX 则通过普通/vector address contract
+读取 VTCM，最适合 consumer 所需的连续、对齐布局。因此跨引擎路径必须分三类：
+
+1. HMX -> HMX 且 layout contract 相同：可以保留 AH/WH；
+2. HMX -> HVX 且索引映射与 AH 物理映射恰好等价：经过证明后才能零转换；
+3. 一般 HMX -> HVX：应在 VTCM 内完成 `AH -> consumer-required layout`，再由 HVX
+   消费，目标是删除 DDR round-trip，而不是错误地删除必要的 layout formation。
+
+当前 HexKL micro lowering 的实际输出链为：
+
+```text
+HMX acc_read -> AH@VTCM -> AH-to-RM@VTCM -> copy-to-DDR
+```
+
+所以将来若发现真正的 HMX-output/HVX-consumer pair，ALPS 的目标应是：
+
+```text
+HMX acc_read -> AH@VTCM -> consumer-layout@VTCM -> HVX
+```
+
+并把下一 tile 的 VTCM layout formation 与当前 HVX/HMX compute 流水化。这与论文的
+consumer-driven in-situ layout formation、prefetch 和 traffic control 故事线一致；
+但不能把 AH 与 HVX layout 混为一谈。
+
+#### 11.34.1 完整 DINOv2 的 root-level 结果与 lifetime 去混淆
+
+完整 DINOv2-small（FP16、HVX vector、HexKL on）第一次精确 operand 分类得到：
+
+```text
+root_type=memref<257x6x64xf16>
+root_bytes=197376
+writers=24 (vector.transfer_write)
+readers=36
+hmx_roles=hexkl.matmul:lhs
+reader map=(d0,d1,d2,d3)->(0,d3,d1,d2)
+rewrite_ready=0
+```
+
+这说明该物理 root 在整函数范围内既作为 HexKL matmul 的 RM lhs，又承载带换序映射的
+HVX/`linalg.generic` reader；它**不是 HMX accumulator output**。但是该 root 是 buffer
+planner 跨层复用的 allocation，root-level 的 HMX/HVX 混合不能证明同一个逻辑 value
+同时服务两个 engine。直接据此实现双 layout 写入同样是不安全的推断。
+
+P5g-d 随后加入保守的 top-level writer epoch 分区：每个 CRP reader 只与同 block 中
+最近的前驱 writer 配对，位于同一 top-level op、跨 block 或次序无法证明的情况记为
+ambiguous。最终完整模型结果为：
+
+| 指标 | 结果 |
+|---|---:|
+| Latency | 6,305.05 ms |
+| Correctness | PASS，finite、top-1 match、max abs diff 0.0044 |
+| root-level HMX-input/HVX mixed allocation | 1 |
+| HVX-only logical writer epochs | **12** |
+| same-epoch HMX+HVX consumers | **0** |
+| ambiguous epochs | **0** |
+| root-level rewrite-ready | 0 |
+
+因此 DINOv2 的结论不是“HMX AH 结果应由 HVX 直接读取”，也不是“同一个 value 必须
+同时生成 HMX/HVX 两种 layout”。真实结论是：**同一个 197 KB allocation 被不同逻辑
+生命周期复用；当前 12 个 CRP 候选全部属于可区分的 HVX-only writer epoch，HMX lhs
+出现在别的 epoch。** 下一 gate 应对这 12 个 epoch 做 writer coverage 与 alias
+重定向证明，然后只在相应生命周期把 producer 直接放入 VTCM/consumer layout；不能
+把整块共享 allocation 粗暴改成 AH 或 head-major，也不能影响其他 HMX epoch。
+
+两轮有效产物保存在：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p5gd_contract_dinov2_20260827
+nano:/home/huzq85/2-working/working_set/alps_p5gd_epoch_dinov2_20260827
+```
+
+第一轮（operand contract）为 6,378.86 ms，第二轮（epoch partition）为 6,305.05 ms；
+两者均是 analysis-only，latency 差异属于设备波动，不能宣称 P5g-d 加速。
+
+#### 11.34.2 producer writer coverage 与 redirect gate
+
+在 lifetime 去混淆之后，P5g-d 继续对每个 HVX-only epoch 检查 writer 和同 epoch
+reader。完整 DINOv2 的 12 个 epoch 结构完全一致：
+
+```text
+writer_count=1
+writer_op=vector.transfer_write
+writer_vector_type=vector<64xf16>
+writer_base_type=memref<64xf16, strided<[1], offset:?>>
+writer_map=(d0)->(d0)
+writer_masked=0
+writer_loops=for(0,6,1);for(0,257,1)
+subview offsets=[token_iv, head_iv, 0]
+subview sizes=[1,1,64]
+subview strides=[1,1,1]
+epoch readers=2 (CRP=1, other HVX=1, HMX=0)
+```
+
+这里的 loop contract 是从 writer 向外打印，因此实际嵌套为 token `0..257`、head
+`0..6`；每个迭代无 mask、identity-map 地写满一个 64-channel row。P5g-d 新增的完整
+覆盖证明要求：root 为静态 shape；末维 vector 宽度等于 root 末维；末维 offset=0、
+size=full、stride=1；每个前导维恰由一个 `lb=0 / ub=shape[d] / step=1` 的 induction
+variable 作为 subview offset，且 size=1。未知动态 bound、mask、非 identity map、缺失
+维度或非单位 stride 均拒绝。
+
+与完整模型 writer 结构相同的定向测试已得到 `complete_coverage=1`。最终完整
+DINOv2-small proof gate 得到：
+
+| 指标 | 结果 |
+|---|---:|
+| Latency | 6,392.25 ms |
+| Correctness | PASS，finite、top-1 match、max abs diff 0.0044 |
+| HVX-only epochs | 12 |
+| single-writer epochs | 12 |
+| legal vector-writer epochs | 12 |
+| **coverage-proven epochs** | **12** |
+| **epoch redirect candidates** | **12** |
+| HMX/mixed/ambiguous epochs | 0 / 0 / 0 |
+
+root-level `rewrite_ready=0` 仍然是正确结果，因为该 197 KB allocation 在整函数中有
+24 个 writer 并跨 HMX/HVX 生命周期复用；真正可改写的粒度是上述 12 个逻辑 epoch，
+而不是整个 root。该轮仍为 analysis-only，6,392.25 ms 不能解释为优化收益。
+
+下一阶段应新增独立、默认关闭的 producer-direct rewrite：为每个已证明 epoch 建立
+consumer-layout VTCM representation，重定向该 epoch 的唯一 producer writer 与两个
+已枚举 reader，并保证其他 HMX epoch 仍使用原 allocation。先完成 alias/view type
+conversion 和 correctness gate，再考虑将当前 token-outer/head-inner producer loop
+交换为 head-outer/token-inner，以使 head-major VTCM formation 也保持连续写入。
+
+最终 proof 产物保存在：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p5gd_proof_dinov2_20260827
+```
+
+#### 11.34.3 P5g-e：按 logical epoch 直接形成 VTCM representation
+
+P5g-e 把 11.34.2 已证明的 12 个 HVX-only epoch 从 analysis 升级为独立、默认关闭的
+rewrite。每个 epoch 在 writer 前建立一个 197,376 B VTCM object，仅把该 epoch 的
+唯一 `vector.transfer_write` 和两个已枚举 HVX reader 重定向到新 object，并在最后一个
+reader 后释放；其他 HMX epoch 仍使用原 DDR allocation。它不插入 DDR→VTCM copy、
+DMA 或 prefetch hint，因此真正实现的是 producer-direct placement，而非增加一次 staging。
+
+完整 DINOv2-small gate：
+
+| 指标 | P5g-e |
+|---|---:|
+| Latency | **6,289.04 ms** |
+| Correctness | PASS，finite、top-1 match、max abs diff 0.0044 |
+| rewritten logical epochs | **12** |
+| prefetch hint / DMA issued | 0 / 0 |
+| compile time | 319.7415 s |
+
+相对 P5g-d proof 的 6,392.25 ms，单样本快 1.64%；但两者不是同轮 matched control，
+目前只能确认机制与正确性，不能把 1.64% 当作稳健加速结论。产物位于：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p5ge_vtcm_dinov2_20260827
+```
+
+#### 11.34.4 P5g-f：head-major VTCM 与 strided alloc lowering 修复
+
+P5g-f 保持逻辑索引 `[token, head, channel]`，但令 VTCM root 的物理 stride 为
+`[64, 16448, 1]`，即物理字节顺序 `[head, token, channel]`。这不是 tensor transpose；
+producer 和 consumer 仍使用同一逻辑坐标，只通过 memref descriptor 表达物理布局。
+
+第一次完整编译暴露了一个独立的 upstream backend 缺口：HexagonMem→LLVM 对静态
+多维 `StridedLayoutAttr` 调用 `normalizeMemRefType`，把一结果 linear map 展平为 rank-1
+descriptor，随后遗留无法 reconcile 的 rank-1→rank-3 cast。修复后，lowering 对静态
+非负 stride VTCM memref：
+
+1. 按 `offset + sum((dim-1)*stride) + 1` 计算真实物理 span；
+2. 直接构造原 rank 的 LLVM memref descriptor；
+3. 显式写入原 shape、offset 和 stride，不再依赖 rank cast。
+
+定向测试覆盖 `memref<257x6x64xf16, strided<[64,16448,1]>,1>`，验证分配
+197,376 B、rank-3 descriptor 以及不存在 unrealized cast。完整模型在系统中断后复用
+已生成 `.so` 恢复设备阶段，结果为：
+
+| 指标 | P5g-d analysis | P5g-e identity VTCM | P5g-f head-major VTCM |
+|---|---:|---:|---:|
+| Latency | 6,392.25 ms | **6,289.04 ms** | 6,348.58 ms |
+| Device result | PASS | PASS | PASS |
+| Correctness | PASS | PASS | **输入和输出均与 P5g-e SHA-256 完全一致** |
+| rewritten epochs | 0 | 12 | 12 |
+
+P5g-f 相对 P5g-d 单样本快 0.68%，但比 P5g-e 慢 0.95%，差异不足以形成性能结论。
+当前 head-major 仅改变物理布局，producer 仍按 token-outer/head-inner 遍历，因而在六个
+head region 间跳写。下一 gate 是在严格 dependence proof 下形成
+head-outer/token-inner producer traversal，使写入顺序与 head-major 物理连续方向一致；
+之后必须用同轮 matched control 判断 layout formation 是否真正降低访问成本。
+
+最终产物位于：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p5gf_headmajor_backendfix_dinov2_20260827
+```
+
+#### 11.34.5 P5g-g：连续 producer traversal 的完整模型结论
+
+P5g-g 在 P5g-f 上增加独立、默认关闭的严格 loop-formation gate。它只接受无 iter
+argument/result 的 perfect two-loop producer nest；P5g-d 已证明唯一 writer 对
+`[token,head,channel]` row 的完整、互斥覆盖。rewrite 将原 token-outer/head-inner
+访问顺序改为 head-outer/token-inner，但仍使用逻辑下标 `[token,head,0]`，因此只是让
+producer 的动态遍历顺序与 head-major `[64,16448,1]` 物理 stride 一致，不改变模型
+语义，也不插入 prefetch、DMA 或额外 copy。
+
+完整 DINOv2-small gate 得到：
+
+| 指标 | P5g-e identity VTCM | P5g-f head-major | P5g-g head-major + continuous producer |
+|---|---:|---:|---:|
+| Latency | **6,289.04 ms** | 6,348.58 ms | 6,394.35 ms |
+| Correctness | PASS | PASS，bit-identical | **PASS，max abs diff 0.0044、top-1 match** |
+| rewritten / interchanged epochs | 12 / 0 | 12 / 0 | **12 / 12** |
+| prefetch hints / runtime DMA | 0 / 0 | 0 / 0 | **0 / 0** |
+| compile time | 319.7415 s | 366.7355 s | 320.7634 s |
+
+三者来自不同单次设备运行，1% 左右差异可能属于系统波动，不能用来声称 slowdown；
+但 P5g-g 显然没有呈现足以继续深挖该局部 loop 的模型级收益。最终 object 仍有
+297,411 条静态 instruction、16,015 个 HVX-like instruction（5.38%）和 21,822 个
+vector load/store mention。当前 12 个约 197 KB logical epoch 即使形成方向正确，也只占
+整图很小一部分，改善其 producer 写序不足以改变约 6.3 s 总延迟。
+
+这一步把下一优先级从“继续微调同一 attention buffer”改为：
+
+1. 在 post-bufferization allocation/copy/view 图上扩大 consumer-contract discharge，
+   真正减少 66.29 MB movement ledger，而不是只优化约 2.37 MB epoch footprint；
+2. 用 region-level cycles、HVX active、HMX utilization、L2 miss/DDR traffic、VTCM stall
+   和 DMA overlap counter 定量区分 compute/codegen 与 memory traffic；
+3. 对能跨多个 consumer 或 layer 复用的 representation 做 persistence + VTCM lifetime
+   coloring；仅对无法消除且有足够计算距离的剩余搬动做异步 prefetch。
+
+产物已直接移动到：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p5gg_contiguous_headmajor_dinov2_20260827
+```
+
+### 11.35 P5h：高覆盖 attention destination formation（2026-08-27）
+
+P5g-e 至 P5g-g 只覆盖 12 个约 197 KB 的 Q/K/V logical epoch，合计约
+2.37 MB，因此即使 producer-direct、VTCM 和连续遍历机制均成立，也不足以显著改变
+完整 DINOv2 的总延迟。P5h 不再继续微调该小 buffer，而是回到 P1 的完整模型 LWP
+与 post-bufferization movement ledger：11 个重复 attention region 各含三次约 1.58 MB
+的 physical copy，合计约 52.18 MB，是 66.29 MB 静态 materialization 的主要部分。
+
+为避免仅按 shape 猜测，P1 ledger 新增 source/destination version、alias root、defining
+op、layout、memory space、direct users、same-type 和 distinct-storage 字段。完整 DINOv2
+显示每层均为同一严格结构：
+
+```text
+source.root [6,257,257xf32]
+  -> source.active [6,257,256xf32, strided]
+  -> copy 到 identity temporary
+  -> consumer 在 temporary 上原地计算
+source.root -> whole copy 到 destination.root
+temporary -> copy 回 destination.active
+```
+
+这不是三个独立 transpose，而是 padded attention row 的 bufferization materialization
+链。P5h 因而实现为独立、默认关闭的
+`enableAlpsAttentionDestinationFormation` gate：
+
+1. 严格要求静态 rank-3、相同 active subview、唯一 seed/writeback/whole-root copy、
+   相同 root type、同一 block 且顺序可证明；
+2. 提前创建最终 destination active subview，以原 seed copy 初始化它；
+3. 保留原 rank-reduction，令所有 consumer subview 直接派生自 destination active，
+   即 consumer-driven in-situ formation；
+4. 删除 temporary、writeback 和 whole-root copy；
+5. whole-root 中没有被 active consumer 覆盖的最后一列仍从 source 复制，保持严格语义。
+
+完整 DINOv2-small（FP16、HVX vector、HexKL on，累积至 P5g-g）结果为：
+
+| 指标 | P5g-g / profiling control | P5h |
+|---|---:|---:|
+| matched / rewritten chains | 0 / 0 | **11 / 11** |
+| pass-estimated eliminated copy bytes | 0 | **34,738,176 B** |
+| residual tail copy bytes | NA | **67,848 B** |
+| post-bufferization copy sites | 133 | 134 |
+| post-bufferization materialization ledger | 66,290,754 B | **33,911,874 B** |
+| ledger net reduction | NA | **32,378,880 B（48.85%）** |
+| runtime prefetch / DMA | 0 / 0 | **0 / 0** |
+| latency | 6,323.76--6,431.61 ms（不同轮 P5g-g） | **6,145.01 ms** |
+| correctness | PASS | **PASS，max abs diff 0.0044，top-1 match** |
+| compile time | 287.83--320.76 s | 343.92 s |
+
+P5h 相对两次最近 P5g-g 单样本快约 2.9%--4.7%；由于不是同轮 matched control，
+只能判断方向明确，不能把该范围当成稳定正式加速比。更重要的是，P5h 第一次让 tensor
+IR 的“预测删除”转化成 final post-bufferization ledger 的大幅下降，证明应优先扩大
+物理 contract discharge 覆盖，而不是继续优化小 footprint 或无选择地插入 prefetch。
+
+同时，约 49% 的静态 materialization 下降只对应数个百分点的模型 latency，说明
+`static copy bytes != critical-path DDR bytes`：这些 copy 可能由高带宽顺序访问完成，且
+attention/MLP 计算仍占主导。下一 gate 不应宣称仅靠 copy 删除已解决瓶颈，而应按以下
+顺序推进：
+
+1. 用同轮 matched control 重复一次 P5h，稳定其 latency 因果量级；
+2. 追踪剩余约 33.91 MB movement top sites，优先选择跨 11/12 层重复的大链；
+3. 分析 P5h 保留的 active seed 是否可由 upstream producer/HMX 直接写入最终
+   destination，从而进一步删除约 17.37 MB，而不是对它立即做同步搬运；
+4. 只有 seed 无法消除且 producer 到 consumer 有实际计算距离时，才把它作为异步
+   DMA/VTCM 或 L2 prefetch 候选，并由 PMU/traffic control admission 控制。
+
+有效完整产物已直接移动到：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p5h_attention_destination_v2_dinov2_20260827
+```
+
+### 11.36 DINOv2：LWP critical path 与 sysMon PMU 物理流量联合归因（2026-08-27）
+
+本轮不再根据静态 copy 数量推测瓶颈，而是把三类证据放在同一个完整
+DINOv2-small、FP16、HVX vector、HexKL-on、P5h 配置中采集：
+
+1. post-bufferization movement ledger：回答“编译器最终显式物化了多少字节”；
+2. LWP：回答“哪些编译后 region 位于 critical path”；
+3. SDK sysMon hardware PMU：回答“执行窗口实际向 L2 外发出了多少 AXI line
+   request，以及 HVX/HMX 在何时活跃”。
+
+#### 11.36.1 P5h 的同轮因果量级与正确性
+
+P5h 的 legality 已收紧为 distinct source/destination root、唯一 whole-root copy、完整
+temporary/destination 生命周期检查、禁止 destination 提前读取及 temporary 晚期使用；
+新增正反例测试覆盖了这些条件。与同配置、仅关闭 P5h 的 P5g-g matched control 比较：
+
+| 指标 | P5g-g matched control | P5h |
+|---|---:|---:|
+| Latency | 6,315.88 ms | **6,097.97 ms** |
+| Speedup | 1.00x | **1.0357x** |
+| Latency reduction | 0% | **3.45%** |
+| post-bufferization materialization | 66,290,754 B | **33,911,874 B** |
+| 物化量下降 | 0 B | **32,378,880 B（48.85%）** |
+| 输出 | reference | **SHA-256 与 control 完全相同** |
+
+因此实现本身是正确且确实命中了物理 copy 的；收益不大不是 rewrite 未发生，而是被删除
+的 copy 只覆盖了整图真实物理访问中的一小部分。
+
+#### 11.36.2 修正后的 LWP：用 exclusive cycles 排名
+
+旧汇总把 parent 和 child 的 inclusive cycles 同时相加，会重复计算嵌套 region。当前脚本
+改为 `exclusive = inclusive - direct-child inclusive`，并只把
+`phase=post-bufferization` 的 logical-access record 与 region 连接。联合 profile 的
+exclusive-cycle 分解显示：
+
+| 类别 / region | Exclusive-cycle share | 解释 |
+|---|---:|---|
+| patch embedding `linalg.conv_2d_nchw_fchw`，source line 259 | **39.09%** | 单一最大热点；57,802,752 logical iterations，非 HMX |
+| 全部 HMX microkernel + packing/unpacking region | **28.42%** | 216 个 region；包含 `rm_to_wh`、MM、acc read、`ah_to_rm` 和 f16→f32 submatrix copy |
+| root / 当前未归因开销 | 9.28% | 需要 marker 或更细 region 才能继续拆分 |
+| 显式 materialization region | 4.13% | 与 P5h 只有数个百分点收益一致 |
+| 其他已插桩 region | 1.51% | 非主要目标 |
+
+line 259 的 post-bufferization logical upper bound 是 462,422,016 B read 和
+231,211,008 B write，但 unique operands 只有 1,145,856 B，logical/unique 约 605x。
+这不是 693.63 MB 的物理 DDR 流量证明，而是说明当前 convolution lowering 在极小
+operand footprint 上执行了大量循环访问和算术，优先应检查 tiling/vectorization、复用
+以及是否发生重复扩展/累加，而不是给它盲目增加 L2 prefetch。
+
+#### 11.36.3 sysMon：模型确有大量真实物理流量，但不等于带宽饱和
+
+SDK 6.4.0.2 的 `sysMonApp profiler` 命令行工具已在手机上直接运行成功，并识别到
+Q6 v73。联合 profile 在 6.563 s 的 host kernel process 窗口内得到：
+
+| Hardware PMU 指标 | 数值 |
+|---|---:|
+| AXI cached read（L2 miss line request） | **791,315,200 B** |
+| AXI cached write | **337,076,864 B** |
+| AXI total | **1,128,392,064 B（约 1.13 GB）** |
+| 平均 read / write bandwidth | 120.57 / 51.36 MB/s |
+| 1 ms AXI bytes p50 / p90 / p99 | 38,144 / 359,424 / 2,649,856 B |
+| HVX packet event | 199,757,981 |
+| HMX active event | 9,687,670 |
+| explicit L2fetch miss | 0 |
+
+按 1 ms sample 的计算部件活动分组，HVX+HMX 同时活跃的窗口贡献 493,339,392 B
+（43.72%）AXI 流量，HVX-only 贡献 279,558,016 B（24.77%），二者都不活跃的窗口仍
+贡献 355,354,752 B（31.49%）。HMX-only 几乎不存在，说明当前 HexKL/HMX 路径会同时
+伴随 HVX-side preparation/packing，而不是一个完全独立、只做矩阵计算的阶段。
+
+P5h 实际删除的 32.38 MB 只相当于该 1.13 GB 窗口流量的约 **2.87%**，与同轮
+3.45% latency reduction 同量级。这解释了“静态 materialization 降低 48.85%，模型却
+只快数个百分点”的表面矛盾：48.85% 的分母只是显式 copy ledger，不是模型的全部物理
+流量。另一方面，约 172 MB/s 的窗口平均 AXI 带宽远低于平台峰值，且流量高度 bursty，
+因此当前也不能把 DINO 简化为持续 DDR bandwidth saturation；更可能是计算、低效访问、
+cache-line miss、packing/unpacking 和间歇性流量共同组成瓶颈。
+
+空闲 2 s 对照只产生约 0.58 MB AXI，总量远小于模型窗口，故 1.13 GB 信号不是后台噪声。
+但当前 default sysMon PMU 是 CDSP system-domain 统计，host process 窗口还比 wrapper
+内部 Perf 多约 0.47 s；该数值适合作为物理流量量级和 matched-delta 指标，不能直接把
+每一字节归属于某一个 LWP region。
+
+#### 11.36.4 LWP 与 PMU 的区别，以及 profiler 安装结论
+
+- **LWP 是软件 region instrumentation。** 它在编译器选定的 region 入口/出口读取
+  cycle，能映射回 source line/operator，适合 critical-path 归因；但会改变执行，并且
+  不测 DDR/L2/VTCM 流量。
+- **sysMon PMU 是硬件事件采样。** 它测真实 processor/HVX/HMX/AXI 事件，适合判断
+  compute-versus-traffic；但默认缺少算子级来源映射。两者互补，不能互相替代。
+- SDK 的 sysMon marker API 本可给指定 code region 做 PMU 归属，但手册明确说明它
+  **不支持 unsigned PD**；当前 Hexagon-MLIR FastRPC runner 正是 unsigned PD，所以
+  不能把 marker 当作现阶段必需方案。STID 也必须在线程创建时设置，而当前执行线程并非
+  runner 自己创建，不能通过一个脚本开关可靠补上。
+- 当前实验所需的 `sysMonApp` CLI 和 parser 都已包含在 SDK 中，已经可以自动 push、
+  采集、pull 和解析；**不需要用户额外安装 sysMon APK**。APK 只在需要 GUI 交互探索时
+  才有价值，不是可复现实验依赖。
+
+完整联合 profile 已移动到：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_dinov2_bottleneck_joint_20260827
+```
+
+#### 11.36.5 收紧后的下一步（避免继续在小 buffer 上来回试验）
+
+1. **先攻 line 259 patch convolution。** 它独占约 39.09% exclusive cycles；检查最终
+   HVX 指令、vector width、tile shape、load reuse 和 f16→f32 accumulation。若它主要是
+   compute/codegen 低效，就优化 vectorization/tiling；若 sysMon matched delta 显示其
+   AXI line request 异常，再做 tile-local VTCM supply/prefetch。
+2. **再攻重复 HMX representation conversion。** 12 层反复出现 WH/AH formation、
+   accumulator readback 和 f16/f32 submatrix copy，合计约 28.42% cycles，并与 43.72%
+   的 HVX+HMX active-window AXI 流量相伴。这里应做 consumer-contract-driven persistent
+   representation：producer 直接形成下一 HMX consumer 所需布局，并让能跨 consumer
+   复用的 weight/tile 保持在适合 HMX 的表示中，避免每次 MM 前后重新 pack/unpack。
+3. **只有无法消除的 critical transfer 才 prefetch。** admission 同时要求：region 位于
+   LWP top critical path、sysMon matched delta 能降低 AXI/stall、producer-consumer 有
+   足够 overlap distance、VTCM lifetime 不与其他 tile 冲突。这样 prefetch 是 layout
+   formation 的异步供给机制，而不是独立撒 hint。
+4. 对每个改动只做同轮 control/treatment：固定 mapping、频率和 correctness，比较
+   latency、exclusive cycles、AXI bytes、HVX/HMX events 及最终 materialization；没有
+   覆盖大数据量或 critical cycles 的候选不再进入完整模型编译。
+
+#### 11.36.6 line 259 最终机器码核验：确认是 vectorization 缺口
+
+对归档的 v73 object 按 LWP region ID 反汇编后，region 3（source line 259）对应
+`0x228--0x7bc`。虽然整图配置是 HVX vector on，该区间没有 HVX vector arithmetic；
+14-wide kernel-width loop 被标量展开，并且每个位置执行：
+
+1. `memuh` 读取一个 f16 input 和一个 f16 weight；
+2. 对二者分别 `call __extendhfsf2`；
+3. 用 scalar `sfmpy` 累加到 f32。
+
+因此每个 14-wide inner reduction 有 **28 次 half-to-float helper call**。外层循环又覆盖
+384 output channels、16x16 output patches、3 input channels，解释了该 region 的
+3.493 billion exclusive pcycles。当前通用 Hexagon tiling/vectorization 只接受最内层
+恰好达到 native data tile，或能把纯 parallel loop interchange 到最内层；这个 NCHW/FCHW
+convolution 的最内层 reduction 是 14，小于 f16 HVX tile 64，而且 convolution 含 reduction
+loop，现有 interchange legality 会拒绝它。现有 `ConvTilingPass` 又只支持
+`conv_2d_nhwc_fhwc`，因此没有覆盖 DINO 的 `conv_2d_nchw_fchw`。
+
+这使下一步决策更明确：不能把 line 259 当作 data-prefetch 候选。应先用独立 gate 做
+patch-convolution reduction vectorization（优先把连续的 kernel-width f16 input/weight
+批量扩展并向量 FMA，再做 horizontal reduction），或形成适合已有 NHWC/HMX convolution
+路径且不会引入更大 layout materialization 的 producer representation。只有消除 scalar
+conversion helper 后，matched sysMon 仍显示 line-request/stall 主导，才为其增加
+VTCM tile supply 或异步 prefetch。这个 codegen 修复是 DINO baseline correctness 的必要
+工程项，但论文贡献仍应表述为“profile-guided admission 避免对 compute-bound region
+错误 prefetch”，而不是把普通 convolution vectorization 包装成 ALPS 创新点。
+
+### 11.37 P5i：consumer-driven patch formation 消除 DINO 最大热点（2026-08-27）
+
+#### 11.37.1 设计与 legality
+
+P5i 没有给 line 259 继续添加 data-prefetch hint，而是把其后继 consumer 的 token
+layout contract 传播回 patch producer。该 pass 独立、默认关闭，仅在以下条件全部成立时
+改写：静态 FP16 NCHW/FCHW、FP32 accumulation、stride 等于 kernel、dilation 为 1、
+输入空间恰好被 non-overlapping patch 覆盖、output channel 是 64 的整数倍、filter 是
+编译期常量，并且 `conv -> f32-to-f16 -> collapse -> [0,2,1] transpose` 全链均为唯一 use。
+overlapping convolution、dynamic shape、非唯一 use 或无法证明的 bias topology 均保留原生
+lowering。
+
+改写后的 reduction loop 为：
+
+```text
+[N, OH, OW, IC, KH, KW, OC]
+```
+
+其中 `OC` 是最内层连续 parallel 维。FCHW filter 在编译期折叠并转置为
+`[IC*KH*KW, OC]`，再以 `[IC,KH,KW,OC]` view 消费；输出直接形成 NHWC，随后只做
+descriptor-only collapse 得到 `[N,OH*OW,OC]` token。因此它既没有生成完整 im2col，
+也没有在运行时转置 384x3x14x14 权重。完整 DINO IR 中只命中 1 个目标，报告消除
+196,608 B patch-output transpose；常量 fold 后可见单一 `588x384xf16` dense resource，
+运行时 filter transpose 已消失。正例及 overlapping-window 反例均有 FileCheck 覆盖。
+
+#### 11.37.2 完整 DINO matched 结果
+
+固定完整 DINOv2-small、FP16、HVX vector、HexKL on，并保持 P5h 及其此前 gate 相同：
+
+| 指标 | P5h matched candidate | P5h + P5i |
+|---|---:|---:|
+| Latency | 6,097.97 ms | **3,740.29 ms** |
+| P5i incremental speedup | 1.00x | **1.6303x** |
+| 相对 P5g-g matched control（6,315.88 ms） | 1.0357x | **1.6886x** |
+| Correctness | PASS | **PASS；max abs diff 0.0046，top-1 match** |
+| Runtime prefetch hints / issued bytes | 0 / 0 | **0 / 0** |
+| Post-bufferization materialization | 33,911,874 B | **33,911,874 B** |
+
+独立 LWP build 的设备 latency 为 3,699.41 ms，正确性同样通过。两次 P5i 结果相近，且
+最终显式 materialization 完全不变，所以这次 1.63x 增量收益不是由新增 prefetch 或
+copy ledger 下降造成，而是由 consumer-required continuity 使原 scalar reduction 进入
+真正的 HVX codegen。P5i object 在该区间出现连续 `vmem/vmpy/vadd`，不再是每个 f16
+元素调用转换 helper 后做 scalar `sfmpy`。
+
+#### 11.37.3 LWP 因果闭环与下一 gate
+
+采用修正后的 exclusive-cycle 汇总，P5i LWP 得到：
+
+| 类别 | P5h share | P5i share | 判断 |
+|---|---:|---:|---|
+| patch embedding line 259 | 39.09% | **0.80%** | 最大热点已退出 critical path |
+| HMX microkernel + representation preparation | 28.42% | **45.25%** | 成为当前第一优化对象 |
+| attention arithmetic（div/exp/reduction 等） | 未单列 | **21.58%** | 当前第二优化对象 |
+| root / 未归因 | 9.28% | **15.39%** | 仍需更细 marker/region 分解 |
+
+这给出一个重要的 profile-guided admission 结论：**不能因为 P5i 的 layout 已连续，就继续
+给 patch 路径加 VTCM/异步 prefetch。** 它当前只剩 0.80% exclusive cycles，即使完全
+消除也不可能带来有意义的模型级收益。下一步先细分 45.25% 中真正的 HMX compute、
+`rm_to_wh/ah_to_rm` packing、accumulator readback 和 f16-to-f32 submatrix copy；再分析
+21.58% attention arithmetic 的 producer/consumer layout 与 vector reduction。只有被
+证明仍处于关键路径、无法通过 direct formation 消除、且存在 producer-consumer overlap
+distance 的连续 supply，才进入 VTCM async-prefetch gate。
+
+实现、完整模型、LWP 与机器码证据已移动到：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p5i_patch_conv_dinov2_20260827
+nano:/home/huzq85/2-working/working_set/alps_p5i_lwp_dinov2_20260827
+```
+
+### 11.38 P5j：consumer-driven HMX FP16 epilogue formation（2026-08-27）
+
+P5i 消除 patch embedding 的 scalar codegen 后，HMX microkernel 及其 representation
+preparation 升至 45.25% exclusive cycles。细粒度 HexKL LWP 又显示，原 HMX 输出路径
+每次先把 accumulator readout 从 VTCM 中的 FP16 tile 扩展为 DDR FP32 submatrix，紧接着
+唯一 consumer 再做 identity-layout FP32→FP16 truncation。这条链既增加输出流量，也让
+同一批元素经历一次无用的 widen+narrow。
+
+P5j 因而在 `matmul-to-hexkl` 中加入默认关闭、严格 legality 的 consumer contract：
+只有 matmul 结果为 FP32、唯一 consumer 是逐元素 identity-map truncf、无其他 use 时，
+才把 HexKL result contract 改为 FP16，并让 decomposition 使用新的
+`hexkl.micro_hmx_copy_f16_to_submatrix`。这不是引入混合精度：HexKL/HMX 原路径本来
+就是 FP16 输入与 FP16 accumulator readout；P5j 只是按最终 consumer 所需表示直接落盘，
+不再人为扩展到 FP32 后立即截断。非唯一 use、非 identity layout 和 FP32 consumer 均
+保持原路径。
+
+完整 DINOv2-small 共形成 **72 个** FP16 epilogue，结果如下：
+
+| 指标 | P5i | P5j |
+|---|---:|---:|
+| Latency | 3,740.29 ms | **3,346.73 ms** |
+| P5j incremental speedup | 1.00x | **1.1176x** |
+| 相对 P5g-g（6,315.88 ms） | 1.6886x | **1.8872x** |
+| Correctness | PASS | **PASS；max abs diff 0.0046、allclose、top-1 match** |
+| Runtime prefetch hints / issued bytes | 0 / 0 | **0 / 0** |
+| Post-bufferization movement ledger | 33,911,874 B | **33,911,874 B** |
+
+ledger 不变是预期行为：它在 HexKL decomposition 之前采集，无法看到 epilogue runtime
+API 内部的数据宽度变化。细粒度 LWP 给出了物理执行侧证据：
+
+| HexKL phase | P5i | P5j | 判断 |
+|---|---:|---:|---|
+| FP16→FP32 output copy | 537,747,174 cycles（9.90%） | **0** | widen 路径已消失 |
+| direct FP16 output copy | 0 | **337,446,121 cycles（6.77%）** | consumer 所需表示直接形成 |
+| RM→WH | 88,411,786 cycles（1.63%） | 91,960,430 cycles（1.84%） | 基本不变 |
+| input submatrix→FP16 | 52,975,269 cycles（0.98%） | 51,263,802 cycles（1.03%） | 基本不变 |
+
+原 9.90% FP32 output-copy phase 被 6.77% FP16 direct-copy phase 替代，减少约
+200.30 M sampled cycles；这与完整模型 10.52% latency reduction 方向一致。HMX MM
+是异步启动，LWP 对单个 `micro_hmx_mm` call 的极小数值不能解释为计算免费；完成等待
+可能落在后续 read/copy phase，因此 phase 归因必须按整条 producer-consumer chain 解读。
+
+产物已直接移动到：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p5j_hmx_f16_epilogue_dinov2_20260827
+nano:/home/huzq85/2-working/working_set/alps_p5j_hexkl_phase_lwp_dinov2_20260827
+```
+
+### 11.39 P5k：HMX non-aligned result 直接形成（2026-08-27）
+
+P5j 的最终 IR 仍暴露出一条重复 72 次的高覆盖搬运链。DINO token M=257 不满足 HMX
+32-row tile 对齐，所以 decomposition 同时为输入和输出创建 288-row padded buffer：
+
+```text
+HMX/VTCM epilogue -> padded [288,N] FP16 DDR result
+                  -> subview [257,N]
+                  -> memref.copy -> final [257,N] destination
+```
+
+输入补齐是 HMX tile contract 所需，但输出补齐并非必要。现有 HexKL
+`copy_f16_to_submatrix` API 已接收独立的 `output_rows/output_cols` valid bounds，
+可在边界 tile 内裁剪 store。P5k 因而增加独立、默认关闭的
+`enableAlpsHmxDirectOutputFormation` gate：HMX 循环与输入 padded representation
+保持不变，epilogue 直接以原始 M/N bounds 写 caller destination，不再分配 padded
+result，也不再生成 output subview、copy 和 dealloc。默认关闭时旧 IR 完全保持；正反向
+FileCheck 同时验证了这一点。
+
+完整 DINOv2-small（P5i+P5j 累积）结果为：
+
+| 指标 | P5j | P5k |
+|---|---:|---:|
+| Latency | 3,346.73 ms | **3,278.35 ms** |
+| P5k incremental speedup | 1.00x | **1.0209x** |
+| Latency reduction | 0% | **2.04%** |
+| 相对 P5i（3,740.29 ms） | 1.1176x | **1.1409x** |
+| 相对 P5g-g（6,315.88 ms） | 1.8872x | **1.9265x** |
+| P5j formed epilogues | 72 | **72** |
+| Correctness | PASS | **PASS；max abs diff 0.0046、allclose、top-1 match** |
+| Runtime prefetch hints / issued bytes | 0 / 0 | **0 / 0** |
+
+因此 P5k 的约 2% 增益不是 cache hint 或 DMA 波动，而是 direct formation 在 HMX
+non-aligned output 上继续删除关键路径搬运。它也让当前论文故事更统一：
+consumer contract 决定最终 representation；能直接形成的就消除搬运，不能消除且有
+overlap distance 的才进入 VTCM/DMA prefetch admission。
+
+P5j+P5k 后，下一优先级不应再修改已退出热点的 patch path，也不应无选择地 prefetch。
+应重新按 LWP 排名剩余 HMX outer regions 与 attention arithmetic：先判断 RM→WH、
+input tile formation、accumulator completion/readout 中哪些是重复 representation
+formation，哪些是 HMX completion critical path；然后只对无法跨 consumer 保留、但可与
+当前 HMX compute 重叠的下一 tile 做异步 VTCM supply。
+
+完整产物已直接移动到：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p5k_hmx_direct_output_dinov2_20260827
+```
+
+#### 11.39.1 P5k 后的 critical-path 复核
+
+独立完整模型 HexKL-phase LWP build 为 3,360.38 ms，相对 P5j LWP 的 3,416.99 ms
+同样快约 1.7%，正确性保持。最新 exclusive-cycle 分解为：
+
+| 类别 | P5j | P5k | 判断 |
+|---|---:|---:|---|
+| HMX outer pipeline | 35.88% | **33.66%** | padded-result copy 从 outer critical path 消失 |
+| attention arithmetic | 16.81% | **17.40%** | 基本不变，比例随总周期变化 |
+| root / 未归因 | 15.99% | **15.75%** | 基本不变 |
+| direct FP16 output drain | 6.77% | **6.78%** | 仍是无法忽略的 residual transfer |
+| RM→WH | 1.84% | **1.85%** | 基本不变 |
+| input submatrix→FP16 | 1.03% | **1.03%** | 基本不变 |
+| patch path | 0.88% | **0.89%** | 已退出优化优先级 |
+
+这进一步确认 P5k 没有“优化错对象”：它删除的是 output drain 之后的额外 padded
+copy，因此 direct FP16 drain 自身应保持不变。下一步要先审计这 72 个 HMX result 的
+downstream consumer：若 consumer 的 elementwise/bias contract 能在 VTCM tile drain
+时直接满足，则融合形成最终表示并删除中间 DDR round trip；若中间 result 语义上必须
+materialize，则该 6.78% residual drain 才进入 double-buffered asynchronous evacuation，
+尝试与下一 HMX tile 的 compute 重叠。
+
+LWP 产物已直接移动到：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p5k_hexkl_phase_lwp_dinov2_20260827
+```
+
+### 11.40 论文叙事保护线：prefetch 必须有独立可验证贡献（2026-08-27）
+
+当前完整 DINO 的强收益主要来自 consumer-driven direct formation 与 continuity：
+P5h 删除物理 copy，P5i 让 patch producer 直接形成可向量化的连续布局，P5j 删除
+FP32 widen/narrow round trip，P5k 删除 HMX padded-output copy。它们与“减少/提前数据
+搬动”的总方向一致，但 **不能把这些收益统称为 prefetch 收益**；目前各强结果中的
+runtime prefetch hints 和 issued bytes 均为 0。
+
+因此论文应把统一机制准确表述为 **consumer-contract-driven data-movement
+orchestration**，其决策顺序是：
+
+1. 能通过 direct/in-situ formation 消除的 transfer 不执行；
+2. 不能消除、但可跨 consumer/layer 保留的 representation 做 persistence；
+3. 仍必须执行且有真实 overlap distance 的 critical transfer 才用 V-DAE +
+   VTCM/DMA asynchronous supply；
+4. PMU/traffic control 负责 admission、节流和拒绝有害 prefetch。
+
+这种叙事允许 ablation 中各项贡献不等大：一个有效系统本来就应让 elimination 优先于
+speculative movement。但为了避免 headline 与证据不一致，异步 prefetch/supply 必须设置
+硬 gate：
+
+- 至少在多个完整模型（最好跨 domain）上有稳定、重复的正增量，而非单个样本噪声；
+- 同时降低 exposed transfer/stall cycles，或在 matched sysMon 中降低/隐藏 AXI traffic；
+- correctness、映射、频率和 thermal state 固定；
+- 无 overlap distance 或 PMU 判定无收益时，能展示 admission 拒绝带来的“避免负收益”。
+
+若最终只能展示“拒绝错误 prefetch”，而 active asynchronous supply 在大多数模型上仍
+为 0 或不稳定，则 prefetch 不应继续作为标题级主贡献：应降为 runtime policy/negative
+result，把论文核心收敛到 consumer-driven representation formation。反之，只要 residual
+critical transfer 上有数个百分点但稳定、可归因的额外收益，prefetch 仍有说服力——它
+不需要超过 P5i，但必须证明是在 direct formation 无法继续后有效隐藏了剩余搬运。
+
+当前最合适的 prefetch 验证点不是已经降至 0.89% 的 patch path，而是 P5k 后仍占
+6.78% 的 HMX FP16 output drain。先做 downstream-consumer audit：可融合则继续消除；
+不可融合部分再做 ping-pong VTCM + asynchronous evacuation。这样无论结果为正或被
+admission 拒绝，都与统一故事线和审稿所需的因果证据一致。
+
+### 11.41 P5l：HMX F16 bias-drain formation 的实现、失败与停止线（2026-08-28）
+
+P5k 后的 downstream audit 找到 72 个 F16 result consumer，其中 36 个是严格的
+rank-2 broadcast bias：`C[m,n] + bias[n] -> final[m,n]`，覆盖 14,211,072 B result。
+P5l 因此增加了独立、默认关闭的 tensor contract、bufferization interface、HMX micro
+drain、LLVM lowering 和 v73 HVX runtime。runtime 在完整 32-column tile 上把两行
+F16 result 与重复 bias 合成一个 128 B HVX add，边界 tile 使用有界 fallback。所有
+新增路径均由 `--alps-p5l` / `ALPS_ENABLE_HMX_F16_BIAS_EPILOGUE_FORMATION` 单独控制。
+
+实现过程暴露了一个不能绕过的 buffer lifetime 问题。allocation-liveness 会让同一个
+memref 承载多个顺序 value epoch；全局 SSA user list 因此不能证明当前 matmul 与
+epilogue 的物理 ownership。第一版严格 user matcher 留下 illegal epilogue。改成“第一个
+lexical writer/reader”后 36 个 contract 都被识别，但 final destination 在若干 site
+中位于 matmul 之后，直接融合产生 dominance error。把整段 HMX compute 移到 epilogue
+虽消除了 verifier error，却跨越了 mutable-buffer lifetime，设备结果错误：
+
+| 轮次 | 编译/设备状态 | Latency | Correctness |
+|---|---|---:|---|
+| compute 延迟到 epilogue | 编译、v73 执行成功 | 3,142.19 ms | FAIL；max diff 2.1235 |
+| 同上 + subview descriptor offset | 编译、v73 执行成功 | 3,073.68 ms | FAIL；max diff 2.1235 |
+
+第二版把 consumer final `tensor.empty` 建在 producer matmul 之前，并禁止 decomposition
+移动 HMX compute。bufferization 后 36 个 site 中只有 23 个满足 producer-point
+dominance，另外 13 个被 admission 正确拒绝。为拒绝项加入普通 elementwise fallback
+后，23 fused + 13 fallback 的完整模型能够执行，但仍未通过数值门槛：
+
+| 指标 | P5k（有效 control） | P5l admitted/fallback |
+|---|---:|---:|
+| Latency | **3,278.35 ms** | 3,648.61 ms（无效，不得用于 speedup） |
+| Correctness | **PASS；max diff 0.0046** | **FAIL；max diff 2.2158，top-1 mismatch** |
+| 可计入论文结果 | 是 | **否** |
+
+这说明当前 `matmul -> standalone epilogue` contract 在 tensor 层仍不足以表达一个原子的
+producer value epoch；bufferization 后再依据相邻 memref 操作融合，无法对 alias、stride、
+destination lifetime 和 producer input lifetime给出完整证明。真正要继续该方向，应新增
+单一 `matmul_with_bias` tensor op，使 lhs/rhs/bias/final destination 从一开始就在同一
+DestinationStyle contract 中，再统一 bufferize/decompose；这属于后续工程项，不能为了
+追逐一次无效 latency 继续给当前 P5l 打补丁。
+
+因此执行停止线：P5l 代码保留为默认关闭的实验原型，但不进入 ALPS 有效累计方案；当前
+最佳正确版本仍是 P5k。下一步回到 11.40 的论文保护线，只研究 P5k 后**无法直接消除**的
+residual HMX drain/transfer：先用 matched LWP/PMU 证明它暴露在 critical path，再让异步
+VTCM/DMA supply 与 HMX compute 重叠。若 active prefetch 没有稳定独立收益，则按既定
+规则把 prefetch 降为 admission/runtime policy，而不夸大为主要加速来源。
+
+完整产物与失败证据：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p5l_dinov2_dominance_fixed_20260828
+nano:/home/huzq85/2-working/working_set/alps_p5l_dinov2_offset_fixed_20260828
+nano:/home/huzq85/2-working/working_set/alps_p5l_dinov2_tensor_order_fixed_20260828
+nano:/home/huzq85/2-working/working_set/alps_p5l_dinov2_admitted_23_20260828
+```
+
+### 11.42 P5m：先证明 residual HMX drain 具备异步准入条件（2026-08-28）
+
+P5m 是严格 analysis-only 阶段，执行路径仍与正确的 P5k 完全相同。它对每个静态 HMX
+result drain 枚举 32×32 F16 descriptor，并分别统计完整 tile、边界 tile、可在后续 HMX
+计算后隐藏的 descriptor、目标 stride 和 UserDMA 2D 合法性。完整 DINOv2-small 得到：
+
+| 指标 | P5m 静态结果 |
+|---|---:|
+| HMX sites / admitted sites | 72 / 72 |
+| 总 drain bytes | 21,316,608 B |
+| 总 descriptors | 11,664 |
+| 完整 / 边界 descriptors | 10,368 / 1,296 |
+| DMA-admitted bytes | 21,233,664 B（99.61%） |
+| 可与后续 HMX 重叠 bytes | 21,086,208 B（98.92%） |
+| 边界同步 bytes | 82,944 B |
+| 2D DMA legality | 通过；最大 destination stride 3,072 B |
+
+P5m latency 为 3,268.25 ms，正确性与 P5k 相同（max abs diff 0.0046、allclose、top-1
+match），说明 analysis 没有改变执行。P5n 需要额外保留 8 KiB VTCM：4 KiB 中容纳两个
+2 KiB ping-pong result tile，另一个 4 KiB 保证随 slab 末端定位的 HexKL config block
+不会与新增 slot 重叠。
+
+完整产物：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p5m_hmx_async_drain_analysis_dinov2_20260828
+```
+
+### 11.43 P5n：VTCM ping-pong + UserDMA 异步 HMX result evacuation（2026-08-28）
+
+P5n 只在 P5m admitted 的完整行 tile 上改变 P5k drain：HMX accumulator 先在独立 VTCM
+slot 中完成 AH→RM；编译器在覆盖该 slot 前等待旧 token，然后发出 VTCM→DDR 2D
+UserDMA 并立即继续下一个 HMX tile。两个 slot 交替使用，短 M 边界仍走有界同步 copy，
+result 逃逸和 VTCM dealloc 前统一 flush。该路径由
+`ALPS_ENABLE_HMX_ASYNC_DRAIN` / `--alps-p5n` 独立控制，默认关闭；P5m/P5n 以及此前
+P0–P5k 的开关仍可分别消融。
+
+定向测试曾捕获一个实现错误：异步分支最初落在 weight-prepack 调度内，而准入条件又排除
+weight-prepack，因此只生成 flush。修复后异步逻辑位于实际使用的 M-outer 调度，并由
+FileCheck 同时验证 `wait -> AH-to-RM -> start`、边界同步 copy 和最终 flush；方言
+round-trip、HexKL-to-LLVM lowering 与增量构建均通过。
+
+同日、相同完整模型与设备配置的 matched 结果为：
+
+| 指标 | P5k matched control | P5n async drain |
+|---|---:|---:|
+| Latency | 3,234.81 ms | **2,993.49 ms** |
+| P5n incremental speedup | 1.00x | **1.0806x** |
+| Latency reduction | 0% | **7.46%** |
+| Correctness | PASS；max diff 0.0046 | **PASS；max diff 0.0046** |
+
+独立 HexKL-phase LWP/P5n telemetry run 为 3,048.39 ms，并给出实际运行时证据：
+
+| 证据 | P5k | P5n |
+|---|---:|---:|
+| 同步 `copy_f16_to_submatrix` root share | 6.78% / 7,200 次 | **0.05% / 1,296 次** |
+| async start exposed share | NA | 0.07% |
+| async wait exposed share | NA | 0.03% |
+| async flush exposed share | NA | <0.01% |
+| UserDMA issued / completed | NA | **10,368 / 10,368** |
+| UserDMA issued bytes | NA | **21,233,664 B** |
+| synchronous DMA fallback | NA | **0** |
+
+LWP 只用于热点排名，实际 descriptor 次数以 runtime telemetry 为准。运行时 issued 数与
+P5m admitted descriptor 数完全一致，completed=issued 且 fallback=0；因此这次收益不是
+L2 hint（L2 issued 仍为 0），而是把 P5k 后语义上必须执行、且已被 LWP 证明暴露在关键
+路径上的 result movement 提前发出，并与下一 HMX tile 计算重叠。同步 drain 从 6.78%
+降到仅剩 1,296 个边界 descriptor，也与 7.46% formal latency reduction 在量级上吻合。
+
+这为论文中的 prefetch 部分提供了首个完整模型、正确性通过、matched control、实际 DMA
+计数和关键路径变化相互闭合的正证据。它应准确称为 **consumer-contract admitted
+asynchronous evacuation/supply**，不能泛化成任意 data prefetch 都有效。当前硬门控结论
+是：P5n 在 DINOv2-small 上通过；但进入论文最终累计方案前，仍需在其他完整模型/至少
+另一个 domain 上验证可迁移性。若没有 residual HMX drain 或缺乏 overlap distance，
+admission 应拒绝，而不是强制启用。
+
+完整产物：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p5k_matched_control_dinov2_20260828
+nano:/home/huzq85/2-working/working_set/alps_p5n_hmx_async_drain_dinov2_20260828
+nano:/home/huzq85/2-working/working_set/alps_p5n_hexkl_phase_lwp_dinov2_20260828
+```

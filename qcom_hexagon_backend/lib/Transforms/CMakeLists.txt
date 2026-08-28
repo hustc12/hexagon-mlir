@@ -57,6 +57,7 @@ add_mlir_library(Transforms
   AlpsExactReadinessPass.cpp
   AlpsProducerDirectAttentionPass.cpp
   AlpsConsumerDrivenLayoutPass.cpp
+  AlpsPatchConvFormationPass.cpp
   AlpsZeroCopyAttentionPass.cpp
   VDAEDecouplePass.cpp
   LayoutOpsEliminationPass.cpp

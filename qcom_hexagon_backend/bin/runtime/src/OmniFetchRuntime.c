@@ -14,12 +14,14 @@
 //   - memcpy/memset are fine (provided by libc++.so.1 on device)
 //===----------------------------------------------------------------------===//
 
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
-#include <stddef.h>
 
 #ifdef __hexagon__
 #include "HAP_user_pmu.h"
+#include "hexagon_types.h"
+#include "hvx_hexagon_protos.h"
 /* HexKL micro API — linked via -lhexkl_micro on the final device .so. */
 int hexkl_micro_hmx_rm_to_wh_f16(uint8_t *vtcm_base, uint32_t weight_offset,
                                  const _Float16 *wt_old, uint32_t row_tile,
@@ -38,25 +40,77 @@ int hexkl_micro_hmx_copy_submatrix_to_f16(uint8_t *vtcm_base,
 /* -------------------------------------------------------------------------
  * Layout kind constants – must match OmniFetchOps.td enum ordinals
  * ------------------------------------------------------------------------- */
-#define LAYOUT_NONE            0
-#define LAYOUT_HMX_WEIGHT      1
-#define LAYOUT_HMX_ACTIVATION  2
-#define LAYOUT_CUSTOM          3
-#define LAYOUT_L2_HINT         4
+#define LAYOUT_NONE 0
+#define LAYOUT_HMX_WEIGHT 1
+#define LAYOUT_HMX_ACTIVATION 2
+#define LAYOUT_CUSTOM 3
+#define LAYOUT_L2_HINT 4
 #define LAYOUT_HMX_WEIGHT_DEQUANT_I8 5
+
+/* P5l consumer-driven HMX drain.  Clang vectorizes the full-width inner loop
+ * for HVX; boundary tiles retain the same clipped semantics as HexKL's native
+ * drain.  Fusing here avoids a DDR-resident matmul intermediate and a second
+ * whole-result bias traversal. */
+void alps_hmx_copy_f16_bias_to_submatrix(
+    uint8_t *vtcm_base, uint32_t in_offset, const _Float16 *bias,
+    _Float16 *dst, int32_t tile_row, int32_t tile_col, int32_t output_rows,
+    int32_t output_cols) {
+  const _Float16 *src = (const _Float16 *)(vtcm_base + in_offset);
+  int32_t row0 = tile_row * 32;
+  int32_t col0 = tile_col * 32;
+  int32_t rows = output_rows - row0;
+  int32_t cols = output_cols - col0;
+  if (rows > 32)
+    rows = 32;
+  if (cols > 32)
+    cols = 32;
+  if (rows <= 0 || cols <= 0)
+    return;
+#ifdef __hexagon__
+  if (cols == 32) {
+    _Float16 bias_pair[64] __attribute__((aligned(128)));
+    _Float16 sum_pair[64] __attribute__((aligned(128)));
+    for (int32_t c = 0; c < 32; ++c) {
+      bias_pair[c] = bias[col0 + c];
+      bias_pair[32 + c] = bias[col0 + c];
+    }
+    HVX_Vector vbias = *(const HVX_Vector *)bias_pair;
+    int32_t r = 0;
+    for (; r + 1 < rows; r += 2) {
+      /* Each pair of flat 32-element VTCM rows is exactly one 128-byte HVX
+       * vector.  The final rows may be separated by the matrix stride in DDR,
+       * so use two bounded 64-byte copies after the vector add. */
+      HVX_Vector values = *(const HVX_Vector *)(src + r * 32);
+      *(HVX_Vector *)sum_pair = Q6_Vhf_vadd_VhfVhf(values, vbias);
+      memcpy(dst + (row0 + r) * output_cols + col0, sum_pair, 64);
+      memcpy(dst + (row0 + r + 1) * output_cols + col0, sum_pair + 32, 64);
+    }
+    if (r < rows)
+      for (int32_t c = 0; c < 32; ++c)
+        dst[(row0 + r) * output_cols + col0 + c] =
+            src[r * 32 + c] + bias[col0 + c];
+    return;
+  }
+#endif
+  for (int32_t r = 0; r < rows; ++r) {
+    for (int32_t c = 0; c < cols; ++c)
+      dst[(row0 + r) * output_cols + col0 + c] =
+          src[r * 32 + c] + bias[col0 + c];
+  }
+}
 
 /* -------------------------------------------------------------------------
  * Adaptive prefetch parameters
  * ------------------------------------------------------------------------- */
-#define MIN_LOOKAHEAD  1
-#define MAX_LOOKAHEAD  8
+#define MIN_LOOKAHEAD 1
+#define MAX_LOOKAHEAD 8
 #define STALL_THRESHOLD 8000u
 
-#define OMNI_ERROR_SEM_TIMEOUT       (1u << 0)
-#define OMNI_ERROR_DESCRIPTOR_FULL   (1u << 1)
-#define OMNI_ERROR_DESCRIPTOR_STALE  (1u << 2)
-#define OMNI_ERROR_DESCRIPTOR_STATE  (1u << 3)
-#define OMNI_ERROR_CONTEXT_BUSY      (1u << 4)
+#define OMNI_ERROR_SEM_TIMEOUT (1u << 0)
+#define OMNI_ERROR_DESCRIPTOR_FULL (1u << 1)
+#define OMNI_ERROR_DESCRIPTOR_STALE (1u << 2)
+#define OMNI_ERROR_DESCRIPTOR_STATE (1u << 3)
+#define OMNI_ERROR_CONTEXT_BUSY (1u << 4)
 static unsigned omni_error_flags = 0;
 
 uint32_t __omni_fetch_get_and_clear_errors(void) {
@@ -74,7 +128,7 @@ uint32_t __omni_fetch_get_and_clear_errors(void) {
  * ------------------------------------------------------------------------- */
 #define ALPS_CONTEXT_SLOTS 4
 #define ALPS_DESCRIPTORS_PER_CONTEXT 8
-#define ALPS_DESCRIPTOR_SLOTS \
+#define ALPS_DESCRIPTOR_SLOTS                                                  \
   (ALPS_CONTEXT_SLOTS * ALPS_DESCRIPTORS_PER_CONTEXT)
 
 enum {
@@ -260,8 +314,7 @@ static int alps_decode_context(int32_t handle, unsigned *slot,
   *generation = (uint32_t)handle / ALPS_CONTEXT_SLOTS;
   AlpsInvocationContext *context = &alps_contexts[*slot];
   return __atomic_load_n(&context->in_use, __ATOMIC_ACQUIRE) &&
-         __atomic_load_n(&context->generation, __ATOMIC_ACQUIRE) ==
-             *generation;
+         __atomic_load_n(&context->generation, __ATOMIC_ACQUIRE) == *generation;
 }
 
 static int alps_decode_descriptor(int32_t handle,
@@ -288,8 +341,8 @@ static int alps_decode_descriptor(int32_t handle,
 }
 
 int32_t __omni_fetch_invocation_begin(void) {
-  unsigned start = __atomic_fetch_add(&alps_context_cursor, 1,
-                                      __ATOMIC_RELAXED);
+  unsigned start =
+      __atomic_fetch_add(&alps_context_cursor, 1, __ATOMIC_RELAXED);
   for (unsigned probe = 0; probe < ALPS_CONTEXT_SLOTS; ++probe) {
     unsigned slot = (start + probe) % ALPS_CONTEXT_SLOTS;
     AlpsInvocationContext *context = &alps_contexts[slot];
@@ -332,9 +385,10 @@ int32_t __omni_fetch_invocation_end(int32_t context_handle) {
   return 1;
 }
 
-int32_t __omni_fetch_descriptor_acquire(
-    int32_t context_handle, int64_t value_version, int64_t tile,
-    int32_t layout, int32_t source_tier, int32_t destination_tier) {
+int32_t __omni_fetch_descriptor_acquire(int32_t context_handle,
+                                        int64_t value_version, int64_t tile,
+                                        int32_t layout, int32_t source_tier,
+                                        int32_t destination_tier) {
   unsigned context_slot;
   uint32_t context_generation;
   if (!alps_decode_context(context_handle, &context_slot,
@@ -355,8 +409,7 @@ int32_t __omni_fetch_descriptor_acquire(
          UINT32_C(0x3ffffff));
     if (generation == 0) {
       generation = 1;
-      __atomic_store_n(&descriptor->generation, generation,
-                       __ATOMIC_RELEASE);
+      __atomic_store_n(&descriptor->generation, generation, __ATOMIC_RELEASE);
     }
     descriptor->context_generation = context_generation;
     descriptor->value_version = value_version;
@@ -397,9 +450,10 @@ int32_t __omni_fetch_descriptor_transition(int32_t descriptor_handle,
   return 1;
 }
 
-int32_t __omni_fetch_descriptor_consume(
-    int32_t descriptor_handle, int64_t value_version, int64_t tile,
-    int32_t layout, int32_t source_tier, int32_t destination_tier) {
+int32_t __omni_fetch_descriptor_consume(int32_t descriptor_handle,
+                                        int64_t value_version, int64_t tile,
+                                        int32_t layout, int32_t source_tier,
+                                        int32_t destination_tier) {
   AlpsInvocationContext *context;
   AlpsExactDescriptor *descriptor;
   if (!alps_decode_descriptor(descriptor_handle, &context, &descriptor)) {
@@ -416,8 +470,8 @@ int32_t __omni_fetch_descriptor_consume(
   }
   int expected = ALPS_DESC_READY;
   if (!__atomic_compare_exchange_n(&descriptor->state, &expected,
-                                   ALPS_DESC_CONSUMING, 0,
-                                   __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                                   ALPS_DESC_CONSUMING, 0, __ATOMIC_ACQ_REL,
+                                   __ATOMIC_ACQUIRE)) {
     alps_descriptor_fail(OMNI_ERROR_DESCRIPTOR_STATE);
     return 0;
   }
@@ -508,9 +562,11 @@ static unsigned omni_l2_duplicate_suppressed = 0;
 static unsigned omni_l2_max_commands = 0;
 static uint64_t omni_l2_max_bytes = 0;
 #define OMNI_L2_RECENT_REQUESTS 64
+#define OMNI_L2_SEGMENTED_SITES 256
 static uint64_t omni_l2_recent_requests[OMNI_L2_RECENT_REQUESTS];
 static unsigned omni_l2_recent_count = 0;
 static unsigned omni_l2_recent_cursor = 0;
+static unsigned omni_l2_segmented_cursor[OMNI_L2_SEGMENTED_SITES];
 
 /* Configure a per-invocation traffic envelope for OmniFetch. Zero limits keep
  * the legacy/unbounded behavior used by external prefetch baselines. */
@@ -524,6 +580,8 @@ void __omni_fetch_l2_configure(uint32_t max_commands, uint64_t max_bytes,
   omni_l2_recent_cursor = 0;
   for (unsigned i = 0; i < OMNI_L2_RECENT_REQUESTS; ++i)
     omni_l2_recent_requests[i] = 0;
+  for (unsigned i = 0; i < OMNI_L2_SEGMENTED_SITES; ++i)
+    omni_l2_segmented_cursor[i] = 0;
   __atomic_store_n(&omni_l2_issued, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&omni_l2_busy_suppressed, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&omni_l2_page_clipped, 0, __ATOMIC_RELAXED);
@@ -536,14 +594,12 @@ void __omni_fetch_l2_configure(uint32_t max_commands, uint64_t max_bytes,
 
 uint64_t __omni_fetch_l2_scheduler_counts(void) {
   uint64_t issued = __atomic_load_n(&omni_l2_issued, __ATOMIC_RELAXED);
-  uint64_t busy =
-      __atomic_load_n(&omni_l2_busy_suppressed, __ATOMIC_RELAXED);
+  uint64_t busy = __atomic_load_n(&omni_l2_busy_suppressed, __ATOMIC_RELAXED);
   return (issued << 32) | (busy & UINT64_C(0xffffffff));
 }
 
 uint64_t __omni_fetch_l2_scheduler_limits(void) {
-  uint64_t clipped =
-      __atomic_load_n(&omni_l2_page_clipped, __ATOMIC_RELAXED);
+  uint64_t clipped = __atomic_load_n(&omni_l2_page_clipped, __ATOMIC_RELAXED);
   uint64_t unsupported =
       __atomic_load_n(&omni_l2_unsupported, __ATOMIC_RELAXED);
   return (clipped << 32) | (unsupported & UINT64_C(0xffffffff));
@@ -605,8 +661,8 @@ uint64_t __omni_fetch_w8_cache_stats(void) {
 
 static unsigned omni_w8_hash(const void *source, int32_t tile_row,
                              int32_t tile_col, int32_t source_cols,
-                             int32_t site_id,
-                             uint64_t context, uint32_t generation) {
+                             int32_t site_id, uint64_t context,
+                             uint32_t generation) {
   /* The lowered source is often a function-local materialization whose
    * address changes between invocations.  Site ID + generation identify the
    * immutable logical weight; keeping the transient pointer in the key turns
@@ -622,38 +678,36 @@ static unsigned omni_w8_hash(const void *source, int32_t tile_row,
   return (unsigned)x & (OMNI_W8_CACHE_SLOTS - 1);
 }
 
-static OmniW8CacheEntry *
-omni_w8_lookup_or_quantize(const _Float16 *source, int32_t tile_row,
-                           int32_t tile_col, int32_t source_cols,
-                           int32_t site_id) {
+static OmniW8CacheEntry *omni_w8_lookup_or_quantize(const _Float16 *source,
+                                                    int32_t tile_row,
+                                                    int32_t tile_col,
+                                                    int32_t source_cols,
+                                                    int32_t site_id) {
   uint64_t context = __atomic_load_n(&omni_wh_context, __ATOMIC_ACQUIRE);
-  uint32_t generation =
-      __atomic_load_n(&omni_wh_generation, __ATOMIC_ACQUIRE);
+  uint32_t generation = __atomic_load_n(&omni_wh_generation, __ATOMIC_ACQUIRE);
   uint32_t epoch = __atomic_load_n(&omni_wh_epoch, __ATOMIC_ACQUIRE);
-  unsigned slot = omni_w8_hash(source, tile_row, tile_col, source_cols,
-                               site_id, context, generation);
+  unsigned slot = omni_w8_hash(source, tile_row, tile_col, source_cols, site_id,
+                               context, generation);
   OmniW8CacheEntry *entry = &omni_w8_cache[slot];
   if (__atomic_load_n(&entry->valid, __ATOMIC_ACQUIRE) &&
       entry->context == context && entry->generation == generation &&
-      entry->epoch == epoch &&
-      entry->tile_row == tile_row && entry->tile_col == tile_col &&
-      entry->source_cols == source_cols && entry->site_id == site_id) {
+      entry->epoch == epoch && entry->tile_row == tile_row &&
+      entry->tile_col == tile_col && entry->source_cols == source_cols &&
+      entry->site_id == site_id) {
     __atomic_fetch_add(&omni_w8_hits, 1, __ATOMIC_RELAXED);
     return entry;
   }
 
   __atomic_store_n(&entry->valid, 0, __ATOMIC_RELEASE);
-  const _Float16 *row0 =
-      source + (size_t)tile_row * 32 * (size_t)source_cols +
-      (size_t)tile_col * 32;
+  const _Float16 *row0 = source + (size_t)tile_row * 32 * (size_t)source_cols +
+                         (size_t)tile_col * 32;
   for (int group = 0; group < OMNI_W8_GROUPS; ++group)
     for (int c = 0; c < 32; ++c) {
       float max_abs = 0.0f;
       int row_begin = group * OMNI_W8_GROUP_ROWS;
       for (int rr = 0; rr < OMNI_W8_GROUP_ROWS; ++rr) {
-        float value = (float)row0[(size_t)(row_begin + rr) *
-                                      (size_t)source_cols +
-                                  c];
+        float value =
+            (float)row0[(size_t)(row_begin + rr) * (size_t)source_cols + c];
         float abs_value = value < 0.0f ? -value : value;
         if (abs_value > max_abs)
           max_abs = abs_value;
@@ -690,15 +744,13 @@ static void omni_w8_dequant_to_wh(const _Float16 *source, void *dest,
                                   int32_t weight_off, int32_t tile_row,
                                   int32_t tile_col, int32_t source_cols,
                                   int32_t site_id) {
-  OmniW8CacheEntry *entry =
-      omni_w8_lookup_or_quantize(source, tile_row, tile_col, source_cols,
-                                 site_id);
+  OmniW8CacheEntry *entry = omni_w8_lookup_or_quantize(
+      source, tile_row, tile_col, source_cols, site_id);
   _Float16 dequant[OMNI_W8_TILE_ELEMS] __attribute__((aligned(128)));
   for (int r = 0; r < 32; ++r)
     for (int c = 0; c < 32; ++c) {
       float scale = entry->scales[(r / OMNI_W8_GROUP_ROWS) * 32 + c];
-      dequant[r * 32 + c] =
-          (_Float16)((float)entry->data[r * 32 + c] * scale);
+      dequant[r * 32 + c] = (_Float16)((float)entry->data[r * 32 + c] * scale);
     }
 #ifdef __hexagon__
   hexkl_micro_hmx_rm_to_wh_f16((uint8_t *)dest, (uint32_t)weight_off, dequant,
@@ -708,10 +760,10 @@ static void omni_w8_dequant_to_wh(const _Float16 *source, void *dest,
 #endif
 }
 
-static unsigned
-omni_wh_cache_hash(const void *source, int32_t tile_row, int32_t tile_col,
-                   int32_t source_cols, int32_t site_id, uint64_t context,
-                   uint32_t generation) {
+static unsigned omni_wh_cache_hash(const void *source, int32_t tile_row,
+                                   int32_t tile_col, int32_t source_cols,
+                                   int32_t site_id, uint64_t context,
+                                   uint32_t generation) {
   uint64_t x = ((uint64_t)(uintptr_t)source >> 7) ^ context;
   x ^= (uint64_t)generation * UINT64_C(0x9e3779b185ebca87);
   x ^= (uint64_t)(uint32_t)site_id * UINT64_C(0xc2b2ae3d27d4eb4f);
@@ -724,10 +776,8 @@ omni_wh_cache_hash(const void *source, int32_t tile_row, int32_t tile_col,
   return (unsigned)x & (OMNI_WH_CACHE_SLOTS - 1);
 }
 
-void __omni_fetch_wh_cache_set_context(uint64_t context,
-                                       uint32_t generation) {
-  uint64_t old_context =
-      __atomic_load_n(&omni_wh_context, __ATOMIC_ACQUIRE);
+void __omni_fetch_wh_cache_set_context(uint64_t context, uint32_t generation) {
+  uint64_t old_context = __atomic_load_n(&omni_wh_context, __ATOMIC_ACQUIRE);
   uint32_t old_generation =
       __atomic_load_n(&omni_wh_generation, __ATOMIC_ACQUIRE);
   if (old_context != context || old_generation != generation)
@@ -736,8 +786,7 @@ void __omni_fetch_wh_cache_set_context(uint64_t context,
   __atomic_store_n(&omni_wh_generation, generation, __ATOMIC_RELEASE);
 }
 
-void __omni_fetch_wh_cache_invalidate(uint64_t context,
-                                      uint32_t generation) {
+void __omni_fetch_wh_cache_invalidate(uint64_t context, uint32_t generation) {
   __atomic_add_fetch(&omni_wh_epoch, 1, __ATOMIC_ACQ_REL);
   for (int i = 0; i < OMNI_WH_CACHE_SLOTS; ++i) {
     if (__atomic_load_n(&omni_wh_cache[i].valid, __ATOMIC_ACQUIRE) &&
@@ -757,8 +806,7 @@ static OmniWhCacheEntry *
 omni_wh_cache_lookup(const void *source, int32_t tile_row, int32_t tile_col,
                      int32_t source_cols, int32_t site_id) {
   uint64_t context = __atomic_load_n(&omni_wh_context, __ATOMIC_ACQUIRE);
-  uint32_t generation =
-      __atomic_load_n(&omni_wh_generation, __ATOMIC_ACQUIRE);
+  uint32_t generation = __atomic_load_n(&omni_wh_generation, __ATOMIC_ACQUIRE);
   uint32_t epoch = __atomic_load_n(&omni_wh_epoch, __ATOMIC_ACQUIRE);
   unsigned base = omni_wh_cache_hash(source, tile_row, tile_col, source_cols,
                                      site_id, context, generation);
@@ -767,10 +815,9 @@ omni_wh_cache_lookup(const void *source, int32_t tile_row, int32_t tile_col,
         &omni_wh_cache[(base + i) & (OMNI_WH_CACHE_SLOTS - 1)];
     if (__atomic_load_n(&entry->valid, __ATOMIC_ACQUIRE) &&
         entry->context == context && entry->generation == generation &&
-        entry->epoch == epoch &&
-        entry->source == source && entry->tile_row == tile_row &&
-        entry->tile_col == tile_col && entry->source_cols == source_cols &&
-        entry->site_id == site_id)
+        entry->epoch == epoch && entry->source == source &&
+        entry->tile_row == tile_row && entry->tile_col == tile_col &&
+        entry->source_cols == source_cols && entry->site_id == site_id)
       return entry;
   }
   return 0;
@@ -780,8 +827,7 @@ static OmniWhCacheEntry *
 omni_wh_cache_reserve(const void *source, int32_t tile_row, int32_t tile_col,
                       int32_t source_cols, int32_t site_id) {
   uint64_t context = __atomic_load_n(&omni_wh_context, __ATOMIC_ACQUIRE);
-  uint32_t generation =
-      __atomic_load_n(&omni_wh_generation, __ATOMIC_ACQUIRE);
+  uint32_t generation = __atomic_load_n(&omni_wh_generation, __ATOMIC_ACQUIRE);
   uint32_t epoch = __atomic_load_n(&omni_wh_epoch, __ATOMIC_ACQUIRE);
   unsigned base = omni_wh_cache_hash(source, tile_row, tile_col, source_cols,
                                      site_id, context, generation);
@@ -815,19 +861,15 @@ omni_wh_cache_reserve(const void *source, int32_t tile_row, int32_t tile_col,
  *                       measured average stall and consumed by the prefetch
  *                       path (async-gate + L2 prefetch-ahead depth). */
 static unsigned omni_stall_accum = 0;
-static int      omni_stall_events = 0;
-static int               omni_eff_lookahead = MAX_LOOKAHEAD;
+static int omni_stall_events = 0;
+static int omni_eff_lookahead = MAX_LOOKAHEAD;
 
 /* Dual-thread DAE scout (Phase 2).  Default off — identical to single-thread
  * software-pipelined V-DAE.  When on, signal() enqueues dma_wait+WH onto a
  * scout worker and returns; wait() only spins on the semaphore. */
 static volatile int omni_dual_thread_dae = 0;
 
-enum {
-  OMNI_SLOT_IDLE = 0,
-  OMNI_SLOT_PENDING = 1,
-  OMNI_SLOT_READY = 2
-};
+enum { OMNI_SLOT_IDLE = 0, OMNI_SLOT_PENDING = 1, OMNI_SLOT_READY = 2 };
 static volatile int omni_scout_slot_state = OMNI_SLOT_IDLE;
 
 /* Strong symbol from multithreading/OmniFetchScout.cpp overrides this weak
@@ -875,7 +917,7 @@ void __omni_fetch_set_dual_thread_dae(int32_t enable) {
 
 /* Maximum spin iterations before giving up (prevents infinite hang on
  * incorrect usage; should never be reached in a correct program). */
-#define OMNI_SEM_MAX_SPIN  0x100000
+#define OMNI_SEM_MAX_SPIN 0x100000
 
 typedef int omni_sem_t;
 static omni_sem_t omni_sem_pool[OMNI_SEM_POOL_SIZE];
@@ -922,9 +964,8 @@ static void omni_scout_complete_and_ready(void *sem_idx_as_ptr) {
 
 int32_t __omni_fetch_create_sem(void) {
   omni_sem_pool_init();
-  int32_t idx =
-      __atomic_fetch_add(&omni_sem_alloc_idx, 1, __ATOMIC_RELAXED) %
-      OMNI_SEM_POOL_SIZE;
+  int32_t idx = __atomic_fetch_add(&omni_sem_alloc_idx, 1, __ATOMIC_RELAXED) %
+                OMNI_SEM_POOL_SIZE;
   unsigned generation =
       __atomic_add_fetch(&omni_sem_generation[idx], 1, __ATOMIC_ACQ_REL);
   __atomic_store_n(&omni_sem_pool[idx], 0, __ATOMIC_RELEASE);
@@ -967,13 +1008,100 @@ extern uint32_t hexagon_runtime_dma_start(void *src, int srcAS, void *dst,
                                           int dstAS, uint32_t length,
                                           int bypassCacheSrc,
                                           int bypassCacheDst, int *status);
-extern uint32_t hexagon_runtime_dma2d_start(
-    void *src, int srcAS, void *dst, int dstAS, uint32_t width,
-    uint32_t height, uint32_t srcStride, uint32_t dstStride, int bypassCacheSrc,
-    int bypassCacheDst, int isOrdered, uint32_t cacheAllocationPolicy,
-    int *status);
+extern uint32_t
+hexagon_runtime_dma2d_start(void *src, int srcAS, void *dst, int dstAS,
+                            uint32_t width, uint32_t height, uint32_t srcStride,
+                            uint32_t dstStride, int bypassCacheSrc,
+                            int bypassCacheDst, int isOrdered,
+                            uint32_t cacheAllocationPolicy, int *status);
 extern void hexagon_runtime_dma_wait(uint32_t token);
 extern int32_t hexagon_runtime_dma_poll(uint32_t token);
+
+/* ALPS P5n HMX result evacuation.  Two 2 KiB RM tiles occupy one independent
+ * 4 KiB VTCM allocation unit.  Waiting happens before HMX overwrites a slot;
+ * start returns immediately so the descriptor can overlap the next HMX tile.
+ * Boundary-row fallback remains in compiler IR and never enters this path. */
+static uint32_t alps_hmx_drain_token[2];
+static unsigned char alps_hmx_drain_active[2];
+static uint64_t alps_hmx_drain_issued;
+static uint64_t alps_hmx_drain_completed;
+static uint64_t alps_hmx_drain_issued_bytes;
+static uint64_t alps_hmx_drain_sync_fallbacks;
+
+void alps_hmx_async_drain_wait_slot(int32_t slot) {
+  if ((unsigned)slot >= 2u)
+    return;
+  if (alps_hmx_drain_active[slot]) {
+#ifdef __hexagon__
+    hexagon_runtime_dma_wait(alps_hmx_drain_token[slot]);
+    __atomic_fetch_add(&alps_hmx_drain_completed, 1, __ATOMIC_RELAXED);
+#endif
+    alps_hmx_drain_active[slot] = 0;
+  }
+}
+
+void alps_hmx_async_drain_start_f16(void *vtcm, int32_t in_offset,
+                                    _Float16 *dst, int32_t tile_row,
+                                    int32_t tile_col, int32_t output_rows,
+                                    int32_t output_cols, int32_t slot) {
+  if (!vtcm || !dst || (unsigned)slot >= 2u || in_offset < 0 ||
+      tile_row < 0 || tile_col < 0 || output_rows <= 0 || output_cols <= 0)
+    return;
+
+  int32_t row = tile_row * 32;
+  int32_t col = tile_col * 32;
+  if (row < 0 || row + 32 > output_rows || col < 0 || col >= output_cols)
+    return;
+  uint32_t columns = (uint32_t)(output_cols - col);
+  if (columns > 32u)
+    columns = 32u;
+
+  _Float16 *src = (_Float16 *)((char *)vtcm + in_offset);
+  _Float16 *out = dst + (size_t)row * (size_t)output_cols + (size_t)col;
+#ifdef __hexagon__
+  int status = OMNI_DMA_OK;
+  uint32_t token = hexagon_runtime_dma2d_start(
+      src, OMNI_VTCM, out, OMNI_DDR, columns * 2u, 32u,
+      /*srcStride=*/64u, /*dstStride=*/(uint32_t)output_cols * 2u,
+      /*bypassCacheSrc=*/0, /*bypassCacheDst=*/0, /*isOrdered=*/0,
+      /*cacheAllocationPolicy=*/0, &status);
+  if (status == OMNI_DMA_OK) {
+    alps_hmx_drain_token[slot] = token;
+    alps_hmx_drain_active[slot] = 1;
+    __atomic_fetch_add(&alps_hmx_drain_issued, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&alps_hmx_drain_issued_bytes,
+                       (uint64_t)columns * 2u * 32u, __ATOMIC_RELAXED);
+    return;
+  }
+#endif
+  /* Recoverable admission fallback: preserve correctness if the UserDMA ring
+   * cannot accept the descriptor. */
+  for (int32_t r = 0; r < 32; ++r)
+    for (uint32_t c = 0; c < columns; ++c)
+      out[(size_t)r * (size_t)output_cols + c] = src[(size_t)r * 32u + c];
+  __atomic_fetch_add(&alps_hmx_drain_sync_fallbacks, 1, __ATOMIC_RELAXED);
+}
+
+void alps_hmx_async_drain_flush(void) {
+  alps_hmx_async_drain_wait_slot(0);
+  alps_hmx_async_drain_wait_slot(1);
+}
+
+uint64_t alps_hmx_async_drain_counts(void) {
+  uint64_t issued =
+      __atomic_load_n(&alps_hmx_drain_issued, __ATOMIC_RELAXED);
+  uint64_t completed =
+      __atomic_load_n(&alps_hmx_drain_completed, __ATOMIC_RELAXED);
+  return (issued << 32) | (completed & UINT64_C(0xffffffff));
+}
+
+uint64_t alps_hmx_async_drain_issued_bytes(void) {
+  return __atomic_load_n(&alps_hmx_drain_issued_bytes, __ATOMIC_RELAXED);
+}
+
+uint64_t alps_hmx_async_drain_sync_fallbacks(void) {
+  return __atomic_load_n(&alps_hmx_drain_sync_fallbacks, __ATOMIC_RELAXED);
+}
 
 #define OMNI_STAGE_ELEMS (32 * 32)
 #define OMNI_STAGE_SLOTS 4
@@ -984,7 +1112,7 @@ typedef struct {
   int active;
   int phase;
   uint32_t token;
-  void *dest; /* full HexKL VTCM i8 slab when hexkl_deferred */
+  void *dest;      /* full HexKL VTCM i8 slab when hexkl_deferred */
   const void *src; /* full DDR matrix when hexkl_deferred */
   int32_t elem_bytes;
   int32_t num_elems;
@@ -995,7 +1123,7 @@ typedef struct {
   int32_t tile_row;
   int32_t tile_col;
   int32_t src_cols;
-  int32_t weight_off; /* absolute byte offset into dest VTCM slab */
+  int32_t weight_off;     /* absolute byte offset into dest VTCM slab */
   int32_t vtcm_stage_off; /* >=0: packed tile lives at dest+off (DMA→VTCM) */
   int32_t site_id; /* >=0: item-4 cache identity for item-5 hybrid mode */
 } OmniAsyncJob;
@@ -1032,9 +1160,9 @@ void __omni_fetch_copy2d(const void *src, void *dest, int32_t elem_bytes,
                          int32_t src_row_stride_elems,
                          int32_t dst_row_stride_elems);
 
-static void omni_pack_weight_tile_to_stage(const _Float16 *src, int32_t tile_row,
-                                           int32_t tile_col, int32_t src_cols,
-                                           void *stage) {
+static void omni_pack_weight_tile_to_stage(const _Float16 *src,
+                                           int32_t tile_row, int32_t tile_col,
+                                           int32_t src_cols, void *stage) {
   const _Float16 *row0 =
       src + (size_t)tile_row * 32 * (size_t)src_cols + (size_t)tile_col * 32;
   __omni_fetch_copy2d(row0, stage, /*elem_bytes=*/2, /*rows=*/32, /*cols=*/32,
@@ -1047,16 +1175,14 @@ static void omni_pack_weight_tile_to_stage(const _Float16 *src, int32_t tile_row
 static uint16_t alps_exact_stage[ALPS_DESCRIPTOR_SLOTS][OMNI_STAGE_ELEMS];
 
 static int64_t alps_pack_tile_identity(int32_t tile_row, int32_t tile_col) {
-  return (int64_t)(((uint64_t)(uint32_t)tile_row << 32) |
-                   (uint32_t)tile_col);
+  return (int64_t)(((uint64_t)(uint32_t)tile_row << 32) | (uint32_t)tile_col);
 }
 
 static int32_t alps_exact_find(int32_t context_handle, int64_t value_version,
                                int32_t tile_row, int32_t tile_col) {
   unsigned context_slot;
   uint32_t context_generation;
-  if (!alps_decode_context(context_handle, &context_slot,
-                           &context_generation))
+  if (!alps_decode_context(context_handle, &context_slot, &context_generation))
     return -1;
   AlpsInvocationContext *context = &alps_contexts[context_slot];
   int64_t tile = alps_pack_tile_identity(tile_row, tile_col);
@@ -1098,8 +1224,7 @@ static void alps_exact_sync_weight(const void *src, void *dest,
 
 static void alps_exact_complete_impl(void *descriptor_handle_as_ptr,
                                      int completed_by_scout) {
-  int32_t descriptor_handle =
-      (int32_t)(intptr_t)descriptor_handle_as_ptr;
+  int32_t descriptor_handle = (int32_t)(intptr_t)descriptor_handle_as_ptr;
   AlpsInvocationContext *context;
   AlpsExactDescriptor *descriptor;
   if (!alps_decode_descriptor(descriptor_handle, &context, &descriptor))
@@ -1113,10 +1238,9 @@ static void alps_exact_complete_impl(void *descriptor_handle_as_ptr,
 #ifdef __hexagon__
   if (descriptor->dma_active) {
     int polls = 0;
-    uint64_t poll_start =
-        __atomic_load_n(&alps_p4a_enabled, __ATOMIC_ACQUIRE)
-            ? alps_read_pcycles()
-            : 0;
+    uint64_t poll_start = __atomic_load_n(&alps_p4a_enabled, __ATOMIC_ACQUIRE)
+                              ? alps_read_pcycles()
+                              : 0;
     while (!hexagon_runtime_dma_poll(descriptor->dma_token)) {
       if (++polls >= OMNI_SEM_MAX_SPIN) {
         __atomic_store_n(&descriptor->state, ALPS_DESC_FAILED,
@@ -1140,25 +1264,23 @@ static void alps_exact_complete_impl(void *descriptor_handle_as_ptr,
 #endif
   const _Float16 *stage = NULL;
   if (descriptor->stage_offset >= 0)
-    stage = (const _Float16 *)((char *)descriptor->dest +
-                              descriptor->stage_offset);
+    stage =
+        (const _Float16 *)((char *)descriptor->dest + descriptor->stage_offset);
   else if (descriptor->stage_slot >= 0)
     stage = (const _Float16 *)alps_exact_stage[descriptor->stage_slot];
 #ifdef __hexagon__
   if (stage)
-    hexkl_micro_hmx_rm_to_wh_f16(
-        (uint8_t *)descriptor->dest, (uint32_t)descriptor->weight_offset,
-        stage, 0, 0, 32);
+    hexkl_micro_hmx_rm_to_wh_f16((uint8_t *)descriptor->dest,
+                                 (uint32_t)descriptor->weight_offset, stage, 0,
+                                 0, 32);
   else
     alps_exact_sync_weight(descriptor->src, descriptor->dest,
                            descriptor->tile_row, descriptor->tile_col,
-                           descriptor->source_cols,
-                           descriptor->weight_offset);
+                           descriptor->source_cols, descriptor->weight_offset);
 #else
   if (stage)
-    hmx_weight_gather(stage,
-                      (char *)descriptor->dest + descriptor->weight_offset,
-                      2, 32, 32);
+    hmx_weight_gather(
+        stage, (char *)descriptor->dest + descriptor->weight_offset, 2, 32, 32);
 #endif
   expected = ALPS_DESC_LAYOUT_PENDING;
   if (!__atomic_compare_exchange_n(&descriptor->state, &expected,
@@ -1184,17 +1306,19 @@ static void alps_exact_complete(void *descriptor_handle_as_ptr) {
   alps_exact_complete_impl(descriptor_handle_as_ptr, /*completed_by_scout=*/1);
 }
 
-int32_t __omni_fetch_exact_weight_kick(
-    int32_t context_handle, int64_t value_version, const void *src, void *dest,
-    int32_t tile_row, int32_t tile_col, int32_t src_cols,
-    int32_t weight_offset, int32_t stage_offset) {
+int32_t __omni_fetch_exact_weight_kick(int32_t context_handle,
+                                       int64_t value_version, const void *src,
+                                       void *dest, int32_t tile_row,
+                                       int32_t tile_col, int32_t src_cols,
+                                       int32_t weight_offset,
+                                       int32_t stage_offset) {
   if (!src || !dest || tile_row < 0 || tile_col < 0 || src_cols <= 0 ||
       weight_offset < 0)
     return 0;
   int64_t tile = alps_pack_tile_identity(tile_row, tile_col);
-  int32_t descriptor_handle = __omni_fetch_descriptor_acquire(
-      context_handle, value_version, tile, LAYOUT_HMX_WEIGHT, OMNI_DDR,
-      OMNI_VTCM);
+  int32_t descriptor_handle =
+      __omni_fetch_descriptor_acquire(context_handle, value_version, tile,
+                                      LAYOUT_HMX_WEIGHT, OMNI_DDR, OMNI_VTCM);
   AlpsInvocationContext *context;
   AlpsExactDescriptor *descriptor;
   if (descriptor_handle < 0 ||
@@ -1222,12 +1346,10 @@ int32_t __omni_fetch_exact_weight_kick(
       !__atomic_load_n(&alps_p4a_dma_allowed, __ATOMIC_ACQUIRE)) {
     alps_exact_sync_weight(src, dest, tile_row, tile_col, src_cols,
                            weight_offset);
-    __omni_fetch_descriptor_transition(descriptor_handle,
-                                       ALPS_DESC_LOAD_PENDING,
-                                       ALPS_DESC_LAYOUT_PENDING);
-    __omni_fetch_descriptor_transition(descriptor_handle,
-                                       ALPS_DESC_LAYOUT_PENDING,
-                                       ALPS_DESC_READY);
+    __omni_fetch_descriptor_transition(
+        descriptor_handle, ALPS_DESC_LOAD_PENDING, ALPS_DESC_LAYOUT_PENDING);
+    __omni_fetch_descriptor_transition(
+        descriptor_handle, ALPS_DESC_LAYOUT_PENDING, ALPS_DESC_READY);
     __atomic_fetch_add(&alps_exact_sync_fallbacks, 1, __ATOMIC_RELAXED);
     __atomic_fetch_add(&alps_p4a_dma_suppressed, 1, __ATOMIC_RELAXED);
     return 1;
@@ -1241,31 +1363,27 @@ int32_t __omni_fetch_exact_weight_kick(
      * publishes READY, so consume/release counters still close exactly. */
     alps_exact_sync_weight(src, dest, tile_row, tile_col, src_cols,
                            weight_offset);
-    __omni_fetch_descriptor_transition(descriptor_handle,
-                                       ALPS_DESC_LOAD_PENDING,
-                                       ALPS_DESC_LAYOUT_PENDING);
-    __omni_fetch_descriptor_transition(descriptor_handle,
-                                       ALPS_DESC_LAYOUT_PENDING,
-                                       ALPS_DESC_READY);
+    __omni_fetch_descriptor_transition(
+        descriptor_handle, ALPS_DESC_LOAD_PENDING, ALPS_DESC_LAYOUT_PENDING);
+    __omni_fetch_descriptor_transition(
+        descriptor_handle, ALPS_DESC_LAYOUT_PENDING, ALPS_DESC_READY);
     __atomic_fetch_add(&alps_exact_sync_fallbacks, 1, __ATOMIC_RELAXED);
     __atomic_fetch_add(&alps_exact_credit_fallbacks, 1, __ATOMIC_RELAXED);
     return 1;
   }
   descriptor->dma_credit_owned = 1;
 
-  const _Float16 *row0 =
-      (const _Float16 *)src +
-      (size_t)tile_row * 32 * (size_t)src_cols + (size_t)tile_col * 32;
+  const _Float16 *row0 = (const _Float16 *)src +
+                         (size_t)tile_row * 32 * (size_t)src_cols +
+                         (size_t)tile_col * 32;
 #ifdef __hexagon__
   int status = OMNI_DMA_OK;
-  void *stage = stage_offset >= 0
-                    ? (void *)((char *)dest + stage_offset)
-                    : (void *)alps_exact_stage[flat];
+  void *stage = stage_offset >= 0 ? (void *)((char *)dest + stage_offset)
+                                  : (void *)alps_exact_stage[flat];
   int dstAS = stage_offset >= 0 ? OMNI_VTCM : OMNI_DDR;
-  uint64_t issue_start =
-      __atomic_load_n(&alps_p4a_enabled, __ATOMIC_ACQUIRE)
-          ? alps_read_pcycles()
-          : 0;
+  uint64_t issue_start = __atomic_load_n(&alps_p4a_enabled, __ATOMIC_ACQUIRE)
+                             ? alps_read_pcycles()
+                             : 0;
   descriptor->dma_token = hexagon_runtime_dma2d_start(
       (void *)row0, OMNI_DDR, stage, dstAS, /*width=*/64, /*height=*/32,
       (uint32_t)src_cols * 2u, /*dstStride=*/64, /*bypassSrc=*/0,
@@ -1279,12 +1397,10 @@ int32_t __omni_fetch_exact_weight_kick(
     alps_exact_sync_weight(src, dest, tile_row, tile_col, src_cols,
                            weight_offset);
     descriptor->dma_token = 0;
-    __omni_fetch_descriptor_transition(descriptor_handle,
-                                       ALPS_DESC_LOAD_PENDING,
-                                       ALPS_DESC_LAYOUT_PENDING);
-    __omni_fetch_descriptor_transition(descriptor_handle,
-                                       ALPS_DESC_LAYOUT_PENDING,
-                                       ALPS_DESC_READY);
+    __omni_fetch_descriptor_transition(
+        descriptor_handle, ALPS_DESC_LOAD_PENDING, ALPS_DESC_LAYOUT_PENDING);
+    __omni_fetch_descriptor_transition(
+        descriptor_handle, ALPS_DESC_LAYOUT_PENDING, ALPS_DESC_READY);
     __atomic_fetch_add(&alps_exact_sync_fallbacks, 1, __ATOMIC_RELAXED);
     return 1;
   }
@@ -1306,8 +1422,7 @@ int32_t __omni_fetch_exact_weight_kick(
 
 int32_t __omni_fetch_exact_weight_consume(int32_t context_handle,
                                           int64_t value_version,
-                                          int32_t tile_row,
-                                          int32_t tile_col) {
+                                          int32_t tile_row, int32_t tile_col) {
   int32_t descriptor_handle =
       alps_exact_find(context_handle, value_version, tile_row, tile_col);
   if (descriptor_handle < 0)
@@ -1365,8 +1480,7 @@ int32_t __omni_fetch_exact_weight_consume(int32_t context_handle,
 
 int32_t __omni_fetch_exact_weight_release(int32_t context_handle,
                                           int64_t value_version,
-                                          int32_t tile_row,
-                                          int32_t tile_col) {
+                                          int32_t tile_row, int32_t tile_col) {
   int32_t descriptor_handle =
       alps_exact_find(context_handle, value_version, tile_row, tile_col);
   if (descriptor_handle < 0)
@@ -1411,8 +1525,7 @@ uint64_t __omni_fetch_p4a_window_counts(void) {
 uint64_t __omni_fetch_p4a_decision_counts(void) {
   uint64_t throttle =
       __atomic_load_n(&alps_p4a_throttle_decisions, __ATOMIC_RELAXED);
-  uint64_t hold =
-      __atomic_load_n(&alps_p4a_hold_decisions, __ATOMIC_RELAXED);
+  uint64_t hold = __atomic_load_n(&alps_p4a_hold_decisions, __ATOMIC_RELAXED);
   return (throttle << 32) | (hold & UINT64_C(0xffffffff));
 }
 
@@ -1447,8 +1560,7 @@ uint64_t __omni_fetch_p4a_pmu_values23(void) {
 static void omni_async_complete(void) {
   if (__atomic_load_n(&omni_async_count, __ATOMIC_ACQUIRE) <= 0)
     return;
-  while (__atomic_exchange_n(&omni_async_consumer_lock, 1,
-                             __ATOMIC_ACQUIRE)) {
+  while (__atomic_exchange_n(&omni_async_consumer_lock, 1, __ATOMIC_ACQUIRE)) {
 #ifdef __hexagon__
     __asm__ volatile("pause(#64)");
 #endif
@@ -1484,8 +1596,7 @@ static void omni_async_complete(void) {
       }
       if (whSrc) {
         hexkl_micro_hmx_rm_to_wh_f16((uint8_t *)dest, (uint32_t)job->weight_off,
-                                     whSrc,
-                                     0, 0, 32);
+                                     whSrc, 0, 0, 32);
       } else if (job->src) {
         hexkl_micro_hmx_rm_to_wh_f16(
             (uint8_t *)dest, (uint32_t)job->weight_off,
@@ -1493,13 +1604,11 @@ static void omni_async_complete(void) {
             (uint32_t)job->tile_col, (uint32_t)job->src_cols);
       }
       if (job->site_id >= 0) {
-        OmniWhCacheEntry *entry = omni_wh_cache_reserve(
-            job->src, job->tile_row, job->tile_col, job->src_cols,
-            job->site_id);
-        memcpy(entry->data, (char *)dest + job->weight_off,
-               OMNI_WH_TILE_BYTES);
-        if (entry->epoch ==
-            __atomic_load_n(&omni_wh_epoch, __ATOMIC_ACQUIRE))
+        OmniWhCacheEntry *entry =
+            omni_wh_cache_reserve(job->src, job->tile_row, job->tile_col,
+                                  job->src_cols, job->site_id);
+        memcpy(entry->data, (char *)dest + job->weight_off, OMNI_WH_TILE_BYTES);
+        if (entry->epoch == __atomic_load_n(&omni_wh_epoch, __ATOMIC_ACQUIRE))
           __atomic_store_n(&entry->valid, 1, __ATOMIC_RELEASE);
       }
     }
@@ -1508,11 +1617,10 @@ static void omni_async_complete(void) {
     (void)eb;
     (void)ne;
 #endif
-    __atomic_store_n(&job->phase, OMNI_JOB_TRANSFORM_READY,
-                     __ATOMIC_RELEASE);
+    __atomic_store_n(&job->phase, OMNI_JOB_TRANSFORM_READY, __ATOMIC_RELEASE);
     __atomic_store_n(&job->active, 0, __ATOMIC_RELEASE);
-    __atomic_store_n(&omni_async_head,
-                     (job_idx + 1) % OMNI_STAGE_SLOTS, __ATOMIC_RELAXED);
+    __atomic_store_n(&omni_async_head, (job_idx + 1) % OMNI_STAGE_SLOTS,
+                     __ATOMIC_RELAXED);
     __atomic_fetch_sub(&omni_async_count, 1, __ATOMIC_RELEASE);
     __atomic_store_n(&omni_async_consumer_lock, 0, __ATOMIC_RELEASE);
     return;
@@ -1594,9 +1702,9 @@ static int omni_async_kick_hexkl_weight(const void *src, void *dest,
   int job_idx = __atomic_load_n(&omni_async_tail, __ATOMIC_RELAXED);
   OmniAsyncJob *job = &omni_async_jobs[job_idx];
 
-  const _Float16 *row0 =
-      (const _Float16 *)src +
-      (size_t)tile_row * 32 * (size_t)src_cols + (size_t)tile_col * 32;
+  const _Float16 *row0 = (const _Float16 *)src +
+                         (size_t)tile_row * 32 * (size_t)src_cols +
+                         (size_t)tile_col * 32;
   const uint32_t width = 32u * 2u;
   const uint32_t height = 32u;
   const uint32_t srcStride = (uint32_t)src_cols * 2u;
@@ -1672,11 +1780,9 @@ static int omni_async_kick(const void *src, void *dest, int32_t elem_bytes,
   uint32_t bytes = (uint32_t)elem_bytes * (uint32_t)num_elems;
   if (bytes == 0 || bytes > sizeof(omni_stage[0]) || !src || !dest)
     return 0;
-  if (__atomic_load_n(&omni_async_count, __ATOMIC_ACQUIRE) >=
-      OMNI_STAGE_SLOTS)
+  if (__atomic_load_n(&omni_async_count, __ATOMIC_ACQUIRE) >= OMNI_STAGE_SLOTS)
     omni_async_complete();
-  if (__atomic_load_n(&omni_async_count, __ATOMIC_ACQUIRE) >=
-      OMNI_STAGE_SLOTS)
+  if (__atomic_load_n(&omni_async_count, __ATOMIC_ACQUIRE) >= OMNI_STAGE_SLOTS)
     return 0;
 
   int job_idx = __atomic_load_n(&omni_async_tail, __ATOMIC_RELAXED);
@@ -1717,7 +1823,8 @@ static int omni_async_kick(const void *src, void *dest, int32_t elem_bytes,
 
 void __omni_fetch_wait(int32_t sem_handle) {
   /* Sem only.  HexKL deferred WH is finished in signal() after Mm so the
-   * DDR→stage DMA can overlap compute; completing in wait() corrupted results. */
+   * DDR→stage DMA can overlap compute; completing in wait() corrupted results.
+   */
   unsigned sem_idx = (unsigned)sem_handle & (OMNI_SEM_POOL_SIZE - 1);
   unsigned generation = (unsigned)sem_handle / OMNI_SEM_POOL_SIZE;
   if (sem_idx >= OMNI_SEM_POOL_SIZE ||
@@ -1743,30 +1850,28 @@ void __omni_fetch_wait(int32_t sem_handle) {
   __atomic_fetch_add(&omni_stall_accum, (unsigned)spins, __ATOMIC_RELAXED);
   __atomic_fetch_add(&omni_stall_events, 1, __ATOMIC_RELAXED);
   int observed = __atomic_load_n(&omni_sem_pool[sem_idx], __ATOMIC_ACQUIRE);
-  while (observed > 0 &&
-         !__atomic_compare_exchange_n(&omni_sem_pool[sem_idx], &observed,
-                                      observed - 1, 0, __ATOMIC_ACQ_REL,
-                                      __ATOMIC_ACQUIRE)) {
+  while (observed > 0 && !__atomic_compare_exchange_n(
+                             &omni_sem_pool[sem_idx], &observed, observed - 1,
+                             0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
   }
 }
 
 /* -------------------------------------------------------------------------
  * In-situ gather helpers (scalar; compiler auto-vectorises on V73+)
  * ------------------------------------------------------------------------- */
-static void gather_reorder(const void *src, void *dest,
-                           int32_t elem_bytes, int32_t count,
-                           const int32_t *index_map) {
+static void gather_reorder(const void *src, void *dest, int32_t elem_bytes,
+                           int32_t count, const int32_t *index_map) {
   const char *s = (const char *)src;
-  char       *d = (char *)dest;
+  char *d = (char *)dest;
   for (int32_t i = 0; i < count; ++i)
     memcpy(d + i * elem_bytes, s + index_map[i] * elem_bytes,
            (size_t)elem_bytes);
 }
 
-static void hmx_weight_gather(const void *src, void *dest,
-                               int32_t elem_bytes, int32_t M, int32_t K) {
+static void hmx_weight_gather(const void *src, void *dest, int32_t elem_bytes,
+                              int32_t M, int32_t K) {
   const char *s = (const char *)src;
-  char       *d = (char *)dest;
+  char *d = (char *)dest;
   const int32_t TILE = 32;
   int32_t num_tiles = (M + TILE - 1) / TILE;
   int32_t dst_flat = 0;
@@ -1774,20 +1879,19 @@ static void hmx_weight_gather(const void *src, void *dest,
     for (int32_t k = 0; k < K; ++k)
       for (int32_t m = 0; m < TILE; ++m) {
         int32_t src_row = t * TILE + m;
-        if (src_row >= M) src_row = M - 1;
-        memcpy(d + dst_flat * elem_bytes,
-               s + (src_row * K + k) * elem_bytes,
+        if (src_row >= M)
+          src_row = M - 1;
+        memcpy(d + dst_flat * elem_bytes, s + (src_row * K + k) * elem_bytes,
                (size_t)elem_bytes);
         ++dst_flat;
       }
 }
 
 static void hmx_activation_gather(const void *src, void *dest,
-                                   int32_t elem_bytes,
-                                   int32_t N, int32_t C,
-                                   int32_t H, int32_t W) {
+                                  int32_t elem_bytes, int32_t N, int32_t C,
+                                  int32_t H, int32_t W) {
   const char *s = (const char *)src;
-  char       *d = (char *)dest;
+  char *d = (char *)dest;
   const int32_t VEC = 32;
   int32_t C32 = (C + VEC - 1) / VEC;
   int32_t dst_flat = 0;
@@ -1802,8 +1906,7 @@ static void hmx_activation_gather(const void *src, void *dest,
               src_flat = n * C * H * W + c * H * W + h * W + w;
             else
               src_flat = n * C * H * W + (C - 1) * H * W + h * W + w;
-            memcpy(d + dst_flat * elem_bytes,
-                   s + src_flat * elem_bytes,
+            memcpy(d + dst_flat * elem_bytes, s + src_flat * elem_bytes,
                    (size_t)elem_bytes);
             ++dst_flat;
           }
@@ -1830,7 +1933,10 @@ static void hmx_activation_gather(const void *src, void *dest,
 enum {
   OMNI_L2_PAGE_BYTES = 4096,
   OMNI_L2_RECOMMENDED_MAX_BYTES = 8191,
-  OMNI_USR_PFA_BIT = 3
+  /* V73 Programmer's Reference Manual, USR register: PFA is bit 31.
+   * The old bit-3 test never observed an active request, so a segmented CRP
+   * hint could overrun the hardware's three-entry pending-command queue. */
+  OMNI_USR_PFA_BIT = 31
 };
 
 static unsigned omni_l2fetch_active(void) {
@@ -1843,20 +1949,18 @@ static void omni_l2fetch_2d(const void *ptr, uint32_t width, uint32_t height,
                             uint32_t stride) {
   uint64_t requested = (uint64_t)width * (uint64_t)height;
   __atomic_fetch_add(&omni_l2_requested_bytes, requested, __ATOMIC_RELAXED);
-  if (!ptr || width == 0 || height == 0 || stride == 0 ||
-      width > UINT16_MAX || height > UINT16_MAX || stride > UINT16_MAX) {
+  if (!ptr || width == 0 || height == 0 || stride == 0 || width > UINT16_MAX ||
+      height > UINT16_MAX || stride > UINT16_MAX) {
     __atomic_fetch_add(&omni_l2_unsupported, 1, __ATOMIC_RELAXED);
     return;
   }
 
   uintptr_t start = (uintptr_t)ptr;
   uintptr_t startPage = start & ~(uintptr_t)(OMNI_L2_PAGE_BYTES - 1);
-  uint32_t pageRoom =
-      OMNI_L2_PAGE_BYTES - (uint32_t)(start - startPage);
+  uint32_t pageRoom = OMNI_L2_PAGE_BYTES - (uint32_t)(start - startPage);
   uint32_t safeWidth = width < pageRoom ? width : pageRoom;
   uint32_t maxRowsByBytes = OMNI_L2_RECOMMENDED_MAX_BYTES / safeWidth;
-  uint32_t safeHeight =
-      height < maxRowsByBytes ? height : maxRowsByBytes;
+  uint32_t safeHeight = height < maxRowsByBytes ? height : maxRowsByBytes;
 
   while (safeHeight > 1) {
     uintptr_t lastStart = start + (uintptr_t)(safeHeight - 1) * stride;
@@ -1877,9 +1981,8 @@ static void omni_l2fetch_2d(const void *ptr, uint32_t width, uint32_t height,
   unsigned issued = __atomic_load_n(&omni_l2_issued, __ATOMIC_RELAXED);
   uint64_t issuedBytes =
       __atomic_load_n(&omni_l2_issued_bytes, __ATOMIC_RELAXED);
-  uint64_t remainingBytes = issuedBytes < omni_l2_max_bytes
-                                ? omni_l2_max_bytes - issuedBytes
-                                : 0;
+  uint64_t remainingBytes =
+      issuedBytes < omni_l2_max_bytes ? omni_l2_max_bytes - issuedBytes : 0;
   if ((omni_l2_max_commands && issued >= omni_l2_max_commands) ||
       (omni_l2_max_bytes && safeBytes > remainingBytes)) {
     __atomic_fetch_add(&omni_l2_budget_suppressed, 1, __ATOMIC_RELAXED);
@@ -1889,22 +1992,20 @@ static void omni_l2fetch_2d(const void *ptr, uint32_t width, uint32_t height,
   /* Coalesce only identical recent hardware requests. Distinct offsets on one
    * page may cover distinct demand lines and therefore remain independent. */
   if (omni_l2_recent_count) {
-    uint64_t requestKey = ((uint64_t)((uintptr_t)ptr >> 7) *
-                           UINT64_C(0x9e3779b97f4a7c15)) ^
-                          ((uint64_t)safeWidth << 48) ^
-                          ((uint64_t)safeHeight << 32) ^ (uint64_t)stride;
+    uint64_t requestKey =
+        ((uint64_t)((uintptr_t)ptr >> 7) * UINT64_C(0x9e3779b97f4a7c15)) ^
+        ((uint64_t)safeWidth << 48) ^ ((uint64_t)safeHeight << 32) ^
+        (uint64_t)stride;
     if (requestKey == 0)
       requestKey = 1;
     for (unsigned i = 0; i < omni_l2_recent_count; ++i) {
       if (omni_l2_recent_requests[i] == requestKey) {
-        __atomic_fetch_add(&omni_l2_duplicate_suppressed, 1,
-                           __ATOMIC_RELAXED);
+        __atomic_fetch_add(&omni_l2_duplicate_suppressed, 1, __ATOMIC_RELAXED);
         return;
       }
     }
     omni_l2_recent_requests[omni_l2_recent_cursor] = requestKey;
-    omni_l2_recent_cursor =
-        (omni_l2_recent_cursor + 1) % omni_l2_recent_count;
+    omni_l2_recent_cursor = (omni_l2_recent_cursor + 1) % omni_l2_recent_count;
   }
 
   /* Do not overwrite a useful V73 command.  This is deliberately a
@@ -1948,6 +2049,29 @@ void __omni_fetch_l2_hint_2d(const void *src, int32_t width_bytes,
 #endif
 }
 
+void __omni_fetch_l2_hint_segmented(const void *src, int32_t width_bytes,
+                                    int32_t rows, int32_t stride_bytes,
+                                    int32_t site_id) {
+  if (!src || width_bytes <= 0 || rows <= 0 || stride_bytes <= 0 || site_id < 0)
+    return;
+#ifdef __hexagon__
+  /* The same CRP source site is revisited many times by an enclosing loop
+   * (1440 calls/site in full DINOv2). Rotate the physical row instead of
+   * expanding one logical hint into a burst of 16 l2fetch commands. This
+   * preserves exact byte addressing, stays single-flight, and converts the
+   * measured duplicate traffic into useful cross-row coverage. */
+  unsigned slot = (unsigned)site_id % OMNI_L2_SEGMENTED_SITES;
+  unsigned cursor =
+      __atomic_fetch_add(&omni_l2_segmented_cursor[slot], 1, __ATOMIC_RELAXED);
+  unsigned row = cursor % (unsigned)rows;
+  const char *row_ptr = (const char *)src + (size_t)row * stride_bytes;
+  omni_l2fetch_2d(row_ptr, (uint32_t)width_bytes, /*height=*/1,
+                  (uint32_t)width_bytes);
+#else
+  (void)site_id;
+#endif
+}
+
 /* -------------------------------------------------------------------------
  * __omni_fetch_prefetch_insitu
  *
@@ -1974,12 +2098,12 @@ void __omni_fetch_l2_hint_2d(const void *src, int32_t width_bytes,
  *   already structured for that upgrade.
  * ------------------------------------------------------------------------- */
 void __omni_fetch_prefetch_insitu(const void *src, void *dest,
-                                   int32_t elem_bytes, int32_t num_elems,
-                                   int32_t layout_kind, int32_t lookahead,
-                                   const int32_t *index_map,
-                                   int32_t tile_row, int32_t tile_col,
-                                   int32_t src_cols, int32_t act_off,
-                                   int32_t scr_off, int32_t src_rows) {
+                                  int32_t elem_bytes, int32_t num_elems,
+                                  int32_t layout_kind, int32_t lookahead,
+                                  const int32_t *index_map, int32_t tile_row,
+                                  int32_t tile_col, int32_t src_cols,
+                                  int32_t act_off, int32_t scr_off,
+                                  int32_t src_rows) {
   if (elem_bytes <= 0 || num_elems <= 0 || !src)
     return;
   /* L2 hints may pass dest==src; real copies require a distinct dest. */
@@ -2042,8 +2166,7 @@ void __omni_fetch_prefetch_insitu(const void *src, void *dest,
       tile_col >= 0) {
     const int32_t weight_off = act_off;
     const int32_t stage_off = scr_off;
-    void *wh_dest =
-        weight_off >= 0 ? (char *)dest + weight_off : dest;
+    void *wh_dest = weight_off >= 0 ? (char *)dest + weight_off : dest;
     if (lookahead == -1) {
       OmniWhCacheEntry *cached =
           omni_wh_cache_lookup(src, tile_row, tile_col, src_cols, src_rows);
@@ -2106,8 +2229,7 @@ void __omni_fetch_prefetch_insitu(const void *src, void *dest,
       OmniWhCacheEntry *entry =
           omni_wh_cache_reserve(src, tile_row, tile_col, src_cols, src_rows);
       memcpy(entry->data, wh_dest, OMNI_WH_TILE_BYTES);
-      if (entry->epoch ==
-          __atomic_load_n(&omni_wh_epoch, __ATOMIC_ACQUIRE))
+      if (entry->epoch == __atomic_load_n(&omni_wh_epoch, __ATOMIC_ACQUIRE))
         __atomic_store_n(&entry->valid, 1, __ATOMIC_RELEASE);
     }
     return;
@@ -2207,8 +2329,7 @@ int32_t __omni_fetch_update_distance(int32_t current_dist) {
    * hexagon_protos.h dependency).  Uses the spin counts accumulated in
    * __omni_fetch_wait since the previous update as the timeliness signal. */
   int events = __atomic_exchange_n(&omni_stall_events, 0, __ATOMIC_ACQ_REL);
-  unsigned accum =
-      __atomic_exchange_n(&omni_stall_accum, 0, __ATOMIC_ACQ_REL);
+  unsigned accum = __atomic_exchange_n(&omni_stall_accum, 0, __ATOMIC_ACQ_REL);
 
   int dist = (current_dist >= MIN_LOOKAHEAD && current_dist <= MAX_LOOKAHEAD)
                  ? current_dist

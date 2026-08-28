@@ -25,6 +25,11 @@ std::string getHmxRmToWhF16FnName();
 std::string getHmxMmF16FnName();
 std::string getHmxAhToRmF16FnName();
 std::string getHmxCopyF16ToF32SubmatrixFnName();
+std::string getHmxCopyF16ToSubmatrixFnName();
+std::string getHmxCopyF16BiasToSubmatrixFnName();
+std::string getHmxAsyncDrainWaitSlotFnName();
+std::string getHmxAsyncDrainStartF16FnName();
+std::string getHmxAsyncDrainFlushFnName();
 
 // HexKL macro runtime entry points
 std::string getMacroInitializeFnName();

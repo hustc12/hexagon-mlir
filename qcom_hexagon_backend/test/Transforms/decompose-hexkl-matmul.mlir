@@ -30,6 +30,26 @@ func.func @test_static_shapes(%arg0: memref<32x64xf16>,
 
 // -----
 
+// Test 7: An F16 result uses the direct F16 epilogue rather than widening to
+// F32 in DDR.
+
+func.func @test_f16_epilogue(%arg0: memref<32x64xf16>,
+                              %arg1: memref<64x128xf16>,
+                              %output: memref<32x128xf16>) {
+    hexkl.matmul ins(%arg0, %arg1 : memref<32x64xf16>, memref<64x128xf16>)
+                 outs(%output : memref<32x128xf16>)
+    return
+}
+
+// CHECK-LABEL: func.func @test_f16_epilogue
+// CHECK:       hexkl.micro_hmx_acc_read_f16
+// CHECK:       hexkl.micro_hmx_ah_to_rm_f16
+// CHECK:       hexkl.micro_hmx_copy_f16_to_submatrix
+// CHECK-NOT:   hexkl.micro_hmx_copy_f16_to_f32_submatrix
+// CHECK:       hexagonmem.dealloc
+
+// -----
+
 // Test 2: Fully dynamic shapes
 
 func.func @test_fully_dynamic(%arg0: memref<?x?xf16>,

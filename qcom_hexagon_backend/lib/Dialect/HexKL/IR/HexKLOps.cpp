@@ -151,3 +151,32 @@ LogicalResult MicroHMXCopyF16ToF32SubmatrixOp::verify() {
                            getOutputRows(), "output_rows", getOutputCols(),
                            "output_cols");
 }
+
+LogicalResult MicroHMXCopyF16ToSubmatrixOp::verify() {
+  Operation *op = getOperation();
+  if (failed(verifyHmxBlockMemref(op, getHmxBlock())))
+    return failure();
+
+  return verifyNonNegative(op, getInOffset(), "in_offset", getTileRow(),
+                           "tile_row", getTileCol(), "tile_col",
+                           getOutputRows(), "output_rows", getOutputCols(),
+                           "output_cols");
+}
+
+LogicalResult MicroHMXCopyF16BiasToSubmatrixOp::verify() {
+  Operation *op = getOperation();
+  if (failed(verifyHmxBlockMemref(op, getHmxBlock())))
+    return failure();
+  auto biasType = dyn_cast<MemRefType>(getBias().getType());
+  auto dstType = dyn_cast<MemRefType>(getDst().getType());
+  if (!biasType || biasType.getRank() != 1 ||
+      !biasType.getElementType().isF16())
+    return emitOpError("bias must be a rank-1 memref of f16");
+  if (!dstType || dstType.getRank() != 2 ||
+      !dstType.getElementType().isF16())
+    return emitOpError("dst must be a rank-2 memref of f16");
+  return verifyNonNegative(op, getInOffset(), "in_offset", getTileRow(),
+                           "tile_row", getTileCol(), "tile_col",
+                           getOutputRows(), "output_rows", getOutputCols(),
+                           "output_cols");
+}

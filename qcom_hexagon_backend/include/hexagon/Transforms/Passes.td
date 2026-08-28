@@ -105,6 +105,9 @@ def HexagonLWPPass : Pass<"hexagon-lwp-instrumentation", "func::FuncOp"> {
     Option<"LWPloopDepth", "depth", "int",
            /*default=*/"1",
            "Depth level instrumentation">,
+    Option<"instrumentHexKLPhases", "hexkl-phases", "bool",
+           /*default=*/"false",
+           "Instrument individual HexKL/HMX compute and representation phases">,
    ];
 
   let constructor = "hexagon::createHexagonLWPPass()";
@@ -264,7 +267,13 @@ def MatmulToHexKL : InterfacePass<"matmul-to-hexkl", "mlir::FunctionOpInterface"
   let options = [
     Option<"mode", "mode", "std::string",
            /*default=*/"\"micro\"",
-           "HexKL API mode: 'micro' (default) or 'macro'">
+           "HexKL API mode: 'micro' (default) or 'macro'">,
+    Option<"consumerF16Epilogue", "consumer-f16-epilogue", "bool",
+           /*default=*/"false",
+           "ALPS P5j: form an F16 HMX epilogue when the sole consumer is an identity F32-to-F16 truncation">,
+    Option<"consumerF16BiasEpilogue", "consumer-f16-bias-epilogue", "bool",
+           /*default=*/"false",
+           "ALPS P5l: fuse a strict rank-2 broadcast bias into the HMX F16 result drain">
   ];
 }
 
@@ -304,6 +313,18 @@ def DecomposeHexKLMatmul :
     Option<"enableDmaToVtcm", "enable-dma-to-vtcm", "bool",
            /*default=*/"false",
            "Reserve a non-aliasing VTCM staging tile for OmniFetch DMA.">,
+    Option<"enableDirectOutputFormation", "enable-direct-output-formation", "bool",
+           /*default=*/"false",
+           "ALPS P5k: use the HexKL epilogue's valid-row/column clipping to write non-aligned results directly into their final destination">,
+    Option<"enableF16BiasEpilogueFormation", "enable-f16-bias-epilogue-formation", "bool",
+           /*default=*/"false",
+           "ALPS P5l: apply a strict rank-2 broadcast bias during the HMX F16 result drain">,
+    Option<"enableAsyncDrainAnalysis", "enable-async-drain-analysis", "bool",
+           /*default=*/"false",
+           "ALPS P5m: analyze admission and overlap coverage for a ping-pong VTCM-to-DDR HMX result drain without changing execution">,
+    Option<"enableAsyncDrain", "enable-async-drain", "bool",
+           /*default=*/"false",
+           "ALPS P5n: asynchronously drain admitted HMX F16 tiles through ping-pong VTCM slots with synchronous boundary fallback">
   ];
 
   let constructor = "hexagon::createDecomposeHexKLMatmulPass()";
@@ -1070,8 +1091,34 @@ def AlpsConsumerDrivenLayout :
            /*default=*/"false",
            "ALPS P5a: assign stable IDs and origin fingerprints to admitted "
            "consumer-layout contracts">,
+    Option<"allowInnermostLoopInterchange", "allow-innermost-loop-interchange", "bool",
+           /*default=*/"false",
+           "ALPS P2g-b: admit an innermost-moving permutation only when every "
+           "producer input remains unit-stride or invariant after interchange">,
+    Option<"allowRegisterTileFormation", "allow-register-tile-formation", "bool",
+           /*default=*/"false",
+           "ALPS P2g-c: form bounded 8x16 HVX register tiles for proven cyclic "
+           "innermost permutations that cannot remain globally unit-stride">,
   ];
   let dependentDialects = [
+    "mlir::linalg::LinalgDialect",
+    "mlir::tensor::TensorDialect",
+  ];
+}
+
+def AlpsPatchConvFormation :
+    InterfacePass<"alps-patch-conv-formation", "mlir::FunctionOpInterface"> {
+  let summary = "Form patch-embedding convolution in its consumer layout";
+  let description = [{
+    Rewrites a strictly proven non-overlapping NCHW/FCHW patch convolution
+    followed by NCHW-to-NHWC materialization into an NHWC producer. Static
+    weights are flattened and transposed so output channels are contiguous,
+    exposing a native-width innermost HVX dimension without materializing the
+    image patch matrix.
+  }];
+  let constructor = "hexagon::createAlpsPatchConvFormationPass()";
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
     "mlir::linalg::LinalgDialect",
     "mlir::tensor::TensorDialect",
   ];
@@ -1099,6 +1146,19 @@ def AlpsContractDischargeLedger :
   ];
 }
 
+def AlpsContinuityAudit :
+    InterfacePass<"alps-continuity-audit", "mlir::FunctionOpInterface"> {
+  let summary = "Audit final physical continuity around ALPS layout contracts";
+  let description = [{
+    ALPS P2g-a is an analysis-only pass over post-bufferization vector IR. It
+    correlates P2a zero-copy and P2e direct/native layout contracts with final
+    vector transfers, then reports unit-stride producer inputs, destination
+    writes, consumer reads, static tile bytes, and VMEMU-risk transfers. It
+    never changes code generation.
+  }];
+  let constructor = "hexagon::createAlpsContinuityAuditPass()";
+}
+
 def AlpsLayoutSupplyPrefetch :
     InterfacePass<"alps-layout-supply-prefetch", "mlir::FunctionOpInterface"> {
   let summary = "Prefetch the next tile feeding a discharged layout contract";
@@ -1123,6 +1183,148 @@ def AlpsLayoutSupplyPrefetch :
     "mlir::omni_fetch::OmniFetchDialect",
     "mlir::scf::SCFDialect",
     "mlir::vector::VectorDialect",
+  ];
+}
+
+def AlpsCrpSupplyAnalysis :
+    InterfacePass<"alps-crp-supply-analysis", "mlir::FunctionOpInterface"> {
+  let summary = "Analyze future supply for P2g register-tile formation";
+  let description = [{
+    ALPS P5f-a is analysis-only. It examines only vector reads emitted from a
+    proven P2g-c register-tile contract and reports whether their storage is
+    loop-invariant/read-only, unit-stride, statically bounded and addressable
+    at least one loop iteration before use. No prefetch or DMA is emitted.
+  }];
+  let constructor = "hexagon::createAlpsCrpSupplyAnalysisPass()";
+  let options = [
+    Option<"pageBytes", "page-bytes", "int64_t", /*default=*/"4096",
+           "Memory page size used for worst-case tile footprint">,
+    Option<"minLeadIterations", "min-lead-iterations", "int64_t",
+           /*default=*/"1",
+           "Minimum loop-carried lookahead required for admission">,
+  ];
+}
+
+def AlpsCrpSupplyPrefetch :
+    InterfacePass<"alps-crp-supply-prefetch", "mlir::FunctionOpInterface"> {
+  let summary = "Prefetch admitted future sources for P2g register tiles";
+  let description = [{
+    ALPS P5f-b inserts a one-iteration-ahead, runtime-page-clipped L2 hint only
+    for an explicitly marked P2g-c register-tile read whose exact subview is
+    unit-stride, external, read-only, statically bounded, and directly
+    addressable from the loop induction variable. Remainders and inferred
+    graph traffic are not admitted.
+  }];
+  let constructor = "hexagon::createAlpsCrpSupplyPrefetchPass()";
+  let options = [
+    Option<"distance", "distance", "int64_t", /*default=*/"1",
+           "Number of loop iterations to prefetch ahead">,
+    Option<"maxBytes", "max-bytes", "int64_t", /*default=*/"128",
+           "Maximum admitted register-tile source bytes">,
+    Option<"pageBytes", "page-bytes", "int64_t", /*default=*/"4096",
+           "Runtime page-clipping granularity">,
+    Option<"maxWorstPages", "max-worst-pages", "int64_t", /*default=*/"2",
+           "Maximum pages touched for an arbitrarily aligned tile">,
+    Option<"pageSafeSegmented", "page-safe-segmented", "bool",
+           /*default=*/"false",
+           "Mark admitted hints for physical contiguous/row-segmented lowering">,
+    Option<"l2LineBytes", "l2-line-bytes", "int64_t", /*default=*/"128",
+           "Physical L2 cache-line bytes used by segmented traffic admission">,
+    Option<"minSegmentUtilizationPercent", "min-segment-utilization-percent",
+           "int64_t", /*default=*/"50",
+           "Minimum useful-byte percentage for a segmented L2 hint">,
+  ];
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::memref::MemRefDialect",
+    "mlir::omni_fetch::OmniFetchDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::vector::VectorDialect",
+  ];
+}
+
+def AlpsCrpVtcmFormation :
+    InterfacePass<"alps-crp-vtcm-formation", "mlir::FunctionOpInterface"> {
+  let summary = "Form exact P2g-c source tiles contiguously in VTCM";
+  let description = [{
+    ALPS P5g-a is a synchronous matched gate for the V73 HVX/VTCM path. It
+    accepts only a statically legal rank-4 P2g-c source whose unit dimensions
+    can collapse to one strided 2-D DDR tile. The pass emits one 2-D copy into
+    a contiguous VTCM tile and redirects the marked HVX transfer to that tile.
+    It neither inserts an L2 hint nor claims overlap; a later P5g-b stage may
+    introduce ping-pong DMA only after this physical-formation gate wins.
+  }];
+  let constructor = "hexagon::createAlpsCrpVtcmFormationPass()";
+  let dependentDialects = [
+    "mlir::memref::MemRefDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::vector::VectorDialect",
+  ];
+}
+
+def AlpsCrpVtcmWindow :
+    InterfacePass<"alps-crp-vtcm-window", "mlir::FunctionOpInterface"> {
+  let summary = "Coalesce narrow CRP tiles into a reusable VTCM supply window";
+  let description = [{
+    ALPS P5g-b widens a family of narrow P2g-c source tiles into a reusable
+    channel window. The initial V73 policy copies a 256x32 f16 source window
+    with one 64-byte-row 2-D DMA and serves adjacent 16x4 HVX register tiles
+    from that VTCM allocation. It is independently switchable and does not
+    imply lookahead or double buffering.
+  }];
+  let constructor = "hexagon::createAlpsCrpVtcmWindowPass()";
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::memref::MemRefDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::vector::VectorDialect",
+  ];
+}
+
+def AlpsCrpProducerDirectAnalysis :
+    InterfacePass<"alps-crp-producer-direct-analysis", "mlir::FunctionOpInterface"> {
+  let summary = "Prove whether a CRP producer can form its result directly in VTCM";
+  let description = [{
+    ALPS P5g-d is an analysis-only gate. It traces each P2g-c register-tile
+    source through memref views to its allocation, inventories all readers and
+    writers, and requires a unique dominating full-overwrite producer, only
+    compatible CRP readers, no escaping aliases, a static lifetime, and a
+    bounded VTCM footprint. It never changes memory space or inserts DMA.
+  }];
+  let options = [
+    Option<"rewriteEpochVtcm", "rewrite-epoch-vtcm", "bool",
+           /*default=*/"false",
+           "P5g-e: redirect only coverage-proven HVX-only epochs to VTCM">,
+    Option<"rewriteEpochHeadMajorVtcm", "rewrite-epoch-head-major-vtcm", "bool",
+           /*default=*/"false",
+           "P5g-f: form proven rank-3 HVX-only epochs directly in head-major VTCM layout">,
+    Option<"rewriteProducerLoopOrder", "rewrite-producer-loop-order", "bool",
+           /*default=*/"false",
+           "P5g-g: interchange an admitted perfect producer nest to head-outer/token-inner order">
+  ];
+  let constructor = "hexagon::createAlpsCrpProducerDirectAnalysisPass()";
+  let dependentDialects = [
+    "mlir::memref::MemRefDialect",
+    "mlir::vector::VectorDialect",
+  ];
+}
+
+def AlpsAttentionDestinationFormation :
+    InterfacePass<"alps-attention-destination-formation", "mlir::FunctionOpInterface"> {
+  let summary = "Form padded attention-row results directly in their final destination";
+  let description = [{
+    ALPS P5h recognizes a post-bufferization attention chain that copies the
+    active columns into an identity-layout temporary, computes in-place,
+    copies the complete padded source into a destination, and finally copies
+    the temporary back over the active destination subview.  It redirects the
+    in-place consumer to the final strided subview and preserves only the
+    untouched tail columns.  This removes the temporary writeback and the
+    redundant active portion of the whole-buffer copy without inserting
+    prefetch or changing numerical computation.
+  }];
+  let constructor = "hexagon::createAlpsAttentionDestinationFormationPass()";
+  let dependentDialects = [
+    "mlir::memref::MemRefDialect",
   ];
 }
 

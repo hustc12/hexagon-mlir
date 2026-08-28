@@ -62,12 +62,20 @@ def run(args: argparse.Namespace) -> None:
         for profile, output in results_by_profile.items():
             finite = bool(torch.isfinite(output[0]).all())
             top1_match = output[0].argmax().item() == reference.argmax().item()
-            diff = (output[0].float() - reference.float()).abs().max().item()
+            abs_diff = (output[0].float() - reference.float()).abs()
+            diff = abs_diff.max().item()
+            mean_diff = abs_diff.mean().item()
+            allclose = bool(
+                torch.allclose(
+                    output[0].float(), reference.float(), rtol=1e-2, atol=1e-2
+                )
+            )
             print(
                 f"[Compare] profile={profile} finite={finite} "
-                f"max_abs_diff={diff:.4f} top1_match={top1_match}"
+                f"max_abs_diff={diff:.4f} mean_abs_diff={mean_diff:.6f} "
+                f"allclose={allclose} top1_match={top1_match}"
             )
-            all_ok = all_ok and finite and top1_match
+            all_ok = all_ok and finite and allclose and top1_match
         if not all_ok:
             raise AssertionError(
                 "DINOv2-small interleaved result failed correctness gate"
@@ -96,6 +104,7 @@ def run(args: argparse.Namespace) -> None:
         enable_lwp=args.enable_lwp,
         lwp_loop_depth=args.lwp_loop_depth,
         disable_lwp_loop=args.disable_lwp_loop,
+        instrument_lwp_hexkl_phases=args.lwp_hexkl_phases,
         omnifetch_items_through=args.omnifetch_items_through,
         enable_omnifetch_m_pad_hmx=args.enable_omnifetch_m_pad_hmx,
         enable_out_params=args.enable_out_params,
@@ -119,13 +128,19 @@ def run(args: argparse.Namespace) -> None:
         iterations=args.device_iterations,
     )
     finite = bool(torch.isfinite(output[0]).all())
-    diff = (output[0].float() - reference.float()).abs().max().item()
+    abs_diff = (output[0].float() - reference.float()).abs()
+    diff = abs_diff.max().item()
+    mean_diff = abs_diff.mean().item()
+    allclose = bool(
+        torch.allclose(output[0].float(), reference.float(), rtol=1e-2, atol=1e-2)
+    )
     top1_match = output[0].argmax().item() == reference.argmax().item()
     print(
         f"[Compare] finite={finite} max_abs_diff={diff:.4f} "
+        f"mean_abs_diff={mean_diff:.6f} allclose={allclose} "
         f"top1_match={top1_match}"
     )
-    if not finite or not top1_match:
+    if not finite or not allclose or not top1_match:
         raise AssertionError("DINOv2-small Hexagon result failed correctness gate")
 
 

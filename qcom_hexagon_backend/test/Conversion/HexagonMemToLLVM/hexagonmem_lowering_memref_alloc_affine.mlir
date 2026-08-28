@@ -44,3 +44,27 @@ func.func @func() {
   %1 = hexagonmem.alloc() : memref<62xi8, #map, 1>
   return
 }
+
+// A permutation-style strided VTCM allocation must retain its logical rank.
+// Normalizing its one-result linear layout map would incorrectly flatten the
+// descriptor and leave an unreconcilable rank-1 -> rank-3 cast downstream.
+//
+// CHECK-LABEL: @head_major
+// CHECK: %[[BYTES:.+]] = llvm.mlir.constant(197376 : i32) : i32
+// CHECK: %[[PTR:.+]] = llvm.call @hexagon_runtime_alloc_1d_dsp(%[[BYTES]], {{.*}}, {{.*}}) : (i32, i64, i1) -> !llvm.ptr
+// CHECK: llvm.mlir.poison : !llvm.struct<(ptr, ptr, i64, array<3 x i64>, array<3 x i64>)>
+// CHECK: llvm.insertvalue {{.*}}[3, 0] : !llvm.struct<(ptr, ptr, i64, array<3 x i64>, array<3 x i64>)>
+// CHECK: llvm.insertvalue {{.*}}[4, 0] : !llvm.struct<(ptr, ptr, i64, array<3 x i64>, array<3 x i64>)>
+// CHECK: llvm.insertvalue {{.*}}[3, 1] : !llvm.struct<(ptr, ptr, i64, array<3 x i64>, array<3 x i64>)>
+// CHECK: llvm.insertvalue {{.*}}[4, 1] : !llvm.struct<(ptr, ptr, i64, array<3 x i64>, array<3 x i64>)>
+// CHECK: llvm.insertvalue {{.*}}[3, 2] : !llvm.struct<(ptr, ptr, i64, array<3 x i64>, array<3 x i64>)>
+// CHECK: llvm.insertvalue {{.*}}[4, 2] : !llvm.struct<(ptr, ptr, i64, array<3 x i64>, array<3 x i64>)>
+// CHECK-NOT: builtin.unrealized_conversion_cast
+func.func @head_major() {
+  %0 = hexagonmem.alloc() {bufferization.manual_deallocation,
+                           alignment = 128 : i64}
+      : memref<257x6x64xf16, strided<[64, 16448, 1]>, 1>
+  hexagonmem.dealloc %0 {bufferization.manual_deallocation}
+      : memref<257x6x64xf16, strided<[64, 16448, 1]>, 1>
+  return
+}

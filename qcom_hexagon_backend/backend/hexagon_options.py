@@ -109,9 +109,29 @@ class HexagonOptions:
     enableAlpsProducerDirectAttention: bool = False
     enableAlpsConsumerDrivenLayout: bool = False
     enableAlpsConsumerLayoutPropagation: bool = False
+    enableAlpsContinuityAudit: bool = False
+    enableAlpsLoopInterchangedDirectFormation: bool = False
+    enableAlpsRegisterTileFormation: bool = False
     enableAlpsContractDischargeLedger: bool = False
     enableAlpsRepresentationSupplyAnalysis: bool = False
     enableAlpsLayoutSupplyPrefetch: bool = False
+    enableAlpsCrpSupplyAnalysis: bool = False
+    enableAlpsCrpSupplyPrefetch: bool = False
+    enableAlpsCrpSegmentedSupply: bool = False
+    enableAlpsCrpVtcmFormation: bool = False
+    enableAlpsCrpVtcmWindow: bool = False
+    enableAlpsCrpVtcmAsyncWindow: bool = False
+    enableAlpsCrpProducerDirectAnalysis: bool = False
+    enableAlpsCrpProducerDirectVtcm: bool = False
+    enableAlpsCrpProducerDirectHeadMajor: bool = False
+    enableAlpsCrpProducerLoopFormation: bool = False
+    enableAlpsAttentionDestinationFormation: bool = False
+    enableAlpsPatchConvFormation: bool = False
+    enableAlpsHmxF16EpilogueFormation: bool = False
+    enableAlpsHmxDirectOutputFormation: bool = False
+    enableAlpsHmxF16BiasEpilogueFormation: bool = False
+    enableAlpsHmxAsyncDrainAnalysis: bool = False
+    enableAlpsHmxAsyncDrain: bool = False
     enableAlpsFusedTransformTransfer: bool = False
     enableAlpsMinimalStaticAdmission: bool = False
     enableAlpsExactReadiness: bool = False
@@ -180,6 +200,8 @@ class HexagonOptions:
     # By default, outer loop and nested sibling loops at LWPloopDepth 1 are instrumented.
     # Increasing LWPloopDepth may cause overhead.
     LWPloopDepth: int = 1
+    # Analysis-only: time each HexKL/HMX compute and representation operation.
+    instrumentLWPHexKLPhases: bool = False
 
     # By default, delete all artifacts pushed to device for this kernel's execution after it runs.
     # This solely applies to execution on the standalone launcher.

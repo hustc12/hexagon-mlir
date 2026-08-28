@@ -74,6 +74,21 @@ static Value alignedPtr(ConversionPatternRewriter &rewriter, Location loc,
   return desc.alignedPtr(rewriter, loc);
 }
 
+// Return the logical element-zero pointer, rather than the allocation base.
+// P5l consumer-contract operands commonly survive bufferization as subviews
+// into reused allocations.  Their aligned pointer still names the allocation
+// base; the descriptor offset must be applied before the runtime can index the
+// bias or final destination as a dense logical matrix.
+static Value alignedPtrWithOffset(ConversionPatternRewriter &rewriter,
+                                  Location loc, Value memrefDesc,
+                                  Type elementType) {
+  MemRefDescriptor desc(memrefDesc);
+  Value ptr = desc.alignedPtr(rewriter, loc);
+  Value offset = desc.offset(rewriter, loc);
+  return rewriter.create<LLVM::GEPOp>(loc, ptr.getType(), elementType, ptr,
+                                      ValueRange{offset});
+}
+
 struct LowerMatmul : public ConvertOpToLLVMPattern<hexkl::MatmulOp> {
   using ConvertOpToLLVMPattern<hexkl::MatmulOp>::ConvertOpToLLVMPattern;
 
@@ -193,6 +208,19 @@ getCopySubmatrixToF16Fn(ModuleOp module, ConversionPatternRewriter &rewriter) {
                                 voidTy);
 }
 
+static FailureOr<LLVM::LLVMFuncOp> getCopyF16BiasToSubmatrixFn(
+    ModuleOp module, ConversionPatternRewriter &rewriter) {
+  auto ctx = module->getContext();
+  auto ptrTy = LLVM::LLVMPointerType::get(ctx);
+  auto i32Ty = rewriter.getI32Type();
+  SmallVector<Type, 8> argTys{ptrTy, i32Ty, ptrTy, ptrTy,
+                              i32Ty, i32Ty, i32Ty, i32Ty};
+  auto voidTy = LLVM::LLVMVoidType::get(ctx);
+  return LLVM::lookupOrCreateFn(
+      rewriter, module, hexkl::getHmxCopyF16BiasToSubmatrixFnName(), argTys,
+      voidTy);
+}
+
 static FailureOr<LLVM::LLVMFuncOp>
 getRmToAhF16Fn(ModuleOp module, ConversionPatternRewriter &rewriter) {
   auto ctx = module->getContext();
@@ -248,6 +276,51 @@ getCopyF16ToF32SubmatrixFn(ModuleOp module,
   return LLVM::lookupOrCreateFn(rewriter, module,
                                 hexkl::getHmxCopyF16ToF32SubmatrixFnName(),
                                 argTys, voidTy);
+}
+
+static FailureOr<LLVM::LLVMFuncOp>
+getCopyF16ToSubmatrixFn(ModuleOp module,
+                        ConversionPatternRewriter &rewriter) {
+  auto ctx = module->getContext();
+  auto ptrTy = LLVM::LLVMPointerType::get(ctx);
+  auto i32Ty = rewriter.getI32Type();
+  SmallVector<Type, 7> argTys{ptrTy, i32Ty, ptrTy, i32Ty, i32Ty, i32Ty, i32Ty};
+  auto voidTy = LLVM::LLVMVoidType::get(ctx);
+  return LLVM::lookupOrCreateFn(
+      rewriter, module, hexkl::getHmxCopyF16ToSubmatrixFnName(), argTys,
+      voidTy);
+}
+
+static FailureOr<LLVM::LLVMFuncOp>
+getAsyncDrainWaitSlotFn(ModuleOp module,
+                        ConversionPatternRewriter &rewriter) {
+  auto i32Ty = rewriter.getI32Type();
+  auto voidTy = LLVM::LLVMVoidType::get(module.getContext());
+  return LLVM::lookupOrCreateFn(
+      rewriter, module, hexkl::getHmxAsyncDrainWaitSlotFnName(), {i32Ty},
+      voidTy);
+}
+
+static FailureOr<LLVM::LLVMFuncOp>
+getAsyncDrainStartF16Fn(ModuleOp module,
+                        ConversionPatternRewriter &rewriter) {
+  auto ctx = module.getContext();
+  auto ptrTy = LLVM::LLVMPointerType::get(ctx);
+  auto i32Ty = rewriter.getI32Type();
+  SmallVector<Type, 8> argTys{ptrTy, i32Ty, ptrTy, i32Ty,
+                              i32Ty, i32Ty, i32Ty, i32Ty};
+  return LLVM::lookupOrCreateFn(
+      rewriter, module, hexkl::getHmxAsyncDrainStartF16FnName(), argTys,
+      LLVM::LLVMVoidType::get(ctx));
+}
+
+static FailureOr<LLVM::LLVMFuncOp>
+getAsyncDrainFlushFn(ModuleOp module,
+                     ConversionPatternRewriter &rewriter) {
+  SmallVector<Type, 0> argTys;
+  return LLVM::lookupOrCreateFn(
+      rewriter, module, hexkl::getHmxAsyncDrainFlushFnName(), argTys,
+      LLVM::LLVMVoidType::get(module.getContext()));
 }
 
 static FailureOr<LLVM::LLVMFuncOp>
@@ -710,6 +783,125 @@ struct LowerCopyF16ToF32Submatrix
   }
 };
 
+struct LowerCopyF16ToSubmatrix
+    : public ConvertOpToLLVMPattern<hexkl::MicroHMXCopyF16ToSubmatrixOp> {
+  using ConvertOpToLLVMPattern<
+      hexkl::MicroHMXCopyF16ToSubmatrixOp>::ConvertOpToLLVMPattern;
+  LogicalResult matchAndRewrite(hexkl::MicroHMXCopyF16ToSubmatrixOp op,
+                                OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const {
+    Location loc = op.getLoc();
+    ModuleOp module = op->getParentOfType<ModuleOp>();
+    Value vtcmBase = alignedPtr(rewriter, loc, adaptor.getHmxBlock());
+    Value dstPtr = alignedPtr(rewriter, loc, adaptor.getDst());
+    auto fn = getCopyF16ToSubmatrixFn(module, rewriter);
+    if (failed(fn))
+      return failure();
+    auto callee = FlatSymbolRefAttr::get((*fn).getOperation());
+    SmallVector<Value> args{vtcmBase,
+                            adaptor.getInOffset(),
+                            dstPtr,
+                            adaptor.getTileRow(),
+                            adaptor.getTileCol(),
+                            adaptor.getOutputRows(),
+                            adaptor.getOutputCols()};
+    rewriter.replaceOpWithNewOp<LLVM::CallOp>(op, TypeRange{}, callee, args);
+    return success();
+  }
+};
+
+struct LowerCopyF16BiasToSubmatrix
+    : public ConvertOpToLLVMPattern<
+          hexkl::MicroHMXCopyF16BiasToSubmatrixOp> {
+  using ConvertOpToLLVMPattern<
+      hexkl::MicroHMXCopyF16BiasToSubmatrixOp>::ConvertOpToLLVMPattern;
+  LogicalResult matchAndRewrite(hexkl::MicroHMXCopyF16BiasToSubmatrixOp op,
+                                OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const {
+    Location loc = op.getLoc();
+    ModuleOp module = op->getParentOfType<ModuleOp>();
+    Value vtcmBase = alignedPtr(rewriter, loc, adaptor.getHmxBlock());
+    Type f16Ty = getTypeConverter()->convertType(rewriter.getF16Type());
+    Value biasPtr = alignedPtrWithOffset(rewriter, loc, adaptor.getBias(),
+                                         f16Ty);
+    Value dstPtr =
+        alignedPtrWithOffset(rewriter, loc, adaptor.getDst(), f16Ty);
+    auto fn = getCopyF16BiasToSubmatrixFn(module, rewriter);
+    if (failed(fn))
+      return failure();
+    auto callee = FlatSymbolRefAttr::get((*fn).getOperation());
+    SmallVector<Value> args{vtcmBase, adaptor.getInOffset(), biasPtr, dstPtr,
+                            adaptor.getTileRow(), adaptor.getTileCol(),
+                            adaptor.getOutputRows(), adaptor.getOutputCols()};
+    rewriter.replaceOpWithNewOp<LLVM::CallOp>(op, TypeRange{}, callee, args);
+    return success();
+  }
+};
+
+struct LowerAsyncDrainWaitSlot
+    : public ConvertOpToLLVMPattern<hexkl::MicroHMXAsyncDrainWaitSlotOp> {
+  using ConvertOpToLLVMPattern<
+      hexkl::MicroHMXAsyncDrainWaitSlotOp>::ConvertOpToLLVMPattern;
+  LogicalResult matchAndRewrite(hexkl::MicroHMXAsyncDrainWaitSlotOp op,
+                                OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const {
+    auto fn = getAsyncDrainWaitSlotFn(op->getParentOfType<ModuleOp>(), rewriter);
+    if (failed(fn))
+      return failure();
+    rewriter.replaceOpWithNewOp<LLVM::CallOp>(
+        op, TypeRange{}, FlatSymbolRefAttr::get((*fn).getOperation()),
+        ValueRange{adaptor.getSlot()});
+    return success();
+  }
+};
+
+struct LowerAsyncDrainStartF16
+    : public ConvertOpToLLVMPattern<hexkl::MicroHMXAsyncDrainStartF16Op> {
+  using ConvertOpToLLVMPattern<
+      hexkl::MicroHMXAsyncDrainStartF16Op>::ConvertOpToLLVMPattern;
+  LogicalResult matchAndRewrite(hexkl::MicroHMXAsyncDrainStartF16Op op,
+                                OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const {
+    Location loc = op.getLoc();
+    ModuleOp module = op->getParentOfType<ModuleOp>();
+    auto fn = getAsyncDrainStartF16Fn(module, rewriter);
+    if (failed(fn))
+      return failure();
+    Value vtcmBase = alignedPtr(rewriter, loc, adaptor.getHmxBlock());
+    Type f16Ty = getTypeConverter()->convertType(rewriter.getF16Type());
+    Value dstPtr =
+        alignedPtrWithOffset(rewriter, loc, adaptor.getDst(), f16Ty);
+    SmallVector<Value> args{vtcmBase,
+                            adaptor.getInOffset(),
+                            dstPtr,
+                            adaptor.getTileRow(),
+                            adaptor.getTileCol(),
+                            adaptor.getOutputRows(),
+                            adaptor.getOutputCols(),
+                            adaptor.getSlot()};
+    rewriter.replaceOpWithNewOp<LLVM::CallOp>(
+        op, TypeRange{}, FlatSymbolRefAttr::get((*fn).getOperation()), args);
+    return success();
+  }
+};
+
+struct LowerAsyncDrainFlush
+    : public ConvertOpToLLVMPattern<hexkl::MicroHMXAsyncDrainFlushOp> {
+  using ConvertOpToLLVMPattern<
+      hexkl::MicroHMXAsyncDrainFlushOp>::ConvertOpToLLVMPattern;
+  LogicalResult matchAndRewrite(hexkl::MicroHMXAsyncDrainFlushOp op,
+                                OpAdaptor,
+                                ConversionPatternRewriter &rewriter) const {
+    auto fn = getAsyncDrainFlushFn(op->getParentOfType<ModuleOp>(), rewriter);
+    if (failed(fn))
+      return failure();
+    rewriter.replaceOpWithNewOp<LLVM::CallOp>(
+        op, TypeRange{}, FlatSymbolRefAttr::get((*fn).getOperation()),
+        ValueRange{});
+    return success();
+  }
+};
+
 //===----------------------------------------------------------------------===//
 // Setup the Lowering Pass and patterns
 //===----------------------------------------------------------------------===//
@@ -729,8 +921,10 @@ void populateHexKLToLLVMConversionPatterns(LLVMTypeConverter &converter,
   // Lower micro ops to externs.
   patterns.add<LowerSetupAccReadF16, LowerAccClearF16, LowerAccReadF16,
                LowerCopySubmatrixToF16, LowerRmToAhF16, LowerRmToWhF16,
-               LowerMmF16, LowerAhToRmF16, LowerCopyF16ToF32Submatrix>(
-      converter);
+               LowerMmF16, LowerAhToRmF16, LowerCopyF16ToF32Submatrix,
+               LowerCopyF16ToSubmatrix,
+               LowerCopyF16BiasToSubmatrix, LowerAsyncDrainWaitSlot,
+               LowerAsyncDrainStartF16, LowerAsyncDrainFlush>(converter);
 }
 
 struct HexKLToLLVMPass : public ::impl::HexKLToLLVMBase<HexKLToLLVMPass> {

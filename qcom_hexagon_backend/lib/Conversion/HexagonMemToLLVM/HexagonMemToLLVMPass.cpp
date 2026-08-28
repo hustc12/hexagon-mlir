@@ -245,6 +245,43 @@ public:
           ValueRange({size, blockSizeValue, alignmentValue, isInVtcmValue}));
     } else {
       auto origMemRefType = mlir::cast<MemRefType>(type);
+
+      // `normalizeMemRefType` is intended for affine/tiled layout maps.  A
+      // strided layout has a single linearized map result, so normalizing it
+      // changes (for example) a rank-3 memref into a rank-1 memref.  The
+      // resulting descriptor cannot then be cast back to the original rank at
+      // the LLVM boundary.  Preserve fully-static strided descriptors and
+      // materialize their sizes/strides directly instead.
+      if (isa<StridedLayoutAttr>(origMemRefType.getLayout()) &&
+          origMemRefType.hasStaticShape()) {
+        SmallVector<int64_t> staticStrides;
+        int64_t staticOffset = 0;
+        if (failed(origMemRefType.getStridesAndOffset(staticStrides,
+                                                      staticOffset)) ||
+            ShapedType::isDynamic(staticOffset) || staticOffset < 0 ||
+            llvm::any_of(staticStrides, [](int64_t stride) {
+              return ShapedType::isDynamic(stride) || stride < 0;
+            }))
+          return rewriter.notifyMatchFailure(
+              op, "expected non-negative static strided VTCM layout");
+
+        int64_t storageElements = staticOffset + 1;
+        for (auto [dim, stride] :
+             llvm::zip_equal(origMemRefType.getShape(), staticStrides))
+          storageElements += (dim - 1) * stride;
+        int64_t storageBytes =
+            storageElements * origMemRefType.getElementTypeBitWidth() / 8;
+        Value sizeAsI32 = getI32Constant(rewriter, loc, storageBytes);
+        mlir::LLVM::CallOp callOp = LLVM::CallOp::create(
+            rewriter, loc, funcOp.value(),
+            ValueRange({sizeAsI32, alignmentValue, isInVtcmValue}));
+        auto memRefDescriptor = MemRefDescriptor::fromStaticShape(
+            rewriter, loc, *getTypeConverter(), origMemRefType,
+            callOp.getResult());
+        rewriter.replaceOp(op, {memRefDescriptor});
+        return success();
+      }
+
       auto memRefType = mlir::affine::normalizeMemRefType(origMemRefType);
       Value size;
 

@@ -7,7 +7,7 @@
 #
 # ===------------------------------------------------------------------------===
 
-import os, subprocess, struct, sys, shutil
+import json, os, subprocess, struct, sys, shutil
 import time
 import torch
 import numpy as np
@@ -298,15 +298,53 @@ class HexagonExecutor:
             HEXKL_ROOT=self.config.env_vars["HEXKL_ROOT"],
             Q6_VERSION=self.config.Q6_VERSION,
         )
-        if (
-            self.enable_hexkl
-            and os.path.exists(hexkl_dir)
-            and os.path.exists(os.path.join(hexkl_dir, "libhexkl_micro.a"))
-            and os.path.exists(os.path.join(hexkl_dir, "libhexkl_macro.a"))
-        ):
-            hexkl_micro_a = os.path.join(hexkl_dir, "libhexkl_micro.a")
-            hexkl_macro_a = os.path.join(hexkl_dir, "libhexkl_macro.a")
+        hexkl_micro_a = os.path.join(hexkl_dir, "libhexkl_micro.a")
+        hexkl_macro_a = os.path.join(hexkl_dir, "libhexkl_macro.a")
+
+        # LinkRuntimeModules pulls OmniFetchRuntime into a kernel whenever an
+        # __omni_fetch_* call is present.  That runtime also contains optional
+        # HMX layout helpers which reference hexkl_micro.  Consequently an HVX
+        # pipeline can need libhexkl_micro even when enableHexKL is false.  Do
+        # not infer this native link dependency from the pass switch: inspect
+        # the object that is actually about to be linked.
+        needs_hexkl_micro = self.enable_hexkl
+        if cpp_wrapper_path is not None and not htp_kernel_gen:
+            hexagon_nm = os.path.join(
+                self.config.env_vars["HEXAGON_TOOLS"], "bin", "hexagon-nm"
+            )
+            try:
+                undefined = subprocess.check_output(
+                    [hexagon_nm, "-u", kernel_obj_path],
+                    text=True,
+                    stderr=subprocess.STDOUT,
+                )
+                if "hexkl_micro_" in undefined:
+                    needs_hexkl_micro = True
+                    if not self.enable_hexkl:
+                        print(
+                            "==> Linking libhexkl_micro.a for an OmniFetch/ALPS "
+                            "runtime dependency (enableHexKL is false)"
+                        )
+            except (OSError, subprocess.CalledProcessError) as error:
+                print(f"Failed to inspect HexKL runtime dependencies: {error}")
+                sys.exit(1)
+
+        if needs_hexkl_micro:
+            if not os.path.exists(hexkl_micro_a):
+                print(
+                    "Required HexKL micro archive was not found: "
+                    f"{hexkl_micro_a}"
+                )
+                sys.exit(1)
             runtime_libs.append(hexkl_micro_a)
+
+        if self.enable_hexkl:
+            if not os.path.exists(hexkl_macro_a):
+                print(
+                    "Required HexKL macro archive was not found: "
+                    f"{hexkl_macro_a}"
+                )
+                sys.exit(1)
             runtime_libs.append(hexkl_macro_a)
 
         # Check if HEXAGON_RUNTIME_LIBS_DIR + "/multithreading exists and "libhexagon_mlir_async_runtime.a" inside it
@@ -458,6 +496,157 @@ class HexagonExecutor:
         lwp_local_path = os.path.join(local_dir, "lwp.json")
 
         etm_local_dir = os.path.join(local_dir, "etm_pyetm")
+        enable_sysmon = os.environ.get("ALPS_ENABLE_SYSMON_PROFILE", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        sysmon_process = None
+        sysmon_log = None
+        sysmon_dir = os.path.join(local_dir, "sysmon_profile")
+
+        def start_sysmon_profile():
+            nonlocal sysmon_process, sysmon_log
+            sdk_root = self.config.env_vars.get("HEXAGON_SDK_ROOT", "")
+            sysmon_binary = os.path.join(
+                sdk_root, "tools", "utils", "sysmon", "sysMonApp"
+            )
+            if not os.path.isfile(sysmon_binary):
+                raise RuntimeError(
+                    "ALPS sysMon profiling requested but sysMonApp was not found at "
+                    f"{sysmon_binary}"
+                )
+            os.makedirs(sysmon_dir, exist_ok=True)
+            adb_prefix = "adb {} -s {}".format(
+                self.config.env_vars["ANDROID_HOST"],
+                self.config.env_vars["ANDROID_SERIAL"],
+            )
+            subprocess.run(
+                f"{adb_prefix} push {sysmon_binary} /data/local/tmp/sysMonApp",
+                shell=True,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
+            )
+            subprocess.run(
+                f"{adb_prefix} shell 'chmod 777 /data/local/tmp/sysMonApp; "
+                "rm -f /sdcard/sysmon_cdsp.bin /data/sysmon_cdsp.bin "
+                "/tmp/sysmon_cdsp.bin'",
+                shell=True,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
+            )
+            sysmon_log = open(
+                os.path.join(sysmon_dir, "sysmon_host.log"),
+                "w",
+                encoding="utf-8",
+            )
+            sysmon_command = (
+                f"{adb_prefix} shell '/data/local/tmp/sysMonApp profiler "
+                "--debugLevel 1 --q6 cdsp --samplingPeriodUs 1000'"
+            )
+            sysmon_process = subprocess.Popen(
+                sysmon_command,
+                shell=True,
+                stdin=subprocess.PIPE,
+                stdout=sysmon_log,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            # Let the profiler domain register its eight counters before the
+            # model begins. The 1 ms raw samples allow this prefix to be
+            # removed during post-processing.
+            time.sleep(1.0)
+
+        def finish_sysmon_profile(kernel_elapsed_seconds):
+            nonlocal sysmon_process, sysmon_log
+            if sysmon_process is None:
+                return
+            try:
+                sysmon_process.communicate(input="\n", timeout=30)
+            except subprocess.TimeoutExpired:
+                sysmon_process.terminate()
+                sysmon_process.wait(timeout=10)
+                raise RuntimeError("sysMonApp did not stop after model execution")
+            finally:
+                if sysmon_log is not None:
+                    sysmon_log.close()
+            if sysmon_process.returncode != 0:
+                raise RuntimeError(
+                    f"sysMonApp failed with return code {sysmon_process.returncode}"
+                )
+            adb_prefix = "adb {} -s {}".format(
+                self.config.env_vars["ANDROID_HOST"],
+                self.config.env_vars["ANDROID_SERIAL"],
+            )
+            raw_path = os.path.join(sysmon_dir, "sysmon_cdsp.bin")
+            with open(
+                os.path.join(sysmon_dir, "kernel_window.json"),
+                "w",
+                encoding="utf-8",
+            ) as window_file:
+                json.dump(
+                    {"kernel_elapsed_seconds": kernel_elapsed_seconds},
+                    window_file,
+                    indent=2,
+                )
+            # Current Android targets normally write /sdcard; retain fallbacks
+            # documented by the SDK for other devices.
+            pull = subprocess.run(
+                f"{adb_prefix} pull /sdcard/sysmon_cdsp.bin {raw_path}",
+                shell=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
+            )
+            if pull.returncode != 0:
+                for candidate in ("/data/sysmon_cdsp.bin", "/tmp/sysmon_cdsp.bin"):
+                    pull = subprocess.run(
+                        f"{adb_prefix} pull {candidate} {raw_path}",
+                        shell=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.STDOUT,
+                    )
+                    if pull.returncode == 0:
+                        break
+            if pull.returncode != 0:
+                raise RuntimeError("could not pull sysMon CDSP profile")
+            parser = os.path.join(
+                self.config.env_vars["HEXAGON_SDK_ROOT"],
+                "tools",
+                "utils",
+                "sysmon",
+                "parser_linux_v2",
+                "HTML_Parser",
+                "sysmon_parser",
+            )
+            parsed_dir = os.path.join(sysmon_dir, "parsed")
+            subprocess.run(
+                [parser, raw_path, "--outdir", parsed_dir],
+                check=True,
+                stdout=sysmon_log if sysmon_log and not sysmon_log.closed else None,
+            )
+            summarizer = os.path.join(
+                self.config.env_vars["HEXAGON_MLIR_ROOT"],
+                "scripts",
+                "summarize_sysmon_profile.py",
+            )
+            subprocess.run(
+                [
+                    sys.executable,
+                    summarizer,
+                    "--raw-pmu",
+                    os.path.join(parsed_dir, "raw_pmu.csv"),
+                    "--kernel-window",
+                    os.path.join(sysmon_dir, "kernel_window.json"),
+                    "--json",
+                    os.path.join(sysmon_dir, "kernel_window_summary.json"),
+                    "--markdown",
+                    os.path.join(sysmon_dir, "kernel_window_summary.md"),
+                ],
+                check=True,
+            )
+            print(f"[ALPS-SYSMON] report={parsed_dir}", flush=True)
 
         # Initializing results list for the previous dumped tensor paths
         result = []
@@ -667,14 +856,21 @@ class HexagonExecutor:
                 if not should_run:
                     continue
                 print(command, flush=True)
+                is_kernel_run = "run_main_on_hexagon.farf" in command
+                if is_kernel_run and enable_sysmon:
+                    start_sysmon_profile()
                 start_time = time.time()
-                subprocess.run(
-                    command,
-                    shell=True,
-                    check=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.STDOUT,
-                )
+                try:
+                    subprocess.run(
+                        command,
+                        shell=True,
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.STDOUT,
+                    )
+                finally:
+                    if is_kernel_run and enable_sysmon:
+                        finish_sysmon_profile(time.time() - start_time)
                 end_time = time.time()
                 elapsed_time = end_time - start_time
                 print(f"Command took {elapsed_time:.4f} seconds.", flush=True)

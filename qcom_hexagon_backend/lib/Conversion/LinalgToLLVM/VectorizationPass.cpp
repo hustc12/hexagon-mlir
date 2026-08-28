@@ -60,9 +60,12 @@ static LogicalResult vectorizeLinalgOp(linalg::LinalgOp op) {
   }
   auto innerLoopDim = op.getStaticLoopRanges()[numLoops - 1];
 
+  const bool hasRegisterTileContract =
+      op->hasAttr("alps.p2g.register_tile_contract");
   auto dataTileSize = computeDataTileSize(op);
-  if (!dataTileSize ||
-      !perfectlyVectorizable(dataTileSize.value(), innerLoopDim)) {
+  if (!hasRegisterTileContract &&
+      (!dataTileSize ||
+       !perfectlyVectorizable(dataTileSize.value(), innerLoopDim))) {
     DBG("-> skipping vectorization. data tile size and loop mismatch");
     return failure();
   }
@@ -81,7 +84,21 @@ static LogicalResult vectorizeLinalgOp(linalg::LinalgOp op) {
 
   SmallVector<int64_t> vecSizes(numLoops, 1);
   SmallVector<bool> scalableDims(numLoops, false);
-  vecSizes[numLoops - 1] = innerLoopDim;
+  if (hasRegisterTileContract) {
+    auto requested =
+        op->getAttrOfType<DenseI64ArrayAttr>("alps.p2g.register_tile_sizes");
+    auto ranges = op.getStaticLoopRanges();
+    if (numLoops < 2 || !requested || requested.size() != 2 ||
+        ShapedType::isDynamic(ranges[numLoops - 2]) ||
+        ShapedType::isDynamic(ranges[numLoops - 1]) ||
+        ranges[numLoops - 2] > static_cast<uint64_t>(requested[0]) ||
+        ranges[numLoops - 1] > static_cast<uint64_t>(requested[1]))
+      return failure();
+    vecSizes[numLoops - 2] = ranges[numLoops - 2];
+    vecSizes[numLoops - 1] = ranges[numLoops - 1];
+  } else {
+    vecSizes[numLoops - 1] = innerLoopDim;
+  }
 
   auto role = op->getAttrOfType<StringAttr>("omni_fetch.kv_cache_role");
   auto operand =
@@ -91,6 +108,19 @@ static LogicalResult vectorizeLinalgOp(linalg::LinalgOp op) {
   if (role && operand && operand.getInt() >= 0 &&
       operand.getInt() < static_cast<int64_t>(op.getDpsInputs().size()))
     kvSource = op.getDpsInputs()[operand.getInt()];
+
+  // linalg::vectorize may materialize transfers inside newly created nested
+  // regions rather than as direct siblings of the source linalg op.  Snapshot
+  // all existing vector operations so P2g-c can mark exactly the operations
+  // created by this vectorization call, independent of their nesting depth.
+  SmallPtrSet<Operation *, 16> vectorOpsBefore;
+  func::FuncOp parentFunction = op->getParentOfType<func::FuncOp>();
+  if (hasRegisterTileContract && parentFunction)
+    parentFunction.walk([&](Operation *candidate) {
+      if (isa<vector::TransferReadOp, vector::TransferWriteOp,
+              vector::TransposeOp>(candidate))
+        vectorOpsBefore.insert(candidate);
+    });
 
   Operation *previous = op->getPrevNode();
   FailureOr<mlir::linalg::VectorizationResult> vectorResults =
@@ -123,6 +153,14 @@ static LogicalResult vectorizeLinalgOp(linalg::LinalgOp op) {
       created = created->getNextNode();
     }
   }
+  if (hasRegisterTileContract) {
+    parentFunction.walk([&](Operation *created) {
+      if (!vectorOpsBefore.contains(created) &&
+          isa<vector::TransferReadOp, vector::TransferWriteOp,
+              vector::TransposeOp>(created))
+        created->setAttr("alps.p2g.register_tile", rewriter.getUnitAttr());
+    });
+  }
   // Replace the original op with the vectorized op.
   rewriter.replaceOp(op, vectorResults->replacements);
   return success();
@@ -144,13 +182,19 @@ public:
     MLIRContext *context = moduleOp.getContext();
     int64_t p2fCandidates = 0;
     int64_t p2fVectorized = 0;
+    int64_t p2gRegisterCandidates = 0;
+    int64_t p2gRegisterVectorized = 0;
     moduleOp.walk([&](linalg::LinalgOp op) {
       DBG("vectorization candidate: " << op << "\n");
       bool isP2f = op->hasAttr("alps.p2f.consumer_layout_contract");
+      bool isP2gRegister =
+          op->hasAttr("alps.p2g.register_tile_contract");
       p2fCandidates += isP2f;
+      p2gRegisterCandidates += isP2gRegister;
       if (succeeded(vectorizeLinalgOp(op))) {
         DBG(" -> vectorization succeeded.\n");
         p2fVectorized += isP2f;
+        p2gRegisterVectorized += isP2gRegister;
       } else {
         DBG(" -> vectorization failed.\n");
       }
@@ -160,6 +204,12 @@ public:
       llvm::errs() << "[ALPS-P2F] vectorization candidates=" << p2fCandidates
                    << " succeeded=" << p2fVectorized
                    << " failed=" << (p2fCandidates - p2fVectorized) << '\n';
+    if (p2gRegisterCandidates)
+      llvm::errs() << "[ALPS-P2G-C] vectorization candidates="
+                   << p2gRegisterCandidates
+                   << " succeeded=" << p2gRegisterVectorized
+                   << " failed="
+                   << (p2gRegisterCandidates - p2gRegisterVectorized) << '\n';
   }
 };
 } // namespace

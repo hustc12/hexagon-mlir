@@ -40,6 +40,11 @@ func.func @ledger(%src: memref<4x8xf32>, %dst: memref<8x4xf32>,
 // CHECK-SAME: kind=physical_copy
 // CHECK-SAME: op=memref.copy
 // CHECK-SAME: static_bytes=128 read_bytes=128 write_bytes=128 materialization_bytes=128
+// CHECK-SAME: source_version=arg0 source_root_version=arg0 source_def=block_argument
+// CHECK-SAME: source_root_def=block_argument source_layout=identity source_space=0
+// CHECK-SAME: destination_def=memref.alloc destination_root_def=memref.alloc
+// CHECK-SAME: destination_layout=identity destination_space=0
+// CHECK-SAME: copy_same_type=1 copy_distinct_storage=1
 // CHECK: [ALPS-P1-SITE] phase=test function=ledger
 // CHECK-SAME: kind=physical_layout_transform
 // CHECK-SAME: op=linalg.transpose
@@ -49,5 +54,16 @@ func.func @ledger(%src: memref<4x8xf32>, %dst: memref<8x4xf32>,
 // CHECK-SAME: op=linalg.generic kv_role=key
 // CHECK-SAME: legal_actions=native+l2_hint+in_situ_sync+dma_vtcm_async
 // CHECK-SAME: decision=candidate_static_vtcm_fit
+// CHECK: [ALPS-P1-ACCESS] phase=test function=ledger
+// CHECK-SAME: op=linalg.transpose source_lines=13
+// CHECK-SAME: loop_ranges=8x4 logical_iterations=32
+// CHECK-SAME: logical_read_upper_bytes=128 logical_write_upper_bytes=128
+// CHECK-SAME: unique_operand_bytes=256 logical_to_unique_permille=1000
+// CHECK-SAME: interpretation=logical_upper_bound_not_physical_ddr
+// CHECK: [ALPS-P1-ACCESS] phase=test function=ledger
+// CHECK-SAME: op=linalg.generic source_lines=16
+// CHECK-SAME: loop_ranges=4x8 logical_iterations=32
+// CHECK-SAME: logical_read_upper_bytes=128 logical_write_upper_bytes=128
 // CHECK: [ALPS-P1-SUMMARY] phase=test function=ledger candidates=1 descriptor_sites=2 physical_transform_sites=1 copy_sites=1 alloc_sites=1
 // CHECK-SAME: static_read_bytes=256 static_write_bytes=256 static_materialization_bytes=256 dynamic_sites=0
+// CHECK-SAME: access_sites=2 logical_read_upper_bytes=256 logical_write_upper_bytes=256

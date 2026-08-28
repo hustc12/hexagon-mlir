@@ -66,6 +66,28 @@ std::string hexkl::getHmxCopyF16ToF32SubmatrixFnName() {
   return fnName;
 }
 
+std::string hexkl::getHmxCopyF16ToSubmatrixFnName() {
+  static const std::string fnName = "hexkl_micro_hmx_copy_f16_to_submatrix";
+  return fnName;
+}
+
+std::string hexkl::getHmxCopyF16BiasToSubmatrixFnName() {
+  static const std::string fnName = "alps_hmx_copy_f16_bias_to_submatrix";
+  return fnName;
+}
+
+std::string hexkl::getHmxAsyncDrainWaitSlotFnName() {
+  return "alps_hmx_async_drain_wait_slot";
+}
+
+std::string hexkl::getHmxAsyncDrainStartF16FnName() {
+  return "alps_hmx_async_drain_start_f16";
+}
+
+std::string hexkl::getHmxAsyncDrainFlushFnName() {
+  return "alps_hmx_async_drain_flush";
+}
+
 std::string hexkl::getMacroInitializeFnName() {
   static const std::string fnName = "hexkl_macro_initialize";
   return fnName;

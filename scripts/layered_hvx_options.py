@@ -113,6 +113,15 @@ def make_layered_hvx_options(args: argparse.Namespace) -> dict:
     options["enableAlpsConsumerLayoutPropagation"] = (
         os.environ.get("ALPS_ENABLE_CONSUMER_LAYOUT_PROPAGATION", "0") == "1"
     )
+    options["enableAlpsContinuityAudit"] = (
+        os.environ.get("ALPS_ENABLE_CONTINUITY_AUDIT", "0") == "1"
+    )
+    options["enableAlpsLoopInterchangedDirectFormation"] = (
+        os.environ.get("ALPS_ENABLE_LOOP_INTERCHANGED_DIRECT", "0") == "1"
+    )
+    options["enableAlpsRegisterTileFormation"] = (
+        os.environ.get("ALPS_ENABLE_REGISTER_TILE_FORMATION", "0") == "1"
+    )
     options["enableAlpsContractDischargeLedger"] = (
         os.environ.get("ALPS_ENABLE_CONTRACT_DISCHARGE_LEDGER", "0") == "1"
     )
@@ -121,6 +130,57 @@ def make_layered_hvx_options(args: argparse.Namespace) -> dict:
     )
     options["enableAlpsLayoutSupplyPrefetch"] = (
         os.environ.get("ALPS_ENABLE_LAYOUT_SUPPLY_PREFETCH", "0") == "1"
+    )
+    options["enableAlpsCrpSupplyAnalysis"] = (
+        os.environ.get("ALPS_ENABLE_CRP_SUPPLY_ANALYSIS", "0") == "1"
+    )
+    options["enableAlpsCrpSupplyPrefetch"] = (
+        os.environ.get("ALPS_ENABLE_CRP_SUPPLY_PREFETCH", "0") == "1"
+    )
+    options["enableAlpsCrpSegmentedSupply"] = (
+        os.environ.get("ALPS_ENABLE_CRP_SEGMENTED_SUPPLY", "0") == "1"
+    )
+    options["enableAlpsCrpVtcmFormation"] = (
+        os.environ.get("ALPS_ENABLE_CRP_VTCM_FORMATION", "0") == "1"
+    )
+    options["enableAlpsCrpVtcmWindow"] = (
+        os.environ.get("ALPS_ENABLE_CRP_VTCM_WINDOW", "0") == "1"
+    )
+    options["enableAlpsCrpVtcmAsyncWindow"] = (
+        os.environ.get("ALPS_ENABLE_CRP_VTCM_ASYNC_WINDOW", "0") == "1"
+    )
+    options["enableAlpsCrpProducerDirectAnalysis"] = (
+        os.environ.get("ALPS_ENABLE_CRP_PRODUCER_DIRECT_ANALYSIS", "0") == "1"
+    )
+    options["enableAlpsCrpProducerDirectVtcm"] = (
+        os.environ.get("ALPS_ENABLE_CRP_PRODUCER_DIRECT_VTCM", "0") == "1"
+    )
+    options["enableAlpsCrpProducerDirectHeadMajor"] = (
+        os.environ.get("ALPS_ENABLE_CRP_PRODUCER_DIRECT_HEAD_MAJOR", "0") == "1"
+    )
+    options["enableAlpsCrpProducerLoopFormation"] = (
+        os.environ.get("ALPS_ENABLE_CRP_PRODUCER_LOOP_FORMATION", "0") == "1"
+    )
+    options["enableAlpsAttentionDestinationFormation"] = (
+        os.environ.get("ALPS_ENABLE_ATTENTION_DESTINATION_FORMATION", "0") == "1"
+    )
+    options["enableAlpsPatchConvFormation"] = (
+        os.environ.get("ALPS_ENABLE_PATCH_CONV_FORMATION", "0") == "1"
+    )
+    options["enableAlpsHmxF16EpilogueFormation"] = (
+        os.environ.get("ALPS_ENABLE_HMX_F16_EPILOGUE_FORMATION", "0") == "1"
+    )
+    options["enableAlpsHmxDirectOutputFormation"] = (
+        os.environ.get("ALPS_ENABLE_HMX_DIRECT_OUTPUT_FORMATION", "0") == "1"
+    )
+    options["enableAlpsHmxF16BiasEpilogueFormation"] = (
+        os.environ.get("ALPS_ENABLE_HMX_F16_BIAS_EPILOGUE_FORMATION", "0") == "1"
+    )
+    options["enableAlpsHmxAsyncDrainAnalysis"] = (
+        os.environ.get("ALPS_ENABLE_HMX_ASYNC_DRAIN_ANALYSIS", "0") == "1"
+    )
+    options["enableAlpsHmxAsyncDrain"] = (
+        os.environ.get("ALPS_ENABLE_HMX_ASYNC_DRAIN", "0") == "1"
     )
     options["enableAlpsFusedTransformTransfer"] = (
         os.environ.get("ALPS_ENABLE_FUSED_TRANSFORM_TRANSFER", "0") == "1"
@@ -141,7 +201,11 @@ def make_layered_hvx_options(args: argparse.Namespace) -> dict:
     # Hexagon hardware thread.  Dual-thread DAE remains an independent switch
     # for schemes whose completion work is safe to execute on the scout.
     options["enableOmniFetchDmaToVtcm"] = False
-    options["enableHexagonmemCopyToDMA"] = False
+    options["enableHexagonmemCopyToDMA"] = (
+        options["enableAlpsCrpVtcmFormation"]
+        or options["enableAlpsCrpVtcmWindow"]
+        or options["enableAlpsCrpVtcmAsyncWindow"]
+    )
 
     print(
         "[LayeredBackendConfig] "
@@ -152,9 +216,29 @@ def make_layered_hvx_options(args: argparse.Namespace) -> dict:
         f"alps_p1_ledger={int(options['enableAlpsMovementLedger'])} "
         f"alps_p2e_consumer_layout={int(options['enableAlpsConsumerDrivenLayout'])} "
         f"alps_p2f_layout_propagation={int(options['enableAlpsConsumerLayoutPropagation'])} "
+        f"alps_p2g_continuity_audit={int(options['enableAlpsContinuityAudit'])} "
+        f"alps_p2g_loop_interchanged={int(options['enableAlpsLoopInterchangedDirectFormation'])} "
+        f"alps_p2g_register_tile={int(options['enableAlpsRegisterTileFormation'])} "
         f"alps_p5a_discharge_ledger={int(options['enableAlpsContractDischargeLedger'])} "
         f"alps_p5b_supply_analysis={int(options['enableAlpsRepresentationSupplyAnalysis'])} "
         f"alps_p5c_layout_supply={int(options['enableAlpsLayoutSupplyPrefetch'])} "
+        f"alps_p5f_a_crp_supply={int(options['enableAlpsCrpSupplyAnalysis'])} "
+        f"alps_p5f_b_crp_prefetch={int(options['enableAlpsCrpSupplyPrefetch'])} "
+        f"alps_p5f_c_segmented={int(options['enableAlpsCrpSegmentedSupply'])} "
+        f"alps_p5g_a_vtcm={int(options['enableAlpsCrpVtcmFormation'])} "
+        f"alps_p5g_b_window={int(options['enableAlpsCrpVtcmWindow'])} "
+        f"alps_p5g_c_async={int(options['enableAlpsCrpVtcmAsyncWindow'])} "
+        f"alps_p5g_d_producer_analysis={int(options['enableAlpsCrpProducerDirectAnalysis'])} "
+        f"alps_p5g_e_producer_vtcm={int(options['enableAlpsCrpProducerDirectVtcm'])} "
+        f"alps_p5g_f_head_major={int(options['enableAlpsCrpProducerDirectHeadMajor'])} "
+        f"alps_p5g_g_producer_loop={int(options['enableAlpsCrpProducerLoopFormation'])} "
+        f"alps_p5h_attention_destination={int(options['enableAlpsAttentionDestinationFormation'])} "
+        f"alps_p5i_patch_conv={int(options['enableAlpsPatchConvFormation'])} "
+        f"alps_p5j_hmx_f16_epilogue={int(options['enableAlpsHmxF16EpilogueFormation'])} "
+        f"alps_p5k_hmx_direct_output={int(options['enableAlpsHmxDirectOutputFormation'])} "
+        f"alps_p5l_hmx_f16_bias_epilogue={int(options['enableAlpsHmxF16BiasEpilogueFormation'])} "
+        f"alps_p5m_hmx_async_drain_analysis={int(options['enableAlpsHmxAsyncDrainAnalysis'])} "
+        f"alps_p5n_hmx_async_drain={int(options['enableAlpsHmxAsyncDrain'])} "
         f"alps_p2d_admission={int(options['enableAlpsMinimalStaticAdmission'])} "
         f"alps_p3a_exact={int(options['enableAlpsExactReadiness'])}"
         f" alps_p3b_overlap={int(options['enableAlpsExactOverlap'])}"

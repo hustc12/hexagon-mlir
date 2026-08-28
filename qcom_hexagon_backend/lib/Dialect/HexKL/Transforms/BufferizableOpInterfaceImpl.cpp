@@ -53,11 +53,37 @@ struct MatmulOpInterface
     return success();
   }
 };
+
+struct F16BiasEpilogueOpInterface
+    : public DstBufferizableOpInterfaceExternalModel<
+          F16BiasEpilogueOpInterface, hexkl::F16BiasEpilogueOp> {
+  LogicalResult bufferize(Operation *op, RewriterBase &rewriter,
+                          const BufferizationOptions &options,
+                          BufferizationState &state) const {
+    auto dps = cast<DestinationStyleOpInterface>(op);
+    if (dps.hasPureBufferSemantics())
+      return success();
+    if (!dps.hasPureTensorSemantics())
+      return op->emitError("op does not have pure tensor semantics");
+    auto epilogue = cast<hexkl::F16BiasEpilogueOp>(op);
+    FailureOr<Value> src = getBuffer(rewriter, epilogue.getSrc(), options, state);
+    FailureOr<Value> bias =
+        getBuffer(rewriter, epilogue.getBias(), options, state);
+    FailureOr<Value> out = getBuffer(rewriter, epilogue.getOuts(), options, state);
+    if (failed(src) || failed(bias) || failed(out))
+      return failure();
+    hexkl::F16BiasEpilogueOp::create(rewriter, epilogue.getLoc(), TypeRange(),
+                                     *src, *bias, *out);
+    replaceOpWithBufferizedValues(rewriter, op, *out);
+    return success();
+  }
+};
 } // namespace
 
 void mlir::hexkl::registerBufferizableOpInterfaceExternalModels(
     DialectRegistry &registry) {
   registry.addExtension(+[](MLIRContext *ctx, hexkl::HexKLDialect *dialect) {
     MatmulOp::attachInterface<MatmulOpInterface>(*ctx);
+    F16BiasEpilogueOp::attachInterface<F16BiasEpilogueOpInterface>(*ctx);
   });
 }

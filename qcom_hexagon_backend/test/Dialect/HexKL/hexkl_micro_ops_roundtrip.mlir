@@ -76,3 +76,42 @@ func.func @copy_f16_to_f32(%hmx: memref<?xi8, 1>, %dst: memref<64x64xf32>) {
   hexkl.micro_hmx_copy_f16_to_f32_submatrix(%hmx, %in_off, %dst, %row, %col, %rows, %cols) : memref<?xi8, 1>, i32, memref<64x64xf32>, i32, i32, i32, i32
   return
 }
+
+func.func @copy_f16_to_f16(%hmx: memref<?xi8, 1>, %dst: memref<64x64xf16>) {
+  %in_off = arith.constant 10240 : i32
+  %row = arith.constant 0 : i32
+  %col = arith.constant 0 : i32
+  %rows = arith.constant 64 : i32
+  %cols = arith.constant 64 : i32
+  // CHECK: hexkl.micro_hmx_copy_f16_to_submatrix(%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}) : memref<?xi8, 1>, i32, memref<64x64xf16>, i32, i32, i32, i32
+  hexkl.micro_hmx_copy_f16_to_submatrix(%hmx, %in_off, %dst, %row, %col, %rows, %cols) : memref<?xi8, 1>, i32, memref<64x64xf16>, i32, i32, i32, i32
+  return
+}
+
+func.func @copy_f16_bias(%hmx: memref<?xi8, 1>, %bias: memref<64xf16>,
+                         %dst: memref<64x64xf16>) {
+  %in_off = arith.constant 10240 : i32
+  %row = arith.constant 0 : i32
+  %col = arith.constant 0 : i32
+  %rows = arith.constant 64 : i32
+  %cols = arith.constant 64 : i32
+  // CHECK: hexkl.micro_hmx_copy_f16_bias_to_submatrix(%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}) : memref<?xi8, 1>, i32, memref<64xf16>, memref<64x64xf16>, i32, i32, i32, i32
+  hexkl.micro_hmx_copy_f16_bias_to_submatrix(%hmx, %in_off, %bias, %dst, %row, %col, %rows, %cols) : memref<?xi8, 1>, i32, memref<64xf16>, memref<64x64xf16>, i32, i32, i32, i32
+  return
+}
+
+func.func @async_drain(%hmx: memref<?xi8, 1>, %dst: memref<64x64xf16>) {
+  %off = arith.constant 12288 : i32
+  %row = arith.constant 0 : i32
+  %col = arith.constant 32 : i32
+  %rows = arith.constant 64 : i32
+  %cols = arith.constant 64 : i32
+  %slot = arith.constant 1 : i32
+  // CHECK: hexkl.micro_hmx_async_drain_wait_slot
+  // CHECK: hexkl.micro_hmx_async_drain_start_f16
+  // CHECK: hexkl.micro_hmx_async_drain_flush
+  hexkl.micro_hmx_async_drain_wait_slot(%slot) : i32
+  hexkl.micro_hmx_async_drain_start_f16(%hmx, %off, %dst, %row, %col, %rows, %cols, %slot) : memref<?xi8, 1>, i32, memref<64x64xf16>, i32, i32, i32, i32, i32
+  hexkl.micro_hmx_async_drain_flush
+  return
+}
