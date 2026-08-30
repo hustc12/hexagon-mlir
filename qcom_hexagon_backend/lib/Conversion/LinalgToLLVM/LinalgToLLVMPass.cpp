@@ -537,6 +537,8 @@ public:
       p2eOptions.allowInnermostLoopInterchange =
           enableAlpsLoopInterchangedDirectFormation;
       p2eOptions.allowRegisterTileFormation = enableAlpsRegisterTileFormation;
+      p2eOptions.registerTileDemandBegin = alpsRegisterTileDemandBegin;
+      p2eOptions.registerTileDemandEnd = alpsRegisterTileDemandEnd;
       pm.addNestedPass<func::FuncOp>(
           createAlpsConsumerDrivenLayoutPass(p2eOptions));
       pm.addPass(createCanonicalizerPass());
@@ -555,7 +557,12 @@ public:
       pm.addNestedPass<func::FuncOp>(createHexagonPuntBufferPass());
     pm.addPass(createCanonicalizerPass()); // erase unstrung allocs
 
-    if (enableConversionToFp16)
+    // Keep the legacy precision-conversion option working, while exposing the
+    // same lowering as an independent ALPS experiment.  The pass itself keeps
+    // matmul, explicit reductions and division out of the downcast policy;
+    // eligible convolution and elementwise islands become genuine fp16 before
+    // HVX tiling/vectorization rather than widening every lane to fp32.
+    if (enableConversionToFp16 || enableAlpsFP16HVXArithmetic)
       pm.addNestedPass<func::FuncOp>(createConversionToFp16Pass());
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
@@ -958,6 +965,13 @@ public:
         pm.addPass(
             bufferization::createBufferResultsToOutParamsPass(outParamsOpts));
       }
+
+      // ALPS C runs only after tensor ownership and function-result ABI have
+      // stabilized.  It replaces eligible bufferized mixed F16/F32 NCHW
+      // convolutions with an output-width vector schedule; later generic
+      // vector/LLVM lowering then sees vector FPEXT rather than scalar helpers.
+      if (enableAlpsHVXWideningConv)
+        pm.addNestedPass<func::FuncOp>(createAlpsHVXWideningConvPass());
 
       if (enableAlpsMovementLedger)
         pm.addNestedPass<func::FuncOp>(createAlpsMovementLedgerPass(

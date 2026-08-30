@@ -116,4 +116,18 @@ TEST(UDMATest2D, FourTensorTileCopy) {
   EXPECT_EQ(std::memcmp(refTile1, tile1, TILE_SIZE), 0);
   EXPECT_EQ(std::memcmp(refTile2, tile2, TILE_SIZE), 0);
   EXPECT_EQ(std::memcmp(refTile3, tile3, TILE_SIZE), 0);
+
+  // V73 2-D ROI and stride fields are 16-bit.  Values wider than the field
+  // must fail instead of being silently masked into a different transfer.
+  uint32_t invalidToken = hexDMASmallQCapacity.copy2D(
+      src0, hexagon::userdma::DDR, tile0, hexagon::userdma::DDR, TILE_WIDTH,
+      TILE_HEIGHT, ORIG_STRIDE, 0x10000, false, false, false, 0, &status);
+  EXPECT_EQ(status, hexagon::userdma::DMAFailure);
+  EXPECT_EQ(invalidToken, 0u);
+
+  invalidToken = hexDMASmallQCapacity.copy2D(
+      src0, hexagon::userdma::DDR, tile0, hexagon::userdma::DDR, 0,
+      TILE_HEIGHT, ORIG_STRIDE, TILE_WIDTH, false, false, false, 0, &status);
+  EXPECT_EQ(status, hexagon::userdma::DMAFailure);
+  EXPECT_EQ(invalidToken, 0u);
 }

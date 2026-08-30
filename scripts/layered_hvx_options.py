@@ -9,6 +9,28 @@ import os
 def add_layered_hvx_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--enable-hexkl", action="store_true")
     parser.add_argument(
+        "--enable-lwp",
+        action="store_true",
+        help="Enable function/loop Lightweight Profiling for every stage.",
+    )
+    parser.add_argument("--lwp-loop-depth", type=int, default=1)
+    parser.add_argument("--disable-lwp-loop", action="store_true")
+    parser.add_argument("--lwp-hexkl-phases", action="store_true")
+    parser.add_argument(
+        "--enable-alps-fp16-hvx-arithmetic",
+        action="store_true",
+        help=(
+            "Default-off negative ablation: lower eligible FP32 convolution/"
+            "elementwise islands in an FP16 model to FP16 arithmetic. V73 "
+            "admission additionally requires the object half-helper audit."
+        ),
+    )
+    parser.add_argument(
+        "--enable-alps-hvx-widening-conv",
+        action="store_true",
+        help="ALPS C mixed F16/F32 NCHW convolution HVX schedule.",
+    )
+    parser.add_argument(
         "--prefetch-baseline",
         choices=("none", "prefetch-kernel-hx", "apt-get-hx"),
         default="none",
@@ -41,6 +63,8 @@ def make_layered_hvx_options(args: argparse.Namespace) -> dict:
 
     if args.prefetch_baseline_distance <= 0:
         raise ValueError("prefetch baseline distance must be positive")
+    if args.lwp_loop_depth < 0:
+        raise ValueError("LWP loop depth must be non-negative")
     item7 = bool(args.enable_omnifetch_kv_cache_prefetch)
     alps_mode = str(args.alps_p0_mode)
     if item7 and alps_mode != "none":
@@ -64,7 +88,17 @@ def make_layered_hvx_options(args: argparse.Namespace) -> dict:
     # Every staged language model is already uniformly f16. Do not insert a
     # mixed-precision conversion pass.
     options["enableConversionToFp16"] = False
+    options["enableAlpsFP16HVXArithmetic"] = bool(
+        args.enable_alps_fp16_hvx_arithmetic
+    )
+    options["enableAlpsHVXWideningConv"] = bool(
+        args.enable_alps_hvx_widening_conv
+    )
     options["lowerConstantsInSeparateSharedObjects"] = True
+    options["enableLWP"] = bool(args.enable_lwp)
+    options["disableLWPLoop"] = bool(args.disable_lwp_loop)
+    options["LWPloopDepth"] = int(args.lwp_loop_depth)
+    options["instrumentLWPHexKLPhases"] = bool(args.lwp_hexkl_phases)
     if "enableBufferResultsToOutParams" in options:
         options["enableBufferResultsToOutParams"] = True
 
@@ -121,6 +155,12 @@ def make_layered_hvx_options(args: argparse.Namespace) -> dict:
     )
     options["enableAlpsRegisterTileFormation"] = (
         os.environ.get("ALPS_ENABLE_REGISTER_TILE_FORMATION", "0") == "1"
+    )
+    options["alpsRegisterTileDemandBegin"] = int(
+        os.environ.get("ALPS_REGISTER_TILE_DEMAND_BEGIN", "0")
+    )
+    options["alpsRegisterTileDemandEnd"] = int(
+        os.environ.get("ALPS_REGISTER_TILE_DEMAND_END", "-1")
     )
     options["enableAlpsContractDischargeLedger"] = (
         os.environ.get("ALPS_ENABLE_CONTRACT_DISCHARGE_LEDGER", "0") == "1"
@@ -210,7 +250,10 @@ def make_layered_hvx_options(args: argparse.Namespace) -> dict:
     print(
         "[LayeredBackendConfig] "
         f"vectorization=1 hexkl={int(options['enableHexKL'])} "
-        "uniform_fp16=1 vtcm_tiling=0 conversion_to_fp16=0 "
+        f"lwp={int(options['enableLWP'])} "
+        f"lwp_hexkl_phases={int(options['instrumentLWPHexKLPhases'])} "
+        "fp16_model_storage=1 kernel_precision=mixed_f16_hmx_f32_hvx "
+        "vtcm_tiling=0 runtime_conversion_to_fp16=0 "
         f"prefetch_baseline={args.prefetch_baseline} "
         f"legacy_item7={int(item7)} alps_p0_mode={alps_mode} "
         f"alps_p1_ledger={int(options['enableAlpsMovementLedger'])} "
@@ -219,6 +262,7 @@ def make_layered_hvx_options(args: argparse.Namespace) -> dict:
         f"alps_p2g_continuity_audit={int(options['enableAlpsContinuityAudit'])} "
         f"alps_p2g_loop_interchanged={int(options['enableAlpsLoopInterchangedDirectFormation'])} "
         f"alps_p2g_register_tile={int(options['enableAlpsRegisterTileFormation'])} "
+        f"alps_p2g_demand_window={options['alpsRegisterTileDemandBegin']}:{options['alpsRegisterTileDemandEnd']} "
         f"alps_p5a_discharge_ledger={int(options['enableAlpsContractDischargeLedger'])} "
         f"alps_p5b_supply_analysis={int(options['enableAlpsRepresentationSupplyAnalysis'])} "
         f"alps_p5c_layout_supply={int(options['enableAlpsLayoutSupplyPrefetch'])} "
@@ -243,5 +287,6 @@ def make_layered_hvx_options(args: argparse.Namespace) -> dict:
         f"alps_p3a_exact={int(options['enableAlpsExactReadiness'])}"
         f" alps_p3b_overlap={int(options['enableAlpsExactOverlap'])}"
         f" alps_p4a_traffic={int(options['enableAlpsTrafficControl'])}"
+        f" alps_fp16_hvx={int(options['enableAlpsFP16HVXArithmetic'])}"
     )
     return options

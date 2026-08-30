@@ -99,6 +99,25 @@ uint32_t UserDMA::copy2D(void *src, AddrSpace srcAS, void *dst, AddrSpace dstAS,
 
   *status = DMAFailure;
 
+  // Every geometric field in a V73 2-D descriptor is exactly 16 bits.  The
+  // descriptor setters mask their input, so accepting a wider value here
+  // would silently wrap (for example, a 303872-byte destination stride became
+  // 41728 bytes).  Reject unrepresentable or empty descriptors before a FIFO
+  // entry is allocated; callers can then take their synchronous fallback.
+  constexpr uint32_t maxROIWidth =
+      DESC_ROIWIDTH_MASK >> DESC_ROIWIDTH_SHIFT;
+  constexpr uint32_t maxROIHeight =
+      DESC_ROIHEIGHT_MASK >> DESC_ROIHEIGHT_SHIFT;
+  constexpr uint32_t maxSrcStride =
+      DESC_SRCSTRIDE_MASK >> DESC_SRCSTRIDE_SHIFT;
+  constexpr uint32_t maxDstStride =
+      DESC_DSTSTRIDE_MASK >> DESC_DSTSTRIDE_SHIFT;
+  if (width == 0 || height == 0 || srcStride == 0 || dstStride == 0 ||
+      width > maxROIWidth || height > maxROIHeight ||
+      srcStride > maxSrcStride || dstStride > maxDstStride) {
+    return 0;
+  }
+
   // source address limited to 32 bits
   uint64_t src64 = reinterpret_cast<uint64_t>(src);
   if (!src64 || src64 > DESC_SRC_MASK) {

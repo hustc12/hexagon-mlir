@@ -472,6 +472,12 @@ class HexagonExecutor:
         local_dir, principal_lib_without_ext, _ = split_path(
             path_to_principal_lib_local
         )
+        # The instrumentation pass writes its ID-to-location map to a global
+        # /tmp file.  Preserve it beside this stage before the next layered
+        # compilation overwrites it, so full staged models can be aggregated.
+        lwp_info_dump = "/tmp/lwp_infodump.txt"
+        if self.enable_lwp and os.path.isfile(lwp_info_dump):
+            shutil.copy2(lwp_info_dump, os.path.join(local_dir, "lwp_infodump.txt"))
         path_to_principal_lib_on_device = paths_to_shared_libs_on_device[0]
 
         if generatePerf:

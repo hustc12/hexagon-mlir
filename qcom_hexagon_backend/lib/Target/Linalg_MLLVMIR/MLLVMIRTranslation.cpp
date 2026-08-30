@@ -119,6 +119,16 @@ void setLinalgToLLVMOptions(
   options.enableConversionToFp16 =
       !arch_kwargs.at("enableConversionToFp16").compare(TRUE);
   {
+    auto it = arch_kwargs.find("enableAlpsFP16HVXArithmetic");
+    options.enableAlpsFP16HVXArithmetic =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsHVXWideningConv");
+    options.enableAlpsHVXWideningConv =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
     auto it = arch_kwargs.find("enableBufferResultsToOutParams");
     options.enableBufferResultsToOutParams =
         (it != arch_kwargs.end() && !it->second.compare(TRUE));
@@ -262,6 +272,16 @@ void setLinalgToLLVMOptions(
     auto it = arch_kwargs.find("enableAlpsRegisterTileFormation");
     options.enableAlpsRegisterTileFormation =
         (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("alpsRegisterTileDemandBegin");
+    if (it != arch_kwargs.end())
+      options.alpsRegisterTileDemandBegin = std::stoll(it->second);
+  }
+  {
+    auto it = arch_kwargs.find("alpsRegisterTileDemandEnd");
+    if (it != arch_kwargs.end())
+      options.alpsRegisterTileDemandEnd = std::stoll(it->second);
   }
   {
     auto it = arch_kwargs.find("enableAlpsContractDischargeLedger");

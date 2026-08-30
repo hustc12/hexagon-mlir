@@ -16,3 +16,17 @@ func.func @p5n_static_f16(%lhs: memref<33x64xf16>,
 // CHECK: hexkl.micro_hmx_async_drain_start_f16
 // CHECK: hexkl.micro_hmx_copy_f16_to_submatrix
 // CHECK: hexkl.micro_hmx_async_drain_flush
+
+// An unrepresentable 2-D destination stride must stay on the synchronous
+// drain path rather than being silently truncated by UserDMA.
+func.func @p5n_stride_overflow(%lhs: memref<32x32xf16>,
+                               %rhs: memref<32x32768xf16>,
+                               %out: memref<32x32768xf16>) {
+  hexkl.matmul ins(%lhs, %rhs : memref<32x32xf16>, memref<32x32768xf16>)
+               outs(%out : memref<32x32768xf16>)
+  return
+}
+
+// CHECK-LABEL: func.func @p5n_stride_overflow
+// CHECK-NOT: hexkl.micro_hmx_async_drain_start_f16
+// CHECK: hexkl.micro_hmx_copy_f16_to_submatrix

@@ -327,6 +327,8 @@ def hexagon_options_phase4(
     enable_omnifetch_kv_cache_prefetch: bool = False,
     disable_omnifetch_persistent_wh_cache: bool = False,
     alps_p0_mode: str = "none",
+    enable_alps_fp16_hvx_arithmetic: Optional[bool] = None,
+    enable_alps_hvx_widening_conv: Optional[bool] = None,
 ):
     from triton.backends.qcom_hexagon_backend.compiler import HexagonOptions
 
@@ -365,6 +367,14 @@ def hexagon_options_phase4(
     if enable_omnifetch_kv_cache_prefetch and alps_p0_mode != "none":
         raise ValueError("legacy item7 and ALPS P0 mode are mutually exclusive")
     alps_p0_enabled = alps_p0_mode != "none"
+    if enable_alps_fp16_hvx_arithmetic is None:
+        enable_alps_fp16_hvx_arithmetic = (
+            os.environ.get("ALPS_ENABLE_FP16_HVX_ARITHMETIC", "0") == "1"
+        )
+    if enable_alps_hvx_widening_conv is None:
+        enable_alps_hvx_widening_conv = (
+            os.environ.get("ALPS_ENABLE_HVX_WIDENING_CONV", "0") == "1"
+        )
 
     options["enableLWP"] = bool(enable_lwp)
     options["disableLWPLoop"] = bool(disable_lwp_loop)
@@ -394,6 +404,8 @@ def hexagon_options_phase4(
             or enable_omnifetch_m_pad_hmx
             or enable_omnifetch_kv_cache_prefetch
             or alps_p0_enabled
+            or enable_alps_fp16_hvx_arithmetic
+            or enable_alps_hvx_widening_conv
             or prefetch_baseline != "none"
         ):
             raise ValueError("upstream-strict baseline cannot enable downstream passes")
@@ -436,6 +448,12 @@ def hexagon_options_phase4(
     ):
         raise ValueError("external prefetch baselines cannot be combined with ALPS")
     options["enablePrefetchKernelHX"] = prefetch_baseline == "prefetch-kernel-hx"
+    options["enableAlpsFP16HVXArithmetic"] = bool(
+        enable_alps_fp16_hvx_arithmetic
+    )
+    options["enableAlpsHVXWideningConv"] = bool(
+        enable_alps_hvx_widening_conv
+    )
     options["prefetchKernelHxDistance"] = int(prefetch_baseline_distance)
     options["enableAPTGetHX"] = prefetch_baseline == "apt-get-hx"
     options["aptGetHxDistance"] = int(prefetch_baseline_distance)
@@ -502,6 +520,12 @@ def hexagon_options_phase4(
     )
     options["enableAlpsRegisterTileFormation"] = (
         os.environ.get("ALPS_ENABLE_REGISTER_TILE_FORMATION", "0") == "1"
+    )
+    options["alpsRegisterTileDemandBegin"] = int(
+        os.environ.get("ALPS_REGISTER_TILE_DEMAND_BEGIN", "0")
+    )
+    options["alpsRegisterTileDemandEnd"] = int(
+        os.environ.get("ALPS_REGISTER_TILE_DEMAND_END", "-1")
     )
     options["enableAlpsContractDischargeLedger"] = (
         os.environ.get("ALPS_ENABLE_CONTRACT_DISCHARGE_LEDGER", "0") == "1"
@@ -620,6 +644,7 @@ def hexagon_options_phase4(
         f"alps_p2g_continuity_audit={int(options['enableAlpsContinuityAudit'])} "
         f"alps_p2g_loop_interchanged={int(options['enableAlpsLoopInterchangedDirectFormation'])} "
         f"alps_p2g_register_tile={int(options['enableAlpsRegisterTileFormation'])} "
+        f"alps_p2g_demand_window={options['alpsRegisterTileDemandBegin']}:{options['alpsRegisterTileDemandEnd']} "
         f"alps_p5a_discharge_ledger={int(options['enableAlpsContractDischargeLedger'])} "
         f"alps_p5b_supply_analysis={int(options['enableAlpsRepresentationSupplyAnalysis'])} "
         f"alps_p5c_layout_supply={int(options['enableAlpsLayoutSupplyPrefetch'])} "
@@ -640,7 +665,9 @@ def hexagon_options_phase4(
         f"alps_p5l_hmx_f16_bias_epilogue={int(options['enableAlpsHmxF16BiasEpilogueFormation'])} "
         f"alps_p5m_hmx_async_drain_analysis={int(options['enableAlpsHmxAsyncDrainAnalysis'])} "
         f"alps_p5n_hmx_async_drain={int(options['enableAlpsHmxAsyncDrain'])} "
-        f"alps_p4a_traffic={int(options['enableAlpsTrafficControl'])}"
+        f"alps_p4a_traffic={int(options['enableAlpsTrafficControl'])} "
+        f"alps_fp16_hvx={int(options['enableAlpsFP16HVXArithmetic'])} "
+        f"alps_hvx_widening_conv={int(options['enableAlpsHVXWideningConv'])}"
     )
     return options
 
@@ -648,6 +675,23 @@ def hexagon_options_phase4(
 def add_phase4_args(parser):
     parser.add_argument("--enable-hexkl", action="store_true")
     parser.add_argument("--enable-omnifetch-vdae", action="store_true")
+    parser.add_argument(
+        "--enable-alps-fp16-hvx-arithmetic",
+        action="store_true",
+        help=(
+            "Default-off negative ablation: lower eligible FP32 convolution/"
+            "elementwise islands in this FP16 model to FP16 arithmetic. V73 "
+            "admission additionally requires the object half-helper audit."
+        ),
+    )
+    parser.add_argument(
+        "--enable-alps-hvx-widening-conv",
+        action="store_true",
+        help=(
+            "ALPS C: retain F16 convolution operands, widen 32 output lanes "
+            "once, and accumulate in a native 128-byte F32 HVX vector."
+        ),
+    )
     parser.add_argument(
         "--prefetch-baseline",
         choices=("none", "prefetch-kernel-hx", "apt-get-hx"),

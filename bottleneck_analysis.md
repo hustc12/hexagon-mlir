@@ -4411,3 +4411,1046 @@ nano:/home/huzq85/2-working/working_set/alps_p5k_matched_control_dinov2_20260828
 nano:/home/huzq85/2-working/working_set/alps_p5n_hmx_async_drain_dinov2_20260828
 nano:/home/huzq85/2-working/working_set/alps_p5n_hexkl_phase_lwp_dinov2_20260828
 ```
+
+### 11.44 跨 domain 验证与正式 ablation study 计划（2026-08-28）
+
+P5n 已在完整 DINOv2-small 上形成“静态准入—实际 UserDMA—关键路径变化—formal
+latency—正确性”闭环，但单一 Vision 模型不足以支持可迁移性结论。下一阶段不把所有
+模型盲目送入 P5n，而是按 P5m 先筛选 residual HMX drain 和真实 overlap distance：
+
+1. **Speech：完整 Whisper-tiny。** 先运行 P5m analysis-only；只有 admitted bytes、
+   overlap bytes、边界比例和 VTCM 需求通过，才运行同配置 P5k/P5n。
+2. **Language：完整 Qwen2.5-0.5B。** 保持现有分层编译、分层设备执行和 Perf 求和
+   语义；同样先 P5m，禁止仅因旧 item7 有收益就推断 P5n 必然有效。
+3. **Vision replication：ViT-Base 或 BEiT-Base。** DINO 已作为 Vision 正例；第三个
+   新模型优先选择无需额外模型适配且 P5m HMX 覆盖更高者，用于同 domain 复现，而非
+   替代跨 domain 证据。
+
+初筛只执行一次完整模型设备测量，且严格串行。停止线如下：
+
+- P5m 没有合法 descriptor、静态 overlap 很低或有效数据量太小：记为 admission
+  negative case，不运行 P5n；
+- P5n correctness 失败、UserDMA issued/completed 不相等或出现 fallback：立即排除；
+- P5n 相对 matched P5k 明确回退：停止该模型，不做长时间局部调参；
+- 初次增益低于约 3%：记为不确定，不进入正式重复实验；
+- 只有增益明确且可由 LWP/PMU/DMA telemetry 解释的模型，才复用同一编译产物做至少
+  3 次串行正式测量，报告 median、离散度和设备状态。
+
+#### 11.44.1 最终 ablation 矩阵
+
+消融必须区分“删除搬运”和“提前搬运”，不能把 layout/direct formation 的收益归入
+prefetch。建议冻结以下嵌套配置：
+
+| ID | 配置 | 隔离的因果问题 |
+|---|---|---|
+| A0 | HMLIR HVX，HexKL Off | 纯 HVX framework baseline |
+| A1 | HMLIR HVX，HexKL On | HMX/HexKL mapping baseline |
+| A2 | A1 + consumer-driven layout/continuity/direct formation | consumer contract 能删除多少 representation movement |
+| A3 | A2 + HMX F16 epilogue/direct-output formation（P5j/P5k） | HMX 边界的 widen/narrow 与 padded-output copy 收益 |
+| A4 | A3 + admitted asynchronous drain（P5n） | 无法删除的 residual movement 被异步隐藏的独立收益 |
+| A5 | A4 + PMU/traffic admission | runtime monitoring、节流和拒绝策略的增量 |
+
+此外增加两个机制消融：
+
+- **forced asynchronous movement vs P5m admission**：证明“选择性 prefetch”优于
+  无条件发出；无 overlap distance 的模型应由 admission 拒绝；
+- **synchronous drain vs ping-pong async drain**：P5k 与 P5n 的一对一比较，是论文中
+  prefetch/提前搬运贡献的主要归因实验。
+
+实现开关必须继续默认关闭且可独立控制。正式表格至少报告 latency、speedup、正确性、
+HMX rewrite/site 数、P5m admitted/overlap bytes、UserDMA issued/completed/bytes/fallback、
+LWP exposed transfer share，以及可获得时的 PMU/sysMon 指标。编译产物和设备结果仍直接
+移动到 nano 的 `working_set`，本地只保留小型 CSV/Markdown 摘要。
+
+### 11.45 P5n 跨 domain 初筛：Whisper、Qwen 与 BEiT（2026-08-28）
+
+本轮配置没有跳过 P5h/P5i。`--alps-p5m` 是累计配置，包含 P0、P2e、P2g/P2gc、
+P5fa、P5gd/P5gf/P5gg、**P5h、P5i、P5j、P5k** 和 P5m；`--alps-p5n` 在此基础上
+仅增加异步 drain。P5i 的 patch-conv contract 对非视觉模型通常自然为零，P5h 则仍按
+合法性匹配。最终 ablation 仍须将 P5h/P5i 单独拆分，不能用累计配置推断单项贡献。
+
+完整 Whisper-tiny 的 P5m 静态筛选显示很高的理论覆盖：65 个 site 中 53 个准入，
+22,405 个 descriptor 中 21,973 个准入；总 drain 为 45,774,400 B，准入
+45,000,256 B，可重叠 44,892,160 B。P5m 的执行路径与 P5k 相同，但设备进程以
+exit 13 / `0x8000040d` 异常退出。按停止线没有重复运行，也没有继续 P5n；因此该模型
+当前只能记为“静态潜力高、累计 control 在设备上不受支持”，不能提供 latency 结论。
+
+完整 Qwen2.5-0.5B（24 层分层执行，seq_len=32）的 P5m/P5k 等价 control 正确通过：
+latency 10,582.80 ms，最终 top-5 匹配。静态聚合为 169 个 admitted site、14,252 个
+descriptor、29,188,096 B admitted bytes，以及 14,083 个可重叠 descriptor、
+28,841,984 B overlap bytes。由于 P5m 是 analysis-only 且执行与 P5k 完全相同，该值
+作为本轮 matched synchronous control，避免再花约 22 分钟重复编译同一路径。
+
+Qwen P5n 的 24 个 transformer layer 均正确通过；每层 UserDMA issued/completed 均为
+396/396、811,008 B、fallback=0。但 head 的 4,748 个 DMA 也显示 issued=completed、
+9,723,904 B、fallback=0 时，输出仍退化为全零量级并触发 correctness 失败。因此
+10,025.77 ms 只是无效运行时间，**不得计算 speedup**。后续源码核查找到了确定根因：
+UserDMA 2D descriptor 的 source/destination stride 都只有 16 bit，而 head stride 为
+303,872 B；当前 runtime 未做范围校验，setter 直接 mask 成 41,728 B，P5m 又错误地把
+它报告为 `dma2d_legal=1`。所以 completed 只表示截断后的错误 descriptor 完成，并不
+表示目标 tensor 正确。按预定停止线不重复运行、不做该模型局部调参。
+
+完整证据：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p5m_hmx_async_drain_analysis_whisper_20260828
+nano:/home/huzq85/2-working/working_set/alps_p5m_hmx_async_drain_analysis_qwen_20260828
+nano:/home/huzq85/2-working/working_set/alps_p5n_hmx_async_drain_qwen_20260828
+```
+
+完整 BEiT-Base 提供了同 domain 的独立复现。P5m/P5k 等价 control 正确通过，latency
+8,864.83 ms；72 个 site 中 60 个准入，28,311,552 B admitted、28,188,672 B 可与后续
+HMX 重叠。P5n latency 为 8,292.04 ms，相对 matched control 为 **1.0691x**，延迟下降
+**6.46%**；运行时 issued/completed=13,824/13,824、issued bytes=28,311,552 B、
+fallback=0，且 max abs diff 仍为 0.0056、top-1 匹配。该结果复现了 DINO 上“无法删除的
+result movement 通过 VTCM ping-pong + UserDMA 提前搬运”的独立收益。
+
+需要严格区分归因：BEiT 的 P5m/P5n 都包含 P5h 与 P5i，因而这一对 matched comparison
+只隔离 **P5n**，不能证明 P5h 或 P5i 单独贡献。P5h/P5i 的收益与交互必须留到 A2/A3
+拆分消融中测量。当前筛选集合为：DINO、BEiT 是 correctness-closed 正例；Whisper 是
+device-unsupported negative；Qwen 是 hardware-descriptor-range negative。跨 domain
+结果说明 P5n 不能无条件泛化，admission 必须验证硬件 descriptor 的 address、width、
+height 和 stride 字段范围，而不只是 bytes 与 overlap distance。
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p5m_hmx_async_drain_analysis_beit_20260828
+nano:/home/huzq85/2-working/working_set/alps_p5n_hmx_async_drain_beit_20260828
+```
+
+随后对层级窗口注意力的完整 Swin Transformer 进行同一筛选。P5m/P5k 等价 control
+latency 为 41,401.57 ms，35/35 site 准入，14,770,176 B admitted、14,698,496 B
+可重叠；P5n 正确通过，latency 40,898.92 ms，issued/completed=7,212/7,212、
+issued bytes=14,770,176 B、fallback=0，top-1 匹配。相对 control 仅 **1.0123x**，
+延迟下降 **1.21%**，低于预设 3% 继续门槛，因此记为“机制正确执行但收益不确定”，
+不进行重复测量或局部调参。这也说明 admitted/overlap bytes 是必要而非充分条件；窗口
+注意力中残余 drain 占总关键路径的比例明显低于平坦 ViT 类模型。
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p5m_hmx_async_drain_analysis_swin_20260828
+nano:/home/huzq85/2-working/working_set/alps_p5n_hmx_async_drain_swin_20260828
+```
+
+Speech/Language 的下一轮筛选进一步收紧了 admission 边界。完整 HuBERT-base 在 P5m
+编译阶段由 P5g-e/f 主动拒绝。进一步源码与日志对照表明，并不是抽象的 alias 不安全：
+P5g-f 的 head-major VTCM type builder 明确只接受 static rank-3 root，但 admission 把
+HuBERT 的 rank-2 `512x64`/`768x64` roots 标成 rewrite-ready，rewrite 入口随即失败，
+最后才被统一包装成“failed to clone alias chain”。因此没有生成设备 module；按停止线
+不绕过证明、不运行 P5n。完整 GPT-2 的 P5m control
+正确通过，latency 3,583.37 ms，但 12 个 block 的 48 个 HMX site 全部被拒绝，唯一静态
+准入项是最终 vocabulary head（3,216,448 B admitted，3,215,360 B overlap）。其
+100,514 B destination stride 同样超过16位上限，若执行会被截断成34,978 B；因此基于
+Qwen 的确定根因直接拒绝 P5n，而不是重复一次已知高风险执行。
+
+这两个 negative case 不属于“测试没跑完”：HuBERT 是 compiler rank-contract negative，
+GPT-2 是 hardware-descriptor-range negative。正式 P5m admission 和 runtime fallback 都
+必须固化 16-bit width/height/stride 检查；P5g-f admission 则必须要求 rank-3，或安全回退
+到非 head-major P5g-e，而不能让 rewrite 阶段才失败。
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p5m_hmx_async_drain_analysis_hubert_20260828
+nano:/home/huzq85/2-working/working_set/alps_p5m_hmx_async_drain_analysis_gpt2_20260828
+```
+
+完整 Whisper-tiny 的功能二分确认了第三个独立根因边界。P2g analysis-only control 正确
+通过，latency 76,799.45 ms，max diff 0.0039、last-token top-1 匹配；仅增加 P2g-c 后，
+编译成功但设备复现 exit 13。P2g-c 报告 21 个 register-tile vectorization candidate，
+13 个成功、8 个失败。继续向后的 P5g-g 仍 exit 13，且其 `rewritten_epochs=0`，所以
+Whisper 的异常不是 P5g/P5h/P5j/P5k 或 P5n 引入，而是首次由 P2g-c register-tile direct
+formation 引入。下一层定位应在这13个成功 site 上做 compiler-side per-site admission/
+bisection；sysMon 只能记录系统 PMU/traffic，无法把 DSP exception 映射回某个 IR site，
+不适合作为此功能错误的首要工具。
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p2g_whisper_rootcause_20260828
+nano:/home/huzq85/2-working/working_set/alps_p2gc_whisper_rootcause_20260828
+nano:/home/huzq85/2-working/working_set/alps_p5gg_whisper_rootcause_20260828
+```
+
+### 11.46 Whisper P2g-c exit 13 的逐站点根因与修复（2026-08-28）
+
+P2g-c 增加了 compiler-side demand window 和逐站点 telemetry。完整 Whisper 共找到
+13 个 register-tile direct site；只启用 demand 0 即可稳定复现 exit 13，因此不再对其余
+site 做线性盲跑。该 site 把 `tensor<1x384x1500xf16>` 直接形成
+`tensor<1x1500x384xf16>`，permutation 为 `[0,2,1]`。失败 object 的 V73 反汇编没有
+VTCM `vgather`/`vscatter`，实际生成的是成组 `vmemu`、寄存器内 `vdeal` 和 `vmemu`
+store；所以这条路径是 HVX VRF register-tile formation，而不是 VTCM gather。
+
+原准入只证明 affine map 可形成 128 B register tile，却没有证明源端整宽 load 的尾部
+安全。V73 的 128 B HVX 向量对 FP16 是 64 elements，而源物理最内层 extent 1500 不能
+被 64 整除；最后一个整宽 `vmemu` 会跨过逻辑 row 边界。对照 object 还排除了栈大小
+假说：失败与正确 control 的 frame 只差约 256 B，control 本身已有约 174 KiB frame。
+
+修复后的 P2g-c admission 要求 source physical innermost row 是整数个 native 128 B
+vector；否则保留原生 transpose，直到未来具备 masked/padded tail lowering。该规则不是
+性能启发式，而是 codegen safety proof。单元测试同时覆盖 64xf16 安全正例和 96xf16
+非整向量拒绝例。完整 Whisper 修复后结果为：
+
+| 指标 | 修复后 P2g-c |
+|---|---:|
+| Latency | 77,912.83 ms |
+| Correctness | PASS；max diff 0.0039；last-token top-1 match |
+| demands / producer-direct / register-tile-direct | 114 / 48 / 12 |
+| rejected unsafe-tail sites | 1（原 demand 0，source inner extent 1500） |
+| eliminated materialization bytes（静态） | 28,237,824 B |
+
+相比同日 P2g analysis-only control 的 76,799.45 ms，修复后的 P2g-c 为约 **0.9857x**
+（慢 1.45%）。因此本结果首先关闭了 Speech 路径的功能正确性缺口，但没有证明 P2g-c
+本身有性能收益。12 个安全站点虽然静态替代了 transpose materialization，其
+`vmemu + vdeal` producer-side formation 仍可能留在关键路径；后续不能把静态 eliminated
+bytes 直接等价为物理 traffic 或 latency reduction。
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p2gc_whisper_site_diag_all_20260828
+nano:/home/huzq85/2-working/working_set/alps_p2gc_whisper_site_0_20260828
+nano:/home/huzq85/2-working/working_set/alps_p2gc_whisper_tailfix_20260828
+```
+
+Whisper 修复后也重新关闭了 P5m/P5n 的 matched comparison。P5m/P5k synchronous
+control 为 71,240.91 ms；52/65 site 通过新的 descriptor-range admission，20,352 个
+descriptor、41,680,896 B admitted，其中 41,574,400 B 具有静态 overlap。其余 13 个
+site 因最大 destination stride 达 103,730 B 而拒绝，证明 aggregate
+`dma2d_legal=0` 不等于所有合法子 site 都必须放弃。
+
+P5n 为 70,414.99 ms，相对 control **1.0117x**、延迟下降 **1.16%**；正确性保持
+max diff 0.0039、last-token top-1 match。运行时 issued/completed 为
+20,352/20,352，issued bytes 41,680,896 B，fallback=0。它说明异步 HMX result drain
+在 Speech 模型上功能正确且真正执行，但收益低于预设 3% continuation threshold，故
+停止重复测量和局部调参。Whisper 应作为 correctness-qualified weak-performance case，
+不能进入显著收益集合；高 admitted/overlap bytes 仍不是关键路径占比的充分条件。
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p5m_whisper_tailfix_20260828
+nano:/home/huzq85/2-working/working_set/alps_p5n_whisper_tailfix_20260828
+```
+
+descriptor-range 修复后，完整 Qwen2.5-0.5B P5n 也从此前的错误全零 head 恢复为正确：
+24 个 transformer layer 各自发出并完成 396 个 descriptor、811,008 B；聚合为
+9,504/9,504、19,464,192 B、fallback=0。最终 vocabulary head 的 destination stride
+为 303,872 B，新的 P5m admission 正确报告 `dma2d_legal=0`、admitted=0，并保留同步
+drain，因此 head 不再发生 silent 16-bit truncation。最终 finite=True、top-5 match，
+max abs 为 0.56640625（沿用该分层完整模型既有 top-5 correctness gate）。
+
+修复后 P5n latency 为 10,364.01 ms，相对同配置 P5m/P5k matched control
+10,582.80 ms 为 **1.0211x**、延迟下降 **2.07%**。它把 Qwen 从“无效运行”升级为
+Language domain 的 correctness-qualified weak-performance case，但仍低于 3% continuation
+threshold，不做正式重复测量。该结果同时验证了新的 admission policy：合法的 layer
+descriptor 继续异步执行，非法的大 stride head 局部同步回退，而不是整模型禁用 P5n。
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p5n_qwen_stridefix_20260828
+```
+
+完整 HuBERT-base 在 rank-contract 修复后的 P5m control 为 180,829.05 ms，P5n 为
+176,891.35 ms，即 **1.0223x**、延迟下降 **2.18%**。74/74 site 合法，运行时
+issued/completed=5,234/5,234、10,719,232 B、fallback=0；正确性 finite、max diff
+0.0083、last-frame top-1 match。与 Whisper 一致，HuBERT 证明 Speech encoder 上机制
+可以正确执行，但未跨过 3% continuation threshold，因此停止重复测量。
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p5m_hubert_rankfix_20260828
+nano:/home/huzq85/2-working/working_set/alps_p5n_hubert_rankfix_20260828
+```
+
+完整 GPT-2 在 descriptor-range 修复后重新运行 P5m，latency 3,583.47 ms，12 层
+finite、last-token top-1 match。12 个 block 的 48 个 HMX site 全部没有 P5k residual
+direct-output descriptor，最终 vocabulary head 的 100,514 B destination stride 被正确
+报告为 `dma2d_legal=0`；因此完整模型 admitted descriptor/bytes 为 0。P5n 不再运行：
+它不会发出异步 DMA，与 control 相同，属于明确的 static admission negative，而不是测试
+缺失。
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p5m_gpt2_stridefix_20260828
+```
+
+本轮修复后的跨 domain 结论是：Vision 的 DINO/BEiT 仍是 P5n 明确正例；Swin、Qwen、
+Whisper、HuBERT 是 correctness-qualified weak cases；GPT-2 是零合法工作量的 admission
+negative。sysMon/PMU 不适合定位本轮三个功能错误，因为它不能把 DSP exception 反向
+映射到 IR demand 或证明 descriptor field 未截断。现在功能正确性已经关闭，后续若要
+解释弱模型的性能差异，再对代表性 weak case 做 LWP/PMU critical-path profiling；不能
+用系统 traffic 计数替代 compiler-side safety proof。
+
+### 11.47 关闭电源混淆并恢复 item7 组合后的 Qwen 归因（2026-08-28）
+
+此前 Qwen P5m/P5n 的 10.58/10.36 s 不能与历史 item7 约 5.86 s 直接比较：前者是
+P5 累计配置但没有组合 item7，后者启用了 item7。手机当时还处于
+`low_power=1`、sticky battery saver 和 Doze，进一步形成了设备状态混淆。新增
+`scripts/prepare_phone_benchmark.sh` 在每次正式运行前关闭 low-power 与 adaptive
+power saver、解除并禁用 light/deep device idle、唤醒设备；thermal protection 保持
+启用，不以关闭安全保护换取数字。vendor 禁止 shell 修改 stay-on/app-standby，因此
+脚本只报告这些只读状态，不伪造“已固定”。本轮三次完整模型均确认
+`low_power=0`、sticky=0、device-idle disabled/ACTIVE。
+
+维护脚本 `run_full_hvx_five_way.sh` 现支持 `--item7-only`，以及把
+`--with-item7` 与 `--alps-p5m`/`--alps-p5n` 组合。完整 Qwen2.5-0.5B、24 层、FP16、
+seq_len=32 的 matched 结果如下；三项均 finite、top-5 match，max abs 为 0.58984375：
+
+| 配置 | Latency | 相对前项 | 相对 item7-only | 运行时机制 |
+|---|---:|---:|---:|---|
+| item7-only | 5,911.34 ms | 1.0000x | 1.0000x | K/V pair=1；L2 issued=0 |
+| item7 + P5m/P5k | 5,639.33 ms | **1.0482x** | **1.0482x** | 累计 layout/direct formation；同步 residual drain |
+| item7 + P5n | **5,328.06 ms** | **1.0584x** | **1.1095x** | 9,504/9,504 async DMA；19,464,192 B；fallback=0 |
+
+item7-only 与历史 5,859.60 ms 只差 0.88%，因此此前“item7 收益消失”的主要原因是
+实验配置错配，不是新 compiler 修改破坏了该路径。item7 仍然没有发出硬件 K/V L2
+hint；它的收益应归因于 attention propagation/tiling/slicing topology，而不能写成
+runtime data-prefetch 收益。P5m 相对 item7 的 4.82% 是累计 representation/layout
+formation 的增量；只有 P5n 相对 matched P5m 的 5.52% 才隔离异步提前搬运。
+
+逐阶段 Perf 排除了单层偶然值。24 层全部在 P5n 下快于 P5m；layer 总和从
+4,467.11 ms 降至 4,150.30 ms，即 **1.0763x**。逐层 P5m/P5n speedup 范围为
+1.0276x--1.1056x。head 因 303,872 B stride 不合法而同步回退，从 1,171.92 ms
+轻微变为 1,177.45 ms；所以完整模型的 P5n 收益确实来自24个合法 transformer layer，
+不是 vocabulary head 或 embedding。
+
+为了在不重编译完整模型的情况下做硬件归因，新增
+`scripts/profile_archived_hexagon_stage.sh`。它复用远端归档的同一个完整 layer-0
+产物，保留 wrapper 编译时嵌入的原设备目录名，并在同一个 sysMon 窗口内串行执行20次。
+首次复用曾因临时目录改名导致 wrapper 找不到硬编码 input、以 `0x8000040d` 退出；确认
+根因后才修复脚本，没有把 exit 13 当性能运行重复。单次窗口太短时 SDK parser 不生成
+PMU CSV，因此20次只用于稳定硬件计数，不替代上面的全模型 latency。
+
+| 代表层 matched sysMon 指标 | item7 + P5m | item7 + P5n | P5n 变化 |
+|---|---:|---:|---:|
+| 最后一轮 wrapper Perf | 187.26 ms | **179.68 ms** | **-4.05% / 1.0422x** |
+| 20次 host window | 9.026 s | **8.902 s** | **-1.38%** |
+| processor cycles | 8,792,980,362 | **8,571,065,337** | **-2.52%** |
+| AXI cached read | 2,305,764,096 B | 2,306,258,432 B | +0.02% |
+| AXI cached write | 791,842,432 B | 971,270,400 B | +22.66% |
+| AXI total | 3,097,606,528 B | 3,277,528,832 B | +5.81% |
+| HVX+HMX-active window AXI | 791,542,400 B | **739,557,376 B** | **-6.57%** |
+| HVX packet / HMX active event | 20,006,622 / 14,724,042 | 20,111,989 / 14,727,075 | +0.53% / +0.02% |
+
+两次 PMU 前后均为 USB powered、100% battery、27.4--27.6 C、low-power off、idle
+disabled，因而没有 thermal/battery-saver 解释。P5n 没有减少总物理流量；异步 drain
+增加了可见写事务，但 processor cycles 和 HVX+HMX active-window AXI 同时下降。当前
+证据支持的机制是：P5n 把无法消除的 residual HMX result movement 与后续计算重叠，
+缩短关键路径，而不是通过减少 DDR 字节加速。`neither` 活动窗口还包含每次独立 runner
+加载约30 MB constants 等系统域开销，所以不应把20次 system-domain AXI 总量外推为
+一次完整推理的 tensor traffic。
+
+完整证据已移动到：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_qwen_matched_item7_power_20260828
+nano:/home/huzq85/2-working/working_set/alps_qwen_matched_item7_p5m_20260828
+nano:/home/huzq85/2-working/working_set/alps_qwen_matched_item7_p5n_20260828
+nano:/home/huzq85/2-working/working_set/alps_qwen_item7_p5n_sysmon_20260828
+```
+
+因此跨 domain 筛选结论应分配置表述：不组合 item7 的原 P5n 矩阵中，显著正例仍是
+DINO/BEiT；在论文目标的 item7 + representation formation + async supply 统一配置下，
+Qwen 已成为首个超过3%门槛且有 PMU/DMA 闭环的 Language 正例。正式 median/离散度不在
+本轮继续重复，按既定约定与所有模型的最终 ablation 一起串行执行，避免筛选阶段演变为
+无休止测试。
+
+## 12. 完整15模型 LWP + sysMon 瓶颈语料库（2026-08-29 起）
+
+### 12.1 为什么需要全模型 profiling，以及如何防止偏离论文故事
+
+对15个完整模型全部建立 LWP + sysMon 语料库是必要的。此前按单模型静态 bytes 或
+latency 猜测热点，已经多次出现“admitted bytes 很高但收益很弱”和“显式 copy 减半但
+真实关键路径只下降数个百分点”。统一 profile 的目的不是为每个模型分别发明一个优化，
+而是先得到可比较的事实，再把热点归并成少数可由 ALPS 统一处理的类别。
+
+固定设备执行配置为完整 FP16 模型、HVX vector、HexKL on、item7 synchronous control。
+已经能承受 P5m/P5k 编译内存的分层模型额外使用该配置观察尚未被 async drain 隐藏的
+residual movement；单体大图不得为了 profiling 强制打开整条 P1--P5 编译期分析链。
+编译期 movement ledger 是离线辅助证据，不是 sysMon 测量语义的一部分。每个模型分两次
+运行：
+
+1. **LWP插桩运行**：分层模型先用loop depth 1；单体大图先用函数/顶层region，仍超过
+   内存预算时只插桩由Perf/sysMon锁定的热点函数。启用HexKL phase markers，用exclusive
+   cycles定位operator/stage critical path；该延迟只用于排名，不作为正式latency。
+2. **非插桩sysMon运行**：使用与正式item7运行相同的device code，优先重放已验证的归档
+   产物；
+   所有input/constant/shared object在PMU启动前预置，避免把编译和ADB上传混入窗口。
+3. 两次均在 `low_power=0`、device-idle disabled、thermal protection enabled下串行运行；
+   不设置timeout，不自动重试exit 13；每个case完成即移动到nano并删除本地大产物。
+
+LWP与sysMon回答不同问题：LWP把cycles映射回stage/operator，sysMon给出真实HVX/HMX、
+AXI read/write和burst行为。sysMon是CDSP system-domain统计，不能单独把某些bytes归给某
+个MLIR op；分层模型的whole-model replay还包含每个runner process的启动成本，因此正式
+模型Perf仍取wrapper内部各stage之和。
+
+实现入口：
+
+```text
+scripts/run_full_bottleneck_corpus.sh
+scripts/profile_archived_hexagon_model.sh
+scripts/summarize_alps_lwp.py
+scripts/summarize_model_sysmon.py
+```
+
+论文适配采用四类标签：
+
+| 标签 | 热点类型 | ALPS中的处理 | 是否进入论文核心 |
+|---|---|---|---|
+| E | 可消除的layout/materialization/representation round trip | consumer-driven direct/in-situ formation、persistent representation | 是，第2贡献 |
+| P | 无法消除但暴露在关键路径且有overlap distance的transfer | VTCM ping-pong、UserDMA async supply/drain | 是，第1/2贡献交界 |
+| R | 带宽/traffic burst、资源冲突或prefetch负收益风险 | PMU admission、traffic control、拒绝/节流 | 是，第3贡献 |
+| C | 纯算术、低效scalar codegen、通用算子实现 | 修复baseline或使用既有HVX/HMX优化 | 工程项；不包装成ALPS创新 |
+
+只有满足以下条件的优化才进入统一方案：至少跨两个模型复现，最好跨domain；覆盖显著
+exclusive cycles或真实traffic；能由E/P/R之一表达；具有独立开关和matched ablation。
+只服务一个模型的普通vectorization、特殊算子或精度技巧保留为baseline engineering，
+不能为了提高数字破坏“先消除、再提前搬运、最后runtime admission”的故事线。
+
+### 12.2 Corpus状态与逐模型优化路径
+
+下表的 `measured` 只在LWP和sysMon均完成后填写；其余行是等待profile验证的假说，不能
+当作测量结论。DINO/Qwen此前数据保留为先验证据，但主corpus仍以本节固定配置为准。
+
+| Domain | 完整模型 | LWP/sysMon状态 | 当前最大瓶颈 | 候选优化路径 | 论文标签 |
+|---|---|---|---|---|---|
+| Language | GPT-2 | **measured** | vocabulary head占约60%；blocks约40%；HMX outer chain与未归因等待占主导 | vocabulary projection分块direct formation；合法stride的chunked drain；细分head root等待 | E/P |
+| Language | SD/CLIP | **LWP + sysMon measured** | 12 layers占99.65%；HMX outer 66.09%，output copy 8.26%，GELU 7.75% | HMX direct consumer formation + async drain；GELU归C | E/P/C |
+| Language | Qwen2.5-0.5B | **LWP + sysMon measured** | head21.69%；HMX outer63.50%；extf链16.22%；output copy6.18% | head分块direct formation + async drain；保留item7 topology | E/P/R |
+| Language | TinyLlama-1.1B | **LWP + sysMon measured** | layers96.69%；HMX outer79.48%；extf链11.08%；output copy2.55% | layer projection persistent representation、合法分块drain | E/P/R |
+| Language | SmolLM2-1.7B | **LWP + sysMon measured** | layers94.42%；HMX outer84.60%；head5.58%；output copy2.12% | layer projection persistent representation、合法分块drain | E/P/R |
+| Vision | Swin Transformer | **full-graph LWP + sysMon measured** | extf/mulf/addf累加链94.00%；HMX仅2.22%；51.10 s | 首先修复window/MLP基础HVX codegen C；随后对window consumer layout做E | C/E |
+| Vision | SegFormer MiT-B0 | **full-graph LWP + sysMon measured** | extf/mulf/addf累加链85.68%；HMX仅2.63%；AXI 0.32 GB | 首先修复多尺度conv/MLP基础HVX codegen C；随后做consumer layout E | C/E |
+| Vision | DeiT-small | **full-graph LWP + sysMon measured** | extf/mulf/addf累加链57.64%；HMX链26.21%；softmax/reduction 4.23%；5.09 s正式运行 | 先修FP32累加/扩展链C，再对HMX表示做E/P；不再假设transpose是第一热点 | C/E/P |
+| Vision | BEiT-base | **full-graph LWP + sysMon measured；P5n正例** | HMX chain 47.57%；extf/mulf/addf 34.90%；softmax/reduction 11.34%；AXI 3.54 GB | HMX direct/persistent representation E + residual async drain P；累加/softmax归C | E/P/C |
+| Vision | DINOv2-small | **LWP + sysMon measured** | patch热点已由P5i消除；剩余HMX outer、attention arithmetic、residual drain；item7 replay 6.07 s | persistent HMX layout；P5n；纯attention算术归C | E/P/C |
+| Speech | Whisper-tiny | **full-shape local LWP + sysMon measured** | encoder frontend 88.37%；一个encoder layer 8.38%；head 2.30%；conv累加链92.43% | 先做frontend HVX conv C，再将conv结果直接形成consumer layout E；P仅处理剩余tile supply | C/E/P |
+| Speech | HuBERT-base | **local LWP + sysMon measured** | frontend90.74%、position9.17%；conv codegen dominated | shared HVX conv C，再做conv→token E | C/E |
+| Speech | Wav2Vec2-base | **local LWP + sysMon measured** | frontend90.96%、position8.95%；conv codegen dominated | shared HVX conv C，再做conv→token E | C/E |
+| Speech | UniSpeech-base | **local LWP + sysMon measured** | frontend90.73%、position9.17%；共享conv瓶颈 | 共享speech C/E contract，不做模型特例 | C/E |
+| Speech | UniSpeech-SAT-base | **local LWP + sysMon measured** | frontend90.03%、position9.88%；共享conv瓶颈 | 共享speech C/E contract，不做模型特例 | C/E |
+
+### 12.3 首个统一样本：完整 GPT-2
+
+完整12层FP16 GPT-2的LWP和非插桩sysMon均通过，正确性为finite、last-token top-1
+match。LWP运行3,625.62 ms、非插桩正式运行3,652.26 ms；二者接近只是设备稳定性旁证，
+不能用插桩值计算speedup。LWP stage aggregate为：vocabulary head **60.26%**，12个
+transformer block合计39.66%，embedding 0.08%。每个block约3.27--3.43%，说明不是单个
+异常layer。
+
+operation aggregate中，root/unattributed为49.80%，完整HMX outer chains约31.50%，
+block内FP16扩展/标量算术链11.43%；独立可见的HMX FP16→FP32 output copy仍占3.66%，
+RM→WH占1.42%。`micro_hmx_mm`本身的marker值很小不能解释为HMX计算免费：MM异步完成
+等待被计入outer chain/root，后续需要在head增加更细completion marker。
+
+whole-model replay的14个stage Perf之和为3,594.78 ms，其中head 2,163.52 ms
+（60.19%），12个block约1,428.32 ms（39.73%），再次独立复现LWP分布。sysMon窗口为
+8.293 s（包含14次runner process启动但不含文件上传），processor cycles 8.405B，
+AXI read/write为1.417/0.549 GB，总量1.966 GB；平均170.84/66.23 MB/s。AXI并非持续
+峰值饱和，且1.512 GB出现在HVX/HMX均未记录活跃的system-domain窗口，主要受分层runner
+启动/constant mapping影响。因此GPT-2的第一优化对象不是全图L2 prefetch，而是占60%的
+vocabulary head：按consumer需要对large-N projection分块，避免大stride/padded result，
+能直接形成就消除；无法消除且满足16-bit descriptor限制的chunk才进入异步drain。
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_full_bottleneck_corpus_20260829/lwp/gpt2
+nano:/home/huzq85/2-working/working_set/alps_full_bottleneck_corpus_20260829/sysmon/gpt2
+```
+
+### 12.4 DeiT暴露出的profiling可扩展性问题与修正协议
+
+DeiT-small的完整单体图分别尝试了LWP depth 1、LWP depth 0，以及把P1--P5m编译期分析
+链绑入非LWP sysMon构建。三条路径均在手机运行前被Linux global OOM终止，python匿名
+RSS约14.67 GB；LWP没有生成`lwp.json`。单线程和depth 0仍失败，证明根因不是手机、
+FP16、编译并行或sysMon，而是完整单体IR与全图分析/插桩的结构性内存峰值。继续重复同一
+路径既不能增加证据，也违反“失败不盲目重跑”的实验约定。
+
+因此用2026-08-15已经通过正确性检查的完整item7产物进行非插桩sysMon replay。wrapper
+Perf为 **5,086.94 ms**；PMU窗口5.531 s，processor cycles 7.754B，AXI read/write为
+620.73/248.43 MB，总869.15 MB；HVX/HMX event为104.06M/7.53M。按1 ms活动窗口：
+HVX+HMX共同活跃1408个sample并产生404.75 MB AXI，HVX-only 644个sample/172.40 MB，
+neither 3478个sample/291.90 MB。它说明DeiT并非“没有vector/HMX工作”，而是规则ViT
+pipeline中计算与外存活动明显重叠；仅凭总AXI仍不能判定某个transpose或drain在关键
+路径上。
+
+DeiT下一步不是再次全图插桩，而是：先以已有compiler ledger列出的96个produced
+representation和72个HMX drain site建立静态候选；再仅对patch embedding、单个
+attention block和HMX completion/drain插入局部LWP marker。若局部exclusive cycles与
+高AXI burst重合，则走E（直接形成/persistent layout）或P（VTCM async drain）；若计算
+marker占主导且搬运不在critical path，则归C，不为追求统一数字强行增加prefetch。
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_full_bottleneck_corpus_20260829/sysmon/deit-small/item7-archived-replay
+```
+
+这几次失败更新了15模型的执行策略：**所有模型都要有sysMon；LWP要覆盖每个模型的关键
+路径，但不要求每个模型都用相同的全图插桩粒度。** 分层Language模型按stage完整画像；
+单体Vision/Speech先做非插桩sysMon和wrapper Perf，再对排名靠前的函数/region做局部LWP。
+两种工具最终仍在统一的E/P/R/C分类上汇合，既保证profiling可扩展，也避免让工具开销
+改变论文故事。
+
+### 12.5 远端直供回放验证：DINOv2-small
+
+为满足本地磁盘约束，新增`profile_remote_archived_hexagon_model.sh`：输入、主shared
+object和constant shared objects从nano经SSH直接流到手机，编译产物不落地`/tmp`；PMU
+启动前完成全部传输，故网络传输不进入sysMon窗口。DINOv2-small的完整item7归档通过
+该路径复测，wrapper Perf为 **6,071.57 ms**，与此前同配置约5.95--6.1 s量级一致。
+
+sysMon窗口6.893 s，processor cycles 9.188B，AXI read/write为842.61/338.96 MB，总
+1.182 GB；HVX/HMX event为173.44M/9.69M。HVX+HMX共同活跃窗口产生488.25 MB AXI，
+HVX-only产生316.43 MB，说明该模型同时存在显著vector、matrix和memory activity。结合
+此前LWP消融，优化判断仍然成立：原patch convolution的39.09%热点可以通过P5i direct
+formation退出关键路径；其后应对residual HMX representation/drain采用E/P，而纯
+attention arithmetic归C。不能仅依据1.182 GB总AXI继续扩大无差别data prefetch。
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_full_bottleneck_corpus_20260829/sysmon/dinov2-small/item7-remote-replay
+```
+
+### 12.6 首个Speech样本：Wav2Vec2-base
+
+完整FP16 Wav2Vec2-base远端item7归档通过sysMon replay，wrapper Perf为
+**184,932.30 ms**，与原归档185,248.95 ms一致。PMU窗口185.752 s，processor cycles
+273.84B、committed packets 89.69B；但HVX/HMX event只有37.78M/8.47M。185,752个1 ms
+sample中，**183,760个**既无HVX也无HMX event，HVX+HMX共同活跃仅1,799个。AXI总量虽有
+5.492 GB，平均read/write bandwidth仅27.28/2.29 MB/s，不是持续DRAM带宽饱和。
+
+编译日志还显示原始98个`batch_matmul`中只flatten了74个，item7传播了24个K/V pair，
+但最终runtime prefetch hint为0。结合PMU，当前最大问题不是“没有发足够prefetch”，而是
+大部分计算没有落到HVX/HMX：可能来自conv frontend、normalization、activation、
+reduction或未满足vector/HMX contract的逐元素loop。下一步要把完整wrapper只作为正式
+latency/sysMon载体，另建保持原shape/weight的frontend、单个encoder block、CTC head局部
+LWP载体；先按exclusive cycles排序，再把layout造成的失败归E，把普通vectorization/
+算子实现归C。只有E路径和随后暴露出的不可消除transfer才能进入ALPS，不把通用Speech
+codegen修复伪装成prefetch贡献。
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_full_bottleneck_corpus_20260829/archived_sysmon/wav2vec2-base
+```
+
+BEiT-base的item7 replay为 **13,824.45 ms**，PMU窗口18.630 s、processor cycles
+24.64B，AXI read/write为2.981/0.555 GB。HVX+HMX共同活跃6575 ms并产生2.340 GB AXI，
+明显不同于Wav2Vec2的scalar-dominated形态；结合此前P5n正收益，它是E/P统一路径的强候选。
+但原始72个batch matmul没有被Python文本rewrite计数命中，不能把所有HMX activity简单
+归因于该rewrite；仍需用局部LWP把attention、MLP和drain completion拆开。
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_full_bottleneck_corpus_20260829/archived_sysmon/beit-base
+```
+
+### 12.7 SD/CLIP：最清晰的跨层重复HMX模式
+
+完整FP16 SD/CLIP的非插桩14-stage Perf合计 **3,438.01 ms**；12个encoder layer占
+99.65%，embedding和final norm合计仅12.14 ms。item7 LWP运行3,489.10 ms并通过完整
+12层正确性；12层的exclusive share分别约8.23--8.58%，没有异常单层。
+
+跨stage LWP operation aggregate显示：完整HMX outer chains占 **66.09%**，独立
+`copy_f16_to_f32_submatrix`占 **8.26%**，GELU标量链7.75%，reduction 4.11%，
+RM→WH 2.00%。这给出了比“总traffic很大”更直接的critical-path证据：每层都重复相同
+HMX计算、accumulator读取、layout/output copy；优先路径是让下游consumer直接接受HMX
+形成的表示（E），不能消除的f16→f32/chunked drain再异步化（P）。GELU和reduction若
+不能由layout contract改善则归C，不写成prefetch贡献。
+
+sysMon窗口11.649 s（包含14次runner启动），processor cycles 7.638B，AXI read/write
+1.700/0.468 GB；HVX+HMX共同活跃2695 ms并产生1.053 GB AXI。它与LWP共同说明CLIP不是
+Wav2Vec2式的纯scalar failure，而是一个适合ALPS E→P路径的规则Transformer正例。
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_full_bottleneck_corpus_20260829/lwp/sd-clip
+nano:/home/huzq85/2-working/working_set/alps_full_bottleneck_corpus_20260829/archived_sysmon/sd-clip
+```
+
+### 12.8 15模型sysMon全覆盖后的瓶颈分群
+
+截至2026-08-29，15个完整模型的非插桩item7 sysMon均已完成。下表中的`active`是至少
+记录到HVX或HMX event的1 ms sample占比；Language模型是多runner分层回放，`neither`
+包含每层进程启动/constant mapping，不能直接解释为scalar比例。Vision/Speech单体模型
+的PMU窗口与wrapper Perf接近，因此其active比例可以更直接用于执行路径分类。
+
+| Domain | Model | Perf | AXI total | HVX/HMX active samples | 测得的瓶颈类别 | 优化决策 |
+|---|---|---:|---:|---:|---|---|
+| Language | GPT-2 | 3.67 s | 2.01 GB | 12.27%* | head 60.26%，large-N projection | E分块direct formation；合法chunk才P |
+| Language | SD/CLIP | 3.44 s | 2.17 GB | 29.12%* | HMX outer/output copy跨12层重复 | E direct consumer layout + P async drain |
+| Language | Qwen2.5-0.5B | 5.88 s | 5.92 GB | 19.41%* | HMX outer 63.50%，head 21.69% | E/P；R约束大流量burst |
+| Language | TinyLlama-1.1B | 17.77 s | 11.61 GB | 43.49%* | layers 96.69%，HMX outer 79.48% | 跨层E/P；head不是首要目标 |
+| Language | SmolLM2-1.7B | 29.73 s | 18.99 GB | 51.06%* | layers 94.42%，HMX outer 84.60% | 跨层E/P；R admission价值最高 |
+| Vision | DINOv2-small | 6.07 s | 1.18 GB | 42.36% | patch已优化，剩余HMX/attention | E/P；纯attention算术归C |
+| Vision | DeiT-small | 5.09 s | 0.87 GB | 37.12% | 规则ViT compute+movement混合 | hotspot-local LWP后选择E/P |
+| Vision | BEiT-base | 13.82 s | 3.54 GB | 46.69% | HMX+HVX活跃窗口2.34 GB AXI | E/P强候选，复用DINO路径 |
+| Vision | Swin Transformer | 51.10 s | 1.10 GB | **3.00%** | window路径绝大部分未用HVX/HMX | 先C修baseline；window layout可归E |
+| Vision | SegFormer MiT-B0 | 8.93 s | 0.32 GB | **3.64%** | 低traffic且绝大部分未用HVX/HMX；宽泛FP16 accumulator实验反而慢21.03% | C应保留f16 operands + vector f32 accumulate并消除scalar helper；多尺度layout只在LWP命中时归E |
+| Speech | Whisper-tiny | 70.07 s | 6.86 GB | 17.20% | HVX event 1.93B，HMX较少 | 定位HVX conv/attention/reduction；E优先于P |
+| Speech | HuBERT-base | 172.77 s | 5.46 GB | **1.27%** | scalar/codegen dominated | 共享Speech局部LWP；先C再E |
+| Speech | Wav2Vec2-base | 184.93 s | 5.49 GB | **1.07%** | scalar/codegen dominated | 共享Speech局部LWP；先C再E |
+| Speech | UniSpeech-base | 184.30 s | 5.48 GB | **1.08%** | 与Wav2Vec2相同signature | 不做模型特例，共享C/E修复 |
+| Speech | UniSpeech-SAT-base | 179.39 s | 5.48 GB | **1.11%** | 与Wav2Vec2相同signature | 不做模型特例，共享C/E修复 |
+
+`*`：分层runner的active百分比不能与单体模型横向解释为scalar占比。
+
+这组数据把后续工作明确分成两条，而不是15条模型特例：
+
+1. **ALPS主线（E→P→R）**：CLIP、Qwen、TinyLlama、SmolLM、DINO、BEiT及
+   GPT head均已显示HMX representation/output或consumer layout问题。先消除/直接形成，
+   对无法消除且位于critical path的chunk异步搬运，最后按PMU traffic admission。
+   DeiT是C+E/P混合型，先处理57.64%的累加链，同时保留26.21%的HMX表示路径。
+2. **baseline enablement（C→E）**：Swin、SegFormer、Whisper、Wav2Vec2、HuBERT、
+   UniSpeech家族
+   当前主要问题是没有进入HVX/HMX；此时prefetch搬运得再好也无法带来1.8x。必须先修通
+   shared operator/vectorization contract，再检查新暴露的layout/materialization是否
+   能由ALPS E处理。C类收益必须在论文ablation中与ALPS收益分栏报告。
+
+Whisper的局部LWP已经把此前的“两者之间”假说收敛为C→E：frontend占88.37%，卷积累加
+链占92.43%，attention不是第一热点。该分群支持论文统一故事，而不是削弱prefetch：
+prefetch被严格
+定义为只服务“不能消除、可重叠、runtime允许”的residual supply；没有满足条件时正确
+行为就是拒绝prefetch。
+
+当前LWP状态为：GPT-2、SD/CLIP、Qwen、TinyLlama、SmolLM、DINO、DeiT、BEiT、Swin和
+SegFormer已有全图或分层operator级结果；Whisper及四个共享Speech encoder已有完整shape
+局部LWP。15个模型的LWP覆盖已经闭环。不能把“带全套重分析pass的LWP编译因内存失败”
+写成模型瓶颈，也不能用
+sysMon system-domain bytes虚构operator归因。
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_full_bottleneck_corpus_20260829/archived_sysmon
+nano:/home/huzq85/2-working/working_set/alps_full_bottleneck_corpus_20260829/lwp
+```
+
+### 12.9 共享Speech encoder的完整shape局部LWP闭环
+
+Wav2Vec2、HuBERT、UniSpeech和UniSpeech-SAT使用相同的完整20560-sample输入、64 frames、
+768 hidden和12层结构，分别把frontend、position formation、一个代表性encoder layer和
+CTC head编译为独立LWP stage。它们不是Debug/缩小模型；正式latency仍取完整单体wrapper，
+局部载体只为避免12层IR复制导致host OOM并做operator attribution。
+
+| Model | Frontend | Position | One encoder layer | CTC head | 用局部Perf估算完整路径 | 正式完整Perf |
+|---|---:|---:|---:|---:|---:|---:|
+| Wav2Vec2 | 162.48 s / 90.96% | 15.98 s / 8.95% | 164.89 ms / 0.09% | 1.51 ms | 180.44 s | 184.93 s |
+| HuBERT | 158.16 s / 90.74% | 15.98 s / 9.17% | 165.41 ms / 0.09% | 1.48 ms | 176.12 s | 172.77 s |
+| UniSpeech | 158.09 s / 90.73% | 15.98 s / 9.17% | 164.53 ms / 0.09% | 1.46 ms | 176.05 s | 184.30 s |
+| UniSpeech-SAT | 160.83 s / 90.03% | 17.65 s / 9.88% | 166.30 ms / 0.09% | 1.53 ms | 180.48 s | 179.39 s |
+
+四个模型一致复现：约99.9%的局部exclusive cycles在7-layer convolution frontend和
+position convolution；最大的operation class都是`extf, extf, mulf, addf`卷积累加链。
+单个Transformer layer已有6/8 batch-matmul rewrite且只约165 ms，attention并不是当前
+百秒级瓶颈。局部估算与完整Perf相差约2--5%，足以形成归因闭环，而不是把局部stage
+延迟冒充完整模型测量。
+
+因此共享Speech优化顺序已经确定：
+
+1. C：给长序列conv1d/feature extractor建立真正的HVX convolution lowering；这是
+   baseline enablement，必须与ALPS贡献分开报告。
+2. E：在conv kernel形成结果时直接产生`(batch, frames, hidden)` consumer layout，合并
+   现有transpose/position input formation；这与consumer-driven in-situ formation主线
+   无缝衔接。
+3. P：只有在C/E之后仍存在不可消除、LWP证明位于critical path的conv tile supply，才
+   使用VTCM async prefetch；当前阶段对attention K/V追加prefetch不会触及主瓶颈。
+4. R：sysMon证明当前平均AXI只有约30 MB/s，runtime应拒绝无差别traffic prefetch；待
+   HVX conv提高带宽需求后再由PMU admission重新决策。
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_full_bottleneck_corpus_20260829/hotspot_lwp_audio
+```
+
+### 12.10 Whisper-tiny的完整shape局部LWP闭环
+
+Whisper使用完整80x3000 mel输入、4层encoder、4层decoder、384 hidden和32-token target，
+分别编译encoder frontend、一个代表性encoder layer、一个decoder layer和vocabulary head。
+局部载体保持完整发布shape和真实算子，不是Debug模型；正式延迟仍取非插桩完整wrapper的
+70,067.02 ms。
+
+| Stage | 局部LWP Perf | Exclusive-cycle share |
+|---|---:|---:|
+| Encoder frontend | 45,146.27 ms | **88.37%** |
+| One encoder layer | 4,346.28 ms | 8.38% |
+| One decoder layer | 494.13 ms | 0.95% |
+| Vocabulary head | 1,194.63 ms | 2.30% |
+
+跨stage operation aggregate中，`extf, extf, mulf, addf`卷积/FP32累加链占
+**92.43%**，HMX链仅2.06%。按4个encoder和4个decoder外推约65.7 s，与完整模型
+70.07 s处于同一量级。因此此前“HVX event较高，可能是attention/layout feeding”的假说
+被测量结果否定：当前第一瓶颈仍是frontend convolution的基础codegen，而不是K/V搬运。
+优化顺序与共享Speech encoder一致：C先建立HVX conv lowering；E让conv直接产生后续token
+layout；只有无法消除且位于critical path的tile supply进入P，最后由R控制流量。
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_full_bottleneck_corpus_20260829/hotspot_lwp_whisper
+```
+
+### 12.11 DeiT轻量全图LWP恢复与瓶颈更正
+
+旧的DeiT全图LWP把P1--P5m重分析链、movement ledger和插桩同时启用，host RSS达到约
+14.67 GiB后OOM。改用与正式item7语义匹配的轻量协议——只启用item7、关闭movement
+ledger、LWP loop depth 0、单线程编译——完整单体图成功编译和运行。编译耗时
+1,264.58 s，插桩Perf为5,006.24 ms，输出finite、max abs diff 0.0035且top-1 match。
+因此旧失败是profiling配置的组合内存峰值，不是DeiT本身不能做全图LWP。
+
+全图exclusive-cycle aggregate为：FP32扩展/乘加链 **57.64%**，HMX chain
+**26.21%**，root/unattributed 8.43%，softmax/reduction 4.23%，其余3.48%。最大单region
+就是`extf, extf, mulf, addf`，占47.76%。这直接更正了“先找transpose/drain”的先验：
+DeiT当前首要路径是C（消除不必要的FP16↔FP32扩展并形成真正HVX累加kernel）；随后才对
+26.21%的HMX输出/表示应用E与P。sysMon总869.15 MB仍说明存在物理流量，但不能跨过
+57.64%的计算/codegen热点直接声称prefetch是第一优化项。
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_full_bottleneck_corpus_20260829/lwp/deit-small/item7-only
+```
+
+### 12.12 BEiT-base轻量全图LWP闭环
+
+BEiT-base采用与DeiT相同的item7-only、movement-ledger off、LWP depth 0、单线程协议，
+完整单体模型成功编译并在手机运行。插桩Perf为13,910.97 ms，输出finite、max abs diff
+0.0049且top-1 match；与非插桩sysMon正式值13,824.45 ms接近，但插桩值仍只用于热点排名。
+
+exclusive-cycle aggregate为：HMX chain **47.57%**，FP32扩展/乘加链 **34.90%**，
+softmax/reduction **11.34%**，其余/未归因6.19%。最大单region是
+`extf, extf, mulf, addf`，占34.79%。结合sysMon 3.54 GB AXI和此前P5n的6.46%收益，
+BEiT是明确的混合路径：E/P可以处理接近一半的HMX表示与drain，C处理35%的累加链和11%的
+softmax/reduction。它支持统一的E→P→R故事，但也说明仅prefetch不可能覆盖全部critical path。
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_full_bottleneck_corpus_20260829/lwp/beit-base/item7-only
+```
+
+### 12.13 Swin Transformer全图LWP闭环
+
+Swin完整模型轻量全图LWP成功，编译949.95 s，插桩Perf 50,973.58 ms，max logit diff
+0.0015且top-1 match。exclusive-cycle aggregate非常集中：`extf, extf, mulf, addf`
+累加链占 **94.00%**，HMX chain 2.22%，softmax/reduction 1.87%，其余1.91%。前十个
+region均为同一累加链，每个约2.63--2.74%，说明问题遍布window blocks，而不是单个异常
+transpose。
+
+它与sysMon中约50秒无HVX/HMX activity形成闭环：Swin当前首要瓶颈是C类基础codegen，
+不是外存带宽，也不是可以直接用prefetch隐藏的layout copy。正确顺序是先把这些规则
+window/MLP累加链lower到真正HVX kernel，再观察随之暴露的window partition/merge物理布局；
+后者才进入consumer-driven E，只有仍不可消除的tile supply进入P。当前对Swin增加无差别
+prefetch预计只会增加traffic，与此前P5n仅1.21%的弱收益一致。
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_full_bottleneck_corpus_20260829/lwp/swin-transformer/item7-only
+```
+
+### 12.14 SegFormer与15模型统一决策闭环
+
+SegFormer MiT-B0轻量全图LWP成功，编译94.94 s，插桩Perf 8,954.01 ms，输出finite、
+max abs diff 0.0013且top-1 match。exclusive-cycle aggregate为：FP32扩展/乘加链
+**85.68%**，其他elementwise 5.92%，softmax/reduction 4.26%，HMX chain仅2.63%，
+未归因1.49%。结合sysMon总AXI仅0.32 GB、绝大多数时间无HVX/HMX活动，当前瓶颈明确是
+C类多尺度conv/MLP codegen；layout formation E应在C修通后处理新暴露的多尺度边界，
+不能把当前低traffic路径包装成prefetch机会。
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_full_bottleneck_corpus_20260829/lwp/segformer-mit-b0/item7-only
+```
+
+15个完整模型的LWP + sysMon现已形成统一决策，而不是15条模型特例：
+
+| 路径 | 模型 | 测量依据 | 进入论文主线的方式 |
+|---|---|---|---|
+| E→P→R（representation/movement first） | GPT-2、SD/CLIP、Qwen、TinyLlama、SmolLM、DINO、BEiT | vocabulary/HMX outer/output、较高AXI或已验证P5n critical overlap | 主论文核心：consumer-driven direct/persistent formation；残余搬运异步化；PMU admission |
+| C+E/P（mixed） | DeiT | 累加链57.64%，HMX 26.21%，AXI 0.87 GB | C收益单列；E/P仍可做第二大路径，不把总收益都归prefetch |
+| C→E（baseline enablement first） | Swin、SegFormer、Whisper、HuBERT、Wav2Vec2、UniSpeech、UniSpeech-SAT | 累加/conv链85.68--99%或frontend 88--91%，HMX很低 | 先修共享HVX conv/accumulation contract；随后让producer直接形成consumer layout |
+
+论文故事仍保持三项贡献不变：V-DAE负责把consumer representation contract传播到producer；
+prefetch + in-situ transformation只处理“不能直接消除、LWP证明位于critical path、可与
+计算重叠”的residual supply；PMU runtime负责traffic admission和退避。C类codegen修复是
+让模型真正进入目标HVX/HMX路径的baseline工程，不应伪装成ALPS prefetch贡献。最终
+ablation必须分别报告C、E、P、R：这样即使P在某些模型上正确拒绝工作，也体现机制的
+选择性，而不是把无效prefetch当成普适贡献。
+
+### 12.15 15个完整模型的推理精度审计（2026-08-29）
+
+必须区分以下三种精度，避免把LWP中的`arith.extf`误读成“模型使用FP32推理”：
+
+1. **模型存储/接口精度**：浮点权重、主激活和浮点输入的dtype；
+2. **kernel输入/输出精度**：HVX/HMX实际消费和产生的数据类型；
+3. **累加精度**：matmul、convolution、LayerNorm、softmax等为避免溢出而临时使用的
+   accumulator dtype。
+
+本次corpus的15个模型在**模型层面**全部使用FP16权重、浮点输入和主激活，也没有运行时
+quantize/dequantize。`.half()`与`torch_dtype=torch.float16`在模型导出前完成，编译产物
+中的权重常量已经是FP16；`enableConversionToFp16=0`表示不在Hexagon pipeline中插入额外
+全图转换pass，而不是关闭FP16。
+
+但模型dtype不能替代kernel dtype审计。当前HMX matmul使用FP16 operands；一部分HVX
+convolution/elementwise lowering却生成`extf(f16→f32), extf, mulf(f32), addf(f32)`。
+这里不仅是FP32 accumulator，乘法本身也是FP32 arithmetic。因而最准确的描述是
+**FP16 model/storage with mixed kernel arithmetic**，不能笼统声称15个模型都是纯FP16
+compute。这是当前Hexagon-MLIR codegen限制，不是模型额外量化开销。
+
+| Domain | 完整模型 | 浮点模型/输入证据 | 累加策略 | 当前corpus是否已是FP16 |
+|---|---|---|---|---|
+| Language | GPT-2 | 统一driver显式`--dtype fp16`；checkpoint以`torch.float16`加载 | HMX matmul为f16 operands；stable norm/softmax允许FP32 | **是** |
+| Language | SD/CLIP | 统一driver显式`--dtype fp16`；text model `.to(float16)` | HMX为f16 operands；GELU/norm存在FP32 arithmetic | **是** |
+| Language | Qwen2.5-0.5B | checkpoint `torch_dtype=float16`，mask/RoPE cache为FP16 | HMX f16 matmul；部分elementwise扩展至FP32 | **是** |
+| Language | TinyLlama-1.1B | 与Qwen layered runner相同的FP16加载和输入协议 | HMX f16 matmul；部分elementwise扩展至FP32 | **是** |
+| Language | SmolLM2-1.7B | 与Qwen layered runner相同的FP16加载和输入协议 | HMX f16 matmul；部分elementwise扩展至FP32 | **是** |
+| Vision | DINOv2-small | model `.half()`，pixels与固定position embedding为FP16 | HMX为f16；patch/部分HVX算术扩展至FP32 | **是** |
+| Vision | DeiT-small | model `.half()`，pixels与position embedding为FP16 | FP32 arithmetic链57.64%，HMX f16链26.21% | **是** |
+| Vision | BEiT-base | model `.half()`，pixels与lifted bias为FP16 | FP32 arithmetic链34.90%，HMX f16链47.57% | **是** |
+| Vision | Swin Transformer | model `.half()`，pixels为FP16 | FP32 arithmetic链94.00%；HMX仅2.22% | **是** |
+| Vision | SegFormer MiT-B0 | model `.half()`，pixels为FP16 | FP32 arithmetic链85.68%；HMX仅2.63% | **是** |
+| Speech | Whisper-tiny | model `.half()`，mel features为FP16；token ID为整数 | frontend conv主要为FP32 arithmetic链 | **是** |
+| Speech | HuBERT-base | model `.half()`，audio samples为FP16 | GroupNorm及conv当前扩展到FP32 arithmetic再写回FP16 | **是** |
+| Speech | Wav2Vec2-base | 同一full-audio FP16 runner | conv当前扩展到FP32 arithmetic再写回FP16 | **是** |
+| Speech | UniSpeech-base | 同一full-audio FP16 runner | conv当前扩展到FP32 arithmetic再写回FP16 | **是** |
+| Speech | UniSpeech-SAT-base | 同一full-audio FP16 runner | conv当前扩展到FP32 arithmetic再写回FP16 | **是** |
+
+需要特别澄清两个容易造成误解的历史入口：
+
+- `benchmark_models/run_gpt2lmheadmodel.py`的monolithic兼容路径仍保留FP32模型选项；本次
+  15模型corpus没有使用它，而是使用`probe_gpt2_layered_export.py --dtype fp16`。
+- 旧Stable Diffusion/UNet runner中可能存在FP32 timestep；本次列表中的`SD/CLIP`只指
+  FP16 CLIP text encoder，不是完整UNet。
+
+#### 是否需要重新跑15个模型的LWP与sysMon
+
+**当前不需要因模型dtype重新跑。** 现有LWP和sysMon已经是在同一FP16模型/输入协议下
+产生；仅重复执行不会把FP32 HVX arithmetic自动变成FP16，只会重复数十小时编译与设备
+运行。日志字段从`uniform_fp16=1`改成更严格的
+`fp16_model_storage=1 kernel_precision=mixed_f16_hmx_f32_hvx`，该改名不改变任何编译
+选项或二进制，operator级判断仍以LWP IR为准。
+
+只有以下情况才需要选择性重跑，而不是全量重跑：
+
+1. 某个runner从`.half()`/`torch_dtype=float16`改为不同dtype；
+2. 修改HVX lowering，形成helper-free的FP16 operand/vector路径（允许V73高效FP32
+   vector accumulator），从而改变实际object；
+3. 引入INT8/INT4或显式quantize/dequantize；
+4. 修改会改变实际kernel dtype的HexKL/HVX lowering。
+
+当前论文配置应表述为 **FP16 model/storage with mixed FP16-HMX and FP32-HVX kernel
+arithmetic**。在实现helper-free的FP16 HVX conv/elementwise lowering之后，必须重新运行
+受影响的Vision和Speech模型的LWP与sysMon，并对baseline与ALPS使用完全相同的kernel precision。
+Language模型只有在其实际lowering发生变化时选择性重跑。最终正式论文表格则应在代码
+冻结后对15模型统一重跑一次，避免把精度/codegen变化误算成ALPS加速。
+
+### 12.16 V73 FP16-HVX lowering实验与12.8分群更新（2026-08-29）
+
+为验证12.15中的精度假说，新增了默认关闭、可独立消融的
+`enableAlpsFP16HVXArithmetic`。它不改变模型dtype、item7、layout、prefetch或HexKL配置，
+只复用上游`conversion-to-fp16`，把FP16模型中满足现有规则的FP32 convolution/elementwise
+island在HVX tiling/vectorization之前改为FP16。统一runner新增
+`--alps-fp16-hvx`，固定比较`hmlir-hvx-hexkl-on`与
+`alps-fp16-hvx-arithmetic`；两组均为完整模型、HVX vector、HexKL on。该开关保留为负向
+消融，**默认关闭，不能并入最终ALPS组合**。
+
+SegFormer入口IR验证显示，旧pass可以把`f32`类型引用从1,105处降到118处，并将首个
+`conv(f16,f16)->f32 -> truncf`改为`conv(f16,f16)->f16`。这证明转换真实发生，而不是
+开关空转。然而完整模型matched结果否定了“更少FP32 IR自然更快”的假说：
+
+| 测量 | HexKL-on control | FP16-HVX arithmetic | 变化 |
+|---|---:|---:|---:|
+| 非LWP wrapper latency | **9,262.15 ms** | 11,209.29 ms | **慢21.03%** |
+| LWP wrapper latency | **9,301.48 ms** | 11,300.98 ms | 慢21.50% |
+| LWP root exclusive cycles | **13.724 B** | 16.668 B | 增加21.45% |
+| main object instruction count | **107,523** | 150,896 | 增加40.34% |
+| HVX-like instruction占比 | **4.54%** | 2.52% | 下降44.42% |
+| `__extendhfsf2` relocation sites | **7,636** | 13,294 | 增加74.09% |
+| `__truncsfhf2` relocation sites | **5,111** | 10,530 | 增加106.03% |
+| sysMon processor cycles | **13.928 B** | 16.809 B | 增加20.68% |
+| sysMon AXI total | 319.24 MB | **292.24 MB** | 减少8.46% |
+| correctness | finite；max diff 0.0016；top-1 match | finite；max diff 0.0017；top-1 match | 均通过 |
+
+这里最重要的结论是：**减少storage/AXI bytes不等于缩短critical path。** FP16组确实少
+约27 MB AXI，却由于scalar half helper和更差的vector coverage增加约2.88 B processor
+cycles。LWP中原control的主要热区是`extf, extf, mulf, addf`，但V73反汇编表明其中已有
+有效`vmpy/vadd/vmem`；它表示FP16 input/weight在HVX中做widening multiply并使用FP32
+accumulator，并不等同于整个卷积退化为FP32模型。强行把accumulator和中间elementwise
+都变为FP16，反而使LLVM/Hexagon backend在未完整vectorize的loop/tail上反复调用
+half-to-float/float-to-half helper。
+
+因此“真正FP16 HVX lowering”在V73上的工程定义必须修正为：
+
+1. convolution保留FP16 input/weight和连续vector load，使用V73高效的widening multiply
+   与FP32 vector accumulator，只在最终边界trunc一次；不能把“FP16 compute”等同于
+   “FP16 accumulator”；
+2. elementwise只有在证明完整vector coverage、无scalar tail/helper且目标指令确实为
+   HVX half-vector op时才允许FP16算术；否则保持当前mixed arithmetic；
+3. 编译期必须加入object审计门：若`__extendhfsf2/__truncsfhf2`增加、HVX-like比例下降，
+   自动拒绝该precision policy；
+4. FP16 storage/layout仍可作为E/P减少搬动的基础，但precision lowering本身归C，不能
+   计入ALPS prefetch贡献。
+
+这也更新了12.8的分群，但没有改变统一故事线：SegFormer以及共享Speech frontend仍属于
+**C→E→P→R**。C的任务不再是“盲目消除所有extf”，而是建立helper-free的FP16-load/
+FP32-vector-accumulate kernel；随后E让该kernel直接形成consumer layout，P只覆盖不能
+消除且位于critical path的tile supply，R依据PMU拒绝额外traffic。对其余14个模型不做
+无意义的宽泛FP16重跑；只有新的helper-free selective lowering改变了实际object后，才
+按12.8分群选择受影响的Vision/Speech模型重新跑LWP和sysMon。代码冻结后仍统一重跑15个
+模型。
+
+`scripts/audit_hexagon_codegen.sh`现已把`extendhfsf2_relocations`、
+`truncsfhf2_relocations`和二者之和写入每个case的`codegen.csv`。这使后续selective
+lowering不再只凭tensor/vector IR获准：即使正确性通过，只要object层half helper回归，
+该case就必须保留为C类负向实验，不能进入ALPS组合。
+
+原始证据：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_fp16_hvx_segformer_lwp_20260829
+nano:/home/huzq85/2-working/working_set/alps_fp16_hvx_segformer_sysmon_20260829
+```
+
+### 12.17 C阶段：native-width HVX widening convolution（2026-08-29）
+
+按照12.16修正后的定义，实现了默认关闭、可独立消融的
+`enableAlpsHVXWideningConv`。该pass不把accumulator降成FP16，而是在
+post-bufferization阶段只匹配`f16 input/filter -> f32 output`的静态
+`linalg.conv_2d_nchw_fchw`和`linalg.conv_1d_ncw_fcw`：沿独立输出位置形成64-lane
+FP16 operand vector，保持每个lane原有reduction顺序，在FP32 vector pair中累加并
+masked-store。64个FP16恰好占V73的一条128 B HVX vector；LLVM因而能够选择
+`Vdd.sf = vmpy(Vu.hf,Vv.hf)`一类native widening指令，而不是把partial half vector
+反复落到scalar conversion helper。该策略只消除被重写卷积内部的动态helper路径；
+object中其余norm、softmax和未匹配算子的helper仍然存在，因此更准确的名称是
+**selective helper-free widening convolution**，不能声称整个模型helper-free。
+
+完整SegFormer的matched结果如下；两组均为FP16模型、HVX vector、HexKL on，且item7、
+layout、prefetch、DMA和PMU admission全部关闭：
+
+| 测量 | HexKL-on control | ALPS C widening conv | 变化 |
+|---|---:|---:|---:|
+| 正式latency | 9,313.73 ms | **6,352.36 ms** | **1.4662x；下降31.80%** |
+| LWP Perf | 9,310.15 ms | **6,482.57 ms** | **1.4362x** |
+| LWP root exclusive cycles | 13.723 B | **9.540 B** | 下降30.48% |
+| sysMon processor cycles | 13,917,700,995 | **9,642,931,398** | 下降30.71% |
+| sysMon committed packets | 4,970,712,872 | **3,190,233,004** | 下降35.82% |
+| sysMon HVX packet event | 5,569,789 | **234,548,436** | 增加42.11x |
+| sysMon AXI total | 318,152,704 B | 317,474,688 B | 基本不变（-0.21%） |
+| main object instructions | 104,983 | 118,014 | 增加12.41% |
+| HVX-like instructions | 4,881 (4.65%) | 7,108 (6.02%) | 增加45.62% |
+| vector load/store mentions | 5,926 | 9,357 | 增加57.89% |
+| half-helper relocations | 12,745 | 12,651 | 减少94个静态site |
+| correctness | finite；max diff 0.0016；top-1 match | finite；max diff 0.0015；top-1 match | 均通过 |
+
+LWP进一步给出直接因果证据：control的纯`extf, extf, mulf, addf`类占root
+47.05%，而被重写的10个卷积在treatment中成为显式
+`maskedload/gather/extf/mulf/addf/maskedstore`类并只占12.37%；root周期与正式latency
+同方向下降。AXI几乎不变，排除了“少读DRAM”作为本轮主要解释；收益来自把原关键路径
+上的scalar/mixed卷积循环变为native-width HVX widening kernel。虽然尚未达到1.8x，
+但C阶段已经通过跨层级因果门，不再对SegFormer反复调参。
+
+同一contract随后扩展到完整Whisper的两个`conv_1d_ncw_fcw`。修复Whisper runner遗漏的
+CLI参数传播后，真正启用的matched结果为113,415.80 -> **108,246.36 ms**，即
+**1.0478x（下降4.56%）**；finite、max diff 0.0044、last-token top-1 match。main object
+的HVX-like count由20,398增至20,678，vector load/store由24,261增至24,835，half-helper
+relocation由1,306降至1,300。收益小于SegFormer并不否定C：Whisper总时间还包含大量
+decoder/attention计算，而本pass只改变两个frontend conv；它证明相同lowering能跨
+Vision/Speech正确生效。第一次Whisper候选因runner漏传开关而显示
+`alps_hvx_widening_conv=0`、object与control完全相同，该空转数据已明确作废，不能用于
+论文。
+
+由此，既定顺序继续为：**C已完成阶段验证 -> E consumer-driven direct layout -> P仅对
+无法消除且位于critical path的residual movement做async DMA/VTCM -> R用PMU admission
+控制traffic**。C是baseline enablement，不冒充prefetch贡献；E/P/R仍承担ALPS论文的
+representation-aware prefetch主线。
+
+原始证据：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_c64_segformer_full_20260829
+nano:/home/huzq85/2-working/working_set/alps_c64_segformer_lwp_20260829
+/tmp/alps_c64_segformer_sysmon_control_20260829
+/tmp/alps_c64_segformer_sysmon_candidate_20260829
+nano:/home/huzq85/2-working/working_set/alps_c_whisper_full_20260829
+```
+
+### 12.18 E阶段：C之上的consumer-driven direct layout（2026-08-29）
+
+为避免把C的codegen收益误算成E，统一runner新增`--alps-c-e`，严格比较
+`ALPS C widening conv`与`ALPS C + consumer-driven layout`。两组都开启相同的FP16
+model、HVX vector、HexKL和C lowering；treatment只额外开启现有P2e
+consumer-driven direct formation。item7、prefetch、DMA、VTCM staging、continuity扩展
+和PMU admission均关闭。
+
+| 模型 | C control | C + E | E独立增量 | 相对原HexKL-on累计 | P2e direct / demands | 静态消除materialization |
+|---|---:|---:|---:|---:|---:|---:|
+| SegFormer MiT-B0 | 6,352.36 ms | **5,489.21 ms** | **1.1572x** | **1.6967x** | 24 / 116 | 1,655,808 B |
+| Whisper-tiny | 108,246.36 ms | **71,512.90 ms** | **1.5137x** | **1.5859x** | 36 / 114 | 18,923,520 B |
+
+两模型的输出正确性都保持不变：SegFormer finite、max diff 0.0015、top-1 match；
+Whisper finite、max diff 0.0044、last-token top-1 match。BackendConfig同时验证C和P2e均为1，
+排除了开关空转。
+
+结果支持统一因果链而非简单叠加：C先把producer的卷积关键路径变成native-width HVX
+widening kernel；E再从terminal consumer的layout contract倒推producer/elementwise链的
+最终表示，删除中间transpose/materialization。Whisper的E增量远大于C，说明Speech此前
+的主要限制并非只有conv arithmetic，还包括frontend输出到后续sequence/attention表示的
+大规模layout round trip。SegFormer的E增量较小但仍稳定，使C+E相对原HexKL-on达到
+1.70x，已经逼近1.8x目标。
+
+这也是ALPS论文第2贡献的直接正例：**prefetch不是无条件提前读canonical buffer，而是
+先由consumer contract决定最终representation；可消除的搬动由in-situ/direct formation
+删除，只有无法消除且处于critical path的residual tile supply才进入P。** 因此下一阶段
+必须做严格的`C+E control`对`C+E+P treatment`，不能复用会同时打开P2g/P5h/P5i等多个
+机制的旧累计开关来声称P收益。
+
+原始证据：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_ce_segformer_full_20260829
+nano:/home/huzq85/2-working/working_set/alps_ce_whisper_full_20260829
+```
+
+### 12.19 P阶段：C+E之后的residual HMX async drain（2026-08-29）
+
+统一runner新增默认关闭的`--alps-c-e-p`。为隔离P，control与treatment都开启相同的
+HVX vector、HexKL、C、P2e consumer-driven layout、P5j HMX F16 direct epilogue和P5k
+direct output；两组都运行P5m静态准入，只有treatment开启P5n双VTCM slot + UserDMA
+异步result drain。旧的P1--P5累计组合没有进入本实验。DINO的`14x14/stride-14`小宽度
+非重叠patchify同时从C中拒绝：它只有16个输出列，不属于64-lane sliding convolution，
+应留给E的patch/direct formation；该门不影响SegFormer的7/4、3/2重叠卷积或Speech
+1D卷积。
+
+完整DINOv2-small结果：
+
+| 测量 | C+E direct-output control | C+E+P async drain | P增量 |
+|---|---:|---:|---:|
+| latency | **5,768.58 ms** | 5,828.72 ms | **0.9897x；慢1.04%** |
+| P5m admitted sites | 72 / 72 | 72 / 72 | 相同 |
+| P5m predicted overlap | 21,086,208 B | 21,086,208 B | 相同 |
+| runtime DMA issued/completed | 0 / 0 | 10,368 / 10,368 | 真实执行 |
+| runtime DMA bytes/fallback | 0 B / 0 | 21,233,664 B / 0 | 真实执行 |
+| correctness | finite；max diff 0.0049；allclose/top-1 | finite；max diff 0.0051；allclose/top-1 | 均通过 |
+
+因此P的机制成立，但仅凭静态descriptor合法、tile数量和producer内的后续HMX调用距离
+仍会误准入：这些drain没有足够关键路径占比，DMA launch/wait与新增AXI traffic略高于被
+隐藏的同步copy。本结果不是“prefetch没有执行”，而是一个有实际DMA证据的负向消融。
+它直接要求R把PMU observation纳入admission：只有观测到同步drain stall/packet占比和
+可用memory slack同时满足阈值的site class才启用P5n；否则保持C+E synchronous direct
+output。R必须以这一组作为reject regression test，而不能通过重复测量或调distance把
+负值包装成正收益。
+
+第一轮配置因DINO runner漏传C且未启用P5j，得到`C=0`、`admitted=0`、DMA=0；该轮明确
+作废，不计入性能数据。有效原始证据：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_cep_dinov2_valid2_20260829
+```
+
+### 12.20 R阶段：把PMU/poll traffic admission接到P5n（2026-08-29）
+
+此前P4A虽然会尝试读取V73 HAP user PMU，但只控制旧P3b weight DMA，对P5n HMX drain
+完全空转。本阶段把R接入P5n的真实wait-slot和start路径，并增加严格
+`--alps-c-e-p-r`：control和treatment均开启同一C+E+P，只有treatment开启R。
+
+R每64个完成descriptor形成一个固定window，读取UDMA active、DMPoll、coherent-read
+stall和VTCM-write stall；若Unsigned PD拒绝HAP user PMU，则明确报告unavailable，并使用
+同一wait-slot的真实软件poll次数作为保守fallback。零poll表示DMA已在demand前完成，必须
+hold；只有平均DMPoll/poll达到每descriptor 4次才throttle。throttle后不改变layout或
+legality，而是调用HexKL原生`hexkl_micro_hmx_copy_f16_to_submatrix`恢复同步direct drain，
+不能用另一套通用copy冒充matched fallback。
+
+最终完整DINOv2-small结果：
+
+| 测量 | C+E+P | C+E+P+R |
+|---|---:|---:|
+| latency（单次formal sample） | 5,825.25 ms | **5,487.22 ms（1.0616x）** |
+| DMA issued/completed | 10,368 / 10,368 | 10,368 / 10,368 |
+| issued bytes | 21,233,664 B | 21,233,664 B |
+| R windows / hold / throttle | NA | 162 / 162 / 0 |
+| suppressed / poll retries | NA | 0 / 0 |
+| HAP PMU status / reads | NA | unavailable(0) / 0 |
+| correctness | finite；max diff 0.0049；allclose/top-1 | 相同 |
+
+因为本次所有window都hold，R没有改变执行的DMA集合，5.825→5.487 s的单样本差值不能
+归因成admission收益，只能作为正确性/无回归观测。可以确认的因果事实是：R不再错误地
+把零等待的理想overlap关闭，并能在未来出现持续late-arrival时恢复到完全相同的HexKL
+同步drain。当前手机Unsigned PD不允许进程内HAP PMU，因此“PMU counter真正触发
+throttle并改善latency”仍是最终ablation的待补证据：优先使用可授权PMU的PD；否则将
+sysMon的模型/site-class先验固化为下一次invocation的admission，同时把进程内软件poll
+作为安全反馈。不能把`pmu_status=0`描述成已完成PMU性能验证。
+
+原始证据：
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_cepr_dinov2_final_20260829
+```

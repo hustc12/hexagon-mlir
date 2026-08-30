@@ -31,8 +31,10 @@ main_object=$(
 }
 
 disassembly=$(mktemp /tmp/omnifetch-disassembly.XXXXXX)
-trap 'rm -f "${disassembly}"' EXIT
+relocations=$(mktemp /tmp/omnifetch-relocations.XXXXXX)
+trap 'rm -f "${disassembly}" "${relocations}"' EXIT
 "${objdump}" -d --no-show-raw-insn "${main_object}" >"${disassembly}"
+"${objdump}" -r "${main_object}" >"${relocations}"
 
 read -r instruction_count hvx_like_count < <(
   awk '
@@ -54,6 +56,13 @@ vector_load_store=$(rg -c 'vmem|v[0-9]+\.[a-z0-9_]+[[:space:]]*=' "${disassembly
 hexkl_calls=${hexkl_calls:-0}
 dma_calls=${dma_calls:-0}
 vector_load_store=${vector_load_store:-0}
+extend_hf_sf=$(
+  awk '$NF == "__extendhfsf2" {count++} END {print count + 0}' "${relocations}"
+)
+trunc_sf_hf=$(
+  awk '$NF == "__truncsfhf2" {count++} END {print count + 0}' "${relocations}"
+)
+half_helper_total=$((extend_hf_sf + trunc_sf_hf))
 
 printf '%s\n' \
   "artifact_dir=${artifact_dir}" \
@@ -63,16 +72,20 @@ printf '%s\n' \
   "hvx_like_percent=${hvx_percent}" \
   "hexkl_hmx_mentions=${hexkl_calls}" \
   "dma_mentions=${dma_calls}" \
-  "vector_load_store_mentions=${vector_load_store}"
+  "vector_load_store_mentions=${vector_load_store}" \
+  "extendhfsf2_relocations=${extend_hf_sf}" \
+  "truncsfhf2_relocations=${trunc_sf_hf}" \
+  "half_conversion_helper_relocations=${half_helper_total}"
 
 if [[ -n "${output_csv}" ]]; then
   if [[ ! -f "${output_csv}" ]]; then
     printf '%s\n' \
-      'artifact_dir,main_object,instruction_count,hvx_like_count,hvx_like_percent,hexkl_hmx_mentions,dma_mentions,vector_load_store_mentions' \
+      'artifact_dir,main_object,instruction_count,hvx_like_count,hvx_like_percent,hexkl_hmx_mentions,dma_mentions,vector_load_store_mentions,extendhfsf2_relocations,truncsfhf2_relocations,half_conversion_helper_relocations' \
       >"${output_csv}"
   fi
-  printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
     "${artifact_dir}" "${main_object}" "${instruction_count}" \
     "${hvx_like_count}" "${hvx_percent}" "${hexkl_calls}" "${dma_calls}" \
-    "${vector_load_store}" >>"${output_csv}"
+    "${vector_load_store}" "${extend_hf_sf}" "${trunc_sf_hf}" \
+    "${half_helper_total}" >>"${output_csv}"
 fi

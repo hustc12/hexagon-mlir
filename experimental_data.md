@@ -121,7 +121,7 @@ every still-untested processor/policy combination is explicitly `NA`.
 
 The five 2026-08-15--16 language/text rows use matched host-staged execution
 because monolithic MLIR-to-LLVM code generation exceeds the 15-GiB host memory
-limit. Every policy compiles and runs the identical uniform-FP16 embedding,
+limit. Every policy compiles and runs the identical FP16-model/storage embedding,
 complete transformer layers, and final norm/head boundaries. The reported
 latency is the sum of every stage's device `Perf`; compilation, ADB transfer,
 and host round trips are excluded symmetrically. These are complete-model
@@ -173,7 +173,7 @@ HMLIR HVX (HexKL Off) are real timing differences but are not clean OmniFetch at
 because merely enabling HexKL changes lowering even when it reports zero HMX
 rewrites.
 
-For the matched uniform-FP16 staged language rows, item7 is 1.87x faster than
+For the matched FP16-model/storage staged language rows, item7 is 1.87x faster than
 HexKL On on Qwen2.5-0.5B, 1.60x on TinyLlama-1.1B, and 1.39x on
 SmolLM2-1.7B. It is only 1.02x faster on SD/CLIP and 0.97x on GPT-2. The much
 larger 5.43--70.81x ratios against HexKL Off primarily expose HexKL/HMX-path
@@ -504,7 +504,7 @@ device `Perf` only and exclude compilation, ADB transfer, and host round trips.
 | Language/text | SmolLM2-1.7B | 1,549,937.550 | 42,315.577 | 36.628x | FP16; top-5 exact. |
 
 The earlier matched staged rows for GPT-2 and CLIP used FP32 and are retained
-for reproducibility but are superseded by uniform FP16 for the primary corpus:
+for reproducibility but are superseded by the FP16-model/storage protocol for the primary corpus:
 
 | Model | FP32 HVX | FP32 HexKL | HVX / HexKL |
 |---|---:|---:|---:|
@@ -558,9 +558,88 @@ otherwise-default layout-aware and adaptive options. They do not delete any
 implementation; the explicitly named cumulative and no-item4 ablation scripts
 remain available to reproduce the historical combination rows.
 
+### 2026-08-28 — ALPS P5m/P5n full-model screening
+
+These are complete, non-Debug FP16 models, run strictly serially with one device
+measurement per configuration. Both P5m and P5n are cumulative configurations
+that include P5h and P5i; P5m is analysis-only and executes the same synchronous
+P5k path, while P5n adds VTCM ping-pong plus UserDMA asynchronous HMX-result
+drain. Therefore each speedup below isolates only the P5n increment and must not
+be attributed to P5h or P5i individually. Formal component ablations are deferred
+until model screening is complete.
+
+| Domain | Complete model | P5m/P5k matched control (ms) | P5n (ms) | Control / P5n | Latency reduction | P5m admitted / overlap bytes | P5n DMA issued / completed; bytes; fallback | Correctness / qualification |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| Vision | DINOv2-small | 3,234.81 | **2,993.49** | **1.0806x** | **7.46%** | 21,233,664 / 21,086,208 | 10,368 / 10,368; 21,233,664; 0 | PASS; max diff 0.0046, top-1 match. Positive case. |
+| Vision | BEiT-base | 8,864.83 | **8,292.04** | **1.0691x** | **6.46%** | 28,311,552 / 28,188,672 | 13,824 / 13,824; 28,311,552; 0 | PASS; max diff 0.0056, top-1 match. Positive case. |
+| Vision | Swin Transformer | 41,401.57 | 40,898.92 | 1.0123x | 1.21% | 14,770,176 / 14,698,496 | 7,212 / 7,212; 14,770,176; 0 | PASS; top-1 match. Below the 3% continuation threshold; inconclusive. |
+| Language/text | Qwen2.5-0.5B | 10,582.80 | **10,364.01** | 1.0211x | 2.07% | 19,464,192 / 19,120,128 (24 legal layers; vocabulary head rejected) | 9,504 / 9,504; 19,464,192; 0 | PASS after descriptor-range fix; finite, top-5 match. The 303,872 B vocabulary-head stride is now rejected and synchronously drained instead of being silently truncated. Correctness-qualified Language weak-performance case, below 3%. |
+| Language/text | GPT-2 | 3,583.47 | NA | NA | NA | 0 / 0 | 0 / 0; 0; 0 | PASS control after descriptor-range fix; all 48 block sites have no residual direct-output drain and the 100,514 B vocabulary-head stride is correctly rejected. P5n is not run because it would issue no asynchronous work. Static admission negative. |
+| Speech/audio | Whisper-tiny | 71,240.91 | **70,414.99** | 1.0117x | 1.16% | 41,680,896 / 41,574,400 | 20,352 / 20,352; 41,680,896; 0 | PASS; max diff 0.0039, top-1 match. P2g-c exit 13 was isolated to a 1500xf16 source row not divisible by the 64-lane/128 B HVX load and fixed with a source-tail admission gate. P5n is a correctness-qualified Speech weak-performance case, below the 3% continuation threshold. |
+| Speech/audio | HuBERT-base | 180,829.05 | **176,891.35** | 1.0223x | 2.18% | 10,719,232 / 10,567,680 | 5,234 / 5,234; 10,719,232; 0 | PASS after rank-contract admission fix; max diff 0.0083, last-frame top-1 match. Correctness-qualified Speech weak-performance case, below 3%. |
+
+#### Matched item7 composition follow-up
+
+The earlier Qwen P5m/P5n row did not include item7 and therefore cannot explain
+the historical item7 latency. With battery saver and device idle disabled, the
+same complete 24-layer FP16 model was rerun with matched composition:
+
+| Complete model | Item7-only (ms) | Item7 + P5m/P5k (ms) | Item7 + P5n (ms) | P5m / P5n | Item7 / P5n | P5n DMA | Correctness |
+|---|---:|---:|---:|---:|---:|---|---|
+| Qwen2.5-0.5B | 5,911.34 | 5,639.33 | **5,328.06** | **1.0584x** | **1.1095x** | 9,504/9,504; 19,464,192 B; fallback=0 | PASS; finite, top-5 match, max abs 0.58984375. |
+
+Item7 issued zero runtime L2 hints, so its recovered gain is a topology effect.
+P5n's 5.52% reduction over matched P5m is the isolated asynchronous-drain
+increment. A 20-repeat matched representative-layer sysMon run found 2.52%
+fewer processor cycles but 5.81% more total AXI bytes under P5n; the result is
+consistent with overlap/critical-path shortening rather than traffic removal.
+The phone remained at 100%, 27.4--27.6 C, with low-power off and device-idle
+disabled. Raw PMU and per-stage data are archived at:
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_qwen_item7_p5n_sysmon_20260828
+```
+
+For the original **without-item7** screening matrix, the
+correctness-qualified P5n positive set is DINOv2-small and BEiT-base. The
+matched composition follow-up adds Qwen as a Language positive candidate, but
+its formal repeated measurement remains part of the final ablation campaign.
+Swin proves that high admitted/overlap bytes alone are insufficient:
+the residual drain must also occupy a meaningful fraction of the critical path.
+Qwen additionally proves that `issued == completed` is insufficient when the
+compiler/runtime have not validated every hardware descriptor field width.
+
+Raw artifacts and logs were moved directly to:
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_p5k_matched_control_dinov2_20260828
+nano:/home/huzq85/2-working/working_set/alps_p5n_hmx_async_drain_dinov2_20260828
+nano:/home/huzq85/2-working/working_set/alps_p5m_hmx_async_drain_analysis_beit_20260828
+nano:/home/huzq85/2-working/working_set/alps_p5n_hmx_async_drain_beit_20260828
+nano:/home/huzq85/2-working/working_set/alps_p5m_hmx_async_drain_analysis_swin_20260828
+nano:/home/huzq85/2-working/working_set/alps_p5n_hmx_async_drain_swin_20260828
+nano:/home/huzq85/2-working/working_set/alps_p5m_hmx_async_drain_analysis_qwen_20260828
+nano:/home/huzq85/2-working/working_set/alps_p5n_hmx_async_drain_qwen_20260828
+nano:/home/huzq85/2-working/working_set/alps_p5m_hmx_async_drain_analysis_gpt2_20260828
+nano:/home/huzq85/2-working/working_set/alps_p5m_hmx_async_drain_analysis_whisper_20260828
+nano:/home/huzq85/2-working/working_set/alps_p5m_hmx_async_drain_analysis_hubert_20260828
+nano:/home/huzq85/2-working/working_set/alps_p2g_whisper_rootcause_20260828
+nano:/home/huzq85/2-working/working_set/alps_p2gc_whisper_rootcause_20260828
+nano:/home/huzq85/2-working/working_set/alps_p5gg_whisper_rootcause_20260828
+nano:/home/huzq85/2-working/working_set/alps_p2gc_whisper_site_diag_all_20260828
+nano:/home/huzq85/2-working/working_set/alps_p2gc_whisper_site_0_20260828
+nano:/home/huzq85/2-working/working_set/alps_p2gc_whisper_tailfix_20260828
+nano:/home/huzq85/2-working/working_set/alps_p5m_whisper_tailfix_20260828
+nano:/home/huzq85/2-working/working_set/alps_p5n_whisper_tailfix_20260828
+nano:/home/huzq85/2-working/working_set/alps_p5n_qwen_stridefix_20260828
+nano:/home/huzq85/2-working/working_set/alps_p5m_hubert_rankfix_20260828
+nano:/home/huzq85/2-working/working_set/alps_p5n_hubert_rankfix_20260828
+nano:/home/huzq85/2-working/working_set/alps_p5m_gpt2_stridefix_20260828
+```
+
 ## 5. Supersession and paper-use guidance
 
-1. Use the **2026-08-08+ uniform-FP16 15-model table** for the current native
+1. Use the **2026-08-08+ FP16-model/storage, mixed-kernel 15-model table** for the current native
    HVX-versus-HexKL full-model corpus. Do not combine it with the much slower
    2026-07-29 monolithic screening numbers.
 2. Use the **2026-08-13 matched HexKL-on/zero-rewrite control** when computing
@@ -580,3 +659,179 @@ remain available to reproduce the historical combination rows.
    open prefetch baselines. Their graph fusion, layout, HMX/HVX mapping, memory
    planning, and runtime scheduling differ fundamentally from the current
    open Hexagon-MLIR pipeline.
+
+### 2026-08-29 — complete-model bottleneck corpus
+
+This corpus profiles correctness-qualified item7 synchronous device code. LWP
+is a separate instrumented run used only for ranking; sysMon replays the
+non-instrumented, already-compiled complete model after all files are placed on
+the phone. P5m/P5k compiler-ledger evidence is attached where the graph can be
+compiled within the host-memory budget, but is not required by sysMon.
+
+| Domain | Complete model | Formal non-LWP latency | LWP top stage/operator | sysMon processor cycles | AXI read / write / total | Status |
+|---|---|---:|---|---:|---:|---|
+| Language/text | GPT-2 | 3,671.84 ms | vocabulary head 60.26%; 12 blocks 39.66%; embedding 0.08% | 8,541,263,621 | 1,443,787,648 / 562,182,144 / 2,005,969,792 B | PASS; standard item7 14-stage sysMon; LWP distribution from matched synchronous analysis. |
+| Language/text | SD/CLIP | 3,438.01 ms | HMX outer chains 66.09%; f16→f32 HMX copy 8.26%; GELU chain 7.75%; reductions 4.11% | 7,637,741,754 | 1,699,881,984 / 467,926,016 / 2,167,808,000 B | LWP + sysMon PASS; 12 layers 99.65% of formal Perf. |
+| Language/text | Qwen2.5-0.5B | 5,875.53 ms | head 21.69%; HMX outer 63.50%; extf/mul/add 16.22%; HMX output copy 6.18%; SiLU 5.94% | 17,332,438,202 | 4,317,510,144 / 1,607,163,264 / 5,924,673,408 B | LWP + sysMon PASS; full 24-layer item7. |
+| Language/text | TinyLlama-1.1B | 17,769.19 ms | 22 layers 96.69%; HMX outer 79.48%; extf chain 11.08%; output copy 2.55% | 35,041,832,364 | 9,049,282,304 / 2,558,079,488 / 11,607,361,792 B | LWP + sysMon PASS. |
+| Language/text | SmolLM2-1.7B | 29,725.99 ms | 24 layers 94.42%; head 5.58%; HMX outer 84.60%; extf chain 7.89%; output copy 2.12% | 56,332,486,863 | 14,924,729,472 / 4,065,359,232 / 18,990,088,704 B | LWP + sysMon PASS. |
+| Vision | Swin Transformer | 51,098.04 ms | full-graph item7-only LWP: extf/mulf/addf 94.00%; HMX 2.22%; softmax/reduction 1.87% | 75,793,607,744 | 783,823,104 / 311,505,664 / 1,095,328,768 B | LWP + sysMon PASS; LWP Perf 50,973.58 ms, max diff 0.0015/top-1 match; scalar/codegen dominated. |
+| Vision | SegFormer MiT-B0 | 8,930.05 ms | full-graph item7-only LWP: extf/mulf/addf 85.68%; other elementwise 5.92%; HMX 2.63% | 13,364,473,801 | 236,403,200 / 80,740,096 / 317,143,296 B | LWP + sysMon PASS; LWP Perf 8,954.01 ms, max diff 0.0013/top-1 match; scalar/codegen dominated. |
+| Vision | DeiT-small | 5,086.94 ms | full-graph item7-only LWP: extf/mulf/addf 57.64%; HMX chain 26.21%; softmax/reduction 4.23% | 7,754,132,341 | 620,727,168 / 248,425,984 / 869,153,152 B | LWP + sysMon PASS; LWP Perf 5,006.24 ms, finite/max diff 0.0035/top-1 match. Earlier P1--P5m instrumentation builds OOMed; lightweight matched build passed. |
+| Vision | BEiT-base | 13,824.45 ms | full-graph item7-only LWP: HMX chain 47.57%; extf/mulf/addf 34.90%; softmax/reduction 11.34% | 24,635,320,296 | 2,980,995,200 / 554,533,888 / 3,535,529,088 B | LWP + sysMon PASS; LWP Perf 13,910.97 ms, finite/max diff 0.0049/top-1 match. |
+| Vision | DINOv2-small | 6,071.57 ms | prior LWP: patch conv 39.09% before P5i; residual HMX outer/attention after P5i | 9,187,880,356 | 842,610,944 / 338,963,712 / 1,181,574,656 B | sysMon PASS by SSH-to-ADB remote replay; low-power off, 28.2 C. |
+| Speech/audio | Whisper-tiny | 70,067.02 ms | full-shape local LWP: frontend 88.37%; one encoder layer 8.38%; head 2.30%; conv accumulation chain 92.43% | 104,747,049,461 | 5,064,919,680 / 1,790,385,408 / 6,855,305,088 B | LWP + sysMon PASS; frontend convolution/codegen dominated. |
+| Speech/audio | HuBERT-base | 172,773.84 ms | full-shape local LWP: frontend 90.74%; position conv 9.17%; one layer 0.09% | 255,846,585,000 | 5,036,792,192 / 418,441,600 / 5,455,233,792 B | LWP + sysMon PASS; convolution codegen dominated. |
+| Speech/audio | Wav2Vec2-base | 184,932.30 ms | full-shape local LWP: frontend 90.96%; position conv 8.95%; one layer 0.09% | 273,842,295,628 | 5,067,176,448 / 424,789,376 / 5,491,965,824 B | LWP + sysMon PASS; convolution codegen dominated. |
+| Speech/audio | UniSpeech-base | 184,300.14 ms | full-shape local LWP: frontend 90.73%; position conv 9.17%; one layer 0.09% | 272,912,050,151 | 5,053,952,896 / 425,125,376 / 5,479,078,272 B | LWP + sysMon PASS; shared convolution bottleneck. |
+| Speech/audio | UniSpeech-SAT-base | 179,391.43 ms | full-shape local LWP: frontend 90.03%; position conv 9.88%; one layer 0.09% | 265,650,670,274 | 5,059,622,912 / 421,796,864 / 5,481,419,776 B | LWP + sysMon PASS; shared convolution bottleneck. |
+
+Raw GPT-2 evidence:
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_full_bottleneck_corpus_20260829/lwp/gpt2
+nano:/home/huzq85/2-working/working_set/alps_full_bottleneck_corpus_20260829/sysmon/gpt2
+```
+
+DeiT and DINO evidence (the earlier DeiT P1--P5m whole-graph LWP OOM builds
+never reached the phone; the lightweight item7-only whole-graph LWP did pass):
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_full_bottleneck_corpus_20260829/sysmon/deit-small/item7-archived-replay
+nano:/home/huzq85/2-working/working_set/alps_full_bottleneck_corpus_20260829/lwp/deit-small/item7-only
+nano:/home/huzq85/2-working/working_set/alps_full_bottleneck_corpus_20260829/sysmon/dinov2-small/item7-remote-replay
+nano:/home/huzq85/2-working/working_set/alps_full_bottleneck_corpus_20260829/hotspot_lwp_whisper
+```
+
+Precision qualification for this complete-model corpus: all 15 rows use FP16
+floating-point weights, primary activations and floating inputs. Integer token
+IDs remain integer. HMX matmul consumes FP16 operands, but some current HVX
+convolution/elementwise lowering widens both operands to FP32 before multiply
+and accumulation. The precise label is therefore **FP16 model/storage with
+mixed FP16-HMX and FP32-HVX kernel arithmetic**, not pure FP16 compute and not
+an FP32 model baseline. No runtime quantize/dequantize pass is enabled. The
+archived measurements do not need a model-dtype-only rerun; affected models
+must be rerun only after a helper-free FP16-operand HVX lowering changes their
+actual object code.
+
+### 2026-08-29 — SegFormer FP16-HVX precision-policy ablation
+
+This is a complete-model, matched HVX-vector + HexKL-on experiment. The only
+treatment is the independently switchable FP16 convolution/elementwise
+precision pass; item7, prefetch and layout passes are off in both arms.
+
+| Complete model | Configuration | Non-LWP latency | Relative to treatment | Processor cycles | AXI read / write / total | Correctness |
+|---|---|---:|---:|---:|---:|---|
+| SegFormer MiT-B0 | HMLIR HVX, HexKL on | **9,262.15 ms** | **0.83x** | 13,928,266,519 | 237,068,544 / 82,174,464 / 319,243,008 B | PASS; finite, max diff 0.0016, top-1 match |
+| SegFormer MiT-B0 | ALPS FP16-HVX arithmetic | 11,209.29 ms | 1.00x | 16,808,990,332 | 220,965,760 / 71,278,720 / 292,244,480 B | PASS; finite, max diff 0.0017, top-1 match |
+
+The treatment is **21.03% slower despite 8.46% less AXI traffic**. Object
+inspection explains the result: instruction count rises from 107,523 to
+150,896, HVX-like share falls from 4.54% to 2.52%, and static relocation sites
+for `__extendhfsf2` / `__truncsfhf2` rise from 7,636 / 5,111 to 13,294 /
+10,530. This broad FP16-accumulator policy is a correctness-qualified negative
+ablation and remains default-off. The V73 baseline-engineering target is
+helper-free FP16 operand loads with vector FP32 accumulation, followed by ALPS
+E/P/R optimization of the residual representation and transfers.
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_fp16_hvx_segformer_lwp_20260829
+nano:/home/huzq85/2-working/working_set/alps_fp16_hvx_segformer_sysmon_20260829
+```
+
+### 2026-08-29 — ALPS C selective HVX widening convolution
+
+Both arms use complete FP16 models, HVX vector execution and HexKL on. The
+only treatment is the independently switchable native-width widening
+convolution pass; item7, layout, prefetch, DMA and PMU admission are off.
+
+| Domain | Complete model | Configuration | Latency | Speedup over treatment | Correctness |
+|---|---|---|---:|---:|---|
+| Vision | SegFormer MiT-B0 | HMLIR HVX, HexKL on | 9,313.73 ms | 1.47x | PASS; finite, max diff 0.0016, top-1 match |
+| Vision | SegFormer MiT-B0 | ALPS C widening conv | **6,352.36 ms** | 1.00x | PASS; finite, max diff 0.0015, top-1 match |
+| Speech/audio | Whisper-tiny | HMLIR HVX, HexKL on | 113,415.80 ms | 1.05x | PASS; finite, max diff 0.0049, last-token top-1 match |
+| Speech/audio | Whisper-tiny | ALPS C widening conv | **108,246.36 ms** | 1.00x | PASS; finite, max diff 0.0044, last-token top-1 match |
+
+For SegFormer, matched sysMon processor cycles fall from 13,917,700,995 to
+9,642,931,398 and committed packets from 4,970,712,872 to 3,190,233,004,
+while AXI traffic stays essentially constant (318,152,704 vs 317,474,688 B).
+The result is therefore a compute/codegen improvement, not a data-prefetch or
+DRAM-traffic reduction. Matched LWP root cycles fall from 13.723 B to 9.540 B.
+
+The first post-transfer Whisper run is excluded: its log reported
+`alps_hvx_widening_conv=0` because the runner omitted CLI-to-backend parameter
+propagation, and its object was byte-for-codegen identical to control. The row
+above is the corrected run with the backend flag explicitly verified as 1.
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_c64_segformer_full_20260829
+nano:/home/huzq85/2-working/working_set/alps_c64_segformer_lwp_20260829
+/tmp/alps_c64_segformer_sysmon_control_20260829
+/tmp/alps_c64_segformer_sysmon_candidate_20260829
+nano:/home/huzq85/2-working/working_set/alps_c_whisper_full_20260829
+```
+
+### 2026-08-29 — ALPS E on top of C
+
+The treatment changes only consumer-driven direct layout formation. Both arms
+retain identical complete FP16 models, HVX vector execution, HexKL-on and the
+selective C widening-convolution lowering.
+
+| Domain | Complete model | Configuration | Latency | Speedup over treatment | P2e direct / demands | Eliminated materialization | Correctness |
+|---|---|---|---:|---:|---:|---:|---|
+| Vision | SegFormer MiT-B0 | ALPS C | 6,352.36 ms | 1.16x | 0 / 0 | 0 B | PASS; finite, max diff 0.0015, top-1 match |
+| Vision | SegFormer MiT-B0 | **ALPS C + E** | **5,489.21 ms** | 1.00x | 24 / 116 | 1,655,808 B | PASS; finite, max diff 0.0015, top-1 match |
+| Speech/audio | Whisper-tiny | ALPS C | 108,246.36 ms | 1.51x | 0 / 0 | 0 B | PASS; finite, max diff 0.0044, last-token top-1 match |
+| Speech/audio | Whisper-tiny | **ALPS C + E** | **71,512.90 ms** | 1.00x | 36 / 114 | 18,923,520 B | PASS; finite, max diff 0.0044, last-token top-1 match |
+
+Relative to the original matched HexKL-on controls, cumulative C+E speedup is
+1.70x for SegFormer (9,313.73 / 5,489.21) and 1.59x for Whisper
+(113,415.80 / 71,512.90). These cumulative ratios are not attributed to
+prefetch: C is compute/codegen baseline enablement and E removes/directly forms
+representations. P will be measured separately on residual movement.
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_ce_segformer_full_20260829
+nano:/home/huzq85/2-working/working_set/alps_ce_whisper_full_20260829
+```
+
+### 2026-08-29 — ALPS P residual async drain on top of C+E
+
+Both complete-model arms enable identical HVX vector, HexKL, C, P2e, HMX F16
+direct epilogue/output formation and P5m analysis. Only the treatment enables
+the P5n VTCM ping-pong asynchronous UserDMA drain. The old cumulative P1--P5
+bundle is absent.
+
+| Domain | Complete model | Configuration | Latency | Speedup over treatment | P5m admitted / overlap bytes | Runtime DMA | Correctness |
+|---|---|---|---:|---:|---:|---|---|
+| Vision | DINOv2-small | **ALPS C+E direct-output control** | **5,768.58 ms** | **0.99x** | 72 / 21,086,208 B | 0 | PASS; finite, max diff 0.0049, allclose/top-1 |
+| Vision | DINOv2-small | ALPS C+E+P async drain | 5,828.72 ms | 1.00x | 72 / 21,086,208 B | 10,368/10,368; 21,233,664 B; fallback=0 | PASS; finite, max diff 0.0051, allclose/top-1 |
+
+P is a correctness-qualified **negative ablation** here: real DMA executes,
+but latency regresses 1.04%. This case is the reject target for R/PMU traffic
+admission; static overlap legality alone is insufficient.
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_cep_dinov2_valid2_20260829
+```
+
+### 2026-08-29 — ALPS R traffic admission on top of C+E+P
+
+Both complete-model arms execute the same P5n asynchronous drain. Only the R
+treatment monitors 64-completion windows and may restore the native HexKL
+synchronous drain after sustained DMPoll pressure.
+
+| Domain | Complete model | Configuration | Latency | Relative to R | DMA issued/completed; bytes | R windows / hold / throttle / suppressed | PMU / software fallback | Correctness |
+|---|---|---|---:|---:|---|---|---|---|
+| Vision | DINOv2-small | ALPS C+E+P | 5,825.25 ms | 1.06x | 10,368/10,368; 21,233,664 B | NA | NA | PASS; finite, max diff 0.0049, allclose/top-1 |
+| Vision | DINOv2-small | **ALPS C+E+P+R** | **5,487.22 ms** | 1.00x | 10,368/10,368; 21,233,664 B | 162 / 162 / 0 / 0 | HAP PMU unavailable; 0 poll retries | PASS; identical gate |
+
+R made no admission change in this run, so the observed 1.0616x single-sample
+difference is **not attributed to R**. The row validates correct monitoring,
+zero-regression execution and honest PMU-unavailable fallback. A PMU-triggered
+performance claim remains pending an authorized-PMU or sysMon-guided final
+ablation.
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_cepr_dinov2_final_20260829
+```

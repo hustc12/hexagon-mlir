@@ -55,6 +55,10 @@ func.func @producer_direct_ready(
 // P5GF: vector.transfer_write {{.*}} {alps.p5g_f.producer_direct_head_major_vtcm}
 // P5GF: vector.transfer_read {{.*}} {alps.p2g.register_tile, alps.p5g_f.consumer_head_major_vtcm}
 // P5GF: memref.dealloc %[[HEAD]] {bufferization.manual_deallocation}
+// P5GF-LABEL: func.func @rank2_epoch_is_not_head_major
+// P5GF-SAME: alps.p5g_f.head_major_rewritten_epochs = 0
+// P5GF-SAME: alps.p5g_f.incompatible_rank_epochs = 1
+// P5GF-NOT: alps.p5g_f.producer_direct_head_major_vtcm
 // P5GG-LABEL: func.func @tiled_vector_overwrite_ready
 // P5GG-SAME: alps.p5g_g.interchanged_producer_epochs = 1
 // P5GG: %[[VTCM:.*]] = memref.alloc() {bufferization.manual_deallocation} : memref<257x6x64xf16, strided<[64, 16448, 1]>, 1 : i32>
@@ -111,6 +115,51 @@ func.func @tiled_vector_overwrite_ready(
     }
   }
   memref.dealloc %root : memref<257x6x64xf16>
+  return
+}
+
+// Rank-2 speech projections can satisfy the epoch coverage proof, but they do
+// not have a logical head dimension.  P5g-f must reject them without failing
+// the pass or inventing a head-major interpretation.
+func.func @rank2_epoch_is_not_head_major(
+    %input: memref<512x64xf16>,
+    %output: memref<512x64xf16>) {
+  %root = memref.alloc() : memref<512x64xf16>
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c4 = arith.constant 4 : index
+  %c16 = arith.constant 16 : index
+  %c64 = arith.constant 64 : index
+  %c512 = arith.constant 512 : index
+  %zero = arith.constant 0.0 : f16
+  scf.for %token = %c0 to %c512 step %c1 {
+    %source = memref.subview %input[%token, 0] [1, 64] [1, 1]
+        : memref<512x64xf16> to memref<64xf16, strided<[1], offset: ?>>
+    %value = vector.transfer_read %source[%c0], %zero
+        : memref<64xf16, strided<[1], offset: ?>>, vector<64xf16>
+    %target = memref.subview %root[%token, 0] [1, 64] [1, 1]
+        : memref<512x64xf16> to memref<64xf16, strided<[1], offset: ?>>
+    vector.transfer_write %value, %target[%c0]
+        : vector<64xf16>, memref<64xf16, strided<[1], offset: ?>>
+  }
+  scf.for %channel = %c0 to %c64 step %c4 {
+    scf.for %token = %c0 to %c512 step %c16 {
+      %tile = memref.subview %root[%token, %channel] [16, 4] [1, 1]
+          : memref<512x64xf16> to
+            memref<16x4xf16, strided<[64, 1], offset: ?>>
+      %value = vector.transfer_read %tile[%c0, %c0], %zero
+          {alps.p2g.register_tile}
+          : memref<16x4xf16, strided<[64, 1], offset: ?>>,
+            vector<16x4xf16>
+      %target = memref.subview %output[%token, %channel] [16, 4] [1, 1]
+          : memref<512x64xf16> to
+            memref<16x4xf16, strided<[64, 1], offset: ?>>
+      vector.transfer_write %value, %target[%c0, %c0]
+          : vector<16x4xf16>,
+            memref<16x4xf16, strided<[64, 1], offset: ?>>
+    }
+  }
+  memref.dealloc %root : memref<512x64xf16>
   return
 }
 

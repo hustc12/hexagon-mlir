@@ -86,93 +86,95 @@ def main() -> None:
     args = parser.parse_args()
 
     json_files = sorted(args.artifact_root.rglob("lwp.json"))
-    if len(json_files) != 1:
-        raise ValueError(
-            f"expected one monolithic lwp.json, found {len(json_files)}"
-        )
-    cycles = parse_lwp(json_files[0])
-    info = parse_info(args.info_dump)
+    if not json_files:
+        raise ValueError("found no lwp.json under artifact root")
     sites = parse_sites(args.ledger)
     accesses = parse_accesses(args.ledger)
     rows = []
-    for region_id, timing in cycles.items():
-        metadata = info.get(region_id, {"lines": set(), "ops": ""})
-        region_lines = metadata["lines"]
-        assert isinstance(region_lines, set)
-        matched = [site for site in sites if region_lines & site["_lines"]]
-        physical = [
-            site
-            for site in matched
-            if site.get("kind")
-            in ("physical_copy", "physical_layout_transform")
-        ]
-        candidates = [
-            site
-            for site in matched
-            if site.get("kind") == "representation_candidate"
-        ]
-        matched_accesses = [
-            access
-            for access in accesses
-            if access.get("phase") == "post-bufferization"
-            and region_lines & access["_lines"]
-        ]
-        rows.append(
-            {
-                "id": region_id,
-                "pcycles": int(timing["pcycles"] or 0),
-                "inclusive_pcycles": int(timing["pcycles"] or 0),
-                "exclusive_pcycles": 0,
-                "iterations": int(timing["iterations"] or 0),
-                "parent": (
-                    timing["parent"] if timing["parent"] is not None else "-"
-                ),
-                "source_lines": ",".join(map(str, sorted(region_lines)))
-                or "none",
-                "ops": metadata["ops"],
-                "matched_sites": len(matched),
-                "candidate_sites": len(candidates),
-                "physical_sites": len(physical),
-                "physical_materialization_bytes": sum(
-                    max(0, int(str(site.get("materialization_bytes", "0"))))
-                    for site in physical
-                ),
-                "candidate_static_bytes": sum(
-                    max(0, int(str(site.get("static_bytes", "-1"))))
-                    for site in candidates
-                ),
-                "access_sites": len(matched_accesses),
-                "logical_read_upper_bytes": sum(
-                    max(0, int(str(access.get("logical_read_upper_bytes", "0"))))
-                    for access in matched_accesses
-                ),
-                "logical_write_upper_bytes": sum(
-                    max(0, int(str(access.get("logical_write_upper_bytes", "0"))))
-                    for access in matched_accesses
-                ),
-                "unique_operand_bytes": sum(
-                    max(0, int(str(access.get("unique_operand_bytes", "0"))))
-                    for access in matched_accesses
-                ),
-            }
-        )
-    by_id = {int(row["id"]): row for row in rows}
-    child_cycles: dict[int, int] = {}
-    for row in rows:
-        parent = row["parent"]
-        if parent is None or parent == "-":
-            continue
-        parent_id = int(parent)
-        child_cycles[parent_id] = child_cycles.get(parent_id, 0) + int(
-            row["inclusive_pcycles"]
-        )
-    for region_id, row in by_id.items():
-        row["exclusive_pcycles"] = max(
-            0, int(row["inclusive_pcycles"]) - child_cycles.get(region_id, 0)
-        )
+    for json_file in json_files:
+        stage = json_file.parent.name
+        function = re.sub(r"-\d{4}-\d{2}-\d{2}.*$", "", stage)
+        stage_info = json_file.parent / "lwp_infodump.txt"
+        info = parse_info(stage_info if stage_info.is_file() else args.info_dump)
+        cycles = parse_lwp(json_file)
+        child_cycles: dict[int, int] = {}
+        for timing in cycles.values():
+            parent = timing["parent"]
+            if parent is not None:
+                child_cycles[int(parent)] = child_cycles.get(int(parent), 0) + int(
+                    timing["pcycles"] or 0
+                )
+        for region_id, timing in cycles.items():
+            metadata = info.get(region_id, {"lines": set(), "ops": ""})
+            region_lines = metadata["lines"]
+            assert isinstance(region_lines, set)
+            matched = [
+                site for site in sites
+                if region_lines & site["_lines"]
+                and str(site.get("function", function)) == function
+            ]
+            physical = [
+                site for site in matched
+                if site.get("kind")
+                in ("physical_copy", "physical_layout_transform")
+            ]
+            candidates = [
+                site for site in matched
+                if site.get("kind") == "representation_candidate"
+            ]
+            matched_accesses = [
+                access for access in accesses
+                if access.get("phase") == "post-bufferization"
+                and region_lines & access["_lines"]
+                and str(access.get("function", function)) == function
+            ]
+            inclusive = int(timing["pcycles"] or 0)
+            rows.append(
+                {
+                    "stage": stage,
+                    "id": region_id,
+                    "pcycles": inclusive,
+                    "inclusive_pcycles": inclusive,
+                    "exclusive_pcycles": max(
+                        0, inclusive - child_cycles.get(region_id, 0)
+                    ),
+                    "iterations": int(timing["iterations"] or 0),
+                    "parent": (
+                        timing["parent"] if timing["parent"] is not None else "-"
+                    ),
+                    "source_lines": ",".join(map(str, sorted(region_lines)))
+                    or "none",
+                    "ops": metadata["ops"],
+                    "matched_sites": len(matched),
+                    "candidate_sites": len(candidates),
+                    "physical_sites": len(physical),
+                    "physical_materialization_bytes": sum(
+                        max(0, int(str(site.get("materialization_bytes", "0"))))
+                        for site in physical
+                    ),
+                    "candidate_static_bytes": sum(
+                        max(0, int(str(site.get("static_bytes", "-1"))))
+                        for site in candidates
+                    ),
+                    "access_sites": len(matched_accesses),
+                    "logical_read_upper_bytes": sum(
+                        max(0, int(str(access.get("logical_read_upper_bytes", "0"))))
+                        for access in matched_accesses
+                    ),
+                    "logical_write_upper_bytes": sum(
+                        max(0, int(str(access.get("logical_write_upper_bytes", "0"))))
+                        for access in matched_accesses
+                    ),
+                    "unique_operand_bytes": sum(
+                        max(0, int(str(access.get("unique_operand_bytes", "0"))))
+                        for access in matched_accesses
+                    ),
+                }
+            )
     rows.sort(key=lambda row: int(row["exclusive_pcycles"]), reverse=True)
     args.csv.parent.mkdir(parents=True, exist_ok=True)
     columns = (
+        "stage",
         "id",
         "pcycles",
         "inclusive_pcycles",
@@ -204,8 +206,8 @@ def main() -> None:
         "",
         "Instrumented pcycles are for ranking only; they do not replace formal latency.",
         "",
-        "| Rank | ID | Exclusive pcycles | Inclusive pcycles | Exclusive share | Iterations | Source lines | Physical bytes | Logical R/W upper bytes | Access sites | Ops |",
-        "|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---|",
+        "| Rank | Stage | ID | Exclusive pcycles | Inclusive pcycles | Exclusive share | Iterations | Source lines | Physical bytes | Logical R/W upper bytes | Access sites | Ops |",
+        "|---:|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---|",
     ]
     for index, row in enumerate(rows[:30], 1):
         share = (
@@ -213,12 +215,67 @@ def main() -> None:
         )
         ops = str(row["ops"]).replace("|", "/")
         lines.append(
-            f"| {index} | {row['id']} | {row['exclusive_pcycles']} | "
+            f"| {index} | {row['stage']} | {row['id']} | {row['exclusive_pcycles']} | "
             f"{row['inclusive_pcycles']} | {share:.2f}% | "
             f"{row['iterations']} | {row['source_lines']} | "
             f"{row['physical_materialization_bytes']} | "
             f"{row['logical_read_upper_bytes']}/{row['logical_write_upper_bytes']} | "
             f"{row['access_sites']} | {ops} |"
+        )
+    stage_totals: dict[str, int] = {}
+    for row in rows:
+        stage_name = str(row["stage"])
+        stage_totals[stage_name] = stage_totals.get(stage_name, 0) + int(
+            row["exclusive_pcycles"]
+        )
+    lines.extend(
+        [
+            "",
+            "## Stage aggregate",
+            "",
+            "| Rank | Stage | Exclusive pcycles | Root share |",
+            "|---:|---|---:|---:|",
+        ]
+    )
+    for index, (stage_name, cycles) in enumerate(
+        sorted(stage_totals.items(), key=lambda item: item[1], reverse=True)[:30],
+        1,
+    ):
+        share = 100.0 * cycles / total if total else 0.0
+        lines.append(f"| {index} | {stage_name} | {cycles} | {share:.2f}% |")
+    operation_totals: dict[str, dict[str, int]] = {}
+    for row in rows:
+        op_name = str(row["ops"]) or "unattributed"
+        aggregate = operation_totals.setdefault(
+            op_name, {"cycles": 0, "iterations": 0, "regions": 0}
+        )
+        aggregate["cycles"] += int(row["exclusive_pcycles"])
+        aggregate["iterations"] += int(row["iterations"])
+        aggregate["regions"] += 1
+    lines.extend(
+        [
+            "",
+            "## Cross-stage operation aggregate",
+            "",
+            "For layered models this sums the same operation class across every "
+            "complete-model stage. IDs remain stage-local.",
+            "",
+            "| Rank | Operation class | Exclusive pcycles | Root share | Regions | Iterations |",
+            "|---:|---|---:|---:|---:|---:|",
+        ]
+    )
+    for index, (op_name, values) in enumerate(
+        sorted(
+            operation_totals.items(),
+            key=lambda item: item[1]["cycles"],
+            reverse=True,
+        )[:20],
+        1,
+    ):
+        share = 100.0 * values["cycles"] / total if total else 0.0
+        lines.append(
+            f"| {index} | {op_name.replace('|', '/')} | {values['cycles']} | "
+            f"{share:.2f}% | {values['regions']} | {values['iterations']} |"
         )
     hexkl_phases: dict[str, dict[str, int]] = {}
     for row in rows:

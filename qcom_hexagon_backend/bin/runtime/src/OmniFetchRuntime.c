@@ -35,6 +35,10 @@ int hexkl_micro_hmx_copy_submatrix_to_f16(uint8_t *vtcm_base,
                                           uint32_t tile_row, uint32_t tile_col,
                                           uint32_t input_rows,
                                           uint32_t input_cols);
+int hexkl_micro_hmx_copy_f16_to_submatrix(
+    uint8_t *vtcm_base, uint32_t in_offset, _Float16 *output_matrix,
+    uint32_t tile_row, uint32_t tile_col, uint32_t output_rows,
+    uint32_t output_cols);
 #endif
 
 /* -------------------------------------------------------------------------
@@ -265,13 +269,15 @@ static void alps_p4a_observe_dma_completion(unsigned poll_retries) {
   if (++alps_p4a_window_completions < ALPS_P4A_WINDOW_COMPLETIONS)
     return;
   ++alps_p4a_windows;
+  uint32_t pmu_window_delta[4] = {0, 0, 0, 0};
 #ifdef __hexagon__
   if (alps_p4a_pmu_status == ALPS_P4A_PMU_AVAILABLE) {
     if (HAP_read_pmu_group(&alps_p4a_pmu_group) == 0) {
       ++alps_p4a_pmu_reads;
       for (unsigned i = 0; i < 4; ++i) {
         uint32_t current = alps_p4a_pmu_group.pmu_value[i];
-        alps_p4a_pmu_delta[i] += current - alps_p4a_pmu_previous[i];
+        pmu_window_delta[i] = current - alps_p4a_pmu_previous[i];
+        alps_p4a_pmu_delta[i] += pmu_window_delta[i];
         alps_p4a_pmu_previous[i] = current;
       }
     } else {
@@ -279,17 +285,20 @@ static void alps_p4a_observe_dma_completion(unsigned poll_retries) {
     }
   }
 #endif
-  /* Throttle both unproductive extremes.  Zero retries means the whole window
-   * arrived earlier than demand; >=4 retries/completion means demand is still
-   * paying sustained DMPoll pressure.  Only the bounded middle region retains
-   * DMA for the next window.  The threshold is fixed before the second full
-   * run; P4A does not search it per model. */
+  /* A zero-retry completion is the desired fully-hidden prefetch case.  Only
+   * sustained late arrival (>=4 polls/completion) is rejected.  When HAP user
+   * PMU is available, DMPoll is one of the observed events above; Unsigned PD
+   * reports PMU unavailable and uses this exact wait-slot signal rather than
+   * inventing counter values.  The threshold is fixed across models. */
   uint64_t average_retries =
       alps_p4a_window_poll_retries / ALPS_P4A_WINDOW_COMPLETIONS;
-  if (alps_p4a_window_poll_retries == 0 || average_retries >= 4) {
+  uint64_t average_pmu_dmpoll =
+      pmu_window_delta[1] / ALPS_P4A_WINDOW_COMPLETIONS;
+  if (average_retries >= 4 || average_pmu_dmpoll >= 4) {
     __atomic_store_n(&alps_p4a_dma_allowed, 0, __ATOMIC_RELEASE);
     ++alps_p4a_throttle_decisions;
   } else {
+    __atomic_store_n(&alps_p4a_dma_allowed, 1, __ATOMIC_RELEASE);
     ++alps_p4a_hold_decisions;
   }
   alps_p4a_window_completions = 0;
@@ -1033,11 +1042,55 @@ void alps_hmx_async_drain_wait_slot(int32_t slot) {
     return;
   if (alps_hmx_drain_active[slot]) {
 #ifdef __hexagon__
-    hexagon_runtime_dma_wait(alps_hmx_drain_token[slot]);
+    unsigned polls = 0;
+    uint64_t poll_start = __atomic_load_n(&alps_p4a_enabled, __ATOMIC_ACQUIRE)
+                              ? alps_read_pcycles()
+                              : 0;
+    while (!hexagon_runtime_dma_poll(alps_hmx_drain_token[slot])) {
+      if (++polls >= OMNI_SEM_MAX_SPIN) {
+        /* The descriptor is already in flight and its VTCM slot cannot be
+         * reused.  Retire it with the runtime's blocking fallback, then make
+         * the saturated window visible to traffic control. */
+        hexagon_runtime_dma_wait(alps_hmx_drain_token[slot]);
+        break;
+      }
+      __asm__ volatile("pause(#64)");
+    }
+    if (__atomic_load_n(&alps_p4a_enabled, __ATOMIC_ACQUIRE)) {
+      __atomic_fetch_add(&alps_p4a_poll_cycles,
+                         alps_read_pcycles() - poll_start,
+                         __ATOMIC_RELAXED);
+      alps_p4a_observe_dma_completion(polls);
+    }
     __atomic_fetch_add(&alps_hmx_drain_completed, 1, __ATOMIC_RELAXED);
 #endif
     alps_hmx_drain_active[slot] = 0;
   }
+}
+
+static void alps_hmx_sync_drain_f16(void *vtcm, int32_t in_offset,
+                                    _Float16 *dst, int32_t tile_row,
+                                    int32_t tile_col, int32_t output_rows,
+                                    int32_t output_cols, const _Float16 *src,
+                                    _Float16 *out, uint32_t columns) {
+#ifdef __hexagon__
+  (void)src;
+  (void)out;
+  (void)columns;
+  hexkl_micro_hmx_copy_f16_to_submatrix(
+      (uint8_t *)vtcm, (uint32_t)in_offset, dst, (uint32_t)tile_row,
+      (uint32_t)tile_col, (uint32_t)output_rows, (uint32_t)output_cols);
+#else
+  (void)vtcm;
+  (void)in_offset;
+  (void)dst;
+  (void)tile_row;
+  (void)tile_col;
+  (void)output_rows;
+  for (int32_t r = 0; r < 32; ++r)
+    for (uint32_t c = 0; c < columns; ++c)
+      out[(size_t)r * (size_t)output_cols + c] = src[(size_t)r * 32u + c];
+#endif
 }
 
 void alps_hmx_async_drain_start_f16(void *vtcm, int32_t in_offset,
@@ -1058,13 +1111,30 @@ void alps_hmx_async_drain_start_f16(void *vtcm, int32_t in_offset,
 
   _Float16 *src = (_Float16 *)((char *)vtcm + in_offset);
   _Float16 *out = dst + (size_t)row * (size_t)output_cols + (size_t)col;
+
+  /* R never changes the HMX result representation.  Once the observed
+   * window rejects more DMA traffic, execute the identical bounded drain
+   * synchronously and leave the slot inactive. */
+  if (__atomic_load_n(&alps_p4a_enabled, __ATOMIC_ACQUIRE) &&
+      !__atomic_load_n(&alps_p4a_dma_allowed, __ATOMIC_ACQUIRE)) {
+    alps_hmx_sync_drain_f16(vtcm, in_offset, dst, tile_row, tile_col,
+                            output_rows, output_cols, src, out, columns);
+    __atomic_fetch_add(&alps_p4a_dma_suppressed, 1, __ATOMIC_RELAXED);
+    return;
+  }
 #ifdef __hexagon__
   int status = OMNI_DMA_OK;
+  uint64_t issue_start = __atomic_load_n(&alps_p4a_enabled, __ATOMIC_ACQUIRE)
+                             ? alps_read_pcycles()
+                             : 0;
   uint32_t token = hexagon_runtime_dma2d_start(
       src, OMNI_VTCM, out, OMNI_DDR, columns * 2u, 32u,
       /*srcStride=*/64u, /*dstStride=*/(uint32_t)output_cols * 2u,
       /*bypassCacheSrc=*/0, /*bypassCacheDst=*/0, /*isOrdered=*/0,
       /*cacheAllocationPolicy=*/0, &status);
+  if (__atomic_load_n(&alps_p4a_enabled, __ATOMIC_ACQUIRE))
+    __atomic_fetch_add(&alps_p4a_issue_cycles,
+                       alps_read_pcycles() - issue_start, __ATOMIC_RELAXED);
   if (status == OMNI_DMA_OK) {
     alps_hmx_drain_token[slot] = token;
     alps_hmx_drain_active[slot] = 1;
@@ -1076,9 +1146,8 @@ void alps_hmx_async_drain_start_f16(void *vtcm, int32_t in_offset,
 #endif
   /* Recoverable admission fallback: preserve correctness if the UserDMA ring
    * cannot accept the descriptor. */
-  for (int32_t r = 0; r < 32; ++r)
-    for (uint32_t c = 0; c < columns; ++c)
-      out[(size_t)r * (size_t)output_cols + c] = src[(size_t)r * 32u + c];
+  alps_hmx_sync_drain_f16(vtcm, in_offset, dst, tile_row, tile_col,
+                          output_rows, output_cols, src, out, columns);
   __atomic_fetch_add(&alps_hmx_drain_sync_fallbacks, 1, __ATOMIC_RELAXED);
 }
 

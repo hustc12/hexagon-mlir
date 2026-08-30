@@ -25,6 +25,7 @@ alps_p0b=0
 alps_p1=0
 alps_p1_profile=0
 alps_p1_hexkl_profile=0
+profile_lwp_loop_depth=1
 alps_p2a=0
 alps_p2b=0
 alps_p2c=0
@@ -57,6 +58,12 @@ alps_p5n=0
 alps_p3a=0
 alps_p3b=0
 alps_p4a=0
+alps_fp16_hvx=0
+alps_hvx_widening_conv=0
+alps_c_e_p=0
+alps_c_e_p_r=0
+with_item7=0
+item7_only_run=0
 models=()
 
 all_models=(
@@ -94,6 +101,8 @@ Options:
   --alps-p1               Run P1 control/elementwise analysis-only ledgers
   --alps-p1-profile       Add loop-level LWP to P1 (monolithic models only)
   --alps-p1-hexkl-profile Add per-phase HexKL/HMX LWP to loop-level profiling
+  --profile-lwp-loop-depth N
+                          LWP loop depth used by profile modes (default: 1)
   --alps-p2a              Run P2a elementwise + zero-copy attention candidate
   --alps-p2b              Run P2b producer-direct + P2a cumulative candidate
   --alps-p2c              Run P2c sync fused transform-transfer + stable P2a
@@ -123,9 +132,16 @@ Options:
   --alps-p5l              Apply rank-2 broadcast bias during the HMX F16 result drain
   --alps-p5m              Analyze admission for ping-pong async HMX result drain (P5k execution unchanged)
   --alps-p5n              Execute ping-pong VTCM + async DMA HMX result drain
+  --with-item7            Compose item7 attention/KV topology with P5m or P5n
+  --item7-only            Run only the maintained item7 configuration
   --alps-p3a              Run P3a exact-readiness contract + P2d + stable P2a
   --alps-p3b              Run P3b descriptor-bound issuer-owned weight DMA overlap
   --alps-p4a              Run P4A telemetry + within-path DMA traffic control
+  --alps-fp16-hvx         Run matched HexKL-on control vs FP16 HVX arithmetic
+  --alps-hvx-widening-conv Run matched HexKL-on control vs ALPS C widening convolution
+  --alps-c-e             Run matched ALPS C control vs C + consumer-driven layout
+  --alps-c-e-p           Run strict C+E HMX direct-output control vs C+E+P async drain
+  --alps-c-e-p-r         Run strict C+E+P control vs C+E+P+R runtime traffic admission
   --output-dir DIR        Local working/result directory
   --remote-dir DIR        nano working_set destination
   --device-iterations N   Device samples per configuration (default: ${iterations})
@@ -216,6 +232,10 @@ while (($#)); do
     --alps-p1-hexkl-profile)
       alps_p0=1; alps_p1=1; alps_p1_profile=1; alps_p1_hexkl_profile=1; shift
       ;;
+    --profile-lwp-loop-depth)
+      [[ $# -ge 2 ]] || { echo "--profile-lwp-loop-depth needs a value" >&2; exit 2; }
+      profile_lwp_loop_depth=$2; shift 2
+      ;;
     --alps-p2a) alps_p0=1; alps_p2a=1; shift ;;
     --alps-p2b) alps_p0=1; alps_p2a=1; alps_p2b=1; shift ;;
     --alps-p2c) alps_p0=1; alps_p2a=1; alps_p2c=1; shift ;;
@@ -299,12 +319,26 @@ while (($#)); do
       alps_p0=1; alps_p2e=1; alps_p2g=1; alps_p2gc=1
       alps_p5fa=1; alps_p5gd=1; alps_p5gf=1; alps_p5gg=1; alps_p5h=1; alps_p5i=1; alps_p5j=1; alps_p5k=1; alps_p5m=1; alps_p5n=1; shift
       ;;
+    --with-item7) with_item7=1; shift ;;
+    --item7-only) alps_p0=1; item7_only_run=1; shift ;;
     --alps-p3a) alps_p0=1; alps_p2a=1; alps_p2d=1; alps_p3a=1; shift ;;
     --alps-p3b)
       alps_p0=1; alps_p2a=1; alps_p2d=1; alps_p3a=1; alps_p3b=1; shift
       ;;
     --alps-p4a)
       alps_p0=1; alps_p2a=1; alps_p2d=1; alps_p3a=1; alps_p3b=1; alps_p4a=1; shift
+      ;;
+    --alps-fp16-hvx) alps_p0=1; alps_fp16_hvx=1; shift ;;
+    --alps-hvx-widening-conv) alps_p0=1; alps_hvx_widening_conv=1; shift ;;
+    --alps-c-e)
+      alps_p0=1; alps_p2e=1; alps_hvx_widening_conv=1; shift
+      ;;
+    --alps-c-e-p)
+      alps_p0=1; alps_p2e=1; alps_hvx_widening_conv=1; alps_c_e_p=1; shift
+      ;;
+    --alps-c-e-p-r)
+      alps_p0=1; alps_p2e=1; alps_hvx_widening_conv=1
+      alps_c_e_p=1; alps_c_e_p_r=1; shift
       ;;
     --output-dir) output_dir=$2; shift 2 ;;
     --remote-dir) remote_dir=$2; shift 2 ;;
@@ -318,7 +352,19 @@ while (($#)); do
   esac
 done
 
-if ((alps_p5n)); then
+if ((alps_c_e_p_r)); then
+  schemes=(alps-c-e-hmx-async-drain alps-c-e-hmx-async-drain-traffic-control)
+elif ((alps_c_e_p)); then
+  schemes=(alps-c-e-hmx-direct-output alps-c-e-hmx-async-drain)
+elif ((alps_hvx_widening_conv && alps_p2e)); then
+  schemes=(alps-hvx-widening-conv alps-hvx-widening-conv-consumer-layout)
+elif ((alps_hvx_widening_conv)); then
+  schemes=(hmlir-hvx-hexkl-on alps-hvx-widening-conv)
+elif ((alps_fp16_hvx)); then
+  schemes=(hmlir-hvx-hexkl-on alps-fp16-hvx-arithmetic)
+elif ((item7_only_run)); then
+  schemes=(item7-only)
+elif ((alps_p5n)); then
   schemes=(alps-hmx-async-drain)
 elif ((alps_p5m)); then
   schemes=(alps-hmx-async-drain-analysis)
@@ -390,8 +436,17 @@ elif ((alps_p0)); then
   schemes=(hmlir-hvx-hexkl-on alps-semantic alps-fusion alps-slicing alps-runtime alps-legacy-all)
 fi
 
+if ((with_item7)); then
+  ((alps_p5m || alps_p5n)) || {
+    echo "--with-item7 is currently supported only with --alps-p5m/--alps-p5n" >&2
+    exit 2
+  }
+  schemes=("${schemes[0]}-item7")
+fi
+
 [[ "${iterations}" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid iterations" >&2; exit 2; }
 [[ "${seq_len}" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid sequence length" >&2; exit 2; }
+[[ "${profile_lwp_loop_depth}" =~ ^[0-9]+$ ]] || { echo "Invalid LWP loop depth" >&2; exit 2; }
 if [[ "${compile_threads}" == auto ]]; then
   available_kib=$(awk '/MemAvailable:/{print $2}' /proc/meminfo)
   cpu_count=$(getconf _NPROCESSORS_ONLN)
@@ -407,10 +462,6 @@ fi
 if ((${#models[@]} == 0)); then models=("${all_models[@]}"); fi
 for model in "${models[@]}"; do
   known_model "${model}" || { echo "Unknown model: ${model}" >&2; exit 2; }
-  if ((alps_p1_profile)) && [[ "$(cli_style_for "${model}")" == layered-fp16 ]]; then
-    echo "P1 LWP profiling currently supports monolithic models only: ${model}" >&2
-    exit 2
-  fi
 done
 
 if ((list_only)); then
@@ -474,18 +525,25 @@ cleanup_case_generated() {
     echo "Refusing generated-file cleanup outside output_dir: ${case_dir}" >&2
     return 2
   }
-  for generated in "${case_dir}/artifacts" "${case_dir}/mlirbc"; do
+  for generated in \
+    "${case_dir}/artifacts" \
+    "${case_dir}/mlirbc" \
+    "${case_dir}/runner_intermediates"; do
     [[ -e "${generated}" ]] && rm -rf -- "${generated}"
   done
 }
 
 move_case_to_remote() {
   local model=$1 scheme=$2 case_dir=$3
+  local replay=${ALPS_ENABLE_MODEL_SYSMON_REPLAY:-0} preserve_summary=0
+  if ((alps_p1_profile)) || [[ "${replay,,}" == 1 || "${replay,,}" == true || "${replay,,}" == yes ]]; then
+    preserve_summary=1
+  fi
   sync_case "${model}" "${scheme}" "${case_dir}"
   # ALPS P0 can generate many full-model objects. The remote copy is the
   # authoritative result: after rsync succeeds, remove the complete local case
   # rather than retaining a second "backup" on the constrained local disk.
-  if ((alps_p0)); then
+  if ((alps_p0 && !preserve_summary)); then
     [[ -n "${output_dir}" && "${case_dir}" == "${output_dir}/"* ]] || {
       echo "Refusing case removal outside output_dir: ${case_dir}" >&2
       return 2
@@ -547,6 +605,25 @@ collect_alps_p1_profile() {
     --markdown "${case_dir}/alps_p1_lwp_regions.md"
 }
 
+collect_sysmon_profile() {
+  local case_dir=$1
+  find "${case_dir}/artifacts" -type f -name kernel_window_summary.json \
+    -print -quit 2>/dev/null | grep -q . || return 0
+  "${venv}/bin/python" "${repo_root}/scripts/summarize_model_sysmon.py" \
+    --artifact-root "${case_dir}/artifacts" \
+    --json "${case_dir}/sysmon_model_summary.json" \
+    --csv "${case_dir}/sysmon_stages.csv" \
+    --markdown "${case_dir}/sysmon_model_summary.md"
+}
+
+collect_model_sysmon_replay() {
+  local case_dir=$1 enabled=${ALPS_ENABLE_MODEL_SYSMON_REPLAY:-0}
+  [[ "${enabled,,}" == 1 || "${enabled,,}" == true || "${enabled,,}" == yes ]] \
+    || return 0
+  "${repo_root}/scripts/profile_archived_hexagon_model.sh" \
+    "${case_dir}/artifacts" "${case_dir}/sysmon_model_replay"
+}
+
 collect_runner_intermediates() {
   local case_dir=$1 marker=$2 generated
   local destination=${case_dir}/runner_intermediates
@@ -584,7 +661,7 @@ base_args_for() {
     printf '%s\n' --enable-hvx-vector
   fi
   if ((alps_p1_profile)); then
-    printf '%s\n' --enable-lwp --lwp-loop-depth 1
+    printf '%s\n' --enable-lwp --lwp-loop-depth "${profile_lwp_loop_depth}"
   fi
   if ((alps_p1_hexkl_profile)); then
     printf '%s\n' --lwp-hexkl-phases
@@ -594,7 +671,11 @@ base_args_for() {
 }
 
 scheme_args_for() {
-  local scheme=$1 candidate_ids=${2:-}
+  local scheme=$1 candidate_ids=${2:-} include_item7=0
+  if [[ "${scheme}" == *-item7 ]]; then
+    include_item7=1
+    scheme=${scheme%-item7}
+  fi
   case "${scheme}" in
     pk-hvx)
       printf '%s\n' --enable-hexkl --prefetch-baseline prefetch-kernel-hx \
@@ -607,6 +688,19 @@ scheme_args_for() {
       ;;
     hmlir-hvx-hexkl-off) ;;
     hmlir-hvx-hexkl-on) printf '%s\n' --enable-hexkl ;;
+    alps-fp16-hvx-arithmetic)
+      printf '%s\n' --enable-hexkl --enable-alps-fp16-hvx-arithmetic
+      ;;
+    alps-hvx-widening-conv)
+      printf '%s\n' --enable-hexkl --enable-alps-hvx-widening-conv
+      ;;
+    alps-hvx-widening-conv-consumer-layout)
+      printf '%s\n' --enable-hexkl --enable-alps-hvx-widening-conv
+      ;;
+    alps-c-e-hmx-direct-output|alps-c-e-hmx-async-drain|alps-c-e-hmx-async-drain-traffic-control)
+      printf '%s\n' --enable-hexkl --enable-alps-hvx-widening-conv \
+        --disable-layout-aware --disable-omnifetch-adaptive
+      ;;
     item7-only)
       printf '%s\n' --enable-hexkl --enable-omnifetch-kv-cache-prefetch \
         --disable-layout-aware --disable-omnifetch-adaptive
@@ -636,6 +730,9 @@ scheme_args_for() {
         --disable-layout-aware --disable-omnifetch-adaptive
       ;;
   esac
+  if ((include_item7)); then
+    printf '%s\n' --enable-omnifetch-kv-cache-prefetch
+  fi
 }
 
 passing_log() {
@@ -656,6 +753,21 @@ upsert_result() {
   hints=$(awk 'match($0,/hints=[0-9]+/){v=substr($0,RSTART+6,RLENGTH-6)}END{print v+0}' "${log}")
   issued=$(awk 'match($0,/issued=[0-9]+/){v=substr($0,RSTART+7,RLENGTH-7)}END{print v+0}' "${log}")
   issued_bytes=$(awk 'match($0,/issued_bytes=[0-9]+/){v=substr($0,RSTART+13,RLENGTH-13)}END{print v+0}' "${log}")
+  # Layered Language models emit one async-drain telemetry record per stage.
+  # The generic extraction above intentionally records the last L2 scheduler
+  # state, which made a synchronously-falling-back vocabulary head overwrite
+  # the 24 valid transformer-layer DMA counts with zero.  For P5n, aggregate
+  # the mechanism's own runtime records across every stage instead.
+  if [[ "${scheme%-item7}" == alps-hmx-async-drain ||
+        "${scheme%-item7}" == alps-c-e-hmx-async-drain ||
+        "${scheme%-item7}" == alps-c-e-hmx-async-drain-traffic-control ]]; then
+    issued=$(awk '/^ALPSHMXAsyncDrain:/{
+      for(i=1;i<=NF;i++)if(index($i,"issued=")==1){v=$i;sub("issued=","",v);s+=v}
+    }END{print s+0}' "${log}")
+    issued_bytes=$(awk '/^ALPSHMXAsyncDrain:/{
+      for(i=1;i<=NF;i++)if(index($i,"issued_bytes=")==1){v=$i;sub("issued_bytes=","",v);s+=v}
+    }END{print s+0}' "${log}")
+  fi
   kv_pairs=$(awk '/\[KVCacheMetadataRoles\]/{for(i=1;i<=NF;i++)if(index($i,"key=")==1){v=$i;sub("key=","",v);s=v}}END{print s+0}' "${log}")
   kv_sites=$(awk '/\[KVCachePrefetch\]/{for(i=1;i<=NF;i++)if(index($i,"sites=")==1){v=$i;sub("sites=","",v);gsub(/[^0-9].*/,"",v);s=v}}END{print s+0}' "${log}")
   correctness=$(awk '/\[Compare\]/{v=$0}END{gsub(/,/,";",v);print v}' "${log}")
@@ -684,6 +796,7 @@ run_case() {
   local case_dir=${output_dir}/${model}/${scheme}
   local log=${case_dir}/run.log status_file=${case_dir}/status.txt
   local marker=${case_dir}/.case-started
+  local result_scheme execution_scheme
   local -a args=()
   mkdir -p "${case_dir}/artifacts"
   if ((reuse_valid)) && passing_log "${log}" "${status_file}"; then
@@ -692,6 +805,8 @@ run_case() {
     return 0
   fi
   touch "${marker}"
+  result_scheme=${scheme}
+  execution_scheme=${scheme%-item7}
   mapfile -t args < <(base_args_for "${model}"; scheme_args_for "${scheme}" "${candidate_ids}")
   if [[ "$(cli_style_for "${model}")" == layered-fp16 ]]; then
     args+=(--output-dir "${case_dir}/mlirbc")
@@ -700,15 +815,15 @@ run_case() {
   # P5n changes only the final HMX drain.  Reuse P5m's cumulative feature
   # identity for every earlier-stage environment gate so control/treatment
   # differ solely by ALPS_ENABLE_HMX_ASYNC_DRAIN.
-  result_scheme=${scheme}
-  if [[ ${scheme} == alps-hmx-async-drain ]]; then
+  scheme=${execution_scheme}
+  if [[ ${execution_scheme} == alps-hmx-async-drain ]]; then
     scheme=alps-hmx-async-drain-analysis
   fi
   set +e
-    ALPS_ENABLE_MOVEMENT_LEDGER="$([[ ${alps_p1} -eq 1 || ${alps_p2a} -eq 1 || ${alps_p2b} -eq 1 || ${alps_p2c} -eq 1 || ${alps_p2d} -eq 1 || ${alps_p2e} -eq 1 || ${alps_p3a} -eq 1 || ${alps_p3b} -eq 1 || ${alps_p4a} -eq 1 ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_MOVEMENT_LEDGER="$([[ ${ALPS_DISABLE_MOVEMENT_LEDGER:-0} -ne 1 && ( ${alps_p1} -eq 1 || ${alps_p2a} -eq 1 || ${alps_p2b} -eq 1 || ${alps_p2c} -eq 1 || ${alps_p2d} -eq 1 || ${alps_p2e} -eq 1 || ${alps_p3a} -eq 1 || ${alps_p3b} -eq 1 || ${alps_p4a} -eq 1 ) ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_ZERO_COPY_ATTENTION="$([[ ${scheme} == alps-elementwise-zero-copy || ${scheme} == alps-elementwise-producer-direct || ${scheme} == alps-elementwise-fused-transfer || ${scheme} == alps-elementwise-admission || ${scheme} == alps-elementwise-exact-readiness || ${scheme} == alps-elementwise-exact-overlap || ${scheme} == alps-elementwise-traffic-control ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_PRODUCER_DIRECT_ATTENTION="$([[ ${scheme} == alps-elementwise-producer-direct ]] && echo 1 || echo 0)" \
-    ALPS_ENABLE_CONSUMER_DRIVEN_LAYOUT="$([[ ${scheme} == alps-consumer-driven-layout || ${scheme} == alps-consumer-layout-propagation || ${scheme} == alps-continuity-audit || ${scheme} == alps-loop-interchanged-direct || ${scheme} == alps-register-tile-direct || ${scheme} == alps-crp-supply-analysis || ${scheme} == alps-crp-supply-prefetch || ${scheme} == alps-crp-segmented-supply || ${scheme} == alps-crp-vtcm-formation || ${scheme} == alps-crp-vtcm-window || ${scheme} == alps-crp-vtcm-async-window || ${scheme} == alps-crp-producer-direct-analysis || ${scheme} == alps-crp-producer-direct-vtcm || ${scheme} == alps-crp-producer-direct-head-major || ${scheme} == alps-crp-producer-head-major-contiguous || ${scheme} == alps-attention-destination-formation || ${scheme} == alps-patch-conv-formation || ${scheme} == alps-hmx-f16-epilogue-formation || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis || ${scheme} == alps-hmx-async-drain || ${scheme} == alps-contract-discharge-ledger || ${scheme} == alps-representation-supply-analysis || ${scheme} == alps-layout-supply-prefetch ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_CONSUMER_DRIVEN_LAYOUT="$([[ ${alps_c_e_p} -eq 1 || ${scheme} == alps-hvx-widening-conv-consumer-layout || ${scheme} == alps-consumer-driven-layout || ${scheme} == alps-consumer-layout-propagation || ${scheme} == alps-continuity-audit || ${scheme} == alps-loop-interchanged-direct || ${scheme} == alps-register-tile-direct || ${scheme} == alps-crp-supply-analysis || ${scheme} == alps-crp-supply-prefetch || ${scheme} == alps-crp-segmented-supply || ${scheme} == alps-crp-vtcm-formation || ${scheme} == alps-crp-vtcm-window || ${scheme} == alps-crp-vtcm-async-window || ${scheme} == alps-crp-producer-direct-analysis || ${scheme} == alps-crp-producer-direct-vtcm || ${scheme} == alps-crp-producer-direct-head-major || ${scheme} == alps-crp-producer-head-major-contiguous || ${scheme} == alps-attention-destination-formation || ${scheme} == alps-patch-conv-formation || ${scheme} == alps-hmx-f16-epilogue-formation || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis || ${scheme} == alps-hmx-async-drain || ${scheme} == alps-contract-discharge-ledger || ${scheme} == alps-representation-supply-analysis || ${scheme} == alps-layout-supply-prefetch ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_CONSUMER_LAYOUT_PROPAGATION="$([[ ${scheme} == alps-consumer-layout-propagation ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_CONTINUITY_AUDIT="$([[ ${scheme} == alps-continuity-audit || ${scheme} == alps-loop-interchanged-direct || ${scheme} == alps-register-tile-direct || ${scheme} == alps-crp-supply-analysis || ${scheme} == alps-crp-supply-prefetch || ${scheme} == alps-crp-segmented-supply || ${scheme} == alps-crp-vtcm-formation || ${scheme} == alps-crp-vtcm-window || ${scheme} == alps-crp-vtcm-async-window || ${scheme} == alps-crp-producer-direct-analysis || ${scheme} == alps-crp-producer-direct-vtcm || ${scheme} == alps-crp-producer-direct-head-major || ${scheme} == alps-crp-producer-head-major-contiguous || ${scheme} == alps-attention-destination-formation || ${scheme} == alps-patch-conv-formation || ${scheme} == alps-hmx-f16-epilogue-formation || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_LOOP_INTERCHANGED_DIRECT="$([[ ${scheme} == alps-loop-interchanged-direct ]] && echo 1 || echo 0)" \
@@ -728,16 +843,17 @@ run_case() {
     ALPS_ENABLE_CRP_PRODUCER_LOOP_FORMATION="$([[ ${scheme} == alps-crp-producer-head-major-contiguous || ${scheme} == alps-attention-destination-formation || ${scheme} == alps-patch-conv-formation || ${scheme} == alps-hmx-f16-epilogue-formation || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_ATTENTION_DESTINATION_FORMATION="$([[ ${scheme} == alps-attention-destination-formation || ${scheme} == alps-patch-conv-formation || ${scheme} == alps-hmx-f16-epilogue-formation || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_PATCH_CONV_FORMATION="$([[ ${scheme} == alps-patch-conv-formation || ${scheme} == alps-hmx-f16-epilogue-formation || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis ]] && echo 1 || echo 0)" \
-    ALPS_ENABLE_HMX_F16_EPILOGUE_FORMATION="$([[ ${scheme} == alps-hmx-f16-epilogue-formation || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis ]] && echo 1 || echo 0)" \
-    ALPS_ENABLE_HMX_DIRECT_OUTPUT_FORMATION="$([[ ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis || ${scheme} == alps-hmx-async-drain ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_HMX_F16_EPILOGUE_FORMATION="$([[ ${alps_c_e_p} -eq 1 || ${scheme} == alps-hmx-f16-epilogue-formation || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_HMX_DIRECT_OUTPUT_FORMATION="$([[ ${alps_c_e_p} -eq 1 || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis || ${scheme} == alps-hmx-async-drain ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_HMX_F16_BIAS_EPILOGUE_FORMATION="$([[ ${scheme} == alps-hmx-f16-bias-epilogue-formation ]] && echo 1 || echo 0)" \
-    ALPS_ENABLE_HMX_ASYNC_DRAIN_ANALYSIS="$([[ ${scheme} == alps-hmx-async-drain-analysis || ${scheme} == alps-hmx-async-drain ]] && echo 1 || echo 0)" \
-    ALPS_ENABLE_HMX_ASYNC_DRAIN="$([[ ${result_scheme} == alps-hmx-async-drain ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_HMX_ASYNC_DRAIN_ANALYSIS="$([[ ${alps_c_e_p} -eq 1 || ${scheme} == alps-hmx-async-drain-analysis || ${scheme} == alps-hmx-async-drain ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_HMX_ASYNC_DRAIN="$([[ ${execution_scheme} == alps-hmx-async-drain || ${execution_scheme} == alps-c-e-hmx-async-drain || ${execution_scheme} == alps-c-e-hmx-async-drain-traffic-control ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_FUSED_TRANSFORM_TRANSFER="$([[ ${scheme} == alps-elementwise-fused-transfer ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_MINIMAL_STATIC_ADMISSION="$([[ ${scheme} == alps-elementwise-admission || ${scheme} == alps-elementwise-exact-readiness || ${scheme} == alps-elementwise-exact-overlap || ${scheme} == alps-elementwise-traffic-control ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_EXACT_READINESS="$([[ ${scheme} == alps-elementwise-exact-readiness || ${scheme} == alps-elementwise-exact-overlap || ${scheme} == alps-elementwise-traffic-control ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_EXACT_OVERLAP="$([[ ${scheme} == alps-elementwise-exact-overlap || ${scheme} == alps-elementwise-traffic-control ]] && echo 1 || echo 0)" \
-    ALPS_ENABLE_TRAFFIC_CONTROL="$([[ ${scheme} == alps-elementwise-traffic-control ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_TRAFFIC_CONTROL="$([[ ${scheme} == alps-elementwise-traffic-control || ${scheme} == alps-c-e-hmx-async-drain-traffic-control ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_FP16_HVX_ARITHMETIC="$([[ ${scheme} == alps-fp16-hvx-arithmetic ]] && echo 1 || echo 0)" \
     HEXAGON_MLIR_DUMP_DIR="${case_dir}/artifacts" \
     "${venv}/bin/python" "${runner}" "${args[@]}" >"${log}" 2>&1
   rc=$?
@@ -756,6 +872,7 @@ run_case() {
     extract_alps_p1_ledger "${case_dir}"
     extract_alps_p2g_audit "${case_dir}"
     collect_alps_p1_profile "${case_dir}" || true
+    collect_sysmon_profile "${case_dir}" || true
     audit_case_codegen "${case_dir}"
     move_case_to_remote "${model}" "${scheme}" "${case_dir}"
     echo "FAIL model=${model} scheme=${scheme} rc=${rc} log=${log}" >&2
@@ -764,13 +881,15 @@ run_case() {
   extract_alps_p1_ledger "${case_dir}"
   extract_alps_p2g_audit "${case_dir}"
   collect_alps_p1_profile "${case_dir}"
+  collect_model_sysmon_replay "${case_dir}"
+  collect_sysmon_profile "${case_dir}"
   audit_case_codegen "${case_dir}"
   move_case_to_remote "${model}" "${scheme}" "${case_dir}"
   echo "DONE model=${model} scheme=${scheme}"
 }
 
 write_ratios() {
-  "${venv}/bin/python" - "${results}" "${output_dir}/summary.md" "${alps_p0}" "${alps_p0b}" "${alps_p1}" "${alps_p2a}" "${alps_p2b}" "${alps_p2c}" "${alps_p2d}" "${alps_p2e}" "${alps_p2f}" "${alps_p2g}" "${alps_p2gb}" "${alps_p2gc}" "${alps_p5a}" "${alps_p5b}" "${alps_p5c}" "${alps_p5fa}" "${alps_p5fb}" "${alps_p5fc}" "${alps_p5g}" "${alps_p5gb}" "${alps_p5gc}" "${alps_p5gd}" "${alps_p5ge}" "${alps_p5gf}" "${alps_p5gg}" "${alps_p5h}" "${alps_p5i}" "${alps_p5j}" "${alps_p5k}" "${alps_p5l}" "${alps_p5m}" "${alps_p5n}" "${alps_p3a}" "${alps_p3b}" "${alps_p4a}" <<'PY'
+  "${venv}/bin/python" - "${results}" "${output_dir}/summary.md" "${alps_p0}" "${alps_p0b}" "${alps_p1}" "${alps_p2a}" "${alps_p2b}" "${alps_p2c}" "${alps_p2d}" "${alps_p2e}" "${alps_p2f}" "${alps_p2g}" "${alps_p2gb}" "${alps_p2gc}" "${alps_p5a}" "${alps_p5b}" "${alps_p5c}" "${alps_p5fa}" "${alps_p5fb}" "${alps_p5fc}" "${alps_p5g}" "${alps_p5gb}" "${alps_p5gc}" "${alps_p5gd}" "${alps_p5ge}" "${alps_p5gf}" "${alps_p5gg}" "${alps_p5h}" "${alps_p5i}" "${alps_p5j}" "${alps_p5k}" "${alps_p5l}" "${alps_p5m}" "${alps_p5n}" "${alps_p3a}" "${alps_p3b}" "${alps_p4a}" "${with_item7}" "${item7_only_run}" "${alps_fp16_hvx}" "${alps_hvx_widening_conv}" "${alps_c_e_p}" "${alps_c_e_p_r}" <<'PY'
 import csv
 import pathlib
 import sys
@@ -812,8 +931,22 @@ alps_p5n = bool(int(sys.argv[34]))
 alps_p3a = bool(int(sys.argv[35]))
 alps_p3b = bool(int(sys.argv[36]))
 alps_p4a = bool(int(sys.argv[37]))
+with_item7 = bool(int(sys.argv[38]))
+item7_only_run = bool(int(sys.argv[39]))
+alps_fp16_hvx = bool(int(sys.argv[40]))
+alps_hvx_widening_conv = bool(int(sys.argv[41]))
+alps_c_e_p = bool(int(sys.argv[42]))
+alps_c_e_p_r = bool(int(sys.argv[43]))
 
-def selected_reference():
+def selected_reference_base():
+    if alps_c_e_p_r:
+        return "alps-c-e-hmx-async-drain-traffic-control"
+    if alps_c_e_p:
+        return "alps-c-e-hmx-async-drain"
+    if alps_hvx_widening_conv and alps_p2e:
+        return "alps-hvx-widening-conv-consumer-layout"
+    if alps_hvx_widening_conv: return "alps-hvx-widening-conv"
+    if alps_fp16_hvx: return "alps-fp16-hvx-arithmetic"
     if alps_p5n: return "alps-hmx-async-drain"
     if alps_p5m: return "alps-hmx-async-drain-analysis"
     if alps_p5l: return "alps-hmx-f16-bias-epilogue-formation"
@@ -850,6 +983,11 @@ def selected_reference():
     if alps_p0b: return "alps-fusion"
     if alps_p0: return "alps-legacy-all"
     return "item7-only"
+def selected_reference():
+    if item7_only_run:
+        return "item7-only"
+    base = selected_reference_base()
+    return f"{base}-item7" if with_item7 else base
 with csv_path.open(newline="", encoding="utf-8") as handle:
     rows = list(csv.DictReader(handle))
 by_model = {}
@@ -873,6 +1011,16 @@ with csv_path.open("w", newline="", encoding="utf-8") as handle:
     writer.writerows(rows)
 reference_name = selected_reference()
 title = "ALPS P5f-b CRP supply prefetch" if alps_p5fb else ("ALPS P5f-a CRP supply analysis" if alps_p5fa else ("ALPS P5c layout-supply prefetch" if alps_p5c else ("ALPS P2g-c register-tile direct formation" if alps_p2gc else ("ALPS P2g-b loop-interchanged direct formation" if alps_p2gb else ("ALPS P2g-a continuity audit" if alps_p2g else ("ALPS P5b representation-aware input supply analysis" if alps_p5b else ("ALPS P5a contract discharge ledger" if alps_p5a else ("ALPS P2f consumer layout codegen propagation" if alps_p2f else ("ALPS P2e consumer-driven layout" if alps_p2e else "ALPS/full-model comparison")))))))))
+if alps_fp16_hvx:
+    title = "ALPS FP16 HVX arithmetic ablation"
+if alps_hvx_widening_conv:
+    title = "ALPS C helper-free HVX widening convolution"
+if alps_hvx_widening_conv and alps_p2e:
+    title = "ALPS C + E consumer-driven direct layout"
+if alps_c_e_p:
+    title = "ALPS C + E direct output + P residual asynchronous drain"
+if alps_c_e_p_r:
+    title = "ALPS C + E + P + R runtime traffic admission"
 if alps_p5fc:
     title = "ALPS P5f-c segmented CRP supply"
 if alps_p5g:
@@ -904,6 +1052,16 @@ if alps_p5m:
 if alps_p5n:
     title = "ALPS P5n HMX ping-pong VTCM asynchronous result drain"
 schemes = (
+    ("alps-c-e-hmx-async-drain", "alps-c-e-hmx-async-drain-traffic-control")
+    if alps_c_e_p_r else
+    ("alps-c-e-hmx-direct-output", "alps-c-e-hmx-async-drain")
+    if alps_c_e_p else
+    ("alps-hvx-widening-conv", "alps-hvx-widening-conv-consumer-layout")
+    if alps_hvx_widening_conv and alps_p2e else
+    ("hmlir-hvx-hexkl-on", "alps-hvx-widening-conv")
+    if alps_hvx_widening_conv else
+    ("hmlir-hvx-hexkl-on", "alps-fp16-hvx-arithmetic")
+    if alps_fp16_hvx else
     ("alps-hmx-async-drain",)
     if alps_p5n else
     ("alps-hmx-async-drain-analysis",)
@@ -976,6 +1134,12 @@ schemes = (
     if alps_p0 else
     ("pk-hvx", "apt-hvx", "hmlir-hvx-hexkl-off", "hmlir-hvx-hexkl-on", "item7-only")
 )
+if with_item7:
+    schemes = tuple(f"{scheme}-item7" for scheme in schemes)
+    title += " + item7 topology"
+if item7_only_run:
+    schemes = ("item7-only",)
+    title = "Item7-only matched rerun"
 lines = [f"# {title}", "", f"| Model | Scheme | Latency ({reference_name} = 1.00x) |", "|---|---|---:|"]
 for model in by_model:
     for scheme in schemes:

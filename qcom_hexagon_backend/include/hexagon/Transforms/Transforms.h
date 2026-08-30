@@ -28,6 +28,9 @@ createConvTilingPass(const ConvTilingOptions &options = ConvTilingOptions());
 std::unique_ptr<OperationPass<func::FuncOp>> createConvertLayoutPass();
 
 std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createAlpsHVXWideningConvPass();
+
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
 createConvertToHexagonmemPass();
 
 std::unique_ptr<OperationPass<func::FuncOp>> createConvertZeroSizeMemrefPass();

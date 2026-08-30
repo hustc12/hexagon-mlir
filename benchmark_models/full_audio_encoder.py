@@ -179,6 +179,9 @@ def run_full_audio_encoder(
             args.disable_omnifetch_persistent_wh_cache
         ),
         alps_p0_mode=args.alps_p0_mode,
+        enable_alps_fp16_hvx_arithmetic=(
+            args.enable_alps_fp16_hvx_arithmetic
+        ),
     )
     output = hex_execution(
         module,

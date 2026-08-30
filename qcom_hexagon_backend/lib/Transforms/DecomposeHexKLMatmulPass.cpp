@@ -42,6 +42,15 @@ using namespace hexagon;
 
 namespace {
 
+// V73 UserDMA 2-D ROI dimensions and strides are 16-bit descriptor fields.
+// Keep this compiler-side predicate in lockstep with UserDMA::copy2D so an
+// illegal async drain remains on the existing synchronous copy path.
+static constexpr int64_t kUserDMA2DFieldMax = 0xFFFF;
+
+static bool isAsyncDrainDMA2DLegal(int64_t outputColumns) {
+  return outputColumns > 0 && outputColumns <= kUserDMA2DFieldMax / 2;
+}
+
 struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
   DecomposeHexKLMatmul(MLIRContext *ctx, bool enableWeightPrepack,
                        bool enableVtcmLifetimeColoring,
@@ -277,6 +286,7 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
         resultType.getElementType().isF16() && lhsType.hasStaticShape() &&
         rhsType.hasStaticShape() && resultType.hasStaticShape() &&
         resultShape[0] >= 32 &&
+        isAsyncDrainDMA2DLegal(resultShape[1]) &&
         (((resultShape[0] + 31) / 32) * ((resultShape[1] + 31) / 32) >= 2) &&
         (!(doMPad || doNPad) || formDirectOutput);
     if ((doMPad || doNPad) && !formDirectOutput) {
@@ -891,6 +901,17 @@ static void analyzeAsyncDrain(hexkl::MatmulOp op,
   ledger.boundaryTiles += siteDescriptors - siteFullTiles;
   ledger.maxDestinationStrideBytes =
       std::max(ledger.maxDestinationStrideBytes, N * 2);
+
+  // Each drain descriptor uses width <= 64 bytes, height = 32,
+  // src_stride = 64, and dst_stride = N * sizeof(f16).  Only the destination
+  // stride can exceed the 16-bit V73 descriptor field for these fixed tiles.
+  // Record the potential traffic, but admit none of an illegal site.
+  if (!isAsyncDrainDMA2DLegal(N)) {
+    ++ledger.rejectedSites;
+    ledger.dma2dLegal = false;
+    ledger.boundaryBytes += siteDrainBytes;
+    return;
+  }
 
   // All complete 32-row bands are admitted.  A final short N tile remains a
   // legal 2D transfer because width shrinks while both strides stay fixed.

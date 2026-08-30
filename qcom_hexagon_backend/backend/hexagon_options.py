@@ -112,6 +112,10 @@ class HexagonOptions:
     enableAlpsContinuityAudit: bool = False
     enableAlpsLoopInterchangedDirectFormation: bool = False
     enableAlpsRegisterTileFormation: bool = False
+    # Diagnostic-only stable P2e demand window for isolating P2g-c sites.
+    # The production default [0, -1) admits every otherwise legal site.
+    alpsRegisterTileDemandBegin: int = 0
+    alpsRegisterTileDemandEnd: int = -1
     enableAlpsContractDischargeLedger: bool = False
     enableAlpsRepresentationSupplyAnalysis: bool = False
     enableAlpsLayoutSupplyPrefetch: bool = False
@@ -179,6 +183,15 @@ class HexagonOptions:
     enableHVXInlining: bool = False
     enableSCFLoopUnroll: bool = False
     enableConversionToFp16: bool = False
+    # ALPS precision-policy experiment: retain an independent switch for
+    # lowering eligible FP32 convolution/elementwise islands in an FP16 model
+    # to FP16 arithmetic. This intentionally remains a default-off negative
+    # ablation: V73 codegen must pass the half-helper/HVX-coverage audit before
+    # any narrower precision policy can be admitted.
+    enableAlpsFP16HVXArithmetic: bool = False
+    # ALPS C: keep F16 operands, widen once per 32-lane output vector, and
+    # accumulate mixed-precision NCHW convolution in one native F32 HVX vector.
+    enableAlpsHVXWideningConv: bool = False
 
     # This option enables 'seeding' of layout conversion ops around conv2d ops.
     # This introduces some builtin.unrealized_conversion_cast ops, that are expected

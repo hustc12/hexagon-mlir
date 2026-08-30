@@ -462,6 +462,19 @@ makeProducerDirect(linalg::TransposeOp transpose, PatternRewriter &rewriter,
           ? std::max<int64_t>(1,
                               hvxVectorBits / (registerTileInner * elementBits))
           : 0;
+  int64_t nativeVectorElements =
+      elementBits > 0 ? hvxVectorBits / elementBits : 0;
+  int64_t sourceInnerExtent = expandedType.getDimSize(targetRank - 1);
+  // P2g-c lowers the interchanged producer input to full-width native HVX
+  // loads followed by an in-register deinterleave (for example vmemu+vdeal
+  // for f16).  Until the lowering carries a masked/padded tail, prove that
+  // the physical innermost source row is an exact number of 128-byte v73
+  // vectors.  The affine-map proof alone is insufficient: Whisper's
+  // [1,384,1500] source passed it, then a final 64-lane load crossed the
+  // 1500-element row boundary and the DSP exited with status 13.
+  bool sourceFullVectorTailLegal =
+      nativeVectorElements > 0 && sourceInnerExtent > 0 &&
+      sourceInnerExtent % nativeVectorElements == 0;
   // Keep the two-dimensional tile within one native v73 HVX vector.  The
   // earlier fixed 8x16 tile was 512 B for f32 and caused a full-model DSP
   // failure even though the smaller Debug extent happened to clamp to 128 B.
@@ -469,7 +482,7 @@ makeProducerDirect(linalg::TransposeOp transpose, PatternRewriter &rewriter,
   bool registerTileLegal =
       allowRegisterTileFormation && movesInnermost &&
       cyclicInnermostPermutation && registerTileMapsLegal &&
-      registerTileOuter > 0 &&
+      registerTileOuter > 0 && sourceFullVectorTailLegal &&
       // The outer register dimension may be smaller than the preferred 8
       // lanes (for example DINOv2's six attention heads).  Tiling and
       // vectorization clamp it to the static remainder, so only reject an
@@ -497,6 +510,9 @@ makeProducerDirect(linalg::TransposeOp transpose, PatternRewriter &rewriter,
       llvm::interleaveComma(permutation, llvm::errs());
       llvm::errs() << " cyclic=" << cyclicInnermostPermutation
                    << " maps_legal=" << registerTileMapsLegal
+                   << " source_inner_extent=" << sourceInnerExtent
+                   << " native_vector_elements=" << nativeVectorElements
+                   << " source_tail_safe=" << sourceFullVectorTailLegal
                    << " outer_extent=" << targetType.getDimSize(targetRank - 2)
                    << " inner_extent=" << targetType.getDimSize(targetRank - 1)
                    << " maps=";
@@ -606,16 +622,34 @@ struct AlpsConsumerDrivenLayoutPass final
       rewriter.setInsertionPoint(transpose);
       bool usedLoopInterchange = false;
       bool usedRegisterTile = false;
+      int64_t demandId = stats.demands - 1;
+      bool demandInRegisterTileWindow =
+          demandId >= registerTileDemandBegin &&
+          (registerTileDemandEnd < 0 || demandId < registerTileDemandEnd);
       if (!unsupported && engine != Engine::Mixed &&
           succeeded(makeProducerDirect(
               transpose, rewriter, bytes, propagateCodegenContract,
               emitDischargeContracts, contractId, allowInnermostLoopInterchange,
-              allowRegisterTileFormation, usedLoopInterchange,
+              allowRegisterTileFormation && demandInRegisterTileWindow,
+              usedLoopInterchange,
               usedRegisterTile))) {
         ++stats.producerDirect;
         stats.loopInterchangedDirect += usedLoopInterchange;
         stats.registerTileDirect += usedRegisterTile;
         stats.eliminatedBytes += bytes;
+        if (usedRegisterTile) {
+          std::string record;
+          llvm::raw_string_ostream os(record);
+          os << "[ALPS-P2G-C-SITE] function=" << function.getName()
+             << " demand=" << demandId << " origin=" << origin
+             << " target_type=" << (targetType ? Type(targetType) : Type{})
+             << " permutation=";
+          llvm::interleaveComma(permutation, os);
+          os << " eliminated_bytes=" << bytes << '\n';
+          os.flush();
+          std::lock_guard<std::mutex> lock(reportMutex);
+          llvm::errs() << record;
+        }
         if (emitDischargeContracts) {
           NamedAttrList record;
           record.set("id", builder.getStringAttr(contractId));
@@ -2817,6 +2851,7 @@ struct AlpsCrpProducerDirectAnalysisPass final
     int64_t vectorWriterEpochs = 0;
     int64_t epochRedirectCandidates = 0;
     int64_t coverageProvenEpochs = 0;
+    int64_t headMajorIncompatibleEpochs = 0;
     int64_t rejectedView = 0;
     int64_t rejectedEscape = 0;
     int64_t rejectedFootprint = 0;
@@ -3091,8 +3126,19 @@ struct AlpsCrpProducerDirectAnalysisPass final
                      lastReaderTop->isBeforeInBlock(top)))
                   lastReaderTop = top;
               }
-              pendingRewrites.push_back({root, vectorWriter, lastWriter,
-                                         lastReaderTop, epochReaderOps});
+              auto rootType = dyn_cast<MemRefType>(root.getType());
+              // P5g-f's physical [head, token, channel] representation is
+              // defined only for rank-3 roots.  Keep rank-2 speech buffers as
+              // analysis-only candidates (or let P5g-e handle them when that
+              // mode is selected) instead of admitting them to a rewriter
+              // that must fail after analysis has completed.
+              if (rewriteEpochHeadMajorVtcm &&
+                  (!rootType || rootType.getRank() != 3)) {
+                ++headMajorIncompatibleEpochs;
+              } else {
+                pendingRewrites.push_back({root, vectorWriter, lastWriter,
+                                           lastReaderTop, epochReaderOps});
+              }
             }
           }
         }
@@ -3272,6 +3318,8 @@ struct AlpsCrpProducerDirectAnalysisPass final
                       builder.getI64IntegerAttr(epochRedirectCandidates));
     function->setAttr("alps.p5g_d.coverage_proven_epochs",
                       builder.getI64IntegerAttr(coverageProvenEpochs));
+    function->setAttr("alps.p5g_f.incompatible_rank_epochs",
+                      builder.getI64IntegerAttr(headMajorIncompatibleEpochs));
     function->setAttr("alps.p5g_e.rewritten_epochs",
                       builder.getI64IntegerAttr(
                           rewriteEpochHeadMajorVtcm ? 0 : rewrittenEpochs));
@@ -3300,6 +3348,8 @@ struct AlpsCrpProducerDirectAnalysisPass final
                  << " vector_writer_epochs=" << vectorWriterEpochs
                  << " redirect_candidates=" << epochRedirectCandidates
                  << " coverage_proven_epochs=" << coverageProvenEpochs
+                 << " head_major_incompatible_rank_epochs="
+                 << headMajorIncompatibleEpochs
                  << " rewrite_enabled="
                  << static_cast<bool>(rewriteEpochVtcm ||
                                       rewriteEpochHeadMajorVtcm)

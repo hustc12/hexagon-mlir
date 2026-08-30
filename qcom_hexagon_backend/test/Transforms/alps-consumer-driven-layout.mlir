@@ -14,6 +14,9 @@
 // RUN:   -pass-pipeline='builtin.module(func.func(alps-consumer-driven-layout{allow-register-tile-formation=true}))' \
 // RUN:   | FileCheck %s --check-prefix=P2GC
 // RUN: linalg-hexagon-opt %s \
+// RUN:   -pass-pipeline='builtin.module(func.func(alps-consumer-driven-layout{allow-register-tile-formation=true register-tile-demand-end=0}))' \
+// RUN:   | FileCheck %s --check-prefix=P2GC-NONE
+// RUN: linalg-hexagon-opt %s \
 // RUN:   -pass-pipeline='builtin.module(func.func(alps-crp-supply-analysis))' \
 // RUN:   | FileCheck %s --check-prefix=P5FA
 // RUN: linalg-hexagon-opt %s \
@@ -293,32 +296,32 @@ func.func @p5gb_coalesced_vtcm_window(
 // Moving the innermost dimension would turn a unit-stride stream into a
 // strided one.  The contract remains auditable, but native materialization is
 // retained.
-func.func @reject_strided_consumer(%input: tensor<8x16x32xf16>,
-                                   %out: tensor<8x32x16xf16>)
-    -> tensor<8x32x16xf16> {
-  %tmp = tensor.empty() : tensor<8x16x32xf16>
+func.func @reject_strided_consumer(%input: tensor<8x16x64xf16>,
+                                   %out: tensor<8x64x16xf16>)
+    -> tensor<8x64x16xf16> {
+  %tmp = tensor.empty() : tensor<8x16x64xf16>
   %produced = linalg.generic {
       indexing_maps = [#id3, #id3],
       iterator_types = ["parallel", "parallel", "parallel"]}
-      ins(%input : tensor<8x16x32xf16>)
-      outs(%tmp : tensor<8x16x32xf16>) {
+      ins(%input : tensor<8x16x64xf16>)
+      outs(%tmp : tensor<8x16x64xf16>) {
     ^bb0(%in: f16, %old: f16):
       linalg.yield %in : f16
-  } -> tensor<8x16x32xf16>
+  } -> tensor<8x16x64xf16>
   %transposed = linalg.transpose
-      ins(%produced : tensor<8x16x32xf16>)
-      outs(%out : tensor<8x32x16xf16>)
+      ins(%produced : tensor<8x16x64xf16>)
+      outs(%out : tensor<8x64x16xf16>)
       permutation = [0, 2, 1]
-  %consumer_out = tensor.empty() : tensor<8x32x16xf16>
+  %consumer_out = tensor.empty() : tensor<8x64x16xf16>
   %result = linalg.generic {
       indexing_maps = [#id3, #id3],
       iterator_types = ["parallel", "parallel", "parallel"]}
-      ins(%transposed : tensor<8x32x16xf16>)
-      outs(%consumer_out : tensor<8x32x16xf16>) {
+      ins(%transposed : tensor<8x64x16xf16>)
+      outs(%consumer_out : tensor<8x64x16xf16>) {
     ^bb0(%in: f16, %old: f16):
       linalg.yield %in : f16
-  } -> tensor<8x32x16xf16>
-  return %result : tensor<8x32x16xf16>
+  } -> tensor<8x64x16xf16>
+  return %result : tensor<8x64x16xf16>
 }
 
 // CHECK-LABEL: func.func @reject_strided_consumer
@@ -355,6 +358,28 @@ func.func @direct_interchanged_hvx_consumer(
   return %result : tensor<8x32x16xf16>
 }
 
+// Native P2g-c source loads are 128 B.  A 96xf16 physical row has a partial
+// final vector, so retain the transpose until masked/padded tail lowering is
+// available rather than allowing an out-of-row vmemu.
+func.func @reject_register_tile_source_tail(
+    %input: tensor<1x16x96xf16>, %out: tensor<1x96x16xf16>)
+    -> tensor<1x96x16xf16> {
+  %tmp = tensor.empty() : tensor<1x16x96xf16>
+  %produced = linalg.generic {
+      indexing_maps = [#id3, #id3],
+      iterator_types = ["parallel", "parallel", "parallel"]}
+      ins(%input : tensor<1x16x96xf16>)
+      outs(%tmp : tensor<1x16x96xf16>) {
+    ^bb0(%in: f16, %old: f16):
+      %v = arith.addf %in, %in : f16
+      linalg.yield %v : f16
+  } -> tensor<1x16x96xf16>
+  %transposed = linalg.transpose
+      ins(%produced : tensor<1x16x96xf16>)
+      outs(%out : tensor<1x96x16xf16>) permutation = [0, 2, 1]
+  return %transposed : tensor<1x96x16xf16>
+}
+
 // P2GB-LABEL: func.func @reject_strided_consumer
 // P2GB-SAME: alps.p2g.loop_interchanged_direct = 0
 // P2GB: linalg.transpose
@@ -369,6 +394,12 @@ func.func @direct_interchanged_hvx_consumer(
 // P2GC: alps.p2g.register_tile_contract
 // P2GC: alps.p2g.register_tile_sizes = array<i64: 4, 16>
 // P2GC-NOT: linalg.transpose
+// P2GC-LABEL: func.func @reject_register_tile_source_tail
+// P2GC-SAME: alps.p2g.register_tile_direct = 0
+// P2GC: linalg.transpose
+// P2GC-NONE-LABEL: func.func @reject_strided_consumer
+// P2GC-NONE-SAME: alps.p2g.register_tile_direct = 0
+// P2GC-NONE: linalg.transpose
 
 func.func @direct_expanded_hvx_consumer(%input: tensor<1x4x12xf16>,
                                         %out: tensor<1x3x4x4xf16>)

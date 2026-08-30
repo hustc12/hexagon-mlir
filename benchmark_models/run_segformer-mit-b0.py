@@ -92,6 +92,12 @@ def run(args: argparse.Namespace) -> None:
         disable_omnifetch_persistent_wh_cache=(
             args.disable_omnifetch_persistent_wh_cache
         ),
+        enable_alps_fp16_hvx_arithmetic=(
+            args.enable_alps_fp16_hvx_arithmetic
+        ),
+        enable_alps_hvx_widening_conv=(
+            args.enable_alps_hvx_widening_conv
+        ),
     )
     output = hex_execution(
         module,

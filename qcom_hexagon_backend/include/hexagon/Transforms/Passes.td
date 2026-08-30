@@ -1099,6 +1099,12 @@ def AlpsConsumerDrivenLayout :
            /*default=*/"false",
            "ALPS P2g-c: form bounded 8x16 HVX register tiles for proven cyclic "
            "innermost permutations that cannot remain globally unit-stride">,
+    Option<"registerTileDemandBegin", "register-tile-demand-begin", "int64_t",
+           /*default=*/"0",
+           "Diagnostic lower bound (inclusive) on stable P2e demand IDs eligible for P2g-c">,
+    Option<"registerTileDemandEnd", "register-tile-demand-end", "int64_t",
+           /*default=*/"-1",
+           "Diagnostic upper bound (exclusive; -1 means unbounded) on P2e demand IDs eligible for P2g-c">,
   ];
   let dependentDialects = [
     "mlir::linalg::LinalgDialect",
@@ -1325,6 +1331,28 @@ def AlpsAttentionDestinationFormation :
   let constructor = "hexagon::createAlpsAttentionDestinationFormationPass()";
   let dependentDialects = [
     "mlir::memref::MemRefDialect",
+  ];
+}
+
+def AlpsHVXWideningConv :
+    InterfacePass<"alps-hvx-widening-conv", "mlir::FunctionOpInterface"> {
+  let summary = "Vectorize mixed F16/F32 NCHW convolution without scalar half helpers";
+  let description = [{
+    ALPS C rewrites bufferized linalg.conv_2d_nchw_fchw operations with F16
+    input/filter and F32 output into an output-width HVX schedule.  Thirty-two
+    output lanes share one F16 filter value, widen the gathered F16 activation
+    vector once, and accumulate in one native 128-byte F32 vector.  The final
+    F32-to-F16 consumer conversion remains outside this pass, so numerical
+    accumulation precision and reduction order are preserved.  Tail lanes are
+    masked and no scalar F16-to-F32 conversion is introduced by the rewrite.
+  }];
+  let constructor = "hexagon::createAlpsHVXWideningConvPass()";
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::linalg::LinalgDialect",
+    "mlir::memref::MemRefDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::vector::VectorDialect",
   ];
 }
 
