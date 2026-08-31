@@ -26,6 +26,15 @@ def percentile(values: list[int], fraction: float) -> int:
     return ordered[index]
 
 
+def row_float(row: dict[str, str], key: str) -> float:
+    value = row.get(key, "0").strip()
+    return float(value) if value else 0.0
+
+
+def average(values: list[float]) -> float:
+    return sum(values) / len(values) if values else math.nan
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--raw-pmu", type=Path, required=True)
@@ -96,13 +105,38 @@ def main() -> None:
     axi_read_bytes = events.get(0x3F, 0) * 128 + events.get(0xCD, 0) * 256
     axi_write_bytes = events.get(0x46, 0) * 128 + events.get(0x55, 0) * 256
     measured_seconds = selected_ms / 1000.0
+    committed_packets = events.get(0x3, 0)
+    npa_core_clocks = [row_float(row, "NPA Core Clk(Mhz)") for row in selected]
+    npa_bus_votes = [row_float(row, "NPA bus vote(Mhz)") for row in selected]
+    dsppm_bus_votes = [row_float(row, "DSPPM bus vote(Mhz)") for row in selected]
+    thermal_limits = [
+        row_float(row, "Thermal Q6 throttle Freq (MHz)") for row in selected
+    ]
+    blc_counts = [int(row_float(row, "BLC latency count")) for row in selected]
+    blc_latencies = [row_float(row, "BLC latency(ns)") for row in selected]
+    blc_weight = sum(blc_counts)
+    blc_weighted_latency = (
+        sum(count * latency for count, latency in zip(blc_counts, blc_latencies))
+        / blc_weight
+        if blc_weight
+        else math.nan
+    )
+    effective_core_mhz = pcycles / selected_ms / 1000.0 if selected_ms else math.nan
+    npa_core_avg = average(npa_core_clocks)
     result = {
         "interpretation": "sysmon_hardware_pmu_kernel_window",
         "kernel_elapsed_seconds": kernel_seconds,
         "selected_sample_milliseconds": selected_ms,
         "selected_samples": len(selected),
         "pcycles": pcycles,
-        "committed_packets": events.get(0x3, 0),
+        "committed_packets": committed_packets,
+        "cycles_per_committed_packet": (
+            pcycles / committed_packets if committed_packets else math.nan
+        ),
+        "effective_core_mhz_from_pcycles": effective_core_mhz,
+        "effective_core_utilization": (
+            effective_core_mhz / npa_core_avg if npa_core_avg else math.nan
+        ),
         "hvx_packet_event_count": events.get(0x111, 0),
         "hmx_active_event_count": events.get(0x200, 0),
         "l2fetch_misses": events.get(0x7F, 0),
@@ -125,6 +159,21 @@ def main() -> None:
         "axi_bytes_per_sample_max": max(axi_bytes_per_sample, default=0),
         "activity_windows": activity,
         "bwmon_bytes": bwmon_bytes,
+        "packet_count_raw": sum(
+            int(row_float(row, "Packet count")) for row in selected
+        ),
+        "npa_core_clock_avg_mhz": npa_core_avg,
+        "npa_core_clock_min_mhz": min(npa_core_clocks, default=math.nan),
+        "npa_core_clock_max_mhz": max(npa_core_clocks, default=math.nan),
+        "npa_bus_vote_avg_mhz": average(npa_bus_votes),
+        "dsppm_bus_vote_avg_mhz": average(dsppm_bus_votes),
+        "thermal_throttle_max_mhz": max(thermal_limits, default=math.nan),
+        "thermal_throttle_nonzero_samples": sum(value > 0 for value in thermal_limits),
+        "blc_transaction_count": sum(
+            int(row_float(row, "BLC transaction count")) for row in selected
+        ),
+        "blc_latency_count": blc_weight,
+        "blc_latency_weighted_avg_ns": blc_weighted_latency,
         "raw_event_totals": {hex(key): value for key, value in sorted(events.items())},
     }
     args.json.parent.mkdir(parents=True, exist_ok=True)
@@ -154,6 +203,15 @@ def main() -> None:
         f"| L2fetch miss | {events.get(0x7F, 0)} |",
         f"| Committed packets | {events.get(0x3, 0)} |",
         f"| Processor cycles | {pcycles} |",
+        f"| Cycles / committed packet | {result['cycles_per_committed_packet']:.4f} |",
+        f"| Effective core frequency from pcycles | {effective_core_mhz:.2f} MHz |",
+        f"| NPA core clock, average | {npa_core_avg:.2f} MHz |",
+        f"| Effective core utilization | {result['effective_core_utilization']:.4f} |",
+        f"| NPA bus vote, average | {result['npa_bus_vote_avg_mhz']:.2f} MHz |",
+        f"| DSPPM bus vote, average | {result['dsppm_bus_vote_avg_mhz']:.2f} MHz |",
+        f"| Thermal throttle limit, maximum | {result['thermal_throttle_max_mhz']:.2f} MHz |",
+        f"| Thermal-throttled samples | {result['thermal_throttle_nonzero_samples']} |",
+        f"| BLC weighted latency | {blc_weighted_latency:.2f} ns |",
         "",
         "| 1 ms activity window | Samples | AXI bytes |",
         "|---|---:|---:|",

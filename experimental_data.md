@@ -79,12 +79,12 @@ They are independent of FP16/FP32 storage precision.
 | Vision | SegFormer MiT-B0 | B=1, 3x224x224 | 3,576,392; 3.58 | [3.7M](https://arxiv.org/abs/2105.15203) | 0.45 | 0.90 |
 | Vision | DeiT-small | B=1, 3x224x224 | 22,051,432; 22.05 | [22M](https://huggingface.co/facebook/deit-small-patch16-224) | 4.62 | 9.25 |
 | Vision | BEiT-base | B=1, 3x224x224 | 86,530,984; 86.53 | [87M](https://huggingface.co/microsoft/beit-base-patch16-224) | 17.56 | 35.13 |
+| Vision | ViT-Base | B=1, 3x224x224 | 86,567,656; 86.57 | [86.6M](https://huggingface.co/google/vit-base-patch16-224) | 17.56 | 35.13 |
 | Vision | DINOv2-small | B=1, 3x224x224 | 22,825,192; 22.83 | [22.1M](https://huggingface.co/facebook/dinov2-small) | 6.12 | 12.25 |
 | Speech | Whisper-tiny | B=1, 80x3000 mel; 32 decoder tokens | 37,760,640; 37.76 | [39M](https://huggingface.co/openai/whisper-tiny) | 21.29 | 42.58 |
 | Speech | HuBERT-base | B=1, 20,560 waveform samples | 94,396,320; 94.40 | [94.7M](https://www.isca-archive.org/interspeech_2023/zaiem23b_interspeech.pdf) | 9.00 | 17.99 |
 | Speech | Wav2Vec2-base | B=1, 20,560 waveform samples | 94,396,320; 94.40 | [95M](https://arxiv.org/abs/2006.11477) | 9.00 | 17.99 |
 | Speech | UniSpeech-base | B=1, 20,560 waveform samples | 94,396,320; 94.40 | [94.68M](https://www.microsoft.com/en-us/research/wp-content/uploads/2022/05/UniSpeech_SAT.pdf) | 9.00 | 17.99 |
-| Speech | UniSpeech-SAT-base | B=1, 20,560 waveform samples | 94,396,320; 94.40 | [94.68M](https://www.microsoft.com/en-us/research/wp-content/uploads/2022/05/UniSpeech_SAT.pdf) | 9.00 | 17.99 |
 
 The five language-model counts include the full-token logits projection; they
 are thus forward-pass counts, not one-token autoregressive decode counts.  The
@@ -660,6 +660,64 @@ nano:/home/huzq85/2-working/working_set/alps_p5m_gpt2_stridefix_20260828
    planning, and runtime scheduling differ fundamentally from the current
    open Hexagon-MLIR pipeline.
 
+### Frozen 15-model ALPS measurement schema (2026-08-29)
+
+The next complete-model table must use the frozen post-`3b90cd4` code and run
+models serially in this order of configurations: PK HVX, APT HVX, Hexagon-MLIR
+HVX (HexKL Off), Hexagon-MLIR HVX (HexKL On), and ALPS C+E+P+R. All models are
+non-Debug and use matched model/storage precision, input shape, layer count,
+device settings, and timing windows. A globally enabled ALPS stage that does
+no work is reported as `not admitted`, not as an active optimization.
+
+This run creates a new table headed **Frozen ALPS 15-model complete-model
+matrix (post-3b90cd4)**. It does not replace any historical table in this file.
+The generated `frozen_full_matrix.csv`, `frozen_full_matrix_long.csv`, and
+`frozen_full_matrix.md` are the authoritative machine-readable and rendered
+sources for that new table.
+
+Correction recorded on 2026-08-30: the current `UniSpeechForCTC` and
+`UniSpeechSatForCTC` default-config runners do **not** constitute two
+independent model structures.  They have the same 12/768/12/3072 encoder,
+identical convolution frontend, identical 94,396,320 parameters, identical
+213 parameter-shape signatures, and export the same 98-batch-matmul graph.
+Their PK ledgers are also identical (387 hints, 1,925,676 runtime issues,
+401,762,008 issued bytes and 24,625,664 B materialization); measured PK latency
+is 172,840.50 versus 174,607.95 ms, a 1.02% run-to-run difference.  The latter
+row is retained only as a duplicate/reproducibility check.  It is excluded from
+the independent-model count, its remaining four configurations were cancelled,
+and complete ViT-Base replaces it in the frozen 15-unique-model matrix.
+
+In addition to latency, speedup, and correctness, every row must record the
+following movement fields. They are deliberately separate because they answer
+different questions:
+
+| Field | Source | Interpretation |
+|---|---|---|
+| Baseline static materialization bytes | P1 post-bufferization ledger | Logical bytes explicitly materialized by copies/physical transforms before ALPS |
+| ALPS static materialization bytes | Matched P1 post-bufferization ledger | Remaining logical materialization after admitted ALPS rewrites |
+| Logical materialization reduction | Baseline minus ALPS, bytes and percent | Compiler-caused reduction; not a hardware traffic counter |
+| Rewrite-attributed eliminated bytes | P2e/P5h/P5i ledgers | Bytes causally discharged by actual direct/in-situ formations |
+| Runtime DMA issued/completed/suppressed bytes | P5n/R runtime ledger | Real asynchronous traffic introduced or rejected by P/R |
+| sysMon AXI read/write/total bytes | Hardware PMU kernel window | External traffic caused by L2 misses, including demand and prefetch |
+| sysMon pcycles/packets/HVX/HMX/L2fetch | Hardware PMU kernel window | Compute coverage, efficiency, and prefetch/cache behavior |
+| sysMon clock/DCVS/thermal/BLC summary | Raw sysMon samples | Run comparability and memory/bus-pressure diagnostics |
+
+For layered Language runners, compiler bytes must be weighted by each stage's
+actual invocation count. Dynamic sites with no trustworthy runtime extent are
+reported as `NA`, never silently treated as zero. The final paper table should
+show logical materialization reduction beside physical AXI change so that a
+compiler estimate is never presented as measured DDR traffic.
+
+The device process currently cannot access HAP user PMU counters from its
+Unsigned PD, but sysMon itself samples hardware PMU through the system profiler
+service. Default-mode sysMon is therefore used for offline evidence and
+cross-invocation profile-guided admission. It cannot implement descriptor-level
+within-invocation feedback because its samples are out-of-process, roughly
+1 ms granularity, and parsed after execution. Custom sysMon User-mode events and
+STID/marker filtering may be used in separate diagnostic runs; they must not be
+mixed into formal latency because four-counter mode can perturb DCVS and
+eight-counter mode disables DCVS.
+
 ### 2026-08-29 — complete-model bottleneck corpus
 
 This corpus profiles correctness-qualified item7 synchronous device code. LWP
@@ -834,4 +892,177 @@ ablation.
 
 ```text
 nano:/home/huzq85/2-working/working_set/alps_cepr_dinov2_final_20260829
+```
+
+## 2026-08-29--30 — Frozen ALPS 15-unique-model complete-model matrix
+
+This is the new post-`3b90cd4` main table.  Every primary row is a complete,
+non-Debug FP16 model, all five configurations passed their model-specific
+correctness gate, execution was strictly serial, and no compile/device timeout
+was used.  Ratios in parentheses are latency divided by ALPS C+E+P+R, so ALPS
+is fixed at 1.00x.  PK means Prefetch-Kernel-HX and APT means APT-GET-HX.
+
+UniSpeech-SAT-Base is not counted as an independent model.  The structural
+audit above showed that its current default-config ForCTC export is identical
+to UniSpeech-Base except for class-name prefixes and random seed.  Its completed
+PK row (`174,607.95 ms`) is retained only as a reproducibility check; the other
+four duplicate runs were cancelled.  Full ViT-Base replaces it, yielding 15
+structurally independent models and 75/75 primary PASS rows.
+
+### Latency
+
+| Domain | Complete model | PK HVX | APT HVX | HMLIR HVX (HexKL Off) | HMLIR HVX (HexKL On) | ALPS C+E+P+R |
+|---|---|---:|---:|---:|---:|---:|
+| Vision | DINOv2-small | 10,363.19 ms (1.88x) | 10,325.86 ms (1.88x) | 30,024.51 ms (5.46x) | 9,878.12 ms (1.80x) | **5,499.60 ms (1.00x)** |
+| Language/text | GPT-2 | 3,659.70 ms (1.04x) | 3,602.06 ms (1.03x) | 17,587.14 ms (5.02x) | 3,584.55 ms (1.02x) | **3,505.38 ms (1.00x)** |
+| Language/text | SD/CLIP | 3,677.41 ms (1.20x) | 3,689.75 ms (1.20x) | 234,816.52 ms (76.63x) | 3,507.08 ms (1.14x) | **3,064.11 ms (1.00x)** |
+| Language/text | Qwen2.5-0.5B | 11,079.34 ms (1.07x) | 11,204.97 ms (1.09x) | 384,424.67 ms (37.29x) | 10,879.13 ms (1.06x) | **10,307.88 ms (1.00x)** |
+| Language/text | TinyLlama-1.1B | 27,392.68 ms (1.01x) | 27,376.92 ms (1.01x) | 917,036.32 ms (33.90x) | 27,117.70 ms (1.00x) | **27,053.75 ms (1.00x)** |
+| Language/text | SmolLM2-1.7B | 39,182.95 ms (1.02x) | 39,215.91 ms (1.02x) | 1,448,959.95 ms (37.78x) | 39,351.79 ms (1.03x) | **38,349.59 ms (1.00x)** |
+| Vision | Swin Transformer | 73,193.61 ms (1.54x) | 73,176.63 ms (1.54x) | 120,881.83 ms (2.54x) | 73,608.59 ms (1.55x) | **47,500.03 ms (1.00x)** |
+| Vision | SegFormer MiT-B0 | 9,270.92 ms (1.73x) | 9,248.58 ms (1.73x) | 27,392.48 ms (5.11x) | 9,221.61 ms (1.72x) | **5,358.76 ms (1.00x)** |
+| Vision | DeiT-Small | 8,580.89 ms (1.71x) | 8,553.92 ms (1.71x) | 23,960.79 ms (4.78x) | 8,278.09 ms (1.65x) | **5,016.40 ms (1.00x)** |
+| Vision | BEiT-Base | 14,796.46 ms (1.19x) | 14,762.74 ms (1.19x) | 113,698.07 ms (9.16x) | 13,506.50 ms (1.09x) | **12,411.58 ms (1.00x)** |
+| Vision | ViT-Base | 20,313.51 ms (1.54x) | 20,391.71 ms (1.55x) | 119,657.63 ms (9.08x) | 19,474.96 ms (1.48x) | **13,180.53 ms (1.00x)** |
+| Speech/audio | Whisper-Tiny | 114,142.31 ms (1.67x) | 114,667.72 ms (1.68x) | 157,107.57 ms (2.30x) | 112,410.63 ms (1.65x) | **68,177.63 ms (1.00x)** |
+| Speech/audio | HuBERT-Base | 172,586.28 ms (0.98x) | 172,448.59 ms (0.98x) | 209,056.42 ms (1.19x) | 172,764.15 ms (0.98x) | 176,251.20 ms (1.00x) |
+| Speech/audio | Wav2Vec2-Base | 175,435.16 ms (1.00x) | 172,905.90 ms (0.99x) | 210,208.72 ms (1.20x) | 176,979.80 ms (1.01x) | **174,954.37 ms (1.00x)** |
+| Speech/audio | UniSpeech-Base | 172,840.50 ms (0.98x) | 175,592.14 ms (1.00x) | 209,262.92 ms (1.19x) | 177,101.66 ms (1.01x) | **176,065.25 ms (1.00x)** |
+
+Relative to the matched HexKL-On control, ALPS reaches at least 1.50x on five
+models: DINOv2 (1.80x), Swin (1.55x), SegFormer (1.72x), DeiT (1.65x), and
+Whisper (1.65x).  ViT is close at 1.48x.  It is effectively neutral on the
+three large LLMs and Wav2Vec2, improves GPT-2/CLIP/Qwen/BEiT modestly, and
+regresses HuBERT by 2.02%; these negative/neutral cases must remain visible.
+Relative to PK, six models are at least 1.50x: DINOv2, Swin, SegFormer, DeiT,
+ViT, and Whisper.
+
+### Materialization and measured external traffic
+
+Post-bufferization materialization and rewrite-attributed elimination are kept
+separate.  A zero in the first delta does not negate a P2e rewrite: it means the
+common post-bufferization ledger still sees the same total physical-copy class,
+while P2e records the tensor-level materialization causally discharged.  AXI is
+the independent sysMon hardware-PMU measurement.
+
+| Domain | Model | HMLIR-On materialization | ALPS materialization | Ledger delta | P2e eliminated | ALPS DMA bytes | HMLIR-On AXI | ALPS AXI | AXI reduction |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Vision | DINOv2-small | 66,290,754 | 66,290,754 | 0 (0.00%) | 7,105,536 | 21,233,664 | 1,158,877,184 | 948,935,040 | 209,942,144 |
+| Language/text | GPT-2 | 3,857,792 | 3,857,792 | 0 (0.00%) | 589,824 | 0 | 2,004,345,600 | 1,964,631,040 | 39,714,560 |
+| Language/text | SD/CLIP | 4,501,570 | 4,501,570 | 0 (0.00%) | 4,257,792 | 10,616,832 | 2,162,537,856 | 2,158,678,656 | 3,859,200 |
+| Language/text | Qwen2.5-0.5B | 11,947,008 | 11,947,008 | 0 (0.00%) | 1,572,864 | 19,464,192 | 5,934,923,264 | 6,031,726,336 | -96,803,072 |
+| Language/text | TinyLlama-1.1B | 6,687,488 | 6,693,120 | -5,632 (-0.08%) | 3,244,032 | 26,918,912 | 11,630,026,496 | 11,717,683,328 | -87,656,832 |
+| Language/text | SmolLM2-1.7B | 11,144,192 | 11,150,336 | -6,144 (-0.06%) | 6,291,456 | 37,748,736 | 19,012,453,248 | 19,052,500,480 | -40,047,232 |
+| Vision | Swin Transformer | 38,927,630 | 41,637,134 | -2,709,504 (-6.96%) | 8,580,096 | 14,770,176 | 1,043,488,512 | 943,997,696 | 99,490,816 |
+| Vision | SegFormer MiT-B0 | 5,727,486 | 5,727,486 | 0 (0.00%) | 1,655,808 | 6,422,784 | 318,393,088 | 184,964,480 | 133,428,608 |
+| Vision | DeiT-Small | 39,470,060 | 39,470,060 | 0 (0.00%) | 5,474,304 | 15,925,248 | 844,810,880 | 695,464,064 | 149,346,816 |
+| Vision | BEiT-Base | 25,808,448 | 25,808,448 | 0 (0.00%) | 10,893,312 | 28,311,552 | 3,512,182,912 | 3,208,813,952 | 303,368,960 |
+| Vision | ViT-Base | 78,416,154 | 78,416,154 | 0 (0.00%) | 10,893,312 | 31,850,496 | 3,627,590,912 | 3,299,069,440 | 328,521,472 |
+| Speech/audio | Whisper-Tiny | 558,061,304 | 558,062,328 | -1,024 (-0.00%) | 18,923,520 | 50,823,168 | 6,942,770,816 | 6,016,917,888 | 925,852,928 |
+| Speech/audio | HuBERT-Base | 24,625,664 | 24,625,664 | 0 (0.00%) | 4,718,592 | 10,719,232 | 5,460,724,608 | 5,426,191,104 | 34,533,504 |
+| Speech/audio | Wav2Vec2-Base | 24,625,664 | 24,625,664 | 0 (0.00%) | 4,718,592 | 10,719,232 | 5,450,981,888 | 5,431,344,640 | 19,637,248 |
+| Speech/audio | UniSpeech-Base | 24,625,664 | 24,625,664 | 0 (0.00%) | 4,718,592 | 10,719,232 | 5,459,425,536 | 5,436,072,192 | 23,353,344 |
+
+Measured AXI traffic falls on 12/15 models and rises on Qwen2.5, TinyLlama,
+and SmolLM2.  The largest reductions occur on Whisper (925.85 MB), ViT
+(328.52 MB), BEiT (303.37 MB), DINOv2 (209.94 MB), DeiT (149.35 MB), and
+SegFormer (133.43 MB).  The three LLM traffic increases align with their weak
+latency gains and make them important rejection/admission cases for P/R.
+
+### ALPS admission/runtime audit
+
+| Domain | Model | P2e direct/demands | P5j formed | P5m admitted | DMA issued/bytes | R windows/hold/throttle/suppressed | Poll retries |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Vision | DINOv2-small | 36/122 | 72 | 72 | 10,368 / 21,233,664 | 162/162/0/0 | 0 |
+| Language/text | GPT-2 | 12/49 | 1 | 0 | 0 / 0 | 0/0/0/0 | 0 |
+| Language/text | SD/CLIP | 36/132 | 72 | 72 | 5,184 / 10,616,832 | 72/72/0/0 | 0 |
+| Language/text | Qwen2.5-0.5B | 48/289 | 169 | 168 | 9,504 / 19,464,192 | 144/144/0/0 | 8 |
+| Language/text | TinyLlama-1.1B | 44/265 | 133 | 133 | 13,144 / 26,918,912 | 191/191/0/0 | 29 |
+| Language/text | SmolLM2-1.7B | 48/289 | 145 | 144 | 18,432 / 37,748,736 | 288/288/0/0 | 0 |
+| Vision | Swin Transformer | 36/165 | 35 | 35 | 7,212 / 14,770,176 | 112/112/0/0 | 1 |
+| Vision | SegFormer MiT-B0 | 24/116 | 52 | 48 | 3,228 / 6,422,784 | 50/50/0/0 | 2 |
+| Vision | DeiT-Small | 36/122 | 72 | 72 | 7,776 / 15,925,248 | 121/121/0/0 | 3 |
+| Vision | BEiT-Base | 36/134 | 60 | 60 | 13,824 / 28,311,552 | 216/216/0/0 | 6 |
+| Vision | ViT-Base | 36/122 | 72 | 72 | 15,552 / 31,850,496 | 243/243/0/0 | 0 |
+| Speech/audio | Whisper-Tiny | 36/114 | 65 | 64 | 24,816 / 50,823,168 | 387/387/0/0 | 9 |
+| Speech/audio | HuBERT-Base | 48/137 | 74 | 74 | 5,234 / 10,719,232 | 81/81/0/0 | 0 |
+| Speech/audio | Wav2Vec2-Base | 48/137 | 74 | 74 | 5,234 / 10,719,232 | 81/81/0/0 | 1 |
+| Speech/audio | UniSpeech-Base | 48/137 | 74 | 74 | 5,234 / 10,719,232 | 81/81/0/0 | 0 |
+
+R observed only hold windows in this frozen run; no window throttled or
+suppressed DMA and the in-process PMU status remained unavailable.  Therefore
+none of the latency change may be attributed to an R policy decision.  R is a
+validated monitoring/safety path here; a traffic-control performance claim
+requires the planned cross-invocation sysMon policy or an authorized-PMU run.
+
+Authoritative generated sources and all moved compile/runtime artifacts:
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_frozen_full_matrix_20260829/results.csv
+nano:/home/huzq85/2-working/working_set/alps_frozen_full_matrix_20260829/frozen_full_matrix.csv
+nano:/home/huzq85/2-working/working_set/alps_frozen_full_matrix_20260829/frozen_full_matrix_long.csv
+nano:/home/huzq85/2-working/working_set/alps_frozen_full_matrix_20260829/frozen_full_matrix.md
+```
+
+## Formal ALPS component ablation — selected complete models
+
+This table is deliberately separate from the 15-model baseline matrix.  Model
+selection is pre-registered from that matrix rather than chosen after inspecting
+component results: every model whose frozen ALPS latency is at least 1.50x faster
+than the matched HexKL-On control is included.  This yields DINOv2-small, Swin,
+SegFormer, DeiT, and Whisper.  A0 and A4 are reused verbatim from the frozen main
+experiment; only A1--A3 require new runs.
+
+| Domain | Complete model | A0: HexKL On | A1: +C | A2: +E | A3: +P | A4: +R / final ALPS | A0/A4 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Vision | DINOv2-small | 9,878.12 ms | 9,829.81 ms (1.00x) | 5,812.16 ms (1.69x) | 5,503.90 ms (1.06x) | **5,499.60 ms (1.00x)** | **1.80x** |
+| Vision | Swin Transformer | 73,608.59 ms | 75,721.32 ms (0.97x) | 47,928.50 ms (1.58x) | 47,764.16 ms (1.00x) | **47,500.03 ms (1.01x)** | **1.55x** |
+| Vision | SegFormer MiT-B0 | 9,221.61 ms | 7,038.80 ms (1.31x) | 5,427.76 ms (1.30x) | 5,326.17 ms (1.02x) | **5,358.76 ms (0.99x)** | **1.72x** |
+| Vision | DeiT-Small | 8,278.09 ms | 8,273.45 ms (1.00x) | 5,290.15 ms (1.56x) | 5,007.50 ms (1.06x) | **5,016.40 ms (1.00x)** | **1.65x** |
+| Speech/audio | Whisper-Tiny | 112,410.63 ms | 107,996.01 ms (1.04x) | 69,066.98 ms (1.56x) | 68,019.59 ms (1.02x) | **68,177.63 ms (1.00x)** | **1.65x** |
+
+Ratios inside A1--A4 cells are adjacent-stage speedups `A(i-1)/Ai`; the final
+column is cumulative `A0/A4`.  All 15 newly run A1--A3 cases passed their
+model-specific correctness gate.  Execution was strictly serial, used complete
+non-Debug FP16 models, and had no timeout or automatic retry.
+
+### Ablation mechanism and physical-traffic audit
+
+| Model | E eliminated bytes | P DMA issued / bytes | A1 sysMon AXI | A2 sysMon AXI | A3 sysMon AXI | A1→A3 AXI reduction |
+|---|---:|---:|---:|---:|---:|---:|
+| DINOv2-small | 7,105,536 | 10,368 / 21,233,664 | 1,158,515,200 | 977,842,304 | 946,680,832 | 211,834,368 (18.28%) |
+| Swin Transformer | 8,580,096 | 7,212 / 14,770,176 | 1,043,097,600 | 960,236,672 | 943,701,248 | 99,396,352 (9.53%) |
+| SegFormer MiT-B0 | 1,655,808 | 3,228 / 6,422,784 | 317,420,672 | 181,221,632 | 185,138,048 | 132,282,624 (41.67%) |
+| DeiT-Small | 5,474,304 | 7,776 / 15,925,248 | 845,373,696 | 714,644,864 | 695,897,728 | 149,475,968 (17.68%) |
+| Whisper-Tiny | 18,923,520 | 24,816 / 50,823,168 | 6,901,641,088 | 6,112,085,760 | 6,014,351,616 | 887,289,472 (12.86%) |
+
+The causal result is consistent across all five models.  E is the dominant
+stage: its adjacent gain is 1.30x--1.69x and it reduces measured AXI traffic in
+every model.  P completes every issued DMA without fallback and contributes
+1.06x on DINOv2/DeiT, about 1.02x on SegFormer/Whisper, and 1.00x on Swin.
+C is topology dependent: it contributes 1.31x on SegFormer and 1.04x on
+Whisper, is neutral on DINOv2/DeiT, and regresses Swin by about 2.8% before E
+recovers the loss.  R made no throttle/suppression decision in the frozen A4
+runs; A3-to-A4 differences are within -0.6%--+0.6% and carry no causal R claim.
+
+The following older complete-model results can be reused as supporting evidence
+and sanity bounds, but not mixed with the frozen table to claim incremental
+speedup:
+
+| Model | Historical staged evidence | Interpretation |
+|---|---|---|
+| SegFormer MiT-B0 | A0 9,313.73; C 6,352.36; C+E 5,489.21 ms | C and E both positive; rerun frozen A1--A3 |
+| Whisper-Tiny | A0 113,415.80; C 108,246.36; C+E 71,512.90 ms | E is the dominant historical increment; rerun frozen A1--A3 |
+| DINOv2-small | C+E 5,768.58; C+E+P 5,828.72 ms | P issued/completed 10,368 DMA operations but slightly regressed; useful negative check |
+| DINOv2-small | C+E+P 5,825.25; C+E+P+R 5,487.22 ms | all 162 R windows held; the difference is not a causal R gain |
+
+Swin and DeiT have frozen endpoint gains but no clean matched C/E/P intermediate
+rows in the historical corpus; the formal A1--A3 rows above now provide those
+measurements rather than inferring them from item7.
+
+Authoritative raw logs, compiler artifacts, movement ledgers, UserDMA telemetry,
+and sysMon summaries were moved to:
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_component_ablation_20260830
 ```

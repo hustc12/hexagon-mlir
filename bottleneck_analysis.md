@@ -5454,3 +5454,218 @@ sysMon的模型/site-class先验固化为下一次invocation的admission，同�
 ```text
 nano:/home/huzq85/2-working/working_set/alps_cepr_dinov2_final_20260829
 ```
+
+### 12.21 当前阶段结论、12.8完成度与冻结后的完整模型计划（2026-08-29）
+
+截至commit `3b90cd4`，必须把“12.8的profiling/路线分类闭环”和“15个模型上的实现/
+性能闭环”分开表述。前者已经完成，后者尚未完成，不能因为C、E、P、R都有代码和代表性
+模型结果，就声称12.8中的每条路线已经在全部模型上兑现。
+
+#### 12.21.1 当前可以得出的因果结论
+
+1. **C（baseline enablement）已经跨Vision/Speech完成阶段验证，但不是ALPS prefetch
+   收益。** SegFormer的HexKL-on control到C为9,313.73 -> 6,352.36 ms（1.4662x）；
+   Whisper为113,415.80 -> 108,246.36 ms（1.0478x）。SegFormer的AXI基本不变，而HVX
+   packet显著增加，收益主要来自把scalar/mixed卷积关键路径改成native-width HVX
+   widening kernel。
+2. **E（consumer-driven direct layout）是目前最清楚的representation/movement收益。**
+   SegFormer从C到C+E为6,352.36 -> 5,489.21 ms（E独立1.1572x，相对原HexKL-on
+   累计1.6967x）；Whisper为108,246.36 -> 71,512.90 ms（E独立1.5137x，累计
+   1.5859x）。这支持“先由consumer contract决定最终表示并直接形成，再对残余供给做
+   prefetch”的论文故事。
+3. **P（residual async DMA/VTCM）机制真实执行，但DINO上的当前静态准入没有性能
+   收益。** 72/72 site获准、10,368个DMA完成且搬运21,233,664 B，但5,768.58 ->
+   5,828.72 ms（0.9897x）。这说明descriptor合法和存在可重叠距离不足以证明搬运位于
+   critical path。
+4. **R已经接入P5n真实路径，但真正的PMU自适应性能闭环尚未完成。** 当前Unsigned PD
+   不允许进程内HAP user PMU；DINO的162个window全部hold，没有改变DMA集合。因此
+   5,825.25 -> 5,487.22 ms的单样本差异不能归因于R，只能作为正确性/无回归观测。
+5. 当前统一故事仍成立：**C修复硬件执行前提；E删除可消除的representation movement；
+   P只提前供应无法消除且位于critical path的残余tile；R拒绝无收益或造成traffic压力的
+   P请求。** 不能把C混写成prefetch，也不能把静态“saved bytes”直接写成物理DDR下降。
+
+#### 12.21.2 12.8路线完成度
+
+| 工作 | 状态 | 边界 |
+|---|---|---|
+| 15个完整模型非插桩sysMon | 已完成 | 已覆盖Language/Vision/Speech |
+| 15模型LWP热点定位 | 已完成 | 单体或分层/局部完整shape方式覆盖 |
+| 12.8瓶颈分群 | 已完成 | 收敛为E→P→R与C→E→P→R两类共享路线 |
+| C/E/P/R独立机制和开关 | 已完成 | 可独立启停和审计 |
+| C代表性完整模型验证 | 已完成 | SegFormer、Whisper；尚未覆盖全部C类模型 |
+| E代表性完整模型验证 | 已完成 | SegFormer、Whisper，并有DINO的HMX direct路径 |
+| P真实DMA执行验证 | 已完成 | DINO有真实DMA证据，但当前为负向性能结果 |
+| R接入P5n实际执行路径 | 已完成 | hold/throttle/suppression可审计 |
+| R由真实PMU改变决策并改善latency | **未完成** | 当前进程内PMU不可用；DINO未发生throttle |
+| 当前冻结代码下15模型最终latency | **未完成** | 需要统一重跑完整非Debug模型 |
+| 5个预注册正例模型的完整消融 | **已完成** | 15个A1--A3 case全部PASS；A0/A4复用冻结主表 |
+
+因此，对“12.8中的路线是否已经都完成”的准确回答是：**profiling、分群和共享机制原型
+已经完成；全部15模型上的路线部署、最终性能确认和R的真实反馈闭环尚未完成。**
+
+#### 12.21.3 冻结后的完整模型主实验
+
+下一阶段不再围绕单模型反复调参，而是冻结代码、精度、设备设置和统计方法，串行运行15个
+完整非Debug模型。每个模型依次记录：
+
+1. Prefetch-Kernel-HX（PK HVX）；
+2. APT-GET-HX（APT HVX）；
+3. Hexagon-MLIR HVX（HexKL Off）；
+4. Hexagon-MLIR HVX（HexKL On，ALPS matched control）；
+5. ALPS C+E+P+R最终组合。
+
+所有case使用相同的FP16 model/storage与mixed FP16-HMX/FP32-HVX kernel precision、
+相同输入shape、模型层数、单HVX执行线程、设备performance设置和统计窗口。ALPS开关可以
+统一打开，但每个机制必须依据合法性/admission选择性生效；未匹配时记录`not admitted`，
+不能把零rewrite/零DMA写成该机制的有效实验。模型严格串行；不设置超时；遇到exit 13
+立即调查而不盲目重跑。每个模型完成后把编译产物和原始日志**移动**到
+`nano:/home/huzq85/2-working/working_set`，确认远端完整后删除本地`/tmp`大文件。
+
+正式表格至少记录latency、相对ALPS的加速比、correctness、实际C rewrite、E formation、
+P DMA issued/completed/bytes、R window/hold/throttle/suppressed、进程内PMU状态和sysMon摘要。
+主实验先回答“冻结后的最终系统在多少完整模型上有效”，随后才进行大规模消融。
+
+本轮必须在`experimental_data.md`中创建一个**新的冻结版本表格**，不得覆盖、合并或静默
+改写此前的历史表。runner同时生成独立的`frozen_full_matrix.csv`、
+`frozen_full_matrix_long.csv`和`frozen_full_matrix.md`：wide表用于论文主表，long表保留每个
+模型/配置的原始指标，Markdown表在全部15模型完成后原样追加到实验文档。
+
+#### 12.21.4 每个模型的数据物化量对比
+
+可以且应当记录“数据物化量减少”，但需要同时报告三个不同层级，避免把预测量冒充硬件
+流量：
+
+| 层级 | 指标 | 计算方式 | 含义与限制 |
+|---|---|---|---|
+| Compiler logical | `static_materialization_bytes` | 在相同post-bufferization观察点分别运行P1 ledger；`baseline - ALPS` | 静态shape下显式copy/transpose/physical transform的读写物化估计 |
+| Transformation causal | `eliminated_materialization_bytes` | 汇总P2e/P5h/P5i等真正rewrite的eliminated/residual字段 | 可归因到具体ALPS rewrite；不能重复累计同一value/version |
+| Runtime added movement | DMA issued/suppressed bytes | P5n runtime ledger | P为提前供给额外发出的真实DMA量；它可能抵消E节省的流量 |
+| Hardware external traffic | sysMon AXI read/write/total | matched kernel window硬件PMU | L2 miss导致的DDR/AXI请求；既包含demand也包含prefetch，不等于逻辑物化量 |
+
+每个模型新增以下派生量：
+
+```text
+logical_materialization_reduction_bytes =
+    baseline_static_materialization_bytes - alps_static_materialization_bytes
+
+logical_materialization_reduction_percent =
+    reduction / baseline_static_materialization_bytes * 100
+
+external_traffic_reduction_bytes =
+    baseline_sysmon_axi_total_bytes - alps_sysmon_axi_total_bytes
+```
+
+分层Language runner必须按每个stage的真实调用次数加权后再求和；不能只把一个layer的
+静态字节当成完整模型，也不能在多处ledger对同一materialization重复计数。动态shape无法
+静态确定的site记录`NA`并保留site count，后续如有必要加入runtime byte counter。论文中
+应并排报告逻辑物化减少和物理AXI变化：前者回答“编译器删除了什么”，后者回答“设备最终
+少访问了多少外部内存”。若两者不一致，差值本身就是cache/reuse/critical-path分析证据。
+
+#### 12.21.5 进程内PMU不可用时的sysMon方案
+
+sysMon可以采集与PMU相同或直接相关的量，因为SDK文档明确说明sysMon profiler service
+本身采样硬件PMU。当前限制不是“手机没有PMU”，而是Unsigned PD中的ALPS进程不能直接
+编程/读取HAP user PMU；sysMon通过系统侧profiler服务仍能取得计数器。当前Default mode
+每1 ms固定采集八个事件，并已能得到：
+
+- processor cycles、committed packets与cycles/packet；
+- HVX packet和HMX active事件；
+- L2 miss引起的AXI cached read/write bytes与带宽；
+- L2fetch miss/traffic；
+- 每1 ms AXI burst的p50/p90/p99/max，以及HVX-only、HMX-only、两者同时活跃窗口；
+- raw CSV中的core/bus clock vote、DCVS、thermal throttle、BLC transaction/latency、
+  BWMON bytes和packet count。
+
+因此主实验可以用sysMon回答：是否compute-bound、是否有持续或突发的DDR压力、prefetch
+是否增加L2/AXI traffic、HVX/HMX覆盖是否改变，以及设备频率/热状态是否匹配。后续应在
+现有`summarize_sysmon_profile.py`中统一派生pCPP、effective utilization、BLC latency和
+频率/thermal摘要，写入每个模型结果。
+
+sysMon还支持User mode、`/data/pmu_events.txt`中的自定义4/8个PMU event以及STID/marker
+过滤，理论上可选择DMPoll、coherent-read stall、VTCM-write stall等V73事件。但User
+mode会占用PMU counter：四counter模式可能改变DCVS决策，八counter模式会关闭DCVS。
+所以它只适合单独的diagnostic/profile run，不能与Default-mode formal latency直接混比；
+具体event ID也必须由V73 event定义和设备实际输出双重验证，不能仅凭名字推断。
+
+sysMon不能完全替代同一次invocation内的R：它是进程外、约1 ms粒度、结束后解析的采样，
+无法在某个DMA descriptor deadline之前把决策返回P5n。当前可行的R闭环应分为两层：
+
+1. **同一次invocation内**：保留P5n软件poll/late-arrival反馈，负责安全fallback和粗粒度
+   throttle；
+2. **跨invocation profile-guided admission**：先用sysMon profile run生成模型/site-class
+   policy，再在下一次formal run中关闭高pCPP、高AXI burst、低overlap收益的P请求；formal
+   latency本身不同时运行sysMon，或严格分开报告profiling overhead。
+
+论文中应将第二层准确称为`sysMon/PMU-guided cross-invocation traffic admission`，而不是
+声称descriptor级在线PMU控制。若后续获得可授权PMU的PD，再补充真正的within-invocation
+R消融；在此之前，sysMon提供的是可信的硬件反馈和下一次执行策略输入，而非即时控制面。
+
+#### 12.21.6 主实验后的消融顺序
+
+15模型主表完成且不存在零工作误标、correctness failure或配置漂移后，再运行：
+
+```text
+A0  Hexagon-MLIR HVX + HexKL On
+A1  A0 + C
+A2  A1 + E
+A3  A2 + P
+A4  A3 + R
+```
+
+历史item7中的semantic/topology/slicing/runtime-prefetch仍单独拆分，不能把topology收益
+自动归因于data prefetch。对于某模型未获准的阶段，表中写`not admitted`而不是把0%变化
+解释成机制无效。这样主表回答最终效果，消融回答效果来自C、删除物化、异步供给还是反馈
+准入，二者不会互相污染。
+
+#### 12.21.7 UniSpeech-SAT重复模型审计与15模型修正（2026-08-30）
+
+冻结矩阵执行到UniSpeech-SAT时做了结构审计。`UniSpeechConfig()`与
+`UniSpeechSatConfig()`虽然属于不同Transformers类，但当前两个ForCTC runner在主实验实际
+执行的图是等价重复：都是12层、hidden 768、12 heads、FFN 3072、相同七层卷积前端和
+`1x20560` FP16输入；总参数同为94,396,320，213个参数tensor的名称（归一化root前缀后）
+与shape逐项相同，模块类型只是`UniSpeech*`/`UniSpeechSat*`类名前缀不同。两者导出IR均有
+98个`linalg.batch_matmul`，HexKL均rewrite 74个。
+
+设备侧证据也一致：PK两者均产生387个hint、1,925,676次runtime issue、401,762,008 B
+issued bytes和24,625,664 B静态materialization；latency分别为172,840.50和174,607.95 ms，
+差异仅1.02%。因此随机seed不同不能把它们算作两个独立模型。UniSpeech-SAT PK保留为
+重复性验证，其余四组在APT编译早期停止，不进入论文主表或模型数量统计。冻结主表改为
+15个**结构独立**的完整模型，并用已支持的完整ViT-Base替换该位置。历史UniSpeech-SAT
+实验不删除，但解释为共享speech graph的回归/negative-control证据，而不是额外模型证据。
+
+#### 12.21.8 正式消融缩减为5个预注册正例模型（2026-08-30）
+
+15模型冻结主表已经回答ALPS的总体有效性、跨模型覆盖和负例；再对全部15模型运行完整
+A0--A4不会成比例增加因果证据。正式消融改为采用主表结果确定、且不依赖人工挑选的准入
+规则：**相对冻结HexKL-On control达到至少1.50x的全部模型**进入消融。满足规则的恰好是
+DINOv2-small（1.80x）、Swin Transformer（1.55x）、SegFormer MiT-B0（1.72x）、
+DeiT-Small（1.65x）和Whisper-Tiny（1.65x）。该集合覆盖Vision和Speech，并包含不同的
+attention、window attention、multi-scale vision以及audio frontend路径。
+
+正式表仍使用统一嵌套配置：
+
+```text
+A0  Hexagon-MLIR HVX + HexKL On
+A1  A0 + C
+A2  A1 + E
+A3  A2 + P
+A4  A3 + R
+```
+
+冻结主实验中的A0和A4直接复用，因此只需补5个模型的A1--A3，共15个配置，而不是原计划
+的45个配置。2026-08-29已有的SegFormer/Whisper C与C+E、DINO C+E/P/R等阶段数据保留为
+机制证据和结果sanity check；由于它们不是同一冻结批次，不能与新表跨代计算incremental
+speedup。只有配置、代码fingerprint、输入、设备状态和测量窗口完全匹配的数据才能进入
+正式消融格子。
+
+正式消融单独成表，同时报告每一级latency、相邻阶段增量`A(i-1)/Ai`和相对A0累计加速。
+若某阶段没有合法site，写`not admitted`；若R只有hold而没有改变P决策，则写
+`monitoring-only / no causal latency claim`，不能把自然波动归因于traffic control。
+
+执行结果：5个模型的15个A1--A3配置全部PASS。E是统一主导项，增量为1.30x--1.69x；
+P在DINOv2/DeiT为约1.06x，在SegFormer/Whisper约1.02x，Swin约1.00x。C只在
+SegFormer（1.31x）和Whisper（1.04x）明确有益，Swin先回退约2.8%但被E恢复。A1到A3的
+sysMon AXI总量在五个模型分别下降18.28%、9.53%、41.67%、17.68%和12.86%，支持收益
+来自consumer-driven representation formation减少物理流量，并由选择性异步供给隐藏一部分
+残余搬运。R仍只有hold，A3/A4的微小差异不作因果性能声明。正式数值和raw artifact路径见
+`experimental_data.md`的独立Ablation Study表。
