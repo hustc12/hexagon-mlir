@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Formal complete-model ALPS A1(C), A2(C+E), A3(C+E+P) ablation.
+# Formal complete-model ALPS A1(C), A2(C+full-E), A3(C+full-E+P) ablation.
+# Full E includes generic P2e formation, P2g continuity/register-tile support,
+# and the legality-gated P5h/P5i attention/patch realizers.
 # A0 and A4 are reused from the frozen 15-model matrix. Models and cases run
 # strictly serially, without a timeout or automatic retry.
 set -euo pipefail

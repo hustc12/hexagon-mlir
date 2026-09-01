@@ -54,6 +54,25 @@ using namespace hexagon;
 
 namespace {
 
+/// Return true when the earlier consumer-driven formation pass proved that
+/// every explicit layout demand in this function is already discharged by
+/// its producer.  In that case retaining the legacy item-7 K/V topology is
+/// redundant: it protects the same attention representation from slicing and
+/// can multiply the later tiling/vectorization IR without enabling a legal
+/// runtime prefetch (eager K/V is produced in this invocation).
+static bool isKvTopologyCoveredByConsumerFormation(
+    FunctionOpInterface function) {
+  auto demands =
+      function->getAttrOfType<IntegerAttr>("alps.p2e.demands");
+  auto formed =
+      function->getAttrOfType<IntegerAttr>("alps.p2e.producer_direct");
+  auto native = function->getAttrOfType<IntegerAttr>("alps.p2e.native");
+  if (!demands || !formed || !native)
+    return false;
+  return demands.getInt() > 0 && formed.getInt() == demands.getInt() &&
+         native.getInt() == 0;
+}
+
 struct HexagonLowerTmTensorPass
     : public ::impl::HexagonLowerTmTensorBase<HexagonLowerTmTensorPass> {
   explicit HexagonLowerTmTensorPass(
@@ -618,9 +637,29 @@ static int64_t annotateEagerAttentionKvStreams(
 }
 
 void HexagonLowerTmTensorPass::runOnOperation() {
+  FunctionOpInterface function = getOperation();
+  bool topologyCovered =
+      emitKvCacheMetadata &&
+      isKvTopologyCoveredByConsumerFormation(function);
+  bool emitAdmittedKvMetadata = emitKvCacheMetadata && !topologyCovered;
+  if (emitKvCacheMetadata) {
+    Builder builder(function.getContext());
+    function->setAttr(
+        "alps.kv_topology_admission",
+        builder.getStringAttr(topologyCovered
+                                  ? "covered_by_consumer_formation"
+                                  : "admit_residual_topology"));
+    llvm::errs() << "[KVTopologyAdmission] function="
+                 << function->getName() << " decision="
+                 << (topologyCovered ? "reject" : "admit") << " reason="
+                 << (topologyCovered
+                         ? "covered_by_consumer_formation"
+                         : "residual_representation_contract")
+                 << "\n";
+  }
   RewritePatternSet patterns(&getContext());
   patterns.add<LowerAttentionOp>(
-      patterns.getContext(), emitKvCacheMetadata, emitKvFusionBoundary,
+      patterns.getContext(), emitAdmittedKvMetadata, emitKvFusionBoundary,
       emitKvElementwiseFusionBoundary, emitKvMultiUseFusionBoundary,
       emitKvSplitReductionBoundary);
 
@@ -629,7 +668,7 @@ void HexagonLowerTmTensorPass::runOnOperation() {
     return;
   }
 
-  if (emitKvCacheMetadata) {
+  if (emitAdmittedKvMetadata) {
     int64_t inferred = annotateEagerAttentionKvStreams(
         getOperation(), emitKvFusionBoundary,
         emitKvElementwiseFusionBoundary, emitKvMultiUseFusionBoundary,
@@ -637,6 +676,10 @@ void HexagonLowerTmTensorPass::runOnOperation() {
     llvm::errs() << "[KVCacheMetadata] function="
                  << getOperation()->getName() << " eager_inferred="
                  << inferred << "\n";
+  } else if (emitKvCacheMetadata) {
+    llvm::errs() << "[KVCacheMetadata] function="
+                 << getOperation()->getName() << " eager_inferred=0"
+                 << " admission=covered_by_consumer_formation\n";
   }
 }
 

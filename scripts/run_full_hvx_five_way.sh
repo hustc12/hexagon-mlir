@@ -64,6 +64,7 @@ alps_c_e_p=0
 alps_c_e_p_r=0
 alps_component_ablation=0
 alps_full_matrix=0
+alps_two_way=0
 with_item7=0
 item7_only_run=0
 models=()
@@ -153,6 +154,7 @@ Options:
   --alps-component-ablation
                          Run the formal A1(C), A2(C+E), A3(C+E+P) matrix
   --alps-full-matrix     Run frozen PK/APT/HexKL-Off/HexKL-On/ALPS-C+E+P+R matrix
+  --alps-two-way        Run only HexKL-On and ALPS-C+full-E+P+R
   --output-dir DIR        Local working/result directory
   --remote-dir DIR        nano working_set destination
   --device-iterations N   Device samples per configuration (default: ${iterations})
@@ -362,6 +364,9 @@ while (($#)); do
     --alps-full-matrix)
       alps_full_matrix=1; shift
       ;;
+    --alps-two-way)
+      alps_full_matrix=1; alps_two_way=1; shift
+      ;;
     --output-dir) output_dir=$2; shift 2 ;;
     --remote-dir) remote_dir=$2; shift 2 ;;
     --device-iterations) iterations=$2; shift 2 ;;
@@ -374,7 +379,9 @@ while (($#)); do
   esac
 done
 
-if ((alps_component_ablation)); then
+if ((alps_two_way)); then
+  schemes=(hmlir-hvx-hexkl-on alps-final)
+elif ((alps_component_ablation)); then
   schemes=(alps-hvx-widening-conv alps-c-e-hmx-direct-output alps-c-e-hmx-async-drain)
 elif ((alps_full_matrix)); then
   schemes=(pk-hvx apt-hvx hmlir-hvx-hexkl-off hmlir-hvx-hexkl-on alps-final)
@@ -724,6 +731,9 @@ scheme_args_for() {
     alps-final)
       printf '%s\n' --enable-hexkl --enable-alps-hvx-widening-conv \
         --disable-layout-aware --disable-omnifetch-adaptive
+      if [[ ${ALPS_DISABLE_ATTENTION_TOPOLOGY:-0} != 1 ]]; then
+        printf '%s\n' --enable-omnifetch-kv-cache-prefetch
+      fi
       ;;
     alps-fp16-hvx-arithmetic)
       printf '%s\n' --enable-hexkl --enable-alps-fp16-hvx-arithmetic
@@ -737,6 +747,9 @@ scheme_args_for() {
     alps-c-e-hmx-direct-output|alps-c-e-hmx-async-drain|alps-c-e-hmx-async-drain-traffic-control)
       printf '%s\n' --enable-hexkl --enable-alps-hvx-widening-conv \
         --disable-layout-aware --disable-omnifetch-adaptive
+      if [[ ${ALPS_DISABLE_ATTENTION_TOPOLOGY:-0} != 1 ]]; then
+        printf '%s\n' --enable-omnifetch-kv-cache-prefetch
+      fi
       ;;
     item7-only)
       printf '%s\n' --enable-hexkl --enable-omnifetch-kv-cache-prefetch \
@@ -832,7 +845,7 @@ upsert_result() {
     correctness=$(awk '/\[(LayeredDeviceFullCompare|CLIPDeviceFullCompare|QwenDeviceFullCompare)\]/{v=$0}END{gsub(/,/,";",v);print v}' "${log}")
   fi
   recorded_log=${log}
-  if ((alps_p0)); then
+  if ((alps_p0 || alps_full_matrix)); then
     recorded_log=${remote_dir}/${model}/${scheme}/run.log
   fi
   awk -F, -v m="${model}" -v s="${scheme}" 'NR==1 || !($1==m && $3==s)' "${results}" > "${results}.tmp"
@@ -852,12 +865,13 @@ run_case() {
   local case_dir=${output_dir}/${model}/${scheme}
   local log=${case_dir}/run.log status_file=${case_dir}/status.txt
   local marker=${case_dir}/.case-started
-  local result_scheme execution_scheme
+  local result_scheme execution_scheme full_e=0
   local -a args=()
   mkdir -p "${case_dir}/artifacts"
   if ((reuse_valid)) && passing_log "${log}" "${status_file}"; then
     echo "REUSE model=${model} scheme=${scheme}"
     upsert_result "${model}" "${scheme}" PASS "${log}"
+    sync_case "${model}" "${scheme}" "${case_dir}"
     return 0
   fi
   touch "${marker}"
@@ -880,19 +894,32 @@ run_case() {
   if [[ ${execution_scheme} == alps-hmx-async-drain ]]; then
     scheme=alps-hmx-async-drain-analysis
   fi
+  # The frozen E component is the complete consumer-driven representation
+  # formation stack, not only the generic P2e matcher.  The maintained item7
+  # flag supplies the proven attention propagation/tiling/slicing topology;
+  # P2g supplies continuity/register-tile machinery, while P5h and P5i are
+  # topology-specific realizers for attention destinations and patch-token
+  # producers.  Keep each internal gate independently ablatable, but make every
+  # formal C+E/P/R endpoint use the same full E definition.
+  if [[ ${scheme} == alps-c-e-hmx-direct-output ||
+        ${scheme} == alps-c-e-hmx-async-drain ||
+        ${scheme} == alps-c-e-hmx-async-drain-traffic-control ||
+        ${scheme} == alps-final ]]; then
+    full_e=1
+  fi
   set +e
     ALPS_ENABLE_MOVEMENT_LEDGER="$([[ ${ALPS_DISABLE_MOVEMENT_LEDGER:-0} -ne 1 && ( ${alps_full_matrix} -eq 1 || ${alps_p1} -eq 1 || ${alps_p2a} -eq 1 || ${alps_p2b} -eq 1 || ${alps_p2c} -eq 1 || ${alps_p2d} -eq 1 || ${alps_p2e} -eq 1 || ${alps_p3a} -eq 1 || ${alps_p3b} -eq 1 || ${alps_p4a} -eq 1 ) ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_ZERO_COPY_ATTENTION="$([[ ${scheme} == alps-elementwise-zero-copy || ${scheme} == alps-elementwise-producer-direct || ${scheme} == alps-elementwise-fused-transfer || ${scheme} == alps-elementwise-admission || ${scheme} == alps-elementwise-exact-readiness || ${scheme} == alps-elementwise-exact-overlap || ${scheme} == alps-elementwise-traffic-control ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_PRODUCER_DIRECT_ATTENTION="$([[ ${scheme} == alps-elementwise-producer-direct ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_CONSUMER_DRIVEN_LAYOUT="$([[ ${scheme} == alps-c-e-hmx-direct-output || ${scheme} == alps-c-e-hmx-async-drain || ${scheme} == alps-c-e-hmx-async-drain-traffic-control || ${scheme} == alps-final || ${scheme} == alps-hvx-widening-conv-consumer-layout || ${scheme} == alps-consumer-driven-layout || ${scheme} == alps-consumer-layout-propagation || ${scheme} == alps-continuity-audit || ${scheme} == alps-loop-interchanged-direct || ${scheme} == alps-register-tile-direct || ${scheme} == alps-crp-supply-analysis || ${scheme} == alps-crp-supply-prefetch || ${scheme} == alps-crp-segmented-supply || ${scheme} == alps-crp-vtcm-formation || ${scheme} == alps-crp-vtcm-window || ${scheme} == alps-crp-vtcm-async-window || ${scheme} == alps-crp-producer-direct-analysis || ${scheme} == alps-crp-producer-direct-vtcm || ${scheme} == alps-crp-producer-direct-head-major || ${scheme} == alps-crp-producer-head-major-contiguous || ${scheme} == alps-attention-destination-formation || ${scheme} == alps-patch-conv-formation || ${scheme} == alps-hmx-f16-epilogue-formation || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis || ${scheme} == alps-hmx-async-drain || ${scheme} == alps-contract-discharge-ledger || ${scheme} == alps-representation-supply-analysis || ${scheme} == alps-layout-supply-prefetch ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_CONSUMER_LAYOUT_PROPAGATION="$([[ ${scheme} == alps-consumer-layout-propagation ]] && echo 1 || echo 0)" \
-    ALPS_ENABLE_CONTINUITY_AUDIT="$([[ ${scheme} == alps-continuity-audit || ${scheme} == alps-loop-interchanged-direct || ${scheme} == alps-register-tile-direct || ${scheme} == alps-crp-supply-analysis || ${scheme} == alps-crp-supply-prefetch || ${scheme} == alps-crp-segmented-supply || ${scheme} == alps-crp-vtcm-formation || ${scheme} == alps-crp-vtcm-window || ${scheme} == alps-crp-vtcm-async-window || ${scheme} == alps-crp-producer-direct-analysis || ${scheme} == alps-crp-producer-direct-vtcm || ${scheme} == alps-crp-producer-direct-head-major || ${scheme} == alps-crp-producer-head-major-contiguous || ${scheme} == alps-attention-destination-formation || ${scheme} == alps-patch-conv-formation || ${scheme} == alps-hmx-f16-epilogue-formation || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_CONTINUITY_AUDIT="$([[ ${full_e} -eq 1 || ${scheme} == alps-continuity-audit || ${scheme} == alps-loop-interchanged-direct || ${scheme} == alps-register-tile-direct || ${scheme} == alps-crp-supply-analysis || ${scheme} == alps-crp-supply-prefetch || ${scheme} == alps-crp-segmented-supply || ${scheme} == alps-crp-vtcm-formation || ${scheme} == alps-crp-vtcm-window || ${scheme} == alps-crp-vtcm-async-window || ${scheme} == alps-crp-producer-direct-analysis || ${scheme} == alps-crp-producer-direct-vtcm || ${scheme} == alps-crp-producer-direct-head-major || ${scheme} == alps-crp-producer-head-major-contiguous || ${scheme} == alps-attention-destination-formation || ${scheme} == alps-patch-conv-formation || ${scheme} == alps-hmx-f16-epilogue-formation || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_LOOP_INTERCHANGED_DIRECT="$([[ ${scheme} == alps-loop-interchanged-direct ]] && echo 1 || echo 0)" \
-    ALPS_ENABLE_REGISTER_TILE_FORMATION="$([[ ${scheme} == alps-register-tile-direct || ${scheme} == alps-crp-supply-analysis || ${scheme} == alps-crp-supply-prefetch || ${scheme} == alps-crp-segmented-supply || ${scheme} == alps-crp-vtcm-formation || ${scheme} == alps-crp-vtcm-window || ${scheme} == alps-crp-vtcm-async-window || ${scheme} == alps-crp-producer-direct-analysis || ${scheme} == alps-crp-producer-direct-vtcm || ${scheme} == alps-crp-producer-direct-head-major || ${scheme} == alps-crp-producer-head-major-contiguous || ${scheme} == alps-attention-destination-formation || ${scheme} == alps-patch-conv-formation || ${scheme} == alps-hmx-f16-epilogue-formation || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_REGISTER_TILE_FORMATION="$([[ ${full_e} -eq 1 || ${scheme} == alps-register-tile-direct || ${scheme} == alps-crp-supply-analysis || ${scheme} == alps-crp-supply-prefetch || ${scheme} == alps-crp-segmented-supply || ${scheme} == alps-crp-vtcm-formation || ${scheme} == alps-crp-vtcm-window || ${scheme} == alps-crp-vtcm-async-window || ${scheme} == alps-crp-producer-direct-analysis || ${scheme} == alps-crp-producer-direct-vtcm || ${scheme} == alps-crp-producer-direct-head-major || ${scheme} == alps-crp-producer-head-major-contiguous || ${scheme} == alps-attention-destination-formation || ${scheme} == alps-patch-conv-formation || ${scheme} == alps-hmx-f16-epilogue-formation || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_CONTRACT_DISCHARGE_LEDGER="$([[ ${scheme} == alps-contract-discharge-ledger ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_REPRESENTATION_SUPPLY_ANALYSIS="$([[ ${scheme} == alps-representation-supply-analysis ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_LAYOUT_SUPPLY_PREFETCH="$([[ ${scheme} == alps-layout-supply-prefetch ]] && echo 1 || echo 0)" \
-    ALPS_ENABLE_CRP_SUPPLY_ANALYSIS="$([[ ${scheme} == alps-crp-supply-analysis || ${scheme} == alps-crp-supply-prefetch || ${scheme} == alps-crp-segmented-supply || ${scheme} == alps-crp-vtcm-formation || ${scheme} == alps-crp-vtcm-window || ${scheme} == alps-crp-vtcm-async-window || ${scheme} == alps-crp-producer-direct-analysis || ${scheme} == alps-crp-producer-direct-vtcm || ${scheme} == alps-crp-producer-direct-head-major || ${scheme} == alps-crp-producer-head-major-contiguous || ${scheme} == alps-attention-destination-formation || ${scheme} == alps-patch-conv-formation || ${scheme} == alps-hmx-f16-epilogue-formation || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_CRP_SUPPLY_ANALYSIS="$([[ ${full_e} -eq 1 || ${scheme} == alps-crp-supply-analysis || ${scheme} == alps-crp-supply-prefetch || ${scheme} == alps-crp-segmented-supply || ${scheme} == alps-crp-vtcm-formation || ${scheme} == alps-crp-vtcm-window || ${scheme} == alps-crp-vtcm-async-window || ${scheme} == alps-crp-producer-direct-analysis || ${scheme} == alps-crp-producer-direct-vtcm || ${scheme} == alps-crp-producer-direct-head-major || ${scheme} == alps-crp-producer-head-major-contiguous || ${scheme} == alps-attention-destination-formation || ${scheme} == alps-patch-conv-formation || ${scheme} == alps-hmx-f16-epilogue-formation || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_CRP_SUPPLY_PREFETCH="$([[ ${scheme} == alps-crp-supply-prefetch || ${scheme} == alps-crp-segmented-supply ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_CRP_SEGMENTED_SUPPLY="$([[ ${scheme} == alps-crp-segmented-supply ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_CRP_VTCM_FORMATION="$([[ ${scheme} == alps-crp-vtcm-formation ]] && echo 1 || echo 0)" \
@@ -900,10 +927,10 @@ run_case() {
     ALPS_ENABLE_CRP_VTCM_ASYNC_WINDOW="$([[ ${scheme} == alps-crp-vtcm-async-window ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_CRP_PRODUCER_DIRECT_ANALYSIS="$([[ ${scheme} == alps-crp-producer-direct-analysis || ${scheme} == alps-crp-producer-direct-vtcm ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_CRP_PRODUCER_DIRECT_VTCM="$([[ ${scheme} == alps-crp-producer-direct-vtcm ]] && echo 1 || echo 0)" \
-    ALPS_ENABLE_CRP_PRODUCER_DIRECT_HEAD_MAJOR="$([[ ${scheme} == alps-crp-producer-direct-head-major || ${scheme} == alps-crp-producer-head-major-contiguous || ${scheme} == alps-attention-destination-formation || ${scheme} == alps-patch-conv-formation || ${scheme} == alps-hmx-f16-epilogue-formation || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis ]] && echo 1 || echo 0)" \
-    ALPS_ENABLE_CRP_PRODUCER_LOOP_FORMATION="$([[ ${scheme} == alps-crp-producer-head-major-contiguous || ${scheme} == alps-attention-destination-formation || ${scheme} == alps-patch-conv-formation || ${scheme} == alps-hmx-f16-epilogue-formation || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis ]] && echo 1 || echo 0)" \
-    ALPS_ENABLE_ATTENTION_DESTINATION_FORMATION="$([[ ${scheme} == alps-attention-destination-formation || ${scheme} == alps-patch-conv-formation || ${scheme} == alps-hmx-f16-epilogue-formation || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis ]] && echo 1 || echo 0)" \
-    ALPS_ENABLE_PATCH_CONV_FORMATION="$([[ ${scheme} == alps-patch-conv-formation || ${scheme} == alps-hmx-f16-epilogue-formation || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_CRP_PRODUCER_DIRECT_HEAD_MAJOR="$([[ ${full_e} -eq 1 || ${scheme} == alps-crp-producer-direct-head-major || ${scheme} == alps-crp-producer-head-major-contiguous || ${scheme} == alps-attention-destination-formation || ${scheme} == alps-patch-conv-formation || ${scheme} == alps-hmx-f16-epilogue-formation || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_CRP_PRODUCER_LOOP_FORMATION="$([[ ${full_e} -eq 1 || ${scheme} == alps-crp-producer-head-major-contiguous || ${scheme} == alps-attention-destination-formation || ${scheme} == alps-patch-conv-formation || ${scheme} == alps-hmx-f16-epilogue-formation || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_ATTENTION_DESTINATION_FORMATION="$([[ ${full_e} -eq 1 || ${scheme} == alps-attention-destination-formation || ${scheme} == alps-patch-conv-formation || ${scheme} == alps-hmx-f16-epilogue-formation || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_PATCH_CONV_FORMATION="$([[ ${full_e} -eq 1 || ${scheme} == alps-patch-conv-formation || ${scheme} == alps-hmx-f16-epilogue-formation || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_HMX_F16_EPILOGUE_FORMATION="$([[ ${scheme} == alps-c-e-hmx-direct-output || ${scheme} == alps-c-e-hmx-async-drain || ${scheme} == alps-c-e-hmx-async-drain-traffic-control || ${scheme} == alps-final || ${scheme} == alps-hmx-f16-epilogue-formation || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_HMX_DIRECT_OUTPUT_FORMATION="$([[ ${scheme} == alps-c-e-hmx-direct-output || ${scheme} == alps-c-e-hmx-async-drain || ${scheme} == alps-c-e-hmx-async-drain-traffic-control || ${scheme} == alps-final || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis || ${scheme} == alps-hmx-async-drain ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_HMX_F16_BIAS_EPILOGUE_FORMATION="$([[ ${scheme} == alps-hmx-f16-bias-epilogue-formation ]] && echo 1 || echo 0)" \
@@ -1224,7 +1251,18 @@ for model in by_model:
         lines.append(f'| {model} | {scheme} | {row["latency_ms"]} ms{suffix} |')
 md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 PY
-  if ((alps_full_matrix)); then
+  if ((alps_two_way)); then
+    "${venv}/bin/python" "${repo_root}/scripts/summarize_alps_two_way.py" \
+      --output-root "${output_dir}" \
+      --results "${results}" \
+      --csv "${output_dir}/alps_full_e_two_way.csv" \
+      --markdown "${output_dir}/alps_full_e_two_way.md"
+    rsync -a --partial \
+      "${results}" "${output_dir}/summary.md" \
+      "${output_dir}/alps_full_e_two_way.csv" \
+      "${output_dir}/alps_full_e_two_way.md" \
+      "nano:${remote_dir}/"
+  elif ((alps_full_matrix)); then
     "${venv}/bin/python" "${repo_root}/scripts/summarize_alps_full_matrix.py" \
       --output-root "${output_dir}" \
       --results "${results}" \
@@ -1247,6 +1285,9 @@ for model in "${models[@]}"; do
     for scheme in "${schemes[@]}"; do
       run_case "${model}" "${scheme}"
     done
+  elif ((alps_two_way)); then
+    run_case "${model}" hmlir-hvx-hexkl-on
+    run_case "${model}" alps-final
   else
     candidate_file=${output_dir}/${model}/apt-candidate-ids.txt
     run_case "${model}" pk-hvx

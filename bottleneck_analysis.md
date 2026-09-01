@@ -5669,3 +5669,74 @@ sysMon AXI总量在五个模型分别下降18.28%、9.53%、41.67%、17.68%和12
 来自consumer-driven representation formation减少物理流量，并由选择性异步供给隐藏一部分
 残余搬运。R仍只有hold，A3/A4的微小差异不作因果性能声明。正式数值和raw artifact路径见
 `experimental_data.md`的独立Ablation Study表。
+
+#### 12.21.9 冻结E职责修正与full-E复测（2026-08-31）
+
+对历史`2,993.49 ms`与窄E冻结`5,499.60 ms`的配置审计确认，两者模型、输入、FP16、
+V73、HVX vector、HexKL和`-O3`均一致；差异来自冻结E错误地只保留基础P2e和HMX
+output formation，而遗漏了旧累计链中的P2g continuity/register-tile、P5h attention
+destination formation和P5i patch/token producer formation。旧`--alps-p5n`名称实际代表
+累积策略，不是单独的异步drain。
+
+机制上P5h和P5i都属于E而不是新的论文顶层组件：P5h令attention consumer直接在最终
+destination上形成结果并删除temporary/writeback；P5i把token consumer的连续layout
+contract传播回patch producer，直接形成`[N,tokens,channels]`，并由连续OC内层维解锁HVX
+codegen。P2g及P5f/P5g中必要的continuity/head-major分析是这些realizer的内部基础设施。
+因此冻结runner已将E统一为：
+
+```text
+consumer contract discovery/propagation
+  -> P2e generic producer-direct formation
+  -> P2g continuity/register-tile realization
+  -> P5h attention destination realization
+  -> P5i patch/token producer realization
+  -> P5j/P5k HMX output realization
+```
+
+各历史gate仍可独立开关，供E内部消融和legality回归使用；论文顶层消融仍保持
+`A0 baseline -> A1 +C -> A2 +full E -> A3 +P -> A4 +R`。
+
+五个预注册完整模型的同轮复测全部PASS。full E相对A1的独立增量为：DINOv2
+`2.99x`、DeiT `2.87x`、Whisper `1.61x`、Swin `1.53x`、SegFormer `1.37x`；加入P后
+分别再获得`1.08x`、`1.12x`、`1.01x`、`1.00x`和`1.01x`。DINO最终为
+`2,976.63 ms`，复现历史约3秒量级；DeiT最终由窄E的`5,016.40 ms`降至
+`2,594.67 ms`。这证明性能恢复来自完整consumer-driven formation，而不是设备频率或
+测量偶然性。
+
+P5h在DINO/Swin/SegFormer/DeiT/Whisper分别改写`11/3/0/11/6`条链，P5i分别形成
+`1/0/2/1/0`个producer；因此它们是同一E抽象下按topology合法性选择的realizer，不是
+DINO专用的无条件开关。A1到A3的sysMon AXI总量分别下降25.50%、10.34%、42.06%、
+22.75%和23.61%。R仍只有hold窗口，没有改变P决策，A3/A4差异不作R的因果收益声明。
+
+完整数值与权威产物路径见`experimental_data.md`的
+“Re-frozen full-E selected-model matrix and ablation”章节。
+
+#### 12.21.10 Consumer-contract topology admission与全量复测（2026-09-01）
+
+恢复item7后，DeiT完整ALPS编译在约16 GB WSL内存上稳定触发OOM（exit 137）。审计排除
+movement ledger后，根因是item7兼容umbrella在P5h之前保护全函数attention topology、关闭
+原生slicing并传播K/V tiling；而后续P5h已经重写11条attention destination链并删除约
+20.07 MB copy。最终runtime没有发出任何K/V L2 hint（eager K/V均为本调用内producer），
+但编译器已经为同一个consumer representation contract重复构造了大规模IR。
+
+最终修复没有按模型名关闭item7，而是增加模型无关的contract subsumption规则。早期P2e若
+证明`demands > 0 && producer_direct == demands && native == 0`，函数记录
+`alps.kv_topology_admission = "covered_by_consumer_formation"`，后续K/V semantic/fusion/tiling
+metadata不再生成；存在任何未形成需求时则记录`admit_residual_topology`。同时Hexagon
+slicing不再因为item7而全模块禁用，而是只跳过实际携带、且通过admission的K/V op。由此
+建立统一顺序：**先消除/原位形成目标表示，再仅为无法消除的residual transfer保留
+topology和prefetch**。
+
+这项修复强化而非削弱论文故事：P5h/full-E与item7是同一个consumer contract的可选
+realizer，不应无条件叠加；P仍独立处理无法消除的HMX/VTCM drain。DeiT修复后完整编译
+成功，ALPS为2,586.91 ms、matched HexKL-On为8,282.03 ms（3.20x），并继续发出7,776个
+async drain descriptor/15,925,248 B，因此不是通过删除prefetch伪造收益。结构规则还在ViT
+和DINO上拒绝冗余topology；Swin、Qwen和分层LLM只有部分consumer formation，仍保留
+item7 residual topology及原有收益路径。
+
+随后对15个完整FP16模型从头运行30个matched case，全部PASS。全体几何平均1.67x，
+Vision为2.43x、Language/text为1.41x、Speech为1.18x；9个模型达到1.50x、7个达到1.80x，
+DeiT和DINO超过3x。Qwen为2.04x，TinyLlama为1.65x，说明admission没有误伤item7的分层
+LLM正例；三个结构近似speech encoder仍约1.01--1.02x，继续作为“合法异步搬运不等于
+关键路径收益”的negative evidence。完整表和raw路径见`experimental_data.md`的
+“Consumer-contract-admitted full rerun”章节。

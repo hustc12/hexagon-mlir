@@ -503,7 +503,10 @@ def HexagonSlicing :
   let options = [
     Option<"slicingFactor", "slicing-factor", "int",
            /*default=*/"1",
-           "Operator slicing factor.">
+           "Operator slicing factor.">,
+    Option<"preserveKvContracts", "preserve-kv-contracts", "bool",
+           /*default=*/"false",
+           "Slice ordinary operations while preserving only admitted K/V topology contracts.">
   ];
   let constructor = "hexagon::createHexagonSlicingPass()";
 }

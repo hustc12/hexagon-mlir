@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the frozen 15-unique-model ALPS table without rewriting history."""
+"""Build a frozen complete-model ALPS table without rewriting history."""
 
 from __future__ import annotations
 
@@ -266,8 +266,12 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(wide_rows)
 
+    model_count = len(by_model)
+    matrix_label = (
+        "15-unique-model" if model_count == 15 else f"{model_count}-model selected"
+    )
     lines = [
-        "# Frozen ALPS 15-unique-model complete-model matrix",
+        f"# Frozen ALPS {matrix_label} complete-model matrix",
         "",
         "This is a new post-`3b90cd4` table. Historical tables remain unchanged.",
         "All models are complete non-Debug models and all speedups use ALPS final as 1.00x.",

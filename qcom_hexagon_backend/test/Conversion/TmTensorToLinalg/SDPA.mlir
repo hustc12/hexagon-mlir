@@ -18,6 +18,28 @@ func.func @SDPA(%arg0: tensor<2x4x8xf32>, %arg1: tensor<2x4x8xf32>,
   return %2 : tensor<2x4x8xf32>
 }
 
+// A complete, model-independent consumer-formation proof subsumes the K/V
+// topology contract. The attention still lowers, but item-7 must not attach
+// fusion/tiling metadata to it.
+func.func @SDPA_covered(
+    %arg0: tensor<2x4x8xf32>, %arg1: tensor<2x4x8xf32>,
+    %arg2: tensor<2x4x8xf32>, %arg3: tensor<2x4x4xf32>)
+    -> tensor<2x4x8xf32> attributes {
+      alps.p2e.demands = 4 : i64,
+      alps.p2e.native = 0 : i64,
+      alps.p2e.producer_direct = 4 : i64} {
+  %0 = tensor.empty() : tensor<2x4x8xf32>
+  %cst = arith.constant 0.000000e+00 : f32
+  %1 = linalg.fill ins(%cst : f32) outs(%0 : tensor<2x4x8xf32>)
+      -> tensor<2x4x8xf32>
+  %2 = tm_tensor.attention
+         ins(%arg0, %arg1, %arg2, %arg3
+             : tensor<2x4x8xf32>, tensor<2x4x8xf32>,
+               tensor<2x4x8xf32>, tensor<2x4x4xf32>)
+         outs(%1 : tensor<2x4x8xf32>) -> tensor<2x4x8xf32>
+  return %2 : tensor<2x4x8xf32>
+}
+
 // CHECK-LABEL: func.func @SDPA
 // CHECK-NOT: alps.kv_fusion_boundary
 // CHECK: %[[CST:.*]] = arith.constant 0xFF800000 : f32
@@ -93,3 +115,8 @@ func.func @SDPA(%arg0: tensor<2x4x8xf32>, %arg1: tensor<2x4x8xf32>,
 // NO-KV-LABEL: func.func @SDPA
 // NO-KV-NOT: omni_fetch.kv_cache_role
 // NO-KV: return
+
+// CHECK-LABEL: func.func @SDPA_covered
+// CHECK-SAME: alps.kv_topology_admission = "covered_by_consumer_formation"
+// CHECK-NOT: omni_fetch.kv_cache_role
+// CHECK: return

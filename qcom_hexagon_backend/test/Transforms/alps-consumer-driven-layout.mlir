@@ -380,6 +380,37 @@ func.func @reject_register_tile_source_tail(
   return %transposed : tensor<1x96x16xf16>
 }
 
+// A native 64xf16 vector contains exactly two complete 32xf16 physical rows.
+// This is row-safe without masked loads and restores the Swin head-layout
+// formation that was over-rejected by the initial tail guard.
+func.func @direct_register_tile_subvector_rows(
+    %input: tensor<1x16x32xf16>, %out: tensor<1x32x16xf16>)
+    -> tensor<1x32x16xf16> {
+  %tmp = tensor.empty() : tensor<1x16x32xf16>
+  %produced = linalg.generic {
+      indexing_maps = [#id3, #id3],
+      iterator_types = ["parallel", "parallel", "parallel"]}
+      ins(%input : tensor<1x16x32xf16>)
+      outs(%tmp : tensor<1x16x32xf16>) {
+    ^bb0(%in: f16, %old: f16):
+      %v = arith.addf %in, %in : f16
+      linalg.yield %v : f16
+  } -> tensor<1x16x32xf16>
+  %transposed = linalg.transpose
+      ins(%produced : tensor<1x16x32xf16>)
+      outs(%out : tensor<1x32x16xf16>) permutation = [0, 2, 1]
+  %consumer_out = tensor.empty() : tensor<1x32x16xf16>
+  %result = linalg.generic {
+      indexing_maps = [#id3, #id3],
+      iterator_types = ["parallel", "parallel", "parallel"]}
+      ins(%transposed : tensor<1x32x16xf16>)
+      outs(%consumer_out : tensor<1x32x16xf16>) {
+    ^bb0(%in: f16, %old: f16):
+      linalg.yield %in : f16
+  } -> tensor<1x32x16xf16>
+  return %result : tensor<1x32x16xf16>
+}
+
 // P2GB-LABEL: func.func @reject_strided_consumer
 // P2GB-SAME: alps.p2g.loop_interchanged_direct = 0
 // P2GB: linalg.transpose
@@ -387,6 +418,10 @@ func.func @reject_register_tile_source_tail(
 // P2GB-SAME: alps.p2e.producer_direct = 1
 // P2GB-SAME: alps.p2g.loop_interchanged_direct = 1
 // P2GB-NOT: linalg.transpose
+// P2GB-LABEL: func.func @reject_register_tile_source_tail
+// P2GB: linalg.transpose
+// P2GB-LABEL: func.func @direct_register_tile_subvector_rows
+// P2GB: linalg.transpose
 
 // P2GC-LABEL: func.func @reject_strided_consumer
 // P2GC-SAME: alps.p2e.producer_direct = 1
@@ -397,6 +432,11 @@ func.func @reject_register_tile_source_tail(
 // P2GC-LABEL: func.func @reject_register_tile_source_tail
 // P2GC-SAME: alps.p2g.register_tile_direct = 0
 // P2GC: linalg.transpose
+// P2GC-LABEL: func.func @direct_register_tile_subvector_rows
+// P2GC-SAME: alps.p2e.producer_direct = 1
+// P2GC-SAME: alps.p2g.register_tile_direct = 1
+// P2GC: alps.p2g.register_tile_contract
+// P2GC-NOT: linalg.transpose
 // P2GC-NONE-LABEL: func.func @reject_strided_consumer
 // P2GC-NONE-SAME: alps.p2g.register_tile_direct = 0
 // P2GC-NONE: linalg.transpose

@@ -467,14 +467,19 @@ makeProducerDirect(linalg::TransposeOp transpose, PatternRewriter &rewriter,
   int64_t sourceInnerExtent = expandedType.getDimSize(targetRank - 1);
   // P2g-c lowers the interchanged producer input to full-width native HVX
   // loads followed by an in-register deinterleave (for example vmemu+vdeal
-  // for f16).  Until the lowering carries a masked/padded tail, prove that
-  // the physical innermost source row is an exact number of 128-byte v73
-  // vectors.  The affine-map proof alone is insufficient: Whisper's
-  // [1,384,1500] source passed it, then a final 64-lane load crossed the
-  // 1500-element row boundary and the DSP exited with status 13.
+  // for f16).  A load is row-safe when either one physical row contains an
+  // integral number of native vectors, or one native vector contains an
+  // integral number of complete rows.  The second case is important for
+  // Swin's 32xf16 head rows: a 128-byte load contains exactly two rows and
+  // the register deinterleave never observes a partial row.  Do not admit a
+  // merely contiguous allocation when neither extent divides the other;
+  // Whisper's 1500xf16 row passed the older allocation-level proof, then a
+  // final 64-lane load contained a partial next row and the DSP exited with
+  // status 13.
   bool sourceFullVectorTailLegal =
       nativeVectorElements > 0 && sourceInnerExtent > 0 &&
-      sourceInnerExtent % nativeVectorElements == 0;
+      (sourceInnerExtent % nativeVectorElements == 0 ||
+       nativeVectorElements % sourceInnerExtent == 0);
   // Keep the two-dimensional tile within one native v73 HVX vector.  The
   // earlier fixed 8x16 tile was 512 B for f32 and caused a full-model DSP
   // failure even though the smaller Debug extent happened to clamp to 128 B.

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # One-command, strictly serial, complete non-Debug 15-unique-model ALPS table.
+# The frozen ALPS endpoint uses full E: P2e/P2g plus legality-gated P5h/P5i.
 # UniSpeech-SAT is diagnostic-only because its current ForCTC export duplicates
 # UniSpeech-Base; ViT-Base occupies that primary-matrix slot.
 # There is deliberately no timeout and no automatic retry after a failed case.

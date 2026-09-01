@@ -388,8 +388,9 @@ public:
       return passOption;
     };
 
-    auto setOpSlicingFactor = [&](auto passOption) {
+    auto setKvContractSlicing = [&](auto passOption) {
       passOption.slicingFactor = slicingFactor;
+      passOption.preserveKvContracts = alpsKvSlicingPolicy;
       return passOption;
     };
 
@@ -726,12 +727,12 @@ public:
       pm.addNestedPass<func::FuncOp>(createAlpsMovementLedgerPass(
           setAlpsLedger(AlpsMovementLedgerOptions{}, "post-fusion")));
 
-    // Full-size attention slicing currently rebuilds the contraction without
-    // copying semantic K/V attributes. Keep the marked boundary intact for
-    // item-7; ordinary HVX/HexKL configurations retain the existing slicing.
-    if (enableSlicing && !alpsKvSlicingPolicy)
+    // Keep slicing enabled function-wide. Item-7 protects only K/V operations
+    // that survived consumer-contract admission; covered/unmarked operations
+    // use the native slicing path and cannot inflate the whole function IR.
+    if (enableSlicing)
       pm.addPass(createHexagonSlicingPass(
-          setOpSlicingFactor(HexagonSlicingOptions{})));
+          setKvContractSlicing(HexagonSlicingOptions{})));
 
     pm.addNestedPass<func::FuncOp>(createDecomposeTensorConcatPass());
     if (forceHVXCroutonization) {

@@ -1,4 +1,5 @@
 // RUN: linalg-hexagon-opt %s --hexagon-slicing="slicing-factor=4" | FileCheck %s -check-prefixes=CHECK
+// RUN: linalg-hexagon-opt %s --hexagon-slicing="slicing-factor=4 preserve-kv-contracts=true" | FileCheck %s -check-prefixes=KV
 
 
 #map = affine_map<(d0) -> (d0)>
@@ -10,6 +11,22 @@ func.func @slice_vec_add(
       linalg.yield %1 : f32
     } -> tensor<1000xf32>
     return %0 : tensor<1000xf32>
+}
+
+func.func @slice_kv_contract(
+  %arg0: tensor<1000xf32>, %arg1: tensor<1000xf32>,
+  %arg2: tensor<1000xf32>) -> tensor<1000xf32> {
+  %0 = linalg.generic {
+      indexing_maps = [#map, #map, #map],
+      iterator_types = ["parallel"],
+      omni_fetch.kv_cache_role = "key"}
+      ins(%arg0, %arg1 : tensor<1000xf32>, tensor<1000xf32>)
+      outs(%arg2 : tensor<1000xf32>) {
+    ^bb0(%in: f32, %in_0: f32, %out: f32):
+      %1 = arith.addf %in, %in_0 : f32
+      linalg.yield %1 : f32
+  } -> tensor<1000xf32>
+  return %0 : tensor<1000xf32>
 }
 
 // CHECK-LABEL: slice_vec_add
@@ -28,3 +45,11 @@ func.func @slice_vec_add(
 // CHECK: %[[CONCAT:.+]] = tensor.concat dim(0) %[[SLICE1]], %[[SLICE2]], %[[SLICE3]], %[[SLICE4]] : (tensor<256xf32>, tensor<256xf32>, tensor<256xf32>, tensor<232xf32>) -> tensor<1000xf32>
 // CHECK: return %[[CONCAT]] : tensor<1000xf32>
 
+// KV-LABEL: func.func @slice_vec_add
+// KV: tensor.concat
+// KV-LABEL: func.func @slice_kv_contract
+// KV-NOT: tensor.extract_slice
+// KV: linalg.generic
+// KV-SAME: omni_fetch.kv_cache_role = "key"
+// KV-NOT: tensor.concat
+// KV: return

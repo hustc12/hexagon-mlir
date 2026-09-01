@@ -231,6 +231,16 @@ struct HexagonSlicingPass
     auto moduleOp = getOperation();
     moduleOp.walk([&](linalg::LinalgOp op) {
       DBG(" Slicing candidate: " << op << "\n");
+      // Item 7 used to disable function-wide slicing.  That made eager
+      // attention graphs explode even when consumer-driven formation had
+      // already discharged their representation contracts.  Preserve only
+      // the K/V operations which survived the model-independent admission
+      // decision; every unmarked operation retains native slicing.
+      if (preserveKvContracts &&
+          op->hasAttr("omni_fetch.kv_cache_role")) {
+        DBG("-> Slicing skipped for admitted K/V contract\n");
+        return WalkResult::advance();
+      }
       if (succeeded(sliceLinalgOp(op, slicingFactor))) {
         DBG("-> Slicing succeeded\n");
       } else {
