@@ -382,7 +382,8 @@ done
 if ((alps_two_way)); then
   schemes=(hmlir-hvx-hexkl-on alps-final)
 elif ((alps_component_ablation)); then
-  schemes=(alps-hvx-widening-conv alps-c-e-hmx-direct-output alps-c-e-hmx-async-drain)
+  schemes=(hmlir-hvx-hexkl-on alps-hvx-widening-conv \
+    alps-c-e-hmx-direct-output alps-c-e-hmx-async-drain alps-final)
 elif ((alps_full_matrix)); then
   schemes=(pk-hvx apt-hvx hmlir-hvx-hexkl-off hmlir-hvx-hexkl-on alps-final)
 elif ((alps_c_e_p_r)); then
@@ -661,7 +662,11 @@ collect_model_sysmon_replay() {
   [[ "${enabled,,}" == 1 || "${enabled,,}" == true || "${enabled,,}" == yes ]] \
     || return 0
   "${repo_root}/scripts/profile_archived_hexagon_model.sh" \
-    "${case_dir}/artifacts" "${case_dir}/sysmon_model_replay"
+    "${case_dir}/artifacts" "${case_dir}/sysmon_model_replay" default
+  if [[ ${ALPS_ENABLE_MEMORY_SYSMON_REPLAY:-0} == 1 ]]; then
+    "${repo_root}/scripts/profile_archived_hexagon_model.sh" \
+      "${case_dir}/artifacts" "${case_dir}/sysmon_memory_replay" memory
+  fi
 }
 
 collect_runner_intermediates() {
@@ -1261,6 +1266,17 @@ PY
       "${results}" "${output_dir}/summary.md" \
       "${output_dir}/alps_full_e_two_way.csv" \
       "${output_dir}/alps_full_e_two_way.md" \
+      "nano:${remote_dir}/"
+  elif ((alps_component_ablation)); then
+    "${venv}/bin/python" "${repo_root}/scripts/summarize_alps_ablation.py" \
+      --output-root "${output_dir}" \
+      --results "${results}" \
+      --csv "${output_dir}/alps_component_ablation.csv" \
+      --markdown "${output_dir}/alps_component_ablation.md"
+    rsync -a --partial \
+      "${results}" "${output_dir}/summary.md" \
+      "${output_dir}/alps_component_ablation.csv" \
+      "${output_dir}/alps_component_ablation.md" \
       "nano:${remote_dir}/"
   elif ((alps_full_matrix)); then
     "${venv}/bin/python" "${repo_root}/scripts/summarize_alps_full_matrix.py" \

@@ -1318,3 +1318,40 @@ moved compiler/runtime products are stored at:
 ```text
 nano:/home/huzq85/2-working/working_set/alps_contract_admission_full_two_way_20260901
 ```
+
+## Consolidated complete-model end-to-end table (2026-09-02)
+
+This table completes the schema in `../alps_end2end_data.csv` for all 15
+complete, non-Debug FP16 models.  The PK and APT latency values are retained
+exactly from the input CSV as requested.  `HMLIR HVX-Off` uses the latest
+available complete-corpus HexKL-Off measurements (the 2026-08-29--30 frozen
+five-way run), while `HMLIR HVX-On` and `ALPS HVX` use the fully new,
+correctness-qualified consumer-contract-admitted rerun from 2026-09-01.
+Consequently this is a consolidated end-to-end summary across experiment
+generations, not a claim that all five columns were measured in one replay.
+
+Every parenthesized value has been recomputed as `column latency / ALPS HVX
+latency`; lower latency is better and ALPS is fixed at `1.00x`.  Thus a value
+above `1.00x` is an ALPS speedup over that column, whereas a value below
+`1.00x` would indicate an ALPS regression.
+
+| Domain | Model | Parameters | PK HVX (ms) | APT HVX (ms) | HMLIR HVX-Off (ms) | HMLIR HVX-On (ms) | ALPS HVX (ms) |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Vision | DINOv2-small | 22.1M | 10,596.72 (3.51x) | 10,591.11 (3.50x) | 30,024.51 (9.93x) | 9,816.67 (3.25x) | **3,022.48 (1.00x)** |
+| Vision | ViT-Base | 86M | 21,489.53 (2.46x) | 20,915.64 (2.39x) | 119,657.63 (13.69x) | 19,543.80 (2.24x) | **8,741.30 (1.00x)** |
+| Vision | DeiT-small | 22M | 9,203.05 (3.56x) | 8,850.23 (3.42x) | 23,960.79 (9.26x) | 8,282.03 (3.20x) | **2,586.91 (1.00x)** |
+| Vision | SegFormer MiT-B0 | 3.7M | 9,413.14 (1.88x) | 9,393.78 (1.88x) | 27,392.48 (5.48x) | 9,278.93 (1.86x) | **4,995.98 (1.00x)** |
+| Vision | Swin Transformer | 28.3M | 77,737.95 (3.00x) | 73,318.92 (2.83x) | 120,881.83 (4.67x) | 73,096.98 (2.82x) | **25,900.24 (1.00x)** |
+| Vision | BEiT-base | 87M | 15,804.82 (1.98x) | 15,837.16 (1.98x) | 113,698.07 (14.24x) | 13,615.33 (1.71x) | **7,983.91 (1.00x)** |
+| Speech | Whisper-tiny | 39M | 115,763.93 (1.91x) | 115,908.13 (1.92x) | 157,107.57 (2.60x) | 111,444.29 (1.84x) | **60,484.06 (1.00x)** |
+| Speech | HuBERT-base | 94.7M | 174,798.20 (1.02x) | 176,416.16 (1.03x) | 209,056.42 (1.22x) | 174,468.38 (1.02x) | **171,114.38 (1.00x)** |
+| Speech | Wav2Vec2-base | 95M | 191,710.61 (1.12x) | 174,880.18 (1.02x) | 210,208.72 (1.23x) | 174,565.85 (1.02x) | **171,162.64 (1.00x)** |
+| Speech | UniSpeech-base | 94.68M | 174,208.93 (1.01x) | 174,355.22 (1.01x) | 209,262.92 (1.21x) | 173,714.96 (1.01x) | **172,468.73 (1.00x)** |
+| Language/text | GPT-2, 12-layers | 124M | 3,714.22 (1.06x) | 3,808.27 (1.09x) | 17,587.14 (5.02x) | 3,560.38 (1.02x) | **3,506.78 (1.00x)** |
+| Language/text | SD/CLIP text encoder | 123M | 4,118.21 (1.32x) | 4,106.20 (1.32x) | 234,816.52 (75.40x) | 3,558.24 (1.14x) | **3,114.11 (1.00x)** |
+| Language/text | Qwen2.5-0.5B | 0.49B | 10,989.09 (2.06x) | 10,994.89 (2.06x) | 384,424.67 (72.05x) | 10,870.77 (2.04x) | **5,335.36 (1.00x)** |
+| Language/text | TinyLlama-1.1B | 1.1B | 27,611.75 (1.67x) | 27,406.97 (1.65x) | 917,036.32 (55.33x) | 27,422.34 (1.65x) | **16,573.73 (1.00x)** |
+| Language/text | SmolLM2-1.7B | 1.7B | 39,463.94 (1.44x) | 39,396.33 (1.44x) | 1,448,959.95 (52.81x) | 39,513.93 (1.44x) | **27,437.04 (1.00x)** |
+
+The machine-readable source for this rendered table is
+`../alps_end2end_data.csv`.

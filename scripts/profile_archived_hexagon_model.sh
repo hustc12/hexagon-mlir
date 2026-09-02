@@ -4,8 +4,8 @@
 # is excluded. Stages execute strictly serially and are never retried.
 set -euo pipefail
 
-if [[ $# -ne 2 ]]; then
-  echo "Usage: $0 ARTIFACT_ROOT OUTPUT_DIR" >&2
+if [[ $# -lt 2 || $# -gt 3 ]]; then
+  echo "Usage: $0 ARTIFACT_ROOT OUTPUT_DIR [default|memory]" >&2
   exit 2
 fi
 
@@ -15,6 +15,12 @@ if [[ -d "$2" ]] && find "$2" -mindepth 1 -print -quit | grep -q .; then
   exit 2
 fi
 output_dir=$(mkdir -p "$2" && realpath "$2")
+profile_mode=${3:-default}
+case "${profile_mode}" in
+  default) sysmon_debug_level=1 ;;
+  memory) sysmon_debug_level=0 ;;
+  *) echo "Unknown sysMon profile mode: ${profile_mode}" >&2; exit 2 ;;
+esac
 serial=${ANDROID_SERIAL:-49d1c7b2}
 sdk_root=${HEXAGON_SDK_ROOT:?HEXAGON_SDK_ROOT is not set}
 tools_root=${HEXAGON_TOOLS:?HEXAGON_TOOLS is not set}
@@ -82,7 +88,7 @@ for stage_dir in "${stage_dirs[@]}"; do
 done
 
 coproc SYSMON_PROC {
-  "${adb_cmd[@]}" shell "/data/local/tmp/sysMonApp profiler --debugLevel 1 --q6 cdsp --samplingPeriodUs 1000" \
+  "${adb_cmd[@]}" shell "/data/local/tmp/sysMonApp profiler --debugLevel ${sysmon_debug_level} --q6 cdsp --samplingPeriodUs 1000" \
     >"${output_dir}/sysmon_host.log" 2>&1
 }
 sysmon_pid=${SYSMON_PROC_PID}
@@ -132,6 +138,8 @@ printf '{\n  "kernel_elapsed_seconds": %s\n}\n' "${elapsed}" \
 python "${repo_root}/scripts/summarize_sysmon_profile.py" \
   --raw-pmu "${output_dir}/parsed/raw_pmu.csv" \
   --kernel-window "${output_dir}/kernel_window.json" \
+  --run-log "${output_dir}/run_host.log" \
+  --profile-mode "${profile_mode}" \
   --json "${output_dir}/kernel_window_summary.json" \
   --markdown "${output_dir}/kernel_window_summary.md"
 "${repo_root}/scripts/prepare_phone_benchmark.sh" status >"${output_dir}/phone_after.txt"

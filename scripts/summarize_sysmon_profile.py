@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import math
+import re
 from pathlib import Path
 
 
@@ -39,6 +40,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--raw-pmu", type=Path, required=True)
     parser.add_argument("--kernel-window", type=Path, required=True)
+    parser.add_argument("--run-log", type=Path)
+    parser.add_argument(
+        "--profile-mode", choices=("default", "memory"), default="default"
+    )
     parser.add_argument("--json", type=Path, required=True)
     parser.add_argument("--markdown", type=Path, required=True)
     args = parser.parse_args()
@@ -64,6 +69,7 @@ def main() -> None:
     selected.reverse()
 
     events: dict[int, int] = {}
+    event_exposure_ms: dict[int, float] = {}
     pcycles = 0
     bwmon_bytes = 0
     axi_bytes_per_sample: list[int] = []
@@ -77,11 +83,14 @@ def main() -> None:
         pcycles += int(row["pcycles"], 0)
         bwmon_bytes += int(row["BWMON Count(Bytes)"], 0)
         sample_events: dict[int, int] = {}
+        sample_period_ms = parse_number(row["Sampling period(ms)"])
         for index in range(8):
             event = int(row[f"PMU_{index}_Num"], 0)
             value = int(row[f"PMU_{index}_Val"], 0)
             events[event] = events.get(event, 0) + value
             sample_events[event] = sample_events.get(event, 0) + value
+        for event in sample_events:
+            event_exposure_ms[event] = event_exposure_ms.get(event, 0.0) + sample_period_ms
         sample_axi = (
             sample_events.get(0x3F, 0) * 128
             + sample_events.get(0xCD, 0) * 256
@@ -123,8 +132,48 @@ def main() -> None:
     )
     effective_core_mhz = pcycles / selected_ms / 1000.0 if selected_ms else math.nan
     npa_core_avg = average(npa_core_clocks)
+
+    def exposure_normalized_event(event: int) -> int | None:
+        """Estimate the full-window count for a multiplexed user-mode event."""
+        exposure = event_exposure_ms.get(event, 0.0)
+        if exposure <= 0.0:
+            return None
+        return round(events.get(event, 0) * selected_ms / exposure)
+
+    vtcm_peaks: list[int] = []
+    vtcm_pools: list[int] = []
+    if args.run_log and args.run_log.is_file():
+        pattern = re.compile(
+            r"\[ALPS-VTCM\]\s+peak_allocated_bytes=(\d+)\s+pool_bytes=(\d+)"
+        )
+        for match in pattern.finditer(
+            args.run_log.read_text(encoding="utf-8", errors="replace")
+        ):
+            vtcm_peaks.append(int(match.group(1)))
+            vtcm_pools.append(int(match.group(2)))
+
+    memory_events = {
+        # Event numbers are the V73 numbers emitted by sysMon's raw_pmu.csv.
+        "dcache_demand_miss_events_estimated": 0x13,
+        "l2_du_read_miss_events_estimated": 0x7D,
+        "l2_du_store_miss_events_estimated": 0x8C,
+        "hvx_l2_load_miss_events_estimated": 0x11A,
+        "hvx_l2_store_miss_events_estimated": 0x124,
+        "vtcm_active_cycles_estimated": 0x14C,
+        "vtcm_vector_load_events_estimated": 0x159,
+        "vtcm_vector_store_events_estimated": 0x15E,
+        "vtcm_read_access_events_estimated": 0x164,
+        "vtcm_write_access_events_estimated": 0x165,
+        "vtcm_external_read_events_estimated": 0x173,
+        "vtcm_external_write_events_estimated": 0x174,
+    }
+    normalized_memory_events = {
+        name: exposure_normalized_event(event)
+        for name, event in memory_events.items()
+    }
     result = {
         "interpretation": "sysmon_hardware_pmu_kernel_window",
+        "profile_mode": args.profile_mode,
         "kernel_elapsed_seconds": kernel_seconds,
         "selected_sample_milliseconds": selected_ms,
         "selected_samples": len(selected),
@@ -175,9 +224,26 @@ def main() -> None:
         "blc_latency_count": blc_weight,
         "blc_latency_weighted_avg_ns": blc_weighted_latency,
         "raw_event_totals": {hex(key): value for key, value in sorted(events.items())},
+        "raw_event_exposure_milliseconds": {
+            hex(key): value for key, value in sorted(event_exposure_ms.items())
+        },
+        **normalized_memory_events,
+        "vtcm_peak_usage_bytes": max(vtcm_peaks) if vtcm_peaks else None,
+        "vtcm_pool_reserved_bytes": max(vtcm_pools) if vtcm_pools else None,
+        # VTCM_RD/VTCM_WR are access-event counters.  Their transferred width
+        # is not reported by sysMon and can differ across scalar, HVX, HMX and
+        # partial accesses, so manufacturing a byte count would be unsound.
+        "vtcm_read_bytes": None,
+        "vtcm_write_bytes": None,
+        "vtcm_byte_count_status": "not_exposed_by_sysmon_use_access_events",
     }
     args.json.parent.mkdir(parents=True, exist_ok=True)
     args.json.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    def metric(value: object, unit: str = "") -> str:
+        if value is None:
+            return "NA"
+        return f"{value} {unit}".rstrip()
+
     lines = [
         "# ALPS sysMon kernel-window summary",
         "",
@@ -212,6 +278,17 @@ def main() -> None:
         f"| Thermal throttle limit, maximum | {result['thermal_throttle_max_mhz']:.2f} MHz |",
         f"| Thermal-throttled samples | {result['thermal_throttle_nonzero_samples']} |",
         f"| BLC weighted latency | {blc_weighted_latency:.2f} ns |",
+        f"| VTCM peak live allocation | {metric(result['vtcm_peak_usage_bytes'], 'B')} |",
+        f"| VTCM arena reserved | {metric(result['vtcm_pool_reserved_bytes'], 'B')} |",
+        f"| D-cache demand misses (exposure-normalized) | {metric(result['dcache_demand_miss_events_estimated'], 'events')} |",
+        f"| L2 DU read misses (exposure-normalized) | {metric(result['l2_du_read_miss_events_estimated'], 'events')} |",
+        f"| L2 DU store misses (exposure-normalized) | {metric(result['l2_du_store_miss_events_estimated'], 'events')} |",
+        f"| HVX L2 load misses (exposure-normalized) | {metric(result['hvx_l2_load_miss_events_estimated'], 'events')} |",
+        f"| HVX L2 store misses (exposure-normalized) | {metric(result['hvx_l2_store_miss_events_estimated'], 'events')} |",
+        f"| VTCM reads (exposure-normalized) | {metric(result['vtcm_read_access_events_estimated'], 'access events')} |",
+        f"| VTCM writes (exposure-normalized) | {metric(result['vtcm_write_access_events_estimated'], 'access events')} |",
+        "| VTCM read bytes | NA (sysMon does not expose access width) |",
+        "| VTCM write bytes | NA (sysMon does not expose access width) |",
         "",
         "| 1 ms activity window | Samples | AXI bytes |",
         "|---|---:|---:|",
