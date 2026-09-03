@@ -17,8 +17,8 @@ class Dinov2SmallWrapper(torch.nn.Module):
         return self.model(pixel_values=pixel_values).logits
 
 
-def create_dinov2_small_full_model_and_input():
-    """Return the exact model and input used by the full Hexagon benchmark."""
+def create_dinov2_small_full_model_and_input(num_hidden_layers: int = 12):
+    """Return the full-width workload, optionally with fewer encoder blocks."""
     torch.manual_seed(142)
     config = Dinov2Config(
         # The published DINOv2 checkpoint stores 518x518 positional
@@ -28,7 +28,7 @@ def create_dinov2_small_full_model_and_input():
         patch_size=14,
         num_channels=3,
         hidden_size=384,
-        num_hidden_layers=12,
+        num_hidden_layers=num_hidden_layers,
         num_attention_heads=6,
         intermediate_size=1536,
         qkv_bias=True,
@@ -76,7 +76,7 @@ def print_dinov2_small_full_identity(
     print(
         "[FullModel] DINOv2-small patch14: stored_image=518 input=224 "
         f"input_shape={tuple(pixels.shape)} input_dtype={pixels.dtype} "
-        "tokens=257 layers=12 "
+        f"tokens=257 layers={config.num_hidden_layers} "
         f"hidden={config.hidden_size} heads={config.num_attention_heads} "
         f"intermediate={config.intermediate_size} params={params} "
         "seed=142 weights=random_full_structure"

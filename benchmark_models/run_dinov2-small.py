@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import os
 import sys
 
 import torch
@@ -27,7 +28,7 @@ from hexkl_utils import (  # noqa: E402
 
 def run(args: argparse.Namespace) -> None:
     patch_full_model_dsp_heap()
-    wrapped, pixels = create_dinov2_small_full_model_and_input()
+    wrapped, pixels = create_dinov2_small_full_model_and_input(args.model_layers)
     print_dinov2_small_full_identity(wrapped, pixels)
     inputs = [pixels]
     # torch-mlir lifts the non-persistent fixed position-embedding buffer to
@@ -133,6 +134,8 @@ def run(args: argparse.Namespace) -> None:
         mlir_text=patched,
         iterations=args.device_iterations,
     )
+    if os.getenv("HEXAGON_MLIR_COMPILE_ONLY", "0") == "1":
+        return
     finite = bool(torch.isfinite(output[0]).all())
     abs_diff = (output[0].float() - reference.float()).abs()
     diff = abs_diff.max().item()
@@ -154,4 +157,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     add_phase4_args(parser)
     parser.add_argument("--device-iterations", type=int, default=1)
+    parser.add_argument(
+        "--model-layers", type=int, choices=(1, 3, 5, 12), default=12,
+        help="Encoder blocks; 12 is the published DINOv2-small architecture.",
+    )
     run(parser.parse_args())

@@ -7,7 +7,7 @@
 #
 # ===------------------------------------------------------------------------===
 
-import json, os, subprocess, struct, sys, shutil
+import json, os, re, shlex, subprocess, struct, sys, shutil
 import time
 import torch
 import numpy as np
@@ -420,6 +420,10 @@ class HexagonExecutor:
             )
         except subprocess.CalledProcessError as e:
             print(f"Error executing the command: {e}")
+            if e.stdout:
+                print(f"STDOUT: {e.stdout}")
+            if e.stderr:
+                print(f"STDERR: {e.stderr}")
             sys.exit(1)
         return kernel_path
 
@@ -961,6 +965,49 @@ class HexagonExecutor:
         SIM_OSM_PATH = os.path.join(local_dir, f"osm.cfg")
         SIM_Q6SS_PATH = os.path.join(local_dir, f"q6ss.cfg")
 
+        # Keep the default simulator path unchanged, but allow portability
+        # experiments to select a concrete core revision and timing mode.  The
+        # revision is deliberately constrained to the active compilation
+        # architecture; accepting arbitrary shell text here would make the
+        # command below unsafe.
+        sim_core = os.getenv("HEXAGON_SIM_CORE", f"v{self.config.Q6_VERSION}")
+        if not re.fullmatch(rf"v{re.escape(self.config.Q6_VERSION)}[A-Za-z0-9_]*", sim_core):
+            raise ValueError(
+                "HEXAGON_SIM_CORE must be a core revision of the active "
+                f"v{self.config.Q6_VERSION} target, got {sim_core!r}"
+            )
+        sim_options = []
+        if os.getenv("HEXAGON_SIM_BYPASS_IDLE", "0") == "1":
+            # Fast-forward intervals in which every simulated hardware thread
+            # is idle.  This preserves executed kernel instructions and is the
+            # one simulator speed knob that does not fake memory latency.
+            sim_options.append("--bypass_idle")
+        if os.getenv("HEXAGON_SIM_TIMING", "0") == "1":
+            sim_options.extend(
+                [
+                    "--timing",
+                    "--pmu_statsfile",
+                    os.path.join(local_dir, "hexagon-sim-pmu.txt"),
+                ]
+            )
+        # Optional platform calibration knobs.  They alter the simulated
+        # target's clock/memory timing; they are intentionally unset by
+        # default because a guessed value would make cross-revision results
+        # look more realistic while making them less defensible.
+        calibration_options = (
+            ("HEXAGON_SIM_DSP_CLOCK_MHZ", "--dsp_clock"),
+            ("HEXAGON_SIM_BUS_RATIO", "--busratio"),
+            ("HEXAGON_SIM_BUS_PENALTY", "--buspenalty"),
+        )
+        for env_name, option_name in calibration_options:
+            value = os.getenv(env_name)
+            if value is None:
+                continue
+            if not value.isdecimal() or int(value) <= 0:
+                raise ValueError(f"{env_name} must be a positive integer, got {value!r}")
+            sim_options.extend([option_name, value])
+        sim_options_string = " ".join(shlex.quote(arg) for arg in sim_options)
+
         commands = [
             (
                 'echo "{}/rtos/qurt/computev{}/debugger/lnx64/qurt_model.so" > {}'.format(
@@ -979,7 +1026,7 @@ class HexagonExecutor:
                     self.config.env_vars["HEXAGON_TOOLS"], SIM_Q6SS_PATH
                 )
             ),
-            ("{} -mv{} \
+            ("{} -m{} {} \
                 --usefs={}/../Tools/target/hexagon/lib/v{}/G0/pic \
                 --simulated_returnval \
                 --cosim_file {} \
@@ -990,7 +1037,8 @@ class HexagonExecutor:
                 stack_size=0x400000 -- \
                 {}").format(
                 self.config.HEX_TOOLS["hexagon-sim"],
-                self.config.Q6_VERSION,
+                sim_core,
+                sim_options_string,
                 self.config.env_vars["HEXAGON_TOOLS"],
                 self.config.Q6_VERSION,
                 SIM_Q6SS_PATH,
@@ -1007,11 +1055,20 @@ class HexagonExecutor:
             for cmd_idx, command in enumerate(commands):
                 print(command)
                 result = subprocess.run(
-                    command, shell=True, check=True, capture_output=True, text=True
+                    command,
+                    shell=True,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    cwd=local_dir,
                 )
                 if cmd_idx == len(commands) - 1:
                     print(f"STDOUT: {result.stdout}")
                     print(f"STDERR: {result.stderr}")
         except subprocess.CalledProcessError as e:
             print(f"Error executing the command: {e}")
+            if e.stdout:
+                print(f"STDOUT: {e.stdout}")
+            if e.stderr:
+                print(f"STDERR: {e.stderr}")
             sys.exit(1)

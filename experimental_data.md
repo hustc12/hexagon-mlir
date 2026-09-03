@@ -1355,3 +1355,49 @@ above `1.00x` is an ALPS speedup over that column, whereas a value below
 
 The machine-readable source for this rendered table is
 `../alps_end2end_data.csv`.
+
+## Hexagon V75/V79 portability study (2026-09-02)
+
+This experiment uses Hexagon Tools 19.0.02 `hexagon-sim` with the concrete
+`v75na_1` and `v79na_1` cores.  It is deliberately split into two evidence
+levels.  First, architecture-preserving proxies execute the complete
+HexKL-Off, HexKL-On, and ALPS paths and pass numerical correctness.  Second,
+the complete published FP16 graphs are passed through ALPS lowering, target
+code generation, and shared-object linking.  Full-model simulator execution
+is not used because instruction-level interpretation requires tens of minutes
+even for a single full-width block and many hours for Swin.
+
+`Kernel PerfP50` is a functional-simulator kernel counter.  It supports only
+within-core relative comparisons and must not be presented as V75/V79 device
+latency.  Simulator frequency, bus ratio, and bus penalty remain uncalibrated;
+only `--bypass_idle` is enabled to skip intervals in which every simulated
+hardware thread is idle.
+
+| Core | Dynamic proxy | HMLIR HVX (HexKL Off) | HMLIR HVX (HexKL On) | ALPS | Off / ALPS | On / ALPS | Correctness |
+|---|---|---:|---:|---:|---:|---:|---|
+| v75na_1 | DINOv2-small | 37,711 | 32,541 | **8,881** | **4.25x** | **3.66x** | finite; Top-1; max error 0.0005 |
+| v79na_1 | DINOv2-small | 50,282 | 43,377 | **11,830** | **4.25x** | **3.67x** | finite; Top-1; max error 0.0002 |
+| v75na_1 | Swin Transformer | 2,001,753 | 559,319 | **498,375** | **4.02x** | **1.12x** | CPU tolerance/Top-1 gate |
+| v79na_1 | Swin Transformer | 2,668,930 | 745,717 | **664,463** | **4.02x** | **1.12x** | CPU tolerance/Top-1 gate |
+
+The DINO proxy uses FP16, image 32, patch 8, and the same attention/MLP
+operator structure.  The Swin proxy uses FP16, image 56, embed 48, window 7,
+and legal depths `[1,1]`, retaining patch embedding, window attention, MLP,
+layout transformations, and patch merging.  All 12 cases are PASS.  ALPS also
+reports nonzero consumer-layout formation, vectorized formation, FP16
+epilogue, and prefetch-admission activity on both revisions.  The nearly
+identical speedup ratios across V75 and V79 are the primary dynamic portability
+observation.
+
+| Core | Complete ALPS model | Published structure | Lowering/codegen/link | Host compile time |
+|---|---|---|---|---:|
+| v75 | DINOv2-small | 224x224, 12 blocks, hidden 384 | PASS | 315.70 s |
+| v79 | DINOv2-small | 224x224, 12 blocks, hidden 384 | PASS | 323.10 s |
+| v75 | Swin-Tiny | 224x224, depths `[2,2,6,2]`, embed 96 | PASS | 943.16 s |
+| v79 | Swin-Tiny | 224x224, depths `[2,2,6,2]`, embed 96 | PASS | 966.15 s |
+
+This supports the bounded claim that full ALPS graphs compile and link for
+V75/V79 and that representative graphs execute correctly with consistent
+relative trends.  It does not replace physical-device measurements.  Exact
+raw values are preserved in
+`docs_engineering/alps_hexsim_portability_20260902.csv`.

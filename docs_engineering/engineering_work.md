@@ -1828,6 +1828,71 @@ HEXAGON_MLIR_DUMP_DIR=../run_artifacts/tinyllama_hexkl \
   --output-dir ../run_artifacts/tinyllama_hexkl/mlirbc
 ```
 
+### 2026-09-02: Hexagon virtual-platform portability assessment
+
+We evaluated both virtual execution engines shipped in Hexagon SDK 6.4.0.2.
+They serve different purposes and must not be treated as interchangeable
+performance platforms.
+
+The SDK QEMU binary is usable after supplying its host-side `libfdt.so.1` and
+`libvirglrenderer.so.1` dependencies.  It reports Hexagon QEMU 11.0.2 and
+ships an HMX coprocessor RPC model.  It is nevertheless unsuitable for an
+ALPS cross-generation latency comparison.  The QEMU guide states that QEMU
+always enables the most recent DSP architecture and cannot select a different
+architecture.  Machine names such as `V68N_1024`, `V73NA_1024`, and
+`V75NA_1024` select system/memory configurations, not the corresponding ISA.
+QEMU also counts packets rather than processor cycles and does not model
+stalls.  Its wall time and reported `pcycle` therefore cannot support a
+prefetch/VTCM/DMA speedup claim.
+
+The detailed `hexagon-sim` binary is available and runs after supplying its
+host-side `libncurses.so.5` compatibility dependency.  The installed simulator
+is version 19.0.02 and explicitly supports architectures 68, 69, 71, 73, 75,
+77, 79, and 81.  It provides timing, PMU, cache, bus, stall, VTCM, and HMX
+controls.  This makes it useful for compilation and functional portability,
+and for microarchitectural investigation after calibration.  It does not by
+itself provide a defensible substitute for a second physical phone:
+
+* the simulator guide calls timing cycle-approximate rather than cycle-accurate;
+  its nominal 3% target applies only against similarly configured hardware;
+* AXI ratios, bus penalties, DSP clocks, cache partitioning, and TCM mappings
+  must match a concrete SoC, which we do not currently possess for the target
+  generations;
+* for V5 and later, the documented timing cache model assumes perfect caches
+  and does not model cache data, precisely weakening the effects ALPS is meant
+  to measure; and
+* the current QuRT boot reports that the default L2 cache parameters do not
+  match its custom configuration, so default timing numbers are uncalibrated.
+
+The installed component matrix further narrows the useful comparison:
+
+| Target | simulator/QuRT path | HMX-capable simulator core | HexKL archive used by current ALPS | Suitable conclusion |
+|---|---|---|---|---|
+| V68 | yes | yes (`H3` variants) | no | HVX compile/function only |
+| V69 | yes | yes (`H3` variants) | no | HVX compile/function only |
+| V71 | simulator ISA only; no packaged QuRT model/runner | no listed HMX core | no | bare-kernel compile only |
+| V73 | yes | yes | yes | physical-phone primary result |
+| V75 | yes | yes | yes | full ALPS functional-portability candidate |
+| V79 | yes | target variants available | yes | later functional candidate |
+
+As a concrete availability test, a previously generated complete DINOv2-small
+V73 shared object, including its 44.6 MB constant sidecar, was loaded through
+QuRT and entered model execution in `hexagon-sim`.  A bounded non-timing run
+reached 100,000,001 simulated pcycles in 35.13 host seconds.  It did not finish
+one inference in that window.  All cache, AXI, VTCM, and HVX PMU events were
+zero in non-timing mode, as expected.  Thus neither this host elapsed time nor
+the packet/pcycle counter is a model latency result.
+
+The two strongest current ALPS models are DeiT-small (3.20x over matched
+HexKL-On) and DINOv2-small (3.25x).  If a functional portability appendix is
+desired, these are the right two models to compile for V75 and run to
+completion under `hexagon-sim`, reporting correctness, successful HMX/HVX
+code generation, and static movement reduction.  We must label any simulator
+packet/cycle data as diagnostic and must not mix it with the physical V73
+latency table.  A publishable cross-generation speedup claim still requires a
+second physical Hexagon device or a vendor-provided, SoC-calibrated HMX virtual
+platform with a validated cache/DDR/VTCM model.
+
 ### 17.16 Falcon decision after the complete HexKL comparison
 
 Falcon-RW-1B is likely to have HexKL-friendly f16 projections: its published
@@ -1964,3 +2029,70 @@ HEXAGON_MLIR_DUMP_DIR=../run_artifacts/smollm2_hexkl \
   scripts/run_smollm2_layered_probe.sh --enable-hexkl --device-iterations 1 \
   --output-dir ../run_artifacts/smollm2_hexkl/mlirbc
 ```
+
+### 17.18 V75/V79 simulator portability validation (2026-09-02)
+
+`hexagon-sim` 19.0.02 was used with the concrete `v75na_1` and `v79na_1`
+cores.  A full timing simulation proved impractical: the simulator interprets
+target instructions on one host core, and even a one-block, full-width DINO
+graph takes tens of minutes.  Changing `--dsp_clock`, `--busratio`, or
+`--buspenalty` changes the target timing model rather than host throughput and
+would bias a memory-optimization comparison.  Functional mode with
+`--bypass_idle` is therefore used for dynamic validation.  `PerfP50` below is
+a simulator kernel counter useful only for within-core relative comparison;
+it is not a V75/V79 device latency.
+
+The dynamic DINO proxy retains DINO attention/MLP structure in f16 at image
+32, patch 8.  The Swin proxy retains f16 patch embedding, two legal window-7
+attention stages and patch merging at image 56, depths `[1,1]`, and embed 48.
+All 12 combinations complete, execute on the requested revision, and pass
+their numerical gates.
+
+| Core | Proxy | HexKL off | HexKL on | ALPS | Off / ALPS | On / ALPS | Correctness |
+|---|---|---:|---:|---:|---:|---:|---|
+| v75na_1 | DINOv2-small | 37,711 | 32,541 | 8,881 | **4.25x** | **3.66x** | finite, Top-1, max error 0.0005 |
+| v79na_1 | DINOv2-small | 50,282 | 43,377 | 11,830 | **4.25x** | **3.67x** | finite, Top-1, max error 0.0002 |
+| v75na_1 | Swin Transformer | 2,001,753 | 559,319 | 498,375 | **4.02x** | **1.12x** | CPU tolerance/Top-1 gate |
+| v79na_1 | Swin Transformer | 2,668,930 | 745,717 | 664,463 | **4.02x** | **1.12x** | CPU tolerance/Top-1 gate |
+
+The near-identical *ratios* across v75 and v79 are the relevant result.  ALPS
+is not merely accepted by both instruction sets: its transformation path is
+active on both.  For example, DINO reports one P5I patch-layout formation,
+four P2E consumer-layout demands, one successful P2G vectorized formation,
+six P5J f16 epilogues, and two admitted supply candidates on each revision.
+Swin reports 16 P2E demands, two successful P2G vectorized formations, nine
+P5J epilogues, and two admitted supply candidates.  Some later candidates are
+correctly rejected by the traffic model; portability does not depend on
+forcing every optional optimization.
+
+To separate small-workload runtime evidence from full-graph compatibility,
+the complete FP16 models were also passed through ALPS lowering, target code
+generation, and shared-object linking without simulator execution:
+
+| Core | Complete model | Structure | Compile + link | Host time (s) |
+|---|---|---|---|---:|
+| v75 | DINOv2-small | 224x224, 12 blocks, hidden 384 | PASS | 315.70 |
+| v79 | DINOv2-small | 224x224, 12 blocks, hidden 384 | PASS | 323.10 |
+| v75 | Swin-Tiny | 224x224, depths `[2,2,6,2]`, embed 96 | PASS | 943.16 |
+| v79 | Swin-Tiny | 224x224, depths `[2,2,6,2]`, embed 96 | PASS | 966.15 |
+
+Together these results support a bounded portability claim: the complete ALPS
+graphs compile and link for v75/v79, and representative model graphs execute
+correctly with consistent relative trends.  They do **not** establish
+hardware-equivalent v75/v79 end-to-end latency.  That stronger claim still
+requires physical devices or a vendor-calibrated SoC memory model.
+
+The serial, restartable commands are:
+
+```bash
+# Dynamic three-way proxy validation; no timing mode and no timeout.
+scripts/run_hexagon_sim_portability.sh --no-timing --workload proxy
+
+# Complete published-structure ALPS lowering/codegen/link validation.
+scripts/run_hexagon_sim_portability.sh --no-timing --compile-only \
+  --model-layers 12 --scheme alps-final \
+  --output-dir /tmp/alps_hexsim_portability_20260902_full_compile
+```
+
+The exact raw summary is preserved in
+`docs_engineering/alps_hexsim_portability_20260902.csv`.

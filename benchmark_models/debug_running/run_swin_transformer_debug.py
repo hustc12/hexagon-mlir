@@ -24,9 +24,9 @@ _SPEC.loader.exec_module(_MOD)
 
 
 def _tiny_config(config):
-    config.depths = [1, 1, 1, 1]
+    config.depths = [1, 1]
     config.embed_dim = 48
-    config.num_heads = [3, 6, 12, 24]
+    config.num_heads = [3, 6]
     config.hidden_act = "gelu_new"
     print(
         f"[Debug] tiny Swin: depths={config.depths} embed_dim={config.embed_dim} "
@@ -72,6 +72,7 @@ def main():
         prefetch_baseline=args.prefetch_baseline,
         prefetch_baseline_distance=args.prefetch_baseline_distance,
         apt_get_hx_manual_candidate_ids=args.apt_get_hx_manual_candidate_ids,
+        input_size=56,
     )
 
 

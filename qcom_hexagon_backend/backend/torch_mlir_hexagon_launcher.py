@@ -744,6 +744,14 @@ class TorchMLIRHexagonLauncher(HexagonLauncherBase):
             flush=True,
         )
 
+        if os.getenv("HEXAGON_MLIR_COMPILE_ONLY", "0") == "1":
+            print(
+                "[CompileOnly] MLIR lowering, target code generation, and "
+                "shared-object linking completed",
+                flush=True,
+            )
+            return []
+
         func_name_with_ciface = "_mlir_ciface_" + func_name
         # Execute the kernel using the HexagonExecutor `hexec`
         results = self.execute_kernel(

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Optional
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -101,6 +102,8 @@ def swin_transformer(
     omnifetch_items_through: int = 0,
     enable_omnifetch_kv_cache_prefetch: bool = False,
     disable_omnifetch_persistent_wh_cache: bool = False,
+    model_layers: Optional[int] = None,
+    input_size: int = 224,
 ):
     # Full 28M-parameter graph exceeds the Debug runner's 256 MiB heap.
     patch_full_model_dsp_heap()
@@ -109,8 +112,20 @@ def swin_transformer(
     torch.manual_seed(211)
     model_name = "microsoft/swin-tiny-patch4-window7-224"
 
-    config = SwinConfig.from_pretrained(model_name)
+    # The benchmark only needs the architecture config and uses deterministic
+    # random weights.  Never perform a network metadata probe during a device
+    # or simulator experiment; the config is part of the local HF cache.
+    config = SwinConfig.from_pretrained(model_name, local_files_only=True)
     config = customize_model_config(config)
+    reduced_depths = {
+        1: [1],
+        3: [1, 1, 1],
+        5: [1, 1, 2, 1],
+        12: [2, 2, 6, 2],
+    }
+    if model_layers is not None:
+        config.depths = reduced_depths[model_layers]
+    config.image_size = input_size
     print(
         f"[Config] depths={config.depths} embed_dim={config.embed_dim} "
         f"num_heads={config.num_heads} window={config.window_size}"
@@ -121,7 +136,7 @@ def swin_transformer(
     wrapped = SwinWrapper(model).eval()
     func_name = wrapped.__class__.__name__
 
-    pixel_values = torch.rand(1, 3, 224, 224, dtype=torch.float16)
+    pixel_values = torch.rand(1, 3, input_size, input_size, dtype=torch.float16)
 
     # relative_position_index buffers are lifted as extra ABI inputs.
     rel_pos_indices = []
@@ -178,6 +193,8 @@ def swin_transformer(
         mlir_text=mlir_text,
         iterations=device_iterations,
     )
+    if os.getenv("HEXAGON_MLIR_COMPILE_ONLY", "0") == "1":
+        return
     print("Successfully ran Swin on Hexagon DSP!")
 
     with torch.no_grad():
@@ -197,6 +214,10 @@ if __name__ == "__main__":
     )
     add_phase4_args(parser)
     parser.add_argument("--device-iterations", type=int, default=1)
+    parser.add_argument(
+        "--model-layers", type=int, choices=(1, 3, 5, 12), default=12,
+        help="Total Swin blocks; 12 is the published [2,2,6,2] architecture.",
+    )
     args = parser.parse_args()
     swin_transformer(
         enable_hexkl=args.enable_hexkl,
@@ -223,4 +244,5 @@ if __name__ == "__main__":
         disable_omnifetch_persistent_wh_cache=(
             args.disable_omnifetch_persistent_wh_cache
         ),
+        model_layers=args.model_layers,
     )

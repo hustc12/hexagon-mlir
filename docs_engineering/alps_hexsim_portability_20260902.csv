@@ -1,0 +1,17 @@
+arch,model,evidence,scheme,status,kernel_perf_p50,sim_pcycles,host_wall_s,correctness_or_result
+v75,dinov2-small,dynamic-proxy,hmlir-hvx-hexkl-off,PASS,37711,39386209,24.17,finite; max_abs_diff=0.0005; top1_match=True
+v75,dinov2-small,dynamic-proxy,hmlir-hvx-hexkl-on,PASS,32541,35752039,26.94,finite; max_abs_diff=0.0005; top1_match=True
+v75,dinov2-small,dynamic-proxy,alps-final,PASS,8881,18724051,22.20,finite; max_abs_diff=0.0005; top1_match=True
+v75,swin-transformer,dynamic-proxy,hmlir-hvx-hexkl-off,PASS,2001753,1480549414,405.42,CPU tolerance match
+v75,swin-transformer,dynamic-proxy,hmlir-hvx-hexkl-on,PASS,559319,423199264,141.44,top1_match=True
+v75,swin-transformer,dynamic-proxy,alps-final,PASS,498375,379937179,177.99,top1_match=True
+v79,dinov2-small,dynamic-proxy,hmlir-hvx-hexkl-off,PASS,50282,51432810,27.65,finite; max_abs_diff=0.0002; top1_match=True
+v79,dinov2-small,dynamic-proxy,hmlir-hvx-hexkl-on,PASS,43377,46373970,27.58,finite; max_abs_diff=0.0002; top1_match=True
+v79,dinov2-small,dynamic-proxy,alps-final,PASS,11830,23674286,21.11,finite; max_abs_diff=0.0002; top1_match=True
+v79,swin-transformer,dynamic-proxy,hmlir-hvx-hexkl-off,PASS,2668930,1971114974,594.61,CPU tolerance match
+v79,swin-transformer,dynamic-proxy,hmlir-hvx-hexkl-on,PASS,745717,561746922,194.58,top1_match=True
+v79,swin-transformer,dynamic-proxy,alps-final,PASS,664463,503646762,237.79,top1_match=True
+v75,dinov2-small,full-224x224-compile-link,alps-final,PASS,NA,NA,315.70,12-layer shared object linked
+v75,swin-transformer,full-224x224-compile-link,alps-final,PASS,NA,NA,943.16,"depths=[2;2;6;2] shared object linked"
+v79,dinov2-small,full-224x224-compile-link,alps-final,PASS,NA,NA,323.10,12-layer shared object linked
+v79,swin-transformer,full-224x224-compile-link,alps-final,PASS,NA,NA,966.15,"depths=[2;2;6;2] shared object linked"
