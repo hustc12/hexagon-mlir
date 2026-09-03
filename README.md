@@ -27,6 +27,7 @@ This initiative complements our commercial toolchains by exploring an open‑sou
 - 🎓 [Tutorials](docs/tutorials/README.md) - A set of tutorials on Triton kernels and PyTorch models
 - ❓ [FAQ](docs/faq.md) - Frequently asked questions
 - 🏗️ [Developer Guide](docs/developer-guide.md) - Insights on how to develop, debug and profile using our compiler toolchain for Triton kernels and PyTorch models
+- 🧪 [ALPS Reproduction](scripts/reproduce/README.md) - One-command complete-model evaluation, ablation, traffic audit, and V75/V79 portability workflow
 
 ## License
 
