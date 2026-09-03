@@ -11,9 +11,12 @@ Run the complete workflow from any directory:
 /path/to/hexagon-mlir/run_alps.sh
 ```
 
-Running without an option prints a prominent long-runtime warning and then
-executes all four experiment classes. The full suite is exhaustive and can
-take many hours or longer. To run only one class, select it explicitly:
+Running without an option prints a prominent long-runtime warning and asks for
+confirmation. Only `y` or `yes` (case-insensitive) starts all four experiment
+classes; any other answer exits without compiling or running a model. The full
+suite is exhaustive and can take many hours or longer. An automated job that
+intentionally wants the complete suite should use `./run_alps.sh --all`, which
+does not prompt. To run only one class, select it explicitly:
 
 ```bash
 ./run_alps.sh --end-to-end

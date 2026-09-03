@@ -12,14 +12,15 @@ usage() {
 Usage: ./run_alps.sh [OPTIONS]
 
 Build ALPS once and run complete-model release experiments strictly serially.
-With no options, all four experiment classes run in the order shown below.
+With no options, the script asks for confirmation and then runs all four
+experiment classes in the order shown below.
 
 Experiment selection:
   -e, --end-to-end     Run the 15-model, five-configuration end-to-end study
   -a, --ablation       Run the A0--A4 ablation on five selected models
   -m, --movement       Generate the data-movement and physical-traffic audit
   -p, --portability    Run the Hexagon V75/V79 portability study
-      --all            Run all four experiment classes (the default)
+      --all            Run all four classes without the default confirmation
   -b, --build-only     Build or reuse the V73 ALPS toolchain; run no experiment
   -h, --help           Show this help and exit
 
@@ -28,7 +29,8 @@ canonical order: end-to-end, ablation, movement/traffic, then portability.
 The build stage is incremental and is checked once before the selected tests.
 
 Examples:
-  ./run_alps.sh                       # build, then run all four classes
+  ./run_alps.sh                       # confirm, build, then run all four classes
+  ./run_alps.sh --all                 # explicitly run all without confirmation
   ./run_alps.sh --end-to-end          # only the complete-model end-to-end study
   ./run_alps.sh --ablation            # only the selected-model ablation
   ./run_alps.sh --movement            # only the movement/traffic audit
@@ -39,6 +41,7 @@ Examples:
 Important runtime notes:
   * The complete default suite is intentionally exhaustive and can take many
     hours or longer, depending on compilation, device, and simulator speed.
+    An unqualified invocation requires an explicit Yes before work begins.
   * Models and configurations are serial; there is no model-level parallelism.
   * Runs have no timeout and failed cases are not automatically retried.
   * Experiment 03 reuses experiment 01 data when available. If those data are
@@ -114,13 +117,32 @@ if ((!explicit_selection || explicit_all)); then
   run_ablation=1
   run_movement=1
   run_portability=1
+fi
+
+if ((!explicit_selection && !explicit_all)); then
   cat >&2 <<'EOF'
 
 WARNING: no individual experiment was selected; the complete ALPS suite will
 run. It covers all four release experiment classes and may take many hours or
 longer. Use --end-to-end, --ablation, --movement, or --portability to run only
-the required class. Run with --help for the complete interface.
+the required class. Use --all to explicitly run the complete suite without an
+interactive prompt. Run with --help for the complete interface.
 EOF
+
+  printf 'Continue with all four experiment classes? [yes/No] ' >&2
+  if ! IFS= read -r confirmation; then
+    printf '\nNo confirmation received; exiting without running ALPS.\n' >&2
+    exit 0
+  fi
+  case ${confirmation,,} in
+    y|yes)
+      echo "Confirmed; starting the complete ALPS suite." >&2
+      ;;
+    *)
+      echo "Not confirmed; exiting without running ALPS." >&2
+      exit 0
+      ;;
+  esac
 fi
 
 stages=(00_build_alps.sh)
