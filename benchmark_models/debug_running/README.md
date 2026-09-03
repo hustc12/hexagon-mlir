@@ -16,7 +16,7 @@ Full published topology: `benchmark_models/run_*.py` (parent directory).
 Use the repository script rather than invoking the runners separately:
 
 ```bash
-ANDROID_SERIAL=49d1c7b2 scripts/run_debug_matrix.sh \
+ANDROID_SERIAL=49d1c7b2 scripts/script_legacy/run_debug_matrix.sh \
   --seq-len 32 \
   --timeout 600 \
   --output-dir /tmp/omnifetch-debug-matrix \

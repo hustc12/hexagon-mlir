@@ -27,7 +27,21 @@ This initiative complements our commercial toolchains by exploring an open‑sou
 - 🎓 [Tutorials](docs/tutorials/README.md) - A set of tutorials on Triton kernels and PyTorch models
 - ❓ [FAQ](docs/faq.md) - Frequently asked questions
 - 🏗️ [Developer Guide](docs/developer-guide.md) - Insights on how to develop, debug and profile using our compiler toolchain for Triton kernels and PyTorch models
-- 🧪 [ALPS Reproduction](scripts/reproduce/README.md) - One-command complete-model evaluation, ablation, traffic audit, and V75/V79 portability workflow
+- 🧪 [ALPS Reproduction](scripts/script_release/README.md) - One-command complete-model evaluation, ablation, traffic audit, and V75/V79 portability workflow
+- 📊 [ALPS Results and Analysis](docs/alps/README.md) - Canonical complete-model data, portability evidence, and bottleneck analysis
+
+## ALPS evaluation
+
+After provisioning the dependencies described in the user guide, the complete
+release evaluation has a single zero-argument entry point:
+
+```bash
+./run_alps.sh
+```
+
+It builds the V73 toolchain once, then runs the 15-model end-to-end matrix, the
+selected-model ablation, the movement/traffic audit, and the V75/V79
+portability study strictly serially.
 
 ## License
 

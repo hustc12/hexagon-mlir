@@ -122,7 +122,7 @@ access/execute。
 
 ## 6. 构建（重要：绕过 requirements pin）
 
-`scripts/build_hexagon_mlir_working.sh` 会 `source scripts/build_triton.sh`，其中
+`scripts/script_legacy/build_hexagon_mlir_working.sh` 会 `source scripts/script_release/setup/build_triton.sh`，其中
 `pip install -r ci/requirements.txt` 死 pin 了 `torch-mlir==20260325.762`（已从 dev-wheels 索引
 下架，只剩 20260401+），导致构建在编译后端前中止。**venv 里 torch-mlir/torch/triton 已装好**，
 可直接跑后端增量编译，绕过该重装：

@@ -120,7 +120,7 @@ def LinalgToLLVM : Pass<"linalg-to-llvm", "mlir::ModuleOp"> {
           "Enable APT-GET-HX timing for manually-safe address candidates">,
     Option<"aptGetHxDistance", "apt-get-hx-distance", "int",
           /*default=*/"1",
-          "Distance selected offline by scripts/apt_get_hx_select.py">,
+          "Distance selected offline by scripts/script_legacy/apt_get_hx_select.py">,
     Option<"aptGetHxManualCandidateIds", "apt-get-hx-manual-candidate-ids", "std::string",
           /*default=*/"\"\"",
           "Comma-separated candidate IDs manually qualified for APT-GET-HX">,

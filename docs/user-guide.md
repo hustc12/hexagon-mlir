@@ -101,7 +101,7 @@ export HEXAGON_MLIR_ROOT=$PWD
 
 ### Script-based Build
 
-We provide a script `HEXAGON_MLIR_ROOT/scripts/build_hexagon_mlir.sh` that automates much of the setup process of building a complete `Hexagon-MLIR + Triton + Torch-MLIR` environment locally, including: 
+We provide a script `HEXAGON_MLIR_ROOT/scripts/script_release/setup/build_hexagon_mlir.sh` that automates much of the setup process of building a complete `Hexagon-MLIR + Triton + Torch-MLIR` environment locally, including:
 
 * Submodule setup for `triton` and `triton_shared`.
 * Downloading and extracting Hexagon SDK, Hexagon Tools, and Hexagon Kernel Library (HexKL).
@@ -109,14 +109,15 @@ We provide a script `HEXAGON_MLIR_ROOT/scripts/build_hexagon_mlir.sh` that autom
 * Creating a Python virtual environment and installing required Python packages.
 * Building Triton with Hexagon backend support and running tests.
 
-The default target is set to v75. To change the target to e.g. v73, you will need to change `export HEXAGON_ARCH_VERSION=75` to `73` in
-`scripts/set_local_env.sh` and  in `scripts/build_triton.sh`.
+The ALPS release workflow defaults to the measured v73 target. Set
+`HEXAGON_ARCH_VERSION` before invoking the setup scripts to target another
+supported revision.
 
 To run the script, navigate to the root of the `hexagon-mlir` repository and execute:
 
 ```bash
-source scripts/set_local_env.sh
-bash ./scripts/build_hexagon_mlir.sh
+source scripts/script_release/setup/set_local_env.sh
+bash ./scripts/script_release/setup/build_hexagon_mlir.sh
 ```
 The script builds hexagon-mlir and runs the LIT tests for you to ensure the build succeeded.
 ```
@@ -258,12 +259,12 @@ export TRITON_PLUGIN_DIRS="$HEXAGON_MLIR_ROOT/triton_shared;$HEXAGON_MLIR_ROOT/q
 export PATH=$TRITON_ROOT/build/cmake.linux-x86_64-cpython-${PYTHON_VERSION}/third_party/qcom_hexagon_backend/bin/:$TRITON_ROOT/build/cmake.linux-x86_64-cpython-${PYTHON_VERSION}/third_party/triton_shared/tools/triton-shared-opt:$PATH
 export PYTHONPATH=$TRITON_ROOT/python:$PYTHONPATH
 ```
-*Note*: Replace `${PYTHON_VERSION}` with your actual Python version, e.g., `3.11`. `HEXAGON_MLIR_ROOT/scripts/set_local_env.sh` is a good reference for setting these variables.
+*Note*: Replace `${PYTHON_VERSION}` with your actual Python version, e.g., `3.11`. `HEXAGON_MLIR_ROOT/scripts/script_release/setup/set_local_env.sh` is a good reference for setting these variables.
 
 Once your environment is valid:
 
 ```bash
-./scripts/build_triton.sh
+./scripts/script_release/setup/build_triton.sh
 ```
 
 This script:

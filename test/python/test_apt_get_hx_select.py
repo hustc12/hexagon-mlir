@@ -2,7 +2,12 @@ import importlib.util
 from pathlib import Path
 
 
-MODULE_PATH = Path(__file__).parents[2] / "scripts" / "apt_get_hx_select.py"
+MODULE_PATH = (
+    Path(__file__).parents[2]
+    / "scripts"
+    / "script_legacy"
+    / "apt_get_hx_select.py"
+)
 SPEC = importlib.util.spec_from_file_location("apt_get_hx_select", MODULE_PATH)
 APT = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None

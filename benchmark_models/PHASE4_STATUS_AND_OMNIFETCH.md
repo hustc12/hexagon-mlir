@@ -147,18 +147,18 @@ Compiler evidence that the path **fired** (not just flags): PrefetchInsert logs 
 
 Official source of truth: [`docs/user-guide.md`](../docs/user-guide.md)
 (“Building Hexagon-MLIR Compiler”) and scripts under `scripts/`.
-One-shot automation: `bash ./scripts/build_hexagon_mlir.sh`.
+One-shot automation: `bash ./scripts/script_release/setup/build_hexagon_mlir.sh`.
 
 There are **two** CMake layers. Do not conflate them:
 
 | Layer | What you configure | Where `Hexagon` appears |
 |-------|--------------------|-------------------------|
 | **1. LLVM for Triton** | `llvm-project/build` | **Must** pass `-DLLVM_TARGETS_TO_BUILD="AMDGPU;NVPTX;X86;Hexagon"` so LLVM can emit Hexagon IR/asm |
-| **2. Triton + Hexagon plugin** | `triton` via `scripts/build_triton.sh` | **Not** via `LLVM_TARGETS_TO_BUILD`. Hexagon backend comes from `TRITON_PLUGIN_DIRS=…/qcom_hexagon_backend` + linking against the LLVM built in layer 1 |
+| **2. Triton + Hexagon plugin** | `triton` via `scripts/script_release/setup/build_triton.sh` | **Not** via `LLVM_TARGETS_TO_BUILD`. Hexagon backend comes from `TRITON_PLUGIN_DIRS=…/qcom_hexagon_backend` + linking against the LLVM built in layer 1 |
 
 Paths below assume layout under `/home/huzq85/2-working/hexagon_npu/` (`BASE_DIR`). Adjust if yours differs.
 
-### 6.1 Environment (manual, matches user-guide + `scripts/set_local_env.sh`)
+### 6.1 Environment (manual, matches user-guide + `scripts/script_release/setup/set_local_env.sh`)
 
 ```bash
 cd /home/huzq85/2-working/hexagon_npu
@@ -198,7 +198,7 @@ export PATH=$TRITON_ROOT/build/cmake.linux-x86_64-cpython-${PYTHON_VERSION}/thir
 export PYTHONPATH=$TRITON_ROOT/python:${PYTHONPATH:-}
 
 # Shorthand: after cd hexagon-mlir, also OK to:
-#   source scripts/set_local_env.sh
+#   source scripts/script_release/setup/set_local_env.sh
 # (sets SDK/Tools/HexKL/TRITON_* relative to parent of HEXAGON_MLIR_ROOT)
 
 export ANDROID_SERIAL=49d1c7b2   # device used for GPT-2 2L ablations
@@ -206,10 +206,10 @@ export ANDROID_SERIAL=49d1c7b2   # device used for GPT-2 2L ablations
 
 ### 6.2 Layer 1 — build LLVM **with Hexagon target** (required once / on LLVM upgrade)
 
-Pin commit to `triton/cmake/llvm-hash.txt` (or the hash used by `scripts/build_hexagon_mlir.sh`).
+Pin commit to `triton/cmake/llvm-hash.txt` (or the hash used by `scripts/script_release/setup/build_hexagon_mlir.sh`).
 **This** is where `-DLLVM_TARGETS_TO_BUILD=…;Hexagon` belongs — without it, Hexagon codegen libraries are missing and the NPU backend cannot lower to Hexagon object code.
 
-From `docs/user-guide.md` / `scripts/build_hexagon_mlir.sh`:
+From `docs/user-guide.md` / `scripts/script_release/setup/build_hexagon_mlir.sh`:
 
 ```bash
 # Example (hash must match Triton’s expected LLVM):
@@ -247,10 +247,10 @@ User guide: set env (§6.1), then:
 
 ```bash
 cd $HEXAGON_MLIR_ROOT
-./scripts/build_triton.sh
+./scripts/script_release/setup/build_triton.sh
 ```
 
-What that script does (see `scripts/build_triton.sh`):
+What that script does (see `scripts/script_release/setup/build_triton.sh`):
 
 * `pip install -r ci/requirements.txt`
 * Sets `TRITON_PLUGIN_DIRS` (includes `qcom_hexagon_backend`)
@@ -301,14 +301,14 @@ cp -f $B/libtriton.so triton/python/triton/_C/libtriton.so
 python3 -c "from triton.backends.qcom_hexagon_backend.compiler import HexagonOptions; print(HexagonOptions())"
 ```
 
-If the CMake cache is corrupted, prefer **re-running `./scripts/build_triton.sh`** (or the `pip install -e .` block in §6.3) over inventing a custom Triton `cmake` line. Avoid deleting the whole tree unless necessary.
+If the CMake cache is corrupted, prefer **re-running `./scripts/script_release/setup/build_triton.sh`** (or the `pip install -e .` block in §6.3) over inventing a custom Triton `cmake` line. Avoid deleting the whole tree unless necessary.
 
 ### 6.5 What to rebuild after which edits
 
 | Change | Rebuild |
 |--------|---------|
 | `OmniFetchRuntime.c` / DMA / scout | `hexagon_runtime` (+ `hexagon_mlir_async_runtime` if scout enqueue) |
-| Prefetch / Decompose / MatmulToHexKL / options | `libtriton.so` (or full `./scripts/build_triton.sh`) |
+| Prefetch / Decompose / MatmulToHexKL / options | `libtriton.so` (or full `./scripts/script_release/setup/build_triton.sh`) |
 | Both | both, then re-run device harness (fresh DSP `.so`) |
 | LLVM hash / need Hexagon codegen libs | rebuild LLVM (§6.2) then Triton (§6.3) |
 
@@ -411,7 +411,7 @@ All listed rows: device Pass + Top-1 (2L).
 
 ## 8. Related living docs
 
-- **Build / install (authoritative):** `docs/user-guide.md`, `scripts/build_hexagon_mlir.sh`, `scripts/build_triton.sh`, `scripts/set_local_env.sh`
+- **Build / install (authoritative):** `docs/user-guide.md`, `scripts/script_release/setup/build_hexagon_mlir.sh`, `scripts/script_release/setup/build_triton.sh`, `scripts/script_release/setup/set_local_env.sh`
 - Living checklist / results table: `plan_todo.md`
 - OmniFetch analysis / roadmap: `benchmark_models/OMNIFETCH_ANALYSIS_AND_ROADMAP.md`
 - OmniFetch handoff: `benchmark_models/OMNIFETCH_IMPROVEMENTS_HANDOFF.md`

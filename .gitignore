@@ -36,6 +36,11 @@
 
 # Generated model compiler artifacts
 *.mlirbc
+*_f16matmul.mlir
+
+# Locally provisioned upstream compiler dependencies
+triton/
+triton_shared/
 
 # Python caches
 __pycache__/

@@ -24,9 +24,9 @@ copy of Triton or triton-shared:
 1. Fetch Qualcomm `main` and advance a new clean snapshot branch.
 2. Rebase `omnifetch-overlay` onto that snapshot.
 3. Resolve only the small integration surface recorded in `manifest.txt`.
-4. Run `scripts/verify_omnifetch_overlay.sh` to detect accidental changes to
+4. Run `scripts/script_legacy/verify_omnifetch_overlay.sh` to detect accidental changes to
    Qualcomm-owned files.
-5. Run `scripts/build_omnifetch_upstream.sh`.
+5. Run `scripts/script_legacy/build_omnifetch_upstream.sh`.
 6. Run the serial no-timeout model matrix.
 
 Do not copy the legacy `triton`, `triton_shared`, build trees, MLIR bytecode,
@@ -34,7 +34,7 @@ shared objects, logs, or model outputs into this repository.
 
 The pinned LLVM revision also needs three later official Hexagon fixes for
 large v73 full models. Exact upstream patches are stored in `patches/llvm/`
-and applied idempotently by `scripts/apply_llvm_hexagon_fixes.sh`: truncating
+and applied idempotently by `scripts/script_legacy/apply_llvm_hexagon_fixes.sh`: truncating
 DoubleRegs/IntRegs COPY support, aligned-frame AP prologue ordering, and AP
 live-in tracking. These are compiler correctness prerequisites, not OmniFetch
 performance improvements.
@@ -43,7 +43,7 @@ The Hexagon-only dependency patch makes Triton's built-in NVIDIA and AMD
 backends optional. OmniFetch sets `TRITON_IN_TREE_BACKENDS` to empty and builds
 LLVM targets `X86;Hexagon`; this avoids compiling AMDGPU/NVPTX while preserving
 the external `triton_shared` and Qualcomm Hexagon plugins. The patch is applied
-idempotently by `scripts/apply_hexagon_only_triton_patch.sh` and is deliberately
+idempotently by `scripts/script_legacy/apply_hexagon_only_triton_patch.sh` and is deliberately
 kept outside the untracked Triton checkout so a future upstream refresh can
 fail cleanly instead of silently carrying stale dependency edits.
 
@@ -61,7 +61,7 @@ entire compile, test, and 15-model HVX/HexKL/HexKL+OmniFetch matrix is launched
 with one command:
 
 ```bash
-BUILD_JOBS=4 scripts/run_all_models_no_timeout.sh
+BUILD_JOBS=4 scripts/script_legacy/run_all_models_no_timeout.sh
 ```
 
 Model/configuration pairs run strictly serially and without a host-side
