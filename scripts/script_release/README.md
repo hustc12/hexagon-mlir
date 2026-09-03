@@ -11,6 +11,22 @@ Run the complete workflow from any directory:
 /path/to/hexagon-mlir/run_alps.sh
 ```
 
+Running without an option prints a prominent long-runtime warning and then
+executes all four experiment classes. The full suite is exhaustive and can
+take many hours or longer. To run only one class, select it explicitly:
+
+```bash
+./run_alps.sh --end-to-end
+./run_alps.sh --ablation
+./run_alps.sh --movement
+./run_alps.sh --portability
+```
+
+Selections can be combined, for example `./run_alps.sh -e -a`. They always run
+in the canonical order shown below. `./run_alps.sh --build-only` only prepares
+or reuses the toolchain, and `./run_alps.sh --help` documents the complete
+interface. Every experiment mode checks the shared incremental build first.
+
 The workflow builds the V73 compiler/runtime once and then executes these
 stages in order:
 
