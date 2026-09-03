@@ -145,6 +145,11 @@ EOF
   esac
 fi
 
+# Keep the release workflow independent of developer shell startup files. The
+# activation occurs inside this process and therefore cannot pollute its parent.
+# shellcheck source=scripts/script_release/setup/set_local_env.sh
+source "${release_dir}/setup/set_local_env.sh" --quiet
+
 stages=(00_build_alps.sh)
 ((run_end_to_end)) && stages+=(01_end_to_end_15_models.sh)
 ((run_ablation)) && stages+=(02_ablation_selected_models.sh)

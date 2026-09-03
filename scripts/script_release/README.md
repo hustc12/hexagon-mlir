@@ -5,6 +5,23 @@ script requires a positional argument. Models and configurations run strictly
 serially, have no timeout, and are not automatically retried after a failed
 case.
 
+## Environment
+
+ALPS does not require any project-specific entries in `~/.bashrc`. For an
+interactive development shell, activate the self-contained environment from
+any directory with:
+
+```bash
+source /path/to/hexagon-mlir/scripts/script_release/setup/set_local_env.sh
+```
+
+This validates the provisioned dependency tree, activates `../mlir-env`, and
+exports the repository-local Triton, LLVM,
+Hexagon SDK/Tools, HexKL, host compiler, and v73 paths only for the current
+shell. It neither aliases `python3` nor changes persistent shell configuration.
+The public `run_alps.sh` entry point sources the same script internally, so it
+can be launched from a clean shell without a separate activation command.
+
 Run the complete workflow from any directory:
 
 ```bash

@@ -101,7 +101,21 @@ export HEXAGON_MLIR_ROOT=$PWD
 
 ### Script-based Build
 
-We provide a script `HEXAGON_MLIR_ROOT/scripts/script_release/setup/build_hexagon_mlir.sh` that automates much of the setup process of building a complete `Hexagon-MLIR + Triton + Torch-MLIR` environment locally, including:
+Project-specific compiler and runtime settings must not be added to
+`~/.bashrc`. Once the dependencies are provisioned, activate them only in the
+shell used for Hexagon-MLIR work:
+
+```bash
+source scripts/script_release/setup/set_local_env.sh
+```
+
+The script resolves paths relative to the repository, activates the dedicated
+`../mlir-env`, checks the LLVM/SDK/Tools/HexKL installations, and exports the
+Triton plugin paths. It does not install aliases or modify shell startup files.
+`run_alps.sh` performs the same activation internally, so the release suite can
+be invoked directly from a clean shell.
+
+We provide a script `${HEXAGON_MLIR_ROOT}/scripts/script_release/setup/build_hexagon_mlir.sh` that automates much of the setup process of building a complete `Hexagon-MLIR + Triton + Torch-MLIR` environment locally, including:
 
 * Submodule setup for `triton` and `triton_shared`.
 * Downloading and extracting Hexagon SDK, Hexagon Tools, and Hexagon Kernel Library (HexKL).
@@ -113,11 +127,12 @@ The ALPS release workflow defaults to the measured v73 target. Set
 `HEXAGON_ARCH_VERSION` before invoking the setup scripts to target another
 supported revision.
 
-To run the script, navigate to the root of the `hexagon-mlir` repository and execute:
+For a new checkout, navigate to its root, provision the toolchain, and then
+activate it in the current shell:
 
 ```bash
-source scripts/script_release/setup/set_local_env.sh
 bash ./scripts/script_release/setup/build_hexagon_mlir.sh
+source scripts/script_release/setup/set_local_env.sh
 ```
 The script builds hexagon-mlir and runs the LIT tests for you to ensure the build succeeded.
 ```
