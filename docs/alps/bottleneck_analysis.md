@@ -3221,7 +3221,8 @@ P2g-c 显式恢复到 post-bufferization vector read 的
 `enableAlpsCrpSupplyPrefetch`，导致 runtime counter 不可见且未配置 traffic envelope。
 现已把 P5f-b 接入相同的 4096-command、8 MiB、64-entry duplicate window 配置和
 `OmniFetchL2Scheduler` 报告。增量构建脚本也会在登录环境仍指向已删除
-`LLVM_DIR` 时自动回退到有效的 `LLVM_DIR_upstream`。
+无效的旧路径时自动回退到规范的 `LLVM_DIR`。迁移期间保留的
+`LLVM_DIR_upstream` 仅是兼容已有 CMake/Ninja 绝对路径的软链接，不再是第二份 LLVM。
 
 隔离后的完整 DINOv2-small（FP16、真实 HVX vectorization、HexKL-on、P2g-c +
 P5f-b）结果为：

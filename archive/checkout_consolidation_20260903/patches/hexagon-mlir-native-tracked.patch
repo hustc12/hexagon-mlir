@@ -1,0 +1,334 @@
+diff --git a/qcom_hexagon_backend/backend/hexagon_options.py b/qcom_hexagon_backend/backend/hexagon_options.py
+index b4b92b2..35bbfce 100644
+--- a/qcom_hexagon_backend/backend/hexagon_options.py
++++ b/qcom_hexagon_backend/backend/hexagon_options.py
+@@ -50,6 +50,9 @@ class HexagonOptions:
+     fusionDoMultiUse: bool = True
+ 
+     enableBufferization: bool = True  # Used to disable for some dma testing
++    # Full-model ABI compatibility: return static memrefs through caller-owned
++    # trailing arguments instead of the fragile by-value descriptor path.
++    enableBufferResultsToOutParams: bool = False
+     enableCollapseAddressSpace: bool = True  # lower llvm.ptr<1> if hexagonmem did not
+     enableConvTiling: bool = False
+     enableDoubleBuffering: bool = False  # enable double buffering optimization
+diff --git a/qcom_hexagon_backend/backend/torch_mlir_hexagon_launcher.py b/qcom_hexagon_backend/backend/torch_mlir_hexagon_launcher.py
+index f6d6a58..7175054 100644
+--- a/qcom_hexagon_backend/backend/torch_mlir_hexagon_launcher.py
++++ b/qcom_hexagon_backend/backend/torch_mlir_hexagon_launcher.py
+@@ -24,6 +24,7 @@ from triton.backends.qcom_hexagon_backend.hexagon_launcher_base import (
+     create_timestamped_folder,
+ )
+ from triton.backends.qcom_hexagon_backend.utils import (
++    get_shape,
+     parse_return_types,
+     profile_torch_mlir_inputs,
+ )
+@@ -56,6 +57,7 @@ return 0;
+ 
+ class TorchMlirHexagonWrapperGenerator(HexagonWrapperGenerator):
+     def __init__(self, input_profs, iterations, func_name, output_profs, options: dict):
++        self.use_out_params = options.get("enableBufferResultsToOutParams", False)
+         super().__init__(
+             input_profs,
+             iterations,
+@@ -67,6 +69,20 @@ class TorchMlirHexagonWrapperGenerator(HexagonWrapperGenerator):
+ 
+     def generate_llvm_function_signature(self):
+         """Generate lowered LLVM function definition to be called from CPP launcher"""
++        if self.use_out_params:
++            function_arg_string = self.generate_llvm_function_signature_arg_string()
++            for out in self.output_profs:
++                if out.rank:
++                    function_arg_string += (
++                        ", "
++                        + self.common_strings.extern_llvm_func_with_return_args.format(
++                            tensor_ctype=out.dtype, tensor_rank=out.rank
++                        )[:-2]
++                    )
++            return self.common_strings.extern_llvm_func_defn.format(
++                kernel_name=self.func_name,
++                function_arg_string=function_arg_string,
++            )
+         # The first argument in the function signature is pointer to the return value struct
+         function_arg_string = "void *,"
+         function_arg_string += self.generate_llvm_function_signature_arg_string()
+@@ -76,6 +92,15 @@ class TorchMlirHexagonWrapperGenerator(HexagonWrapperGenerator):
+ 
+     def generate_llvm_function_call(self):
+         """Generates actual function call to lowered LLVM function call"""
++        if self.use_out_params:
++            function_call_descriptor_string = self.generate_llvm_function_call_arg_string()
++            for idx, out in enumerate(self.output_profs):
++                if out.rank:
++                    function_call_descriptor_string += f", odt{idx}"
++            return self.common_strings.extern_llvm_func_call.format(
++                func_name=self.func_name,
++                descriptor_string=function_call_descriptor_string,
++            )
+         # The function call contains the pointer to the Result as the first parameter
+         function_call_descriptor_string = "r,"
+         function_call_descriptor_string += self.generate_llvm_function_call_arg_string()
+@@ -83,6 +108,32 @@ class TorchMlirHexagonWrapperGenerator(HexagonWrapperGenerator):
+             func_name=self.func_name, descriptor_string=function_call_descriptor_string
+         )
+ 
++    def generate_result_struct(self):
++        if self.use_out_params:
++            return ""
++        return super().generate_result_struct()
++
++    def generate_result_struct_init(self):
++        if self.use_out_params:
++            declarations = ""
++            for idx, out in enumerate(self.output_profs):
++                if not out.rank:
++                    continue
++                sizes, strides = get_shape(out.shape)
++                declarations += (
++                    f"Tensor<{out.dtype}, {out.rank}> O{idx}"
++                    f"({{{sizes}, {strides}, 128}}, MemType::HEAP);\n"
++                    f"MemRefDescriptor<{out.dtype}, {out.rank}> *odt{idx} = "
++                    f"O{idx}.toMemRefDesc();\n"
++                )
++            return declarations
++        return super().generate_result_struct_init()
++
++    def generate_update_tensor_calls(self):
++        if self.use_out_params:
++            return ""
++        return super().generate_update_tensor_calls()
++
+     def generate_input_wrapper_struct_def(self):
+         """Generates template for input wrapper structs"""
+         return ""
+@@ -165,6 +216,15 @@ class TorchMLIRHexagonLauncher(HexagonLauncherBase):
+         )
+         # Careful, this needs to be done before calling mlir_to_obj()
+         result_types = qcom_hexagon_backend.get_return_list(mlir_mod, func_name)
++        result_shapes = qcom_hexagon_backend.get_return_shapes(mlir_mod, func_name)
++        arg_list = qcom_hexagon_backend.get_arg_list(mlir_mod, func_name)
++        if len(arg_list) != len(inputs):
++            arg_shapes = qcom_hexagon_backend.get_arg_shapes(mlir_mod, func_name)
++            raise ValueError(
++                f"Entry function '{func_name}' expects {len(arg_list)} arguments "
++                f"but the host provided {len(inputs)} input(s); argument shapes: "
++                f"{arg_shapes}"
++            )
+         func_name_with_ciface = "_mlir_ciface_" + func_name
+ 
+         # MLIR to (potentially several) object files (as strings)
+@@ -212,7 +272,7 @@ class TorchMLIRHexagonLauncher(HexagonLauncherBase):
+             # 2 - If it's the principal module only, deal with the wrapper code that we need to generate and dump
+             if i == 0:
+                 # Creating the wrapper generator for the principal module
+-                return_types = parse_return_types(result_types)
++                return_types = parse_return_types(result_types, result_shapes)
+                 input_profs = profile_torch_mlir_inputs(inputs)
+ 
+                 # Pass options to the wrapper generator.
+diff --git a/qcom_hexagon_backend/backend/utils.py b/qcom_hexagon_backend/backend/utils.py
+index 89eb916..6440c60 100644
+--- a/qcom_hexagon_backend/backend/utils.py
++++ b/qcom_hexagon_backend/backend/utils.py
+@@ -212,19 +212,27 @@ def make_profiled_return(iter_in):
+             "idx",  # Index of return type
+             "dtype",  # CPP data type of the return type
+             "rank",  # Rank of the return type (None for scalars)
++            "shape",  # Static dimension sizes (empty for scalars)
+         ),
+     )
+     return profiled_return(*iter_in)
+ 
+ 
+-def parse_return_types(return_type_list):
++def parse_return_types(return_type_list, return_shape_list=None):
+ 
+     return_types = []
+     for idx, r in enumerate(return_type_list):
+         rank = None if r[0] == 0 else r[0]
+         dtype = str(r[1])
++        shape = (
++            list(return_shape_list[idx])
++            if return_shape_list is not None and idx < len(return_shape_list)
++            else []
++        )
+ 
+-        return_types.append(make_profiled_return([idx, get_mlir_to_ctype(dtype), rank]))
++        return_types.append(
++            make_profiled_return([idx, get_mlir_to_ctype(dtype), rank, shape])
++        )
+ 
+     return return_types
+ 
+diff --git a/qcom_hexagon_backend/include/hexagon/Conversion/LinalgToLLVM/Passes.td b/qcom_hexagon_backend/include/hexagon/Conversion/LinalgToLLVM/Passes.td
+index 4f1bc6d..28c3ac7 100644
+--- a/qcom_hexagon_backend/include/hexagon/Conversion/LinalgToLLVM/Passes.td
++++ b/qcom_hexagon_backend/include/hexagon/Conversion/LinalgToLLVM/Passes.td
+@@ -159,7 +159,11 @@ def LinalgToLLVM : Pass<"linalg-to-llvm", "mlir::ModuleOp"> {
+           "Enable SCF loop unrolling optimization">,
+     Option<"forceHVXCroutonization", "force-hvx-croutonization", "bool",
+           /*default=*/"false",
+-          "Force HVX croutonization pass">
++          "Force HVX croutonization pass">,
++    Option<"enableBufferResultsToOutParams", "enable-buffer-results-to-out-params", "bool",
++          /*default=*/"false",
++          "Convert memref-typed function results into trailing caller-owned "
++          "out-param arguments">
+    ];
+ }
+ 
+diff --git a/qcom_hexagon_backend/lib/Conversion/LinalgToLLVM/LinalgToLLVMPass.cpp b/qcom_hexagon_backend/lib/Conversion/LinalgToLLVM/LinalgToLLVMPass.cpp
+index ccbb4bc..79160d9 100644
+--- a/qcom_hexagon_backend/lib/Conversion/LinalgToLLVM/LinalgToLLVMPass.cpp
++++ b/qcom_hexagon_backend/lib/Conversion/LinalgToLLVM/LinalgToLLVMPass.cpp
+@@ -407,6 +407,18 @@ public:
+ 
+       pm.addNestedPass<func::FuncOp>(createConvertZeroSizeMemrefPass());
+       pm.addPass(createConvertBufferizationToMemRefPass());
++
++      if (enableBufferResultsToOutParams) {
++        bufferization::BufferResultsToOutParamsPassOptions outParamsOpts;
++        // The model entry point is public. The upstream pass deliberately
++        // preserves public ABI by default, but this opt-in compatibility mode
++        // also updates the generated C wrapper and therefore must transform
++        // the public entry point itself.
++        outParamsOpts.modifyPublicFunctions = true;
++        outParamsOpts.hoistStaticAllocs = true;
++        pm.addPass(
++            bufferization::createBufferResultsToOutParamsPass(outParamsOpts));
++      }
+     }
+ 
+     if (enableConvertToHexagonmem)
+diff --git a/qcom_hexagon_backend/lib/Target/Linalg_MLLVMIR/MLLVMIRTranslation.cpp b/qcom_hexagon_backend/lib/Target/Linalg_MLLVMIR/MLLVMIRTranslation.cpp
+index d76e6c3..6acfbb6 100644
+--- a/qcom_hexagon_backend/lib/Target/Linalg_MLLVMIR/MLLVMIRTranslation.cpp
++++ b/qcom_hexagon_backend/lib/Target/Linalg_MLLVMIR/MLLVMIRTranslation.cpp
+@@ -108,6 +108,11 @@ void setLinalgToLLVMOptions(
+       !arch_kwargs.at("enableSCFLoopUnroll").compare(TRUE);
+   options.enableConversionToFp16 =
+       !arch_kwargs.at("enableConversionToFp16").compare(TRUE);
++  {
++    auto it = arch_kwargs.find("enableBufferResultsToOutParams");
++    options.enableBufferResultsToOutParams =
++        (it != arch_kwargs.end() && !it->second.compare(TRUE));
++  }
+ }
+ 
+ namespace mlir {
+diff --git a/qcom_hexagon_backend/python/triton_qcom_hexagon_backend.cc b/qcom_hexagon_backend/python/triton_qcom_hexagon_backend.cc
+index 07f31e5..8e6a55d 100644
+--- a/qcom_hexagon_backend/python/triton_qcom_hexagon_backend.cc
++++ b/qcom_hexagon_backend/python/triton_qcom_hexagon_backend.cc
+@@ -56,6 +56,18 @@ void init_triton_hexagon_translation(py::module &m) {
+     return hexagon_backend::getReturnList(module_op, fName);
+   });
+ 
++  m.def("get_return_shapes", [](mlir::ModuleOp &module_op, std::string fName) {
++    return hexagon_backend::getReturnShapes(module_op, fName);
++  });
++
++  m.def("get_arg_list", [](mlir::ModuleOp &module_op, std::string fName) {
++    return hexagon_backend::getArgList(module_op, fName);
++  });
++
++  m.def("get_arg_shapes", [](mlir::ModuleOp &module_op, std::string fName) {
++    return hexagon_backend::getArgShapes(module_op, fName);
++  });
++
+   m.def("extract_func_name_from_mlir_module", [](mlir::ModuleOp &module_op) {
+     return hexagon_backend::extractSingleFuncName(module_op);
+   });
+diff --git a/qcom_hexagon_backend/python/triton_qcom_hexagon_backend_api.cc b/qcom_hexagon_backend/python/triton_qcom_hexagon_backend_api.cc
+index 6246879..0594532 100644
+--- a/qcom_hexagon_backend/python/triton_qcom_hexagon_backend_api.cc
++++ b/qcom_hexagon_backend/python/triton_qcom_hexagon_backend_api.cc
+@@ -332,6 +332,63 @@ getReturnList(mlir::ModuleOp module_op, const std::string &fName) {
+   return resultList;
+ }
+ 
++std::vector<std::vector<int64_t>>
++getReturnShapes(mlir::ModuleOp module_op, const std::string &fName) {
++  std::vector<std::vector<int64_t>> shapeList;
++  for (auto funcOp : module_op.getOps<mlir::func::FuncOp>()) {
++    if (funcOp.getName() != fName)
++      continue;
++    for (auto resultType : funcOp.getResultTypes()) {
++      std::vector<int64_t> shape;
++      if (auto tensorType =
++              mlir::dyn_cast<mlir::RankedTensorType>(resultType))
++        for (int64_t dim : tensorType.getShape())
++          shape.push_back(dim);
++      shapeList.push_back(shape);
++    }
++  }
++  return shapeList;
++}
++
++std::vector<std::pair<int, mlir::Type>>
++getArgList(mlir::ModuleOp module_op, const std::string &fName) {
++  std::vector<std::pair<int, mlir::Type>> argList;
++  for (auto funcOp : module_op.getOps<mlir::func::FuncOp>()) {
++    if (funcOp.getName() != fName)
++      continue;
++    for (auto argType : funcOp.getArgumentTypes()) {
++      int rank;
++      mlir::Type dtype;
++      if (auto tensorType = mlir::dyn_cast<mlir::RankedTensorType>(argType)) {
++        rank = tensorType.getRank();
++        dtype = tensorType.getElementType();
++      } else {
++        rank = 0;
++        dtype = argType;
++      }
++      argList.push_back(std::make_pair(rank, dtype));
++    }
++  }
++  return argList;
++}
++
++std::vector<std::vector<int64_t>>
++getArgShapes(mlir::ModuleOp module_op, const std::string &fName) {
++  std::vector<std::vector<int64_t>> shapeList;
++  for (auto funcOp : module_op.getOps<mlir::func::FuncOp>()) {
++    if (funcOp.getName() != fName)
++      continue;
++    for (auto argType : funcOp.getArgumentTypes()) {
++      std::vector<int64_t> shape;
++      if (auto tensorType = mlir::dyn_cast<mlir::RankedTensorType>(argType))
++        for (int64_t dim : tensorType.getShape())
++          shape.push_back(dim);
++      shapeList.push_back(shape);
++    }
++  }
++  return shapeList;
++}
++
+ std::string extractSingleFuncName(mlir::ModuleOp &module_op) {
+   std::string module_func_name;
+   std::vector<std::string> vector_func_names;
+@@ -546,4 +603,4 @@ std::string translateLinalgToLLVMIR(
+   return str;
+ }
+ 
+-} // namespace hexagon_backend
+\ No newline at end of file
++} // namespace hexagon_backend
+diff --git a/qcom_hexagon_backend/python/triton_qcom_hexagon_backend_api.h b/qcom_hexagon_backend/python/triton_qcom_hexagon_backend_api.h
+index 73cad59..3fac391 100644
+--- a/qcom_hexagon_backend/python/triton_qcom_hexagon_backend_api.h
++++ b/qcom_hexagon_backend/python/triton_qcom_hexagon_backend_api.h
+@@ -22,6 +22,12 @@
+ namespace hexagon_backend {
+ std::vector<std::pair<int, mlir::Type>> getReturnList(mlir::ModuleOp module_op,
+                                                       const std::string &fName);
++std::vector<std::vector<int64_t>>
++getReturnShapes(mlir::ModuleOp module_op, const std::string &fName);
++std::vector<std::pair<int, mlir::Type>> getArgList(mlir::ModuleOp module_op,
++                                                   const std::string &fName);
++std::vector<std::vector<int64_t>>
++getArgShapes(mlir::ModuleOp module_op, const std::string &fName);
+ std::string extractSingleFuncName(mlir::ModuleOp &module_op);
+ void loadDialects(mlir::MLIRContext &context);
+ 

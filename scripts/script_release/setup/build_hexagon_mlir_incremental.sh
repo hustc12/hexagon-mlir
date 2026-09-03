@@ -73,10 +73,9 @@ export HOST_TOOLCHAIN="${HOST_TOOLCHAIN:-${PARENT_DIR}/HOST_TOOLCHAIN}"
 export HEXAGON_SDK_ROOT="${HEXAGON_SDK_ROOT:-${PARENT_DIR}/HEXAGON_SDK/Hexagon_SDK/6.4.0.2}"
 export HEXAGON_TOOLS="${HEXAGON_TOOLS:-${PARENT_DIR}/HEXAGON_TOOLS/Tools}"
 export HEXKL_ROOT="${HEXKL_ROOT:-${PARENT_DIR}/HEXKL_DIR/hexkl_addon}"
-DEFAULT_LLVM_PROJECT_BUILD_DIR="${PARENT_DIR}/LLVM_DIR_upstream/llvm-project/build"
-# LLVM_DIR was intentionally removed after the upstream-v73 migration.  A
-# login shell may still export that stale path; treat a missing inherited path
-# like an unset override instead of failing before the existing build starts.
+DEFAULT_LLVM_PROJECT_BUILD_DIR="${PARENT_DIR}/LLVM_DIR/llvm-project/build"
+# LLVM_DIR is the canonical checkout name. Treat a missing inherited path like
+# an unset override so stale shells cannot select a removed toolchain.
 if [[ -z "${LLVM_PROJECT_BUILD_DIR:-}" ||
       ! -d "${LLVM_PROJECT_BUILD_DIR}" ]]; then
   export LLVM_PROJECT_BUILD_DIR="${DEFAULT_LLVM_PROJECT_BUILD_DIR}"

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Build the exact LLVM revision required by the freshly checked out Triton.
-# This deliberately uses LLVM_DIR_upstream so the legacy toolchain remains
-# byte-for-byte recoverable.
+# LLVM_DIR is the canonical source/build checkout. LLVM_DIR_upstream may remain
+# as a compatibility symlink for build caches created during migration.
 set -euo pipefail
 
 repo_dir="$(git rev-parse --show-toplevel)"
 parent_dir="$(cd "${repo_dir}/.." && pwd)"
-llvm_src="${LLVM_UPSTREAM_SRC:-${parent_dir}/LLVM_DIR_upstream/llvm-project}"
+llvm_src="${LLVM_UPSTREAM_SRC:-${parent_dir}/LLVM_DIR/llvm-project}"
 llvm_build="${LLVM_UPSTREAM_BUILD:-${llvm_src}/build}"
 host_toolchain="${HOST_TOOLCHAIN:-${parent_dir}/HOST_TOOLCHAIN}"
 jobs="${LLVM_BUILD_JOBS:-4}"

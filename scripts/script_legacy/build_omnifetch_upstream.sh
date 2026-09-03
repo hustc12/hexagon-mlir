@@ -14,7 +14,7 @@ bash "${repo_dir}/scripts/script_legacy/apply_hexagon_only_triton_patch.sh"
 
 bash "${repo_dir}/scripts/script_legacy/build_upstream_llvm.sh"
 
-export LLVM_PROJECT_BUILD_DIR="${parent_dir}/LLVM_DIR_upstream/llvm-project/build"
+export LLVM_PROJECT_BUILD_DIR="${parent_dir}/LLVM_DIR/llvm-project/build"
 export HOST_TOOLCHAIN="${parent_dir}/HOST_TOOLCHAIN"
 export HEXAGON_SDK_ROOT="${parent_dir}/HEXAGON_SDK/Hexagon_SDK/6.4.0.2"
 export HEXAGON_TOOLS="${parent_dir}/HEXAGON_TOOLS/Tools"

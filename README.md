@@ -43,6 +43,16 @@ It builds the V73 toolchain once, then runs the 15-model end-to-end matrix, the
 selected-model ablation, the movement/traffic audit, and the V75/V79
 portability study strictly serially.
 
+## Repository layout
+
+`hexagon-mlir` is the only active source checkout. Historical changes from the
+former `hexagon-mlir-legacy` checkout and the temporary
+`hexagon-mlir-native` worktree are preserved under
+`archive/checkout_consolidation_20260903`; generated model binaries are not
+kept in Git. The canonical LLVM checkout is `../LLVM_DIR`. A temporary
+`../LLVM_DIR_upstream -> LLVM_DIR` compatibility symlink may exist solely so
+older CMake/Ninja caches containing absolute paths remain usable.
+
 ## License
 
 Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
