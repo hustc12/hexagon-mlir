@@ -602,6 +602,11 @@ def hexagon_options_phase4(
     options["enableAlpsTrafficControl"] = (
         os.environ.get("ALPS_ENABLE_TRAFFIC_CONTROL", "0") == "1"
     )
+    options["enableAlpsDualThreadDae"] = (
+        os.environ.get("ALPS_ENABLE_VECTOR_DAE", "0") == "1"
+    )
+    if options["enableAlpsDualThreadDae"] and not options["enableAlpsExactOverlap"]:
+        raise ValueError("vectorized DAE requires an exact-overlap residual supply")
     # P3b starts and retires UserDMA on the issuing Hexagon hardware thread.
     # UserDMA completion state is thread-contextual, so exact overlap must not
     # implicitly move completion polling to the optional scout thread.  The
@@ -666,6 +671,7 @@ def hexagon_options_phase4(
         f"alps_p5m_hmx_async_drain_analysis={int(options['enableAlpsHmxAsyncDrainAnalysis'])} "
         f"alps_p5n_hmx_async_drain={int(options['enableAlpsHmxAsyncDrain'])} "
         f"alps_p4a_traffic={int(options['enableAlpsTrafficControl'])} "
+        f"alps_vector_dae={int(options['enableAlpsDualThreadDae'])} "
         f"alps_fp16_hvx={int(options['enableAlpsFP16HVXArithmetic'])} "
         f"alps_hvx_widening_conv={int(options['enableAlpsHVXWideningConv'])}"
     )

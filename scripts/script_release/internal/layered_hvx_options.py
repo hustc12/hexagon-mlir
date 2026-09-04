@@ -56,6 +56,20 @@ def add_layered_hvx_args(parser: argparse.ArgumentParser) -> None:
     # command line for monolithic and layered model families.
     parser.add_argument("--disable-layout-aware", action="store_true")
     parser.add_argument("--disable-alps-adaptive", action="store_true")
+    parser.add_argument(
+        "--alps-lookahead",
+        type=int,
+        default=2,
+        help="Bounded ALPS access lead in consumer tiles (1..7).",
+    )
+    parser.add_argument(
+        "--enable-alps-vector-dae",
+        action="store_true",
+        help=(
+            "Run exact residual supply on the scout-owned vectorized "
+            "Decoupled Access--Execute path."
+        ),
+    )
 
 
 def make_layered_hvx_options(args: argparse.Namespace) -> dict:
@@ -65,6 +79,8 @@ def make_layered_hvx_options(args: argparse.Namespace) -> dict:
         raise ValueError("prefetch baseline distance must be positive")
     if args.lwp_loop_depth < 0:
         raise ValueError("LWP loop depth must be non-negative")
+    if not 1 <= args.alps_lookahead <= 7:
+        raise ValueError("ALPS lookahead must be in [1, 7]")
     item7 = bool(args.enable_alps_kv_cache_prefetch)
     alps_mode = str(args.alps_p0_mode)
     if item7 and alps_mode != "none":
@@ -237,9 +253,13 @@ def make_layered_hvx_options(args: argparse.Namespace) -> dict:
     options["enableAlpsTrafficControl"] = (
         os.environ.get("ALPS_ENABLE_TRAFFIC_CONTROL", "0") == "1"
     )
-    # Keep P3b issuer-owned: UserDMA start/poll must remain on the same
-    # Hexagon hardware thread.  Dual-thread DAE remains an independent switch
-    # for schemes whose completion work is safe to execute on the scout.
+    options["enableAlpsDualThreadDae"] = bool(
+        args.enable_alps_vector_dae
+        or os.environ.get("ALPS_ENABLE_VECTOR_DAE", "0") == "1"
+    )
+    options["alpsLookahead"] = int(args.alps_lookahead)
+    if options["enableAlpsDualThreadDae"] and not options["enableAlpsExactOverlap"]:
+        raise ValueError("vectorized DAE requires an exact-overlap residual supply")
     options["enableAlpsDmaToVtcm"] = False
     options["enableHexagonmemCopyToDMA"] = (
         options["enableAlpsCrpVtcmFormation"]
@@ -287,6 +307,7 @@ def make_layered_hvx_options(args: argparse.Namespace) -> dict:
         f"alps_p3a_exact={int(options['enableAlpsExactReadiness'])}"
         f" alps_p3b_overlap={int(options['enableAlpsExactOverlap'])}"
         f" alps_p4a_traffic={int(options['enableAlpsTrafficControl'])}"
+        f" alps_vector_dae={int(options['enableAlpsDualThreadDae'])}"
         f" alps_fp16_hvx={int(options['enableAlpsFP16HVXArithmetic'])}"
     )
     return options

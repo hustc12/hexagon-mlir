@@ -71,8 +71,11 @@ struct AlpsExactReadinessPass final
       ++exactContracts;
       kick->setAttr("alps.p3a.exact_readiness",
                     Builder(function.getContext()).getBoolAttr(true));
+      int64_t lookahead = 1;
+      if (auto attr = kick->getAttrOfType<IntegerAttr>("alps.p3b.lookahead"))
+        lookahead = attr.getInt();
       record << "[ALPS-P3A-SITE] function=" << function.getName()
-             << " layout=1 lookahead=1 accepted=1"
+             << " layout=1 lookahead=" << lookahead << " accepted=1"
              << " reason=descriptor_bound_exact_weight\n";
     });
 

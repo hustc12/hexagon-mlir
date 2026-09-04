@@ -1,5 +1,5 @@
 // RUN: linalg-hexagon-opt %s \
-// RUN:   -pass-pipeline='builtin.module(func.func(alps-minimal-static-admission{min-dma-bytes=2048 min-overlap-ops=2 enable-p3-exact-readiness=true},prefetch-insert{lookahead=1 enable-layout-aware=true enable-two-dim-pipeline=true enable-alps-exact-overlap=true},alps-exact-readiness))' \
+// RUN:   -pass-pipeline='builtin.module(func.func(alps-minimal-static-admission{min-dma-bytes=2048 min-overlap-ops=2 enable-p3-exact-readiness=true},prefetch-insert{lookahead=2 enable-layout-aware=true enable-two-dim-pipeline=true enable-alps-exact-overlap=true},alps-exact-readiness))' \
 // RUN:   2>&1 | FileCheck %s
 
 func.func @p3b_weight(
@@ -23,12 +23,14 @@ func.func @p3b_weight(
 
 // CHECK: [ALPS-P2D-SITE] function=p3b_weight
 // CHECK-SAME: action=dma_vtcm_async reason=p3_exact_weight_pipeline
+// CHECK: [ALPS-P3A-SITE] function=p3b_weight layout=1 lookahead=2 accepted=1
 // CHECK: [ALPS-P3A-SUMMARY] function=p3b_weight async_candidates=1 exact_contracts=1 rejected=0
 // CHECK-LABEL: func.func @p3b_weight
 // CHECK-SAME: alps.p3a.exact_contracts = 1
 // CHECK: %[[CTX:.*]] = alps.invocation_begin
 // CHECK: alps.exact_weight_consume %[[CTX]]
 // CHECK: alps.exact_weight_kick %[[CTX]]
+// CHECK-SAME: alps.p3b.lookahead = 2
 // CHECK: hexkl.micro_hmx_mm_f16
 // CHECK: alps.exact_weight_release %[[CTX]]
 // CHECK: alps.invocation_end %[[CTX]]

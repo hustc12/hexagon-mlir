@@ -31,12 +31,37 @@ int32_t __alps_exact_weight_release(int32_t context, int64_t version,
                                           int32_t tile_col);
 uint64_t __alps_exact_dma_counts(void);
 uint64_t __alps_exact_control_counts(void);
+uint64_t __alps_exact_vdae_counts(void);
+uint64_t __alps_exact_vdae_ready_bytes(void);
+uint64_t __alps_exact_vdae_wait_cycles(void);
+uint64_t __alps_exact_vdae_cache_counts(void);
+void __alps_set_dual_thread_dae(int32_t enable);
 void __alps_p4a_configure(int32_t enable);
+void __alps_p4a_configure_policy(int32_t enable, int32_t initial_dma_allowed,
+                                 uint32_t window_completions,
+                                 uint32_t late_poll_threshold,
+                                 uint32_t probe_interval);
+int32_t __alps_p4a_request_allowed(void);
+void __alps_p4a_observe_dma_completion(unsigned poll_retries);
 uint64_t __alps_p4a_window_counts(void);
 uint64_t __alps_p4a_decision_counts(void);
 uint64_t __alps_p4a_pmu_status_counts(void);
+uint64_t __alps_p4a_recovery_counts(void);
+uint64_t __alps_p4a_policy_config(void);
 
 int main(void) {
+  // A profile may start in cooldown.  Suppression must periodically admit a
+  // probe, and an on-time probe must re-open asynchronous movement.
+  __alps_p4a_configure_policy(1, 0, 2, 4, 2);
+  if (__alps_p4a_request_allowed() || !__alps_p4a_request_allowed())
+    return 9;
+  __alps_p4a_observe_dma_completion(0);
+  uint64_t recovery = __alps_p4a_recovery_counts();
+  if (!__alps_p4a_request_allowed() || (uint32_t)(recovery >> 32) != 1 ||
+      (uint32_t)recovery != 1 ||
+      __alps_p4a_policy_config() != ((uint64_t)2 << 32 | (uint64_t)4 << 16 | 2))
+    return 10;
+
   __alps_p4a_configure(1);
   if (__alps_p4a_window_counts() != 0 ||
       __alps_p4a_decision_counts() != 0 ||
@@ -72,6 +97,7 @@ int main(void) {
   for (int i = 0; i < 64 * 64; ++i)
     weight[i] = (uint16_t)(i + 1);
   int32_t exact_context = __alps_invocation_begin();
+  __alps_set_dual_thread_dae(1);
   if (!__alps_exact_weight_kick(exact_context, 19, weight, wh, 1, 0,
                                       64, 0, -1) ||
       !__alps_exact_weight_consume(exact_context, 19, 1, 0) ||
@@ -79,16 +105,40 @@ int main(void) {
       !__alps_invocation_end(exact_context))
     return 6;
 
+  // The first scout request forms and retains the consumer-ready WH tile.
+  // Reusing the same immutable source/version should supply WH directly.
+  int32_t warm_context = __alps_invocation_begin();
+  if (!__alps_exact_weight_kick(warm_context, 19, weight, wh, 1, 0, 64, 0,
+                                -1) ||
+      !__alps_exact_weight_consume(warm_context, 19, 1, 0) ||
+      !__alps_exact_weight_release(warm_context, 19, 1, 0) ||
+      !__alps_invocation_end(warm_context))
+    return 11;
+
   uint64_t counts = __alps_descriptor_counts();
   uint64_t release_failures = __alps_descriptor_release_failures();
   uint64_t dma = __alps_exact_dma_counts();
   uint64_t control = __alps_exact_control_counts();
-  if ((uint32_t)(counts >> 32) != 2 || (uint32_t)counts != 2 ||
-      (uint32_t)(release_failures >> 32) != 2 ||
+  uint64_t vdae = __alps_exact_vdae_counts();
+  uint64_t cache = __alps_exact_vdae_cache_counts();
+  uint32_t errors = __alps_get_and_clear_errors();
+  fprintf(stderr,
+          "counts=%llu releases=%llu dma=%llu control=%llu vdae=%llu "
+          "ready_bytes=%llu wait_cycles=%llu cache=%llu errors=%u\n",
+          (unsigned long long)counts, (unsigned long long)release_failures,
+          (unsigned long long)dma, (unsigned long long)control,
+          (unsigned long long)vdae,
+          (unsigned long long)__alps_exact_vdae_ready_bytes(),
+          (unsigned long long)__alps_exact_vdae_wait_cycles(),
+          (unsigned long long)cache, errors);
+  if ((uint32_t)(counts >> 32) != 3 || (uint32_t)counts != 3 ||
+      (uint32_t)(release_failures >> 32) != 3 ||
       (uint32_t)release_failures < 2 ||
-      (uint32_t)(dma >> 32) != 1 || (uint32_t)dma != 1 ||
-      control != 0 ||
-      __alps_get_and_clear_errors() == 0)
+      (uint32_t)(dma >> 32) != 2 || (uint32_t)dma != 2 ||
+      control != 0 || (uint32_t)(vdae >> 32) != 2 ||
+      (uint32_t)vdae != 2 || __alps_exact_vdae_ready_bytes() != 4096 ||
+      (uint32_t)(cache >> 32) != 1 || (uint32_t)cache != 1 ||
+      __alps_exact_vdae_wait_cycles() != 0 || errors == 0)
     return 7;
   puts("ALPS exact-readiness contract: PASS");
   return 0;

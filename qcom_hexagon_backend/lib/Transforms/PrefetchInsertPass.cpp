@@ -1187,9 +1187,10 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
 
   // ----- Phase 2a/2b: layout-aware path -----
   // Weight: replace RmToWh with prefetch_in_situ → hexkl_micro WH layout.
-  // Phase 2b software pipeline (lookahead>=1, dual weight slots):
-  //   always sync-fill current (correctness)
-  //   async kick of tile kt+1 into the idle slot (dma2d→stage; WH in wait)
+  // Phase 2b software pipeline (lookahead>=1, lookahead+1 weight slots):
+  //   synchronously fill the first `lookahead` tiles (bounded prologue)
+  //   async kick tile kt+lookahead into its non-aliasing queue slot
+  //   consume/release the exact READY tile after that K-tile lead
   // Activation: replace CopySubmatrix+RmToAh with HexKL-accurate HMXActivation
   //   prefetch into the VTCM slab (sync only; no Mm overlap in this loop).
   int inserted = 0;
@@ -1285,11 +1286,13 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
     if (decision.mode == TransformMode::AsyncInSitu && mmOp) {
       ++stats.async;
       auto i32Ty = b.getI32Type();
-      Value c0 = b.create<arith::ConstantIntOp>(loc, i32Ty, 0);
-      Value c1 = b.create<arith::ConstantIntOp>(loc, i32Ty, 1);
-      Value c2 = b.create<arith::ConstantIntOp>(loc, i32Ty, 2);
+      int exactLookahead = exactAdmitted ? std::clamp(lookahead, 1, 7) : 1;
+      int exactSlotCount = exactLookahead + 1;
+      Value cLookahead = b.create<arith::ConstantIntOp>(
+          loc, i32Ty, exactLookahead);
+      Value cSlotCount = b.create<arith::ConstantIntOp>(
+          loc, i32Ty, exactSlotCount);
       Value c4096 = b.create<arith::ConstantIntOp>(loc, i32Ty, 4096);
-      Value neg4096 = b.create<arith::ConstantIntOp>(loc, i32Ty, -4096);
       Value version;
       if (exactAdmitted) {
         OpBuilder::InsertionGuard guard(builder);
@@ -1305,9 +1308,10 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
       SmallVector<Value, 5> syncParams = {ktVal, colVal, wtCols, curOff};
       Value stageOff;
       if (enableDmaToVtcm) {
-        Value kTilesPlus2 = b.create<arith::AddIOp>(
-            loc, ubI32, b.create<arith::ConstantIntOp>(loc, i32Ty, 2));
-        stageOff = b.create<arith::MulIOp>(loc, kTilesPlus2, c4096);
+        Value kTilesPlusSlots = b.create<arith::AddIOp>(loc, ubI32,
+                                                        cSlotCount);
+        stageOff =
+            b.create<arith::MulIOp>(loc, kTilesPlusSlots, c4096);
         syncParams.push_back(stageOff);
       }
       if (!stageOff)
@@ -1335,18 +1339,20 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
       };
 
       if (enableTwoDimPipeline) {
-        // Bootstrap only tile 0. Later current tiles were loaded and reshaped
-        // by the previous iteration; repeating the synchronous WH transform
-        // here would serialize and nullify the pipeline.
+        // Bootstrap the bounded prologue.  A future tile is issued exactly
+        // `exactLookahead` iterations before demand, so later current tiles
+        // must only consume the matching descriptor-produced WH slot.
         Value lbI32 =
             b.create<arith::IndexCastOp>(loc, i32Ty, loop.getLowerBound());
-        Value isFirst = b.create<arith::CmpIOp>(
-            loc, arith::CmpIPredicate::eq, ktVal, lbI32);
+        Value prologueEnd =
+            b.create<arith::AddIOp>(loc, lbI32, cLookahead);
+        Value isPrologue = b.create<arith::CmpIOp>(
+            loc, arith::CmpIPredicate::slt, ktVal, prologueEnd);
         if (exactAdmitted) {
-          Value isNotFirst = b.create<arith::CmpIOp>(
-              loc, arith::CmpIPredicate::ne, ktVal, lbI32);
+          Value isSteadyState = b.create<arith::CmpIOp>(
+              loc, arith::CmpIPredicate::sge, ktVal, prologueEnd);
           b.create<scf::IfOp>(
-              loc, isNotFirst,
+              loc, isSteadyState,
               [&](OpBuilder &thenBuilder, Location thenLoc) {
                 thenBuilder.create<ExactWeightConsumeOp>(
                     thenLoc, thenBuilder.getI1Type(), exactContext, version,
@@ -1356,7 +1362,7 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
           OpBuilder afterMm(mmOp);
           afterMm.setInsertionPointAfter(mmOp);
           afterMm.create<scf::IfOp>(
-              loc, isNotFirst,
+              loc, isSteadyState,
               [&](OpBuilder &thenBuilder, Location thenLoc) {
                 thenBuilder.create<ExactWeightReleaseOp>(
                     thenLoc, thenBuilder.getI1Type(), exactContext, version,
@@ -1365,7 +1371,7 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
               });
         }
         b.create<scf::IfOp>(
-            loc, isFirst, [&](OpBuilder &thenBuilder, Location thenLoc) {
+            loc, isPrologue, [&](OpBuilder &thenBuilder, Location thenLoc) {
               emitSyncCurrent(thenBuilder, thenLoc);
               thenBuilder.create<scf::YieldOp>(thenLoc);
             });
@@ -1374,20 +1380,23 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
       }
       ++inserted;
 
-      Value nextKtRaw = b.create<arith::AddIOp>(loc, ktVal, c1);
+      Value nextKtRaw =
+          b.create<arith::AddIOp>(loc, ktVal, cLookahead);
       Value hasNext = b.create<arith::CmpIOp>(
           loc, arith::CmpIPredicate::slt, nextKtRaw, ubI32);
       b.create<scf::IfOp>(
           loc, hasNext,
           [&](OpBuilder &thenBuilder, Location thenLoc) {
-            Value phase =
-                thenBuilder.create<arith::RemUIOp>(thenLoc, ktVal, c2);
-            Value isEven = thenBuilder.create<arith::CmpIOp>(
-                thenLoc, arith::CmpIPredicate::eq, phase, c0);
-            Value delta = thenBuilder.create<arith::SelectOp>(
-                thenLoc, isEven, c4096, neg4096);
+            Value currentSlot = thenBuilder.create<arith::RemUIOp>(
+                thenLoc, ktVal, cSlotCount);
+            Value nextSlot = thenBuilder.create<arith::RemUIOp>(
+                thenLoc, nextKtRaw, cSlotCount);
+            Value slotDelta = thenBuilder.create<arith::SubIOp>(
+                thenLoc, nextSlot, currentSlot);
             Value nextOff = thenBuilder.create<arith::AddIOp>(
-                thenLoc, curOff, delta);
+                thenLoc, curOff,
+                thenBuilder.create<arith::MulIOp>(thenLoc, slotDelta,
+                                                  c4096));
 
             SmallVector<Value, 5> asyncParams = {nextKtRaw, colVal, wtCols,
                                                  nextOff};
@@ -1407,13 +1416,14 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
               kick->setAttr("alps.p2d.action",
                             thenBuilder.getStringAttr("dma_vtcm_async"));
               kick->setAttr("alps.p3b.lookahead",
-                            thenBuilder.getI64IntegerAttr(1));
+                            thenBuilder.getI64IntegerAttr(exactLookahead));
             } else {
               auto asyncPrefetch = thenBuilder.create<PrefetchInSituOp>(
                   thenLoc, srcMem, vtcmMem,
                   enableDequantReshape ? LayoutTransform::HMXWeightDequantI8
                                        : LayoutTransform::HMXWeight,
-                  /*lookahead=*/1, DenseI32ArrayAttr{}, asyncParams);
+                  /*lookahead=*/exactLookahead, DenseI32ArrayAttr{},
+                  asyncParams);
               annotateTransformDecision(asyncPrefetch, decision);
             }
             thenBuilder.create<scf::YieldOp>(thenLoc);

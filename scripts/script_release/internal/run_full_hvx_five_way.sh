@@ -17,6 +17,7 @@ output_dir=${OUTPUT_DIR:-${parent_dir}/run_artifacts/full_hvx_five_way_$(date +%
 remote_dir=${REMOTE_RESULTS_DIR:-/home/huzq85/2-working/working_set/full_hvx_five_way_$(date +%Y%m%d_%H%M%S)}
 iterations=${DEVICE_ITERATIONS:-1}
 seq_len=${ALPS_SEQ_LEN:-32}
+alps_lookahead=${ALPS_LOOKAHEAD:-2}
 compile_threads=${HEXAGON_MLIR_COMPILE_THREADS:-auto}
 reuse_valid=${REUSE_VALID_LOGS:-1}
 list_only=0
@@ -58,6 +59,8 @@ alps_p5n=0
 alps_p3a=0
 alps_p3b=0
 alps_p4a=0
+alps_vector_dae=0
+alps_vdae_full_e=0
 alps_fp16_hvx=0
 alps_hvx_widening_conv=0
 alps_c_e_p=0
@@ -145,6 +148,9 @@ Options:
   --item7-only            Run only the maintained item7 configuration
   --alps-p3a              Run P3a exact-readiness contract + P2d + stable P2a
   --alps-p3b              Run P3b descriptor-bound issuer-owned weight DMA overlap
+  --alps-vector-dae       Run P3b with scout-owned Access/UserDMA and HVX/HMX Execute
+  --alps-vdae-full-e      Compare full consumer formation against formation + V-DAE
+                         and formation + V-DAE + runtime traffic admission
   --alps-p4a              Run P4A telemetry + within-path DMA traffic control
   --alps-fp16-hvx         Run matched HexKL-on control vs FP16 HVX arithmetic
   --alps-hvx-widening-conv Run matched HexKL-on control vs ALPS C widening convolution
@@ -159,6 +165,8 @@ Options:
   --remote-dir DIR        nano working_set destination
   --device-iterations N   Device samples per configuration (default: ${iterations})
   --seq-len N             Full LLM prefill length (default: ${seq_len})
+  --alps-lookahead N      Bounded vectorized DAE tile lead, 1..7
+                          (default: ${alps_lookahead})
   --compile-threads N     CPU cores for the one active model compile
                           (default: auto; memory-aware, capped at 4)
   --no-reuse              Recompile passing configurations
@@ -342,6 +350,17 @@ while (($#)); do
     --alps-p3b)
       alps_p0=1; alps_p2a=1; alps_p2d=1; alps_p3a=1; alps_p3b=1; shift
       ;;
+    --alps-vector-dae)
+      alps_p0=1; alps_p2a=1; alps_p2d=1; alps_p3a=1; alps_p3b=1
+      alps_vector_dae=1; shift
+      ;;
+    --alps-vdae-full-e)
+      alps_p0=1; alps_p2e=1; alps_p2g=1; alps_p2gc=1
+      alps_p5fa=1; alps_p5gd=1; alps_p5gf=1; alps_p5gg=1
+      alps_p5h=1; alps_p5i=1; alps_p5j=1; alps_p5k=1
+      alps_p2a=1; alps_p2d=1; alps_p3a=1; alps_p3b=1
+      alps_vector_dae=1; alps_vdae_full_e=1; shift
+      ;;
     --alps-p4a)
       alps_p0=1; alps_p2a=1; alps_p2d=1; alps_p3a=1; alps_p3b=1; alps_p4a=1; shift
       ;;
@@ -371,6 +390,7 @@ while (($#)); do
     --remote-dir) remote_dir=$2; shift 2 ;;
     --device-iterations) iterations=$2; shift 2 ;;
     --seq-len) seq_len=$2; shift 2 ;;
+    --alps-lookahead) alps_lookahead=$2; shift 2 ;;
     --compile-threads) compile_threads=$2; shift 2 ;;
     --no-reuse) reuse_valid=0; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -378,6 +398,11 @@ while (($#)); do
     *) models+=("$1"); shift ;;
   esac
 done
+
+[[ "${alps_lookahead}" =~ ^[1-7]$ ]] || {
+  echo "--alps-lookahead must be an integer in [1, 7]" >&2
+  exit 2
+}
 
 if ((alps_two_way)); then
   schemes=(hmlir-hvx-hexkl-on alps-final)
@@ -404,6 +429,9 @@ elif ((alps_p5m)); then
   schemes=(alps-hmx-async-drain-analysis)
 elif ((alps_p5l)); then
   schemes=(alps-hmx-f16-bias-epilogue-formation)
+elif ((alps_vdae_full_e)); then
+  schemes=(alps-c-e-hmx-direct-output alps-vdae-full-e \
+    alps-vdae-full-e-traffic-control)
 elif ((alps_p5k)); then
   schemes=(alps-hmx-direct-output-formation)
 elif ((alps_p5j)); then
@@ -442,6 +470,8 @@ elif ((alps_p2g)); then
   schemes=(alps-continuity-audit)
 elif ((alps_p4a)); then
   schemes=(alps-elementwise-traffic-control)
+elif ((alps_vector_dae)); then
+  schemes=(alps-elementwise-vector-dae)
 elif ((alps_p3b)); then
   schemes=(alps-elementwise-exact-overlap)
 elif ((alps_p3a)); then
@@ -749,11 +779,15 @@ scheme_args_for() {
     alps-hvx-widening-conv-consumer-layout)
       printf '%s\n' --enable-hexkl --enable-alps-hvx-widening-conv
       ;;
-    alps-c-e-hmx-direct-output|alps-c-e-hmx-async-drain|alps-c-e-hmx-async-drain-traffic-control)
+    alps-c-e-hmx-direct-output|alps-c-e-hmx-async-drain|alps-c-e-hmx-async-drain-traffic-control|alps-vdae-full-e|alps-vdae-full-e-traffic-control)
       printf '%s\n' --enable-hexkl --enable-alps-hvx-widening-conv \
         --disable-layout-aware --disable-alps-adaptive
       if [[ ${ALPS_DISABLE_ATTENTION_TOPOLOGY:-0} != 1 ]]; then
         printf '%s\n' --enable-alps-kv-cache-prefetch
+      fi
+      if [[ ${scheme} == alps-vdae-full-e ||
+            ${scheme} == alps-vdae-full-e-traffic-control ]]; then
+        printf '%s\n' --alps-lookahead "${alps_lookahead}"
       fi
       ;;
     item7-only)
@@ -780,9 +814,10 @@ scheme_args_for() {
     alps-consumer-driven-layout|alps-consumer-layout-propagation|alps-continuity-audit|alps-loop-interchanged-direct|alps-register-tile-direct|alps-crp-supply-analysis|alps-crp-supply-prefetch|alps-crp-segmented-supply|alps-crp-vtcm-formation|alps-crp-vtcm-window|alps-crp-vtcm-async-window|alps-crp-producer-direct-analysis|alps-crp-producer-direct-vtcm|alps-crp-producer-direct-head-major|alps-crp-producer-head-major-contiguous|alps-attention-destination-formation|alps-patch-conv-formation|alps-hmx-f16-epilogue-formation|alps-hmx-direct-output-formation|alps-hmx-f16-bias-epilogue-formation|alps-hmx-async-drain-analysis|alps-hmx-async-drain|alps-contract-discharge-ledger|alps-representation-supply-analysis|alps-layout-supply-prefetch)
       printf '%s\n' --enable-hexkl --disable-layout-aware --disable-alps-adaptive
       ;;
-    alps-elementwise-admission|alps-elementwise-exact-readiness|alps-elementwise-exact-overlap|alps-elementwise-traffic-control)
+    alps-elementwise-admission|alps-elementwise-exact-readiness|alps-elementwise-exact-overlap|alps-elementwise-vector-dae|alps-elementwise-traffic-control)
       printf '%s\n' --enable-hexkl --alps-p0-mode elementwise-fusion \
-        --disable-layout-aware --disable-alps-adaptive
+        --disable-layout-aware --disable-alps-adaptive \
+        --alps-lookahead "${alps_lookahead}"
       ;;
   esac
   if ((include_item7)); then
@@ -909,14 +944,16 @@ run_case() {
   if [[ ${scheme} == alps-c-e-hmx-direct-output ||
         ${scheme} == alps-c-e-hmx-async-drain ||
         ${scheme} == alps-c-e-hmx-async-drain-traffic-control ||
+        ${scheme} == alps-vdae-full-e ||
+        ${scheme} == alps-vdae-full-e-traffic-control ||
         ${scheme} == alps-final ]]; then
     full_e=1
   fi
   set +e
     ALPS_ENABLE_MOVEMENT_LEDGER="$([[ ${ALPS_DISABLE_MOVEMENT_LEDGER:-0} -ne 1 && ( ${alps_full_matrix} -eq 1 || ${alps_p1} -eq 1 || ${alps_p2a} -eq 1 || ${alps_p2b} -eq 1 || ${alps_p2c} -eq 1 || ${alps_p2d} -eq 1 || ${alps_p2e} -eq 1 || ${alps_p3a} -eq 1 || ${alps_p3b} -eq 1 || ${alps_p4a} -eq 1 ) ]] && echo 1 || echo 0)" \
-    ALPS_ENABLE_ZERO_COPY_ATTENTION="$([[ ${scheme} == alps-elementwise-zero-copy || ${scheme} == alps-elementwise-producer-direct || ${scheme} == alps-elementwise-fused-transfer || ${scheme} == alps-elementwise-admission || ${scheme} == alps-elementwise-exact-readiness || ${scheme} == alps-elementwise-exact-overlap || ${scheme} == alps-elementwise-traffic-control ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_ZERO_COPY_ATTENTION="$([[ ${scheme} == alps-elementwise-zero-copy || ${scheme} == alps-elementwise-producer-direct || ${scheme} == alps-elementwise-fused-transfer || ${scheme} == alps-elementwise-admission || ${scheme} == alps-elementwise-exact-readiness || ${scheme} == alps-elementwise-exact-overlap || ${scheme} == alps-elementwise-vector-dae || ${scheme} == alps-elementwise-traffic-control || ${scheme} == alps-vdae-full-e || ${scheme} == alps-vdae-full-e-traffic-control ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_PRODUCER_DIRECT_ATTENTION="$([[ ${scheme} == alps-elementwise-producer-direct ]] && echo 1 || echo 0)" \
-    ALPS_ENABLE_CONSUMER_DRIVEN_LAYOUT="$([[ ${scheme} == alps-c-e-hmx-direct-output || ${scheme} == alps-c-e-hmx-async-drain || ${scheme} == alps-c-e-hmx-async-drain-traffic-control || ${scheme} == alps-final || ${scheme} == alps-hvx-widening-conv-consumer-layout || ${scheme} == alps-consumer-driven-layout || ${scheme} == alps-consumer-layout-propagation || ${scheme} == alps-continuity-audit || ${scheme} == alps-loop-interchanged-direct || ${scheme} == alps-register-tile-direct || ${scheme} == alps-crp-supply-analysis || ${scheme} == alps-crp-supply-prefetch || ${scheme} == alps-crp-segmented-supply || ${scheme} == alps-crp-vtcm-formation || ${scheme} == alps-crp-vtcm-window || ${scheme} == alps-crp-vtcm-async-window || ${scheme} == alps-crp-producer-direct-analysis || ${scheme} == alps-crp-producer-direct-vtcm || ${scheme} == alps-crp-producer-direct-head-major || ${scheme} == alps-crp-producer-head-major-contiguous || ${scheme} == alps-attention-destination-formation || ${scheme} == alps-patch-conv-formation || ${scheme} == alps-hmx-f16-epilogue-formation || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis || ${scheme} == alps-hmx-async-drain || ${scheme} == alps-contract-discharge-ledger || ${scheme} == alps-representation-supply-analysis || ${scheme} == alps-layout-supply-prefetch ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_CONSUMER_DRIVEN_LAYOUT="$([[ ${full_e} -eq 1 || ${scheme} == alps-hvx-widening-conv-consumer-layout || ${scheme} == alps-consumer-driven-layout || ${scheme} == alps-consumer-layout-propagation || ${scheme} == alps-continuity-audit || ${scheme} == alps-loop-interchanged-direct || ${scheme} == alps-register-tile-direct || ${scheme} == alps-crp-supply-analysis || ${scheme} == alps-crp-supply-prefetch || ${scheme} == alps-crp-segmented-supply || ${scheme} == alps-crp-vtcm-formation || ${scheme} == alps-crp-vtcm-window || ${scheme} == alps-crp-vtcm-async-window || ${scheme} == alps-crp-producer-direct-analysis || ${scheme} == alps-crp-producer-direct-vtcm || ${scheme} == alps-crp-producer-direct-head-major || ${scheme} == alps-crp-producer-head-major-contiguous || ${scheme} == alps-attention-destination-formation || ${scheme} == alps-patch-conv-formation || ${scheme} == alps-hmx-f16-epilogue-formation || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis || ${scheme} == alps-hmx-async-drain || ${scheme} == alps-contract-discharge-ledger || ${scheme} == alps-representation-supply-analysis || ${scheme} == alps-layout-supply-prefetch ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_CONSUMER_LAYOUT_PROPAGATION="$([[ ${scheme} == alps-consumer-layout-propagation ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_CONTINUITY_AUDIT="$([[ ${full_e} -eq 1 || ${scheme} == alps-continuity-audit || ${scheme} == alps-loop-interchanged-direct || ${scheme} == alps-register-tile-direct || ${scheme} == alps-crp-supply-analysis || ${scheme} == alps-crp-supply-prefetch || ${scheme} == alps-crp-segmented-supply || ${scheme} == alps-crp-vtcm-formation || ${scheme} == alps-crp-vtcm-window || ${scheme} == alps-crp-vtcm-async-window || ${scheme} == alps-crp-producer-direct-analysis || ${scheme} == alps-crp-producer-direct-vtcm || ${scheme} == alps-crp-producer-direct-head-major || ${scheme} == alps-crp-producer-head-major-contiguous || ${scheme} == alps-attention-destination-formation || ${scheme} == alps-patch-conv-formation || ${scheme} == alps-hmx-f16-epilogue-formation || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_LOOP_INTERCHANGED_DIRECT="$([[ ${scheme} == alps-loop-interchanged-direct ]] && echo 1 || echo 0)" \
@@ -936,16 +973,17 @@ run_case() {
     ALPS_ENABLE_CRP_PRODUCER_LOOP_FORMATION="$([[ ${full_e} -eq 1 || ${scheme} == alps-crp-producer-head-major-contiguous || ${scheme} == alps-attention-destination-formation || ${scheme} == alps-patch-conv-formation || ${scheme} == alps-hmx-f16-epilogue-formation || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_ATTENTION_DESTINATION_FORMATION="$([[ ${full_e} -eq 1 || ${scheme} == alps-attention-destination-formation || ${scheme} == alps-patch-conv-formation || ${scheme} == alps-hmx-f16-epilogue-formation || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_PATCH_CONV_FORMATION="$([[ ${full_e} -eq 1 || ${scheme} == alps-patch-conv-formation || ${scheme} == alps-hmx-f16-epilogue-formation || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis ]] && echo 1 || echo 0)" \
-    ALPS_ENABLE_HMX_F16_EPILOGUE_FORMATION="$([[ ${scheme} == alps-c-e-hmx-direct-output || ${scheme} == alps-c-e-hmx-async-drain || ${scheme} == alps-c-e-hmx-async-drain-traffic-control || ${scheme} == alps-final || ${scheme} == alps-hmx-f16-epilogue-formation || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis ]] && echo 1 || echo 0)" \
-    ALPS_ENABLE_HMX_DIRECT_OUTPUT_FORMATION="$([[ ${scheme} == alps-c-e-hmx-direct-output || ${scheme} == alps-c-e-hmx-async-drain || ${scheme} == alps-c-e-hmx-async-drain-traffic-control || ${scheme} == alps-final || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis || ${scheme} == alps-hmx-async-drain ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_HMX_F16_EPILOGUE_FORMATION="$([[ ${scheme} == alps-c-e-hmx-direct-output || ${scheme} == alps-c-e-hmx-async-drain || ${scheme} == alps-c-e-hmx-async-drain-traffic-control || ${scheme} == alps-vdae-full-e || ${scheme} == alps-vdae-full-e-traffic-control || ${scheme} == alps-final || ${scheme} == alps-hmx-f16-epilogue-formation || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_HMX_DIRECT_OUTPUT_FORMATION="$([[ ${scheme} == alps-c-e-hmx-direct-output || ${scheme} == alps-c-e-hmx-async-drain || ${scheme} == alps-c-e-hmx-async-drain-traffic-control || ${scheme} == alps-vdae-full-e || ${scheme} == alps-vdae-full-e-traffic-control || ${scheme} == alps-final || ${scheme} == alps-hmx-direct-output-formation || ${scheme} == alps-hmx-f16-bias-epilogue-formation || ${scheme} == alps-hmx-async-drain-analysis || ${scheme} == alps-hmx-async-drain ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_HMX_F16_BIAS_EPILOGUE_FORMATION="$([[ ${scheme} == alps-hmx-f16-bias-epilogue-formation ]] && echo 1 || echo 0)" \
-    ALPS_ENABLE_HMX_ASYNC_DRAIN_ANALYSIS="$([[ ${scheme} == alps-c-e-hmx-direct-output || ${scheme} == alps-c-e-hmx-async-drain || ${scheme} == alps-c-e-hmx-async-drain-traffic-control || ${scheme} == alps-final || ${scheme} == alps-hmx-async-drain-analysis || ${scheme} == alps-hmx-async-drain ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_HMX_ASYNC_DRAIN_ANALYSIS="$([[ ${scheme} == alps-c-e-hmx-direct-output || ${scheme} == alps-c-e-hmx-async-drain || ${scheme} == alps-c-e-hmx-async-drain-traffic-control || ${scheme} == alps-vdae-full-e || ${scheme} == alps-vdae-full-e-traffic-control || ${scheme} == alps-final || ${scheme} == alps-hmx-async-drain-analysis || ${scheme} == alps-hmx-async-drain ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_HMX_ASYNC_DRAIN="$([[ ${execution_scheme} == alps-final || ${execution_scheme} == alps-hmx-async-drain || ${execution_scheme} == alps-c-e-hmx-async-drain || ${execution_scheme} == alps-c-e-hmx-async-drain-traffic-control ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_FUSED_TRANSFORM_TRANSFER="$([[ ${scheme} == alps-elementwise-fused-transfer ]] && echo 1 || echo 0)" \
-    ALPS_ENABLE_MINIMAL_STATIC_ADMISSION="$([[ ${scheme} == alps-elementwise-admission || ${scheme} == alps-elementwise-exact-readiness || ${scheme} == alps-elementwise-exact-overlap || ${scheme} == alps-elementwise-traffic-control ]] && echo 1 || echo 0)" \
-    ALPS_ENABLE_EXACT_READINESS="$([[ ${scheme} == alps-elementwise-exact-readiness || ${scheme} == alps-elementwise-exact-overlap || ${scheme} == alps-elementwise-traffic-control ]] && echo 1 || echo 0)" \
-    ALPS_ENABLE_EXACT_OVERLAP="$([[ ${scheme} == alps-elementwise-exact-overlap || ${scheme} == alps-elementwise-traffic-control ]] && echo 1 || echo 0)" \
-    ALPS_ENABLE_TRAFFIC_CONTROL="$([[ ${scheme} == alps-final || ${scheme} == alps-elementwise-traffic-control || ${scheme} == alps-c-e-hmx-async-drain-traffic-control ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_MINIMAL_STATIC_ADMISSION="$([[ ${scheme} == alps-elementwise-admission || ${scheme} == alps-elementwise-exact-readiness || ${scheme} == alps-elementwise-exact-overlap || ${scheme} == alps-elementwise-vector-dae || ${scheme} == alps-elementwise-traffic-control || ${scheme} == alps-vdae-full-e || ${scheme} == alps-vdae-full-e-traffic-control ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_EXACT_READINESS="$([[ ${scheme} == alps-elementwise-exact-readiness || ${scheme} == alps-elementwise-exact-overlap || ${scheme} == alps-elementwise-vector-dae || ${scheme} == alps-elementwise-traffic-control || ${scheme} == alps-vdae-full-e || ${scheme} == alps-vdae-full-e-traffic-control ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_EXACT_OVERLAP="$([[ ${scheme} == alps-elementwise-exact-overlap || ${scheme} == alps-elementwise-vector-dae || ${scheme} == alps-elementwise-traffic-control || ${scheme} == alps-vdae-full-e || ${scheme} == alps-vdae-full-e-traffic-control ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_VECTOR_DAE="$([[ ${scheme} == alps-elementwise-vector-dae || ${scheme} == alps-vdae-full-e || ${scheme} == alps-vdae-full-e-traffic-control ]] && echo 1 || echo 0)" \
+    ALPS_ENABLE_TRAFFIC_CONTROL="$([[ ${scheme} == alps-final || ${scheme} == alps-elementwise-traffic-control || ${scheme} == alps-c-e-hmx-async-drain-traffic-control || ${scheme} == alps-vdae-full-e-traffic-control ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_FP16_HVX_ARITHMETIC="$([[ ${scheme} == alps-fp16-hvx-arithmetic ]] && echo 1 || echo 0)" \
     HEXAGON_MLIR_DUMP_DIR="${case_dir}/artifacts" \
     "${venv}/bin/python" "${runner}" "${args[@]}" >"${log}" 2>&1

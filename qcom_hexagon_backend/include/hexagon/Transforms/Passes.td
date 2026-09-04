@@ -313,6 +313,11 @@ def DecomposeHexKLMatmul :
     Option<"enableDmaToVtcm", "enable-dma-to-vtcm", "bool",
            /*default=*/"false",
            "Reserve a non-aliasing VTCM staging tile for Alps DMA.">,
+    Option<"exactWeightLookahead", "exact-weight-lookahead", "int",
+           /*default=*/"1",
+           "Number of future exact HMX weight tiles kept in the bounded "
+           "vectorized DAE queue (1..7). The decomposition reserves "
+           "lookahead+1 non-aliasing WH slots.">,
     Option<"enableDirectOutputFormation", "enable-direct-output-formation", "bool",
            /*default=*/"false",
            "ALPS P5k: use the HexKL epilogue's valid-row/column clipping to write non-aligned results directly into their final destination">,
@@ -932,14 +937,14 @@ def AlpsExactReadiness :
 }
 
 //===----------------------------------------------------------------------===//
-// ALPS: V-DAE (Virtual Decoupled Access-Execute) pass
+// ALPS: V-DAE (Vectorized Decoupled Access-Execute) pass
 //===----------------------------------------------------------------------===//
 
 def AlpsVDAEInsert :
     InterfacePass<"alps-vdae-insert", "mlir::FunctionOpInterface"> {
   let summary = "Decouple Memory Access and Compute Execution using semaphores";
   let description = [{
-    Implements the Virtual Decoupled Access-Execute (V-DAE) transformation
+    Implements the Vectorized Decoupled Access-Execute (V-DAE) transformation
     for DNN inference loops on Hexagon NPU.
 
     **Problem**: VLIW (Very Long Instruction Word) architecture means a single

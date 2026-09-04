@@ -68,6 +68,12 @@ void HexagonThreadPool::workerThread() {
 }
 
 // Alps dual-thread DAE scout entry (Phase 2).
+// The generated wrapper references this strong anchor whenever vectorized DAE
+// is enabled.  That forces this object out of the static archive instead of
+// silently satisfying scout_enqueue with AlpsRuntime.c's synchronous weak
+// fallback.
+extern "C" void hexagon_runtime_require_scout(void) {}
+
 extern "C" void hexagon_runtime_scout_enqueue(void (*fn)(void *), void *arg) {
   static HexagonThreadPool pool(/*numThreads=*/1);
   if (!fn)

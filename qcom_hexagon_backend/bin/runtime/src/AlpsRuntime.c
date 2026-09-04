@@ -164,6 +164,8 @@ typedef struct {
   int32_t stage_offset;
   int32_t stage_slot;
   int32_t dma_credit_owned;
+  int32_t scout_owned;
+  int32_t source_is_wh;
 } AlpsExactDescriptor;
 
 typedef struct {
@@ -183,12 +185,20 @@ static uint64_t alps_exact_dma_completed = 0;
 static uint64_t alps_exact_scout_completed = 0;
 static uint64_t alps_exact_sync_fallbacks = 0;
 static uint64_t alps_exact_consume_waits = 0;
+static uint64_t alps_exact_execute_wait_cycles = 0;
+static uint64_t alps_exact_scout_enqueued = 0;
+static uint64_t alps_exact_ready_before_consume = 0;
+static uint64_t alps_exact_ready_before_consume_bytes = 0;
+static uint64_t alps_exact_wh_cache_hits = 0;
+static uint64_t alps_exact_wh_cache_misses = 0;
 static uint64_t alps_exact_credit_fallbacks = 0;
 static uint64_t alps_exact_dma_timeouts = 0;
 /* P4A is separately configured by the generated launcher.  It never changes
  * legality or representation; it only throttles the already-legal P3b DMA
  * path for subsequent windows. */
-#define ALPS_P4A_WINDOW_COMPLETIONS 64u
+#define ALPS_P4A_DEFAULT_WINDOW_COMPLETIONS 64u
+#define ALPS_P4A_DEFAULT_LATE_POLL_THRESHOLD 4u
+#define ALPS_P4A_DEFAULT_PROBE_INTERVAL 64u
 #define ALPS_P4A_PMU_UNAVAILABLE 0u
 #define ALPS_P4A_PMU_AVAILABLE 1u
 #define ALPS_P4A_PMU_READ_FAILED 2u
@@ -203,6 +213,15 @@ static uint64_t alps_p4a_window_poll_retries = 0;
 static uint64_t alps_p4a_total_poll_retries = 0;
 static uint64_t alps_p4a_issue_cycles = 0;
 static uint64_t alps_p4a_poll_cycles = 0;
+static uint64_t alps_p4a_suppressed_since_probe = 0;
+static uint64_t alps_p4a_probe_decisions = 0;
+static uint64_t alps_p4a_recovery_decisions = 0;
+static int alps_p4a_probe_inflight = 0;
+static uint32_t alps_p4a_window_target =
+    ALPS_P4A_DEFAULT_WINDOW_COMPLETIONS;
+static uint32_t alps_p4a_late_poll_threshold =
+    ALPS_P4A_DEFAULT_LATE_POLL_THRESHOLD;
+static uint32_t alps_p4a_probe_interval = ALPS_P4A_DEFAULT_PROBE_INTERVAL;
 static uint32_t alps_p4a_pmu_status = ALPS_P4A_PMU_UNAVAILABLE;
 static uint32_t alps_p4a_pmu_reads = 0;
 static uint32_t alps_p4a_pmu_delta[4];
@@ -221,9 +240,22 @@ static uint64_t alps_read_pcycles(void) {
 #endif
 }
 
-void __alps_p4a_configure(int32_t enable) {
+void __alps_p4a_configure_policy(int32_t enable, int32_t initial_dma_allowed,
+                                 uint32_t window_completions,
+                                 uint32_t late_poll_threshold,
+                                 uint32_t probe_interval) {
+  if (window_completions == 0)
+    window_completions = ALPS_P4A_DEFAULT_WINDOW_COMPLETIONS;
+  if (late_poll_threshold == 0)
+    late_poll_threshold = ALPS_P4A_DEFAULT_LATE_POLL_THRESHOLD;
+  if (probe_interval == 0)
+    probe_interval = ALPS_P4A_DEFAULT_PROBE_INTERVAL;
+  alps_p4a_window_target = window_completions;
+  alps_p4a_late_poll_threshold = late_poll_threshold;
+  alps_p4a_probe_interval = probe_interval;
   __atomic_store_n(&alps_p4a_enabled, enable ? 1 : 0, __ATOMIC_RELEASE);
-  __atomic_store_n(&alps_p4a_dma_allowed, 1, __ATOMIC_RELEASE);
+  __atomic_store_n(&alps_p4a_dma_allowed,
+                   !enable || initial_dma_allowed ? 1 : 0, __ATOMIC_RELEASE);
   alps_p4a_windows = 0;
   alps_p4a_throttle_decisions = 0;
   alps_p4a_hold_decisions = 0;
@@ -233,6 +265,10 @@ void __alps_p4a_configure(int32_t enable) {
   alps_p4a_total_poll_retries = 0;
   alps_p4a_issue_cycles = 0;
   alps_p4a_poll_cycles = 0;
+  alps_p4a_suppressed_since_probe = 0;
+  alps_p4a_probe_decisions = 0;
+  alps_p4a_recovery_decisions = 0;
+  alps_p4a_probe_inflight = 0;
   alps_p4a_pmu_status = ALPS_P4A_PMU_UNAVAILABLE;
   alps_p4a_pmu_reads = 0;
   memset(alps_p4a_pmu_delta, 0, sizeof(alps_p4a_pmu_delta));
@@ -260,13 +296,44 @@ void __alps_p4a_configure(int32_t enable) {
 #endif
 }
 
-static void alps_p4a_observe_dma_completion(unsigned poll_retries) {
+void __alps_p4a_configure(int32_t enable) {
+  __alps_p4a_configure_policy(
+      enable, /*initial_dma_allowed=*/1,
+      ALPS_P4A_DEFAULT_WINDOW_COMPLETIONS,
+      ALPS_P4A_DEFAULT_LATE_POLL_THRESHOLD,
+      ALPS_P4A_DEFAULT_PROBE_INTERVAL);
+}
+
+/* Return whether one asynchronous request may be issued.  Suppression is a
+ * cooldown, not a terminal state: every probe_interval rejected requests one
+ * request is admitted to measure whether the pressure has cleared. */
+int32_t __alps_p4a_request_allowed(void) {
+  if (!__atomic_load_n(&alps_p4a_enabled, __ATOMIC_ACQUIRE) ||
+      __atomic_load_n(&alps_p4a_dma_allowed, __ATOMIC_ACQUIRE))
+    return 1;
+  uint64_t suppressed =
+      __atomic_add_fetch(&alps_p4a_suppressed_since_probe, 1,
+                         __ATOMIC_RELAXED);
+  __atomic_fetch_add(&alps_p4a_dma_suppressed, 1, __ATOMIC_RELAXED);
+  if (suppressed < alps_p4a_probe_interval)
+    return 0;
+  __atomic_store_n(&alps_p4a_suppressed_since_probe, 0, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&alps_p4a_probe_decisions, 1, __ATOMIC_RELAXED);
+  __atomic_store_n(&alps_p4a_probe_inflight, 1, __ATOMIC_RELEASE);
+  return 1;
+}
+
+void __alps_p4a_observe_dma_completion(unsigned poll_retries) {
   if (!__atomic_load_n(&alps_p4a_enabled, __ATOMIC_ACQUIRE))
     return;
   __atomic_fetch_add(&alps_p4a_total_poll_retries, poll_retries,
                      __ATOMIC_RELAXED);
   alps_p4a_window_poll_retries += poll_retries;
-  if (++alps_p4a_window_completions < ALPS_P4A_WINDOW_COMPLETIONS)
+  uint32_t completion_target =
+      __atomic_load_n(&alps_p4a_probe_inflight, __ATOMIC_ACQUIRE)
+          ? 1u
+          : alps_p4a_window_target;
+  if (++alps_p4a_window_completions < completion_target)
     return;
   ++alps_p4a_windows;
   uint32_t pmu_window_delta[4] = {0, 0, 0, 0};
@@ -289,20 +356,26 @@ static void alps_p4a_observe_dma_completion(unsigned poll_retries) {
    * sustained late arrival (>=4 polls/completion) is rejected.  When HAP user
    * PMU is available, DMPoll is one of the observed events above; Unsigned PD
    * reports PMU unavailable and uses this exact wait-slot signal rather than
-   * inventing counter values.  The threshold is fixed across models. */
+   * inventing counter values.  Profile-guided runs may configure the window
+   * and threshold, while the default remains fixed across models. */
   uint64_t average_retries =
-      alps_p4a_window_poll_retries / ALPS_P4A_WINDOW_COMPLETIONS;
+      alps_p4a_window_poll_retries / completion_target;
   uint64_t average_pmu_dmpoll =
-      pmu_window_delta[1] / ALPS_P4A_WINDOW_COMPLETIONS;
-  if (average_retries >= 4 || average_pmu_dmpoll >= 4) {
+      pmu_window_delta[1] / completion_target;
+  if (average_retries >= alps_p4a_late_poll_threshold ||
+      average_pmu_dmpoll >= alps_p4a_late_poll_threshold) {
     __atomic_store_n(&alps_p4a_dma_allowed, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&alps_p4a_suppressed_since_probe, 0, __ATOMIC_RELAXED);
     ++alps_p4a_throttle_decisions;
   } else {
-    __atomic_store_n(&alps_p4a_dma_allowed, 1, __ATOMIC_RELEASE);
+    if (!__atomic_exchange_n(&alps_p4a_dma_allowed, 1,
+                             __ATOMIC_ACQ_REL))
+      ++alps_p4a_recovery_decisions;
     ++alps_p4a_hold_decisions;
   }
   alps_p4a_window_completions = 0;
   alps_p4a_window_poll_retries = 0;
+  __atomic_store_n(&alps_p4a_probe_inflight, 0, __ATOMIC_RELEASE);
 }
 /* P3b deliberately starts with one retained UserDMA descriptor.  The upstream
  * UserDMA ring recycles completed hardware descriptors without a consumer
@@ -1060,7 +1133,7 @@ void alps_hmx_async_drain_wait_slot(int32_t slot) {
       __atomic_fetch_add(&alps_p4a_poll_cycles,
                          alps_read_pcycles() - poll_start,
                          __ATOMIC_RELAXED);
-      alps_p4a_observe_dma_completion(polls);
+      __alps_p4a_observe_dma_completion(polls);
     }
     __atomic_fetch_add(&alps_hmx_drain_completed, 1, __ATOMIC_RELAXED);
 #endif
@@ -1115,11 +1188,9 @@ void alps_hmx_async_drain_start_f16(void *vtcm, int32_t in_offset,
   /* R never changes the HMX result representation.  Once the observed
    * window rejects more DMA traffic, execute the identical bounded drain
    * synchronously and leave the slot inactive. */
-  if (__atomic_load_n(&alps_p4a_enabled, __ATOMIC_ACQUIRE) &&
-      !__atomic_load_n(&alps_p4a_dma_allowed, __ATOMIC_ACQUIRE)) {
+  if (!__alps_p4a_request_allowed()) {
     alps_hmx_sync_drain_f16(vtcm, in_offset, dst, tile_row, tile_col,
                             output_rows, output_cols, src, out, columns);
-    __atomic_fetch_add(&alps_p4a_dma_suppressed, 1, __ATOMIC_RELAXED);
     return;
   }
 #ifdef __hexagon__
@@ -1326,31 +1397,45 @@ static void alps_exact_complete_impl(void *descriptor_handle_as_ptr,
       uint64_t poll_end = alps_read_pcycles();
       __atomic_fetch_add(&alps_p4a_poll_cycles, poll_end - poll_start,
                          __ATOMIC_RELAXED);
-      alps_p4a_observe_dma_completion((unsigned)polls);
+      __alps_p4a_observe_dma_completion((unsigned)polls);
     }
     descriptor->dma_active = 0;
   }
 #endif
   const _Float16 *stage = NULL;
-  if (descriptor->stage_offset >= 0)
-    stage =
-        (const _Float16 *)((char *)descriptor->dest + descriptor->stage_offset);
-  else if (descriptor->stage_slot >= 0)
-    stage = (const _Float16 *)alps_exact_stage[descriptor->stage_slot];
+  if (!descriptor->source_is_wh) {
+    if (descriptor->stage_offset >= 0)
+      stage = (const _Float16 *)((char *)descriptor->dest +
+                                descriptor->stage_offset);
+    else if (descriptor->stage_slot >= 0)
+      stage = (const _Float16 *)alps_exact_stage[descriptor->stage_slot];
+  }
 #ifdef __hexagon__
-  if (stage)
+  if (descriptor->source_is_wh) {
+    /* Direct DDR-WH -> VTCM-WH DMA already formed the consumer layout. */
+  } else if (stage) {
     hexkl_micro_hmx_rm_to_wh_f16((uint8_t *)descriptor->dest,
                                  (uint32_t)descriptor->weight_offset, stage, 0,
                                  0, 32);
-  else
+  } else {
     alps_exact_sync_weight(descriptor->src, descriptor->dest,
                            descriptor->tile_row, descriptor->tile_col,
                            descriptor->source_cols, descriptor->weight_offset);
+  }
 #else
-  if (stage)
+  if (!descriptor->source_is_wh && stage)
     hmx_weight_gather(
         stage, (char *)descriptor->dest + descriptor->weight_offset, 2, 32, 32);
 #endif
+  if (descriptor->scout_owned && !descriptor->source_is_wh) {
+    AlpsWhCacheEntry *entry = alps_wh_cache_reserve(
+        descriptor->src, descriptor->tile_row, descriptor->tile_col,
+        descriptor->source_cols, (int32_t)descriptor->value_version);
+    memcpy(entry->data, (char *)descriptor->dest + descriptor->weight_offset,
+           ALPS_WH_TILE_BYTES);
+    if (entry->epoch == __atomic_load_n(&alps_wh_epoch, __ATOMIC_ACQUIRE))
+      __atomic_store_n(&entry->valid, 1, __ATOMIC_RELEASE);
+  }
   expected = ALPS_DESC_LAYOUT_PENDING;
   if (!__atomic_compare_exchange_n(&descriptor->state, &expected,
                                    ALPS_DESC_READY, 0, __ATOMIC_RELEASE,
@@ -1371,8 +1456,98 @@ static void alps_exact_complete_impl(void *descriptor_handle_as_ptr,
     __atomic_fetch_add(&alps_exact_scout_completed, 1, __ATOMIC_RELAXED);
 }
 
-static void alps_exact_complete(void *descriptor_handle_as_ptr) {
-  alps_exact_complete_impl(descriptor_handle_as_ptr, /*completed_by_scout=*/1);
+/* Start one exact transfer on the calling hardware thread.  In vectorized
+ * DAE mode this function and alps_exact_complete_impl are both called by the
+ * scout, which keeps UserDMA's thread-context-sensitive lifecycle entirely
+ * on the Access stream. */
+static int alps_exact_start_transfer(int32_t descriptor_handle) {
+  AlpsInvocationContext *context;
+  AlpsExactDescriptor *descriptor;
+  if (!alps_decode_descriptor(descriptor_handle, &context, &descriptor))
+    return 0;
+  (void)context;
+  unsigned flat = (unsigned)descriptor_handle % ALPS_DESCRIPTOR_SLOTS;
+  AlpsWhCacheEntry *cached = NULL;
+  if (descriptor->scout_owned) {
+    cached = alps_wh_cache_lookup(
+        descriptor->src, descriptor->tile_row, descriptor->tile_col,
+        descriptor->source_cols, (int32_t)descriptor->value_version);
+    if (cached)
+      __atomic_fetch_add(&alps_exact_wh_cache_hits, 1, __ATOMIC_RELAXED);
+    else
+      __atomic_fetch_add(&alps_exact_wh_cache_misses, 1, __ATOMIC_RELAXED);
+  }
+  const _Float16 *row0 = cached
+                            ? (const _Float16 *)cached->data
+                            : (const _Float16 *)descriptor->src +
+                                  (size_t)descriptor->tile_row * 32 *
+                                      (size_t)descriptor->source_cols +
+                                  (size_t)descriptor->tile_col * 32;
+  descriptor->source_is_wh = cached != NULL;
+#ifdef __hexagon__
+  int status = ALPS_DMA_OK;
+  void *stage = cached
+                    ? (void *)((char *)descriptor->dest +
+                               descriptor->weight_offset)
+                    : descriptor->stage_offset >= 0
+                          ? (void *)((char *)descriptor->dest +
+                                    descriptor->stage_offset)
+                          : (void *)alps_exact_stage[flat];
+  int dstAS = cached || descriptor->stage_offset >= 0 ? ALPS_VTCM : ALPS_DDR;
+  uint64_t issue_start = __atomic_load_n(&alps_p4a_enabled, __ATOMIC_ACQUIRE)
+                             ? alps_read_pcycles()
+                             : 0;
+  if (cached) {
+    descriptor->dma_token = hexagon_runtime_dma_start(
+        (void *)row0, ALPS_DDR, stage, dstAS, ALPS_WH_TILE_BYTES,
+        /*bypassSrc=*/0, /*bypassDst=*/0, &status);
+  } else {
+    descriptor->dma_token = hexagon_runtime_dma2d_start(
+        (void *)row0, ALPS_DDR, stage, dstAS, /*width=*/64, /*height=*/32,
+        (uint32_t)descriptor->source_cols * 2u, /*dstStride=*/64,
+        /*bypassSrc=*/0, /*bypassDst=*/0, /*isOrdered=*/0,
+        /*cacheAllocationPolicy=*/0, &status);
+  }
+  if (__atomic_load_n(&alps_p4a_enabled, __ATOMIC_ACQUIRE))
+    __atomic_fetch_add(&alps_p4a_issue_cycles,
+                       alps_read_pcycles() - issue_start, __ATOMIC_RELAXED);
+  if (status != ALPS_DMA_OK) {
+    descriptor->dma_credit_owned = 0;
+    __atomic_store_n(&alps_exact_dma_credit, 0, __ATOMIC_RELEASE);
+    alps_exact_sync_weight(descriptor->src, descriptor->dest,
+                           descriptor->tile_row, descriptor->tile_col,
+                           descriptor->source_cols, descriptor->weight_offset);
+    descriptor->dma_token = 0;
+    __alps_descriptor_transition(
+        descriptor_handle, ALPS_DESC_LOAD_PENDING, ALPS_DESC_LAYOUT_PENDING);
+    __alps_descriptor_transition(
+        descriptor_handle, ALPS_DESC_LAYOUT_PENDING, ALPS_DESC_READY);
+    __atomic_fetch_add(&alps_exact_sync_fallbacks, 1, __ATOMIC_RELAXED);
+    return 0;
+  }
+  /* Token zero is valid; status reports whether the descriptor was issued. */
+  descriptor->dma_active = 1;
+#else
+  if (cached)
+    memcpy((char *)descriptor->dest + descriptor->weight_offset, cached->data,
+           ALPS_WH_TILE_BYTES);
+  else
+    alps_pack_weight_tile_to_stage((const _Float16 *)descriptor->src,
+                                   descriptor->tile_row,
+                                   descriptor->tile_col,
+                                   descriptor->source_cols,
+                                   alps_exact_stage[flat]);
+#endif
+  __atomic_thread_fence(__ATOMIC_RELEASE);
+  __atomic_fetch_add(&alps_exact_dma_kicks, 1, __ATOMIC_RELAXED);
+  return 1;
+}
+
+static void alps_exact_scout_issue_and_complete(void *descriptor_handle_as_ptr) {
+  int32_t descriptor_handle = (int32_t)(intptr_t)descriptor_handle_as_ptr;
+  if (alps_exact_start_transfer(descriptor_handle))
+    alps_exact_complete_impl(descriptor_handle_as_ptr,
+                             /*completed_by_scout=*/1);
 }
 
 int32_t __alps_exact_weight_kick(int32_t context_handle,
@@ -1410,9 +1585,10 @@ int32_t __alps_exact_weight_kick(int32_t context_handle,
   descriptor->dma_token = 0;
   descriptor->dma_active = 0;
   descriptor->dma_credit_owned = 0;
+  descriptor->scout_owned = 0;
+  descriptor->source_is_wh = 0;
 
-  if (__atomic_load_n(&alps_p4a_enabled, __ATOMIC_ACQUIRE) &&
-      !__atomic_load_n(&alps_p4a_dma_allowed, __ATOMIC_ACQUIRE)) {
+  if (!__alps_p4a_request_allowed()) {
     alps_exact_sync_weight(src, dest, tile_row, tile_col, src_cols,
                            weight_offset);
     __alps_descriptor_transition(
@@ -1420,7 +1596,19 @@ int32_t __alps_exact_weight_kick(int32_t context_handle,
     __alps_descriptor_transition(
         descriptor_handle, ALPS_DESC_LAYOUT_PENDING, ALPS_DESC_READY);
     __atomic_fetch_add(&alps_exact_sync_fallbacks, 1, __ATOMIC_RELAXED);
-    __atomic_fetch_add(&alps_p4a_dma_suppressed, 1, __ATOMIC_RELAXED);
+    return 1;
+  }
+
+  /* A single scout owns start+wait and drains its callback queue serially.
+   * Therefore dual-stream requests are bounded by the exact descriptor ring,
+   * but do not contend for the legacy Execute-owned single-DMA credit.  Taking
+   * that credit at enqueue time made every request after the first fall back
+   * synchronously on Execute and destroyed the intended access lead. */
+  if (__atomic_load_n(&alps_dual_thread_dae, __ATOMIC_ACQUIRE)) {
+    descriptor->scout_owned = 1;
+    __atomic_fetch_add(&alps_exact_scout_enqueued, 1, __ATOMIC_RELAXED);
+    hexagon_runtime_scout_enqueue(alps_exact_scout_issue_and_complete,
+                                  (void *)(intptr_t)descriptor_handle);
     return 1;
   }
 
@@ -1442,50 +1630,7 @@ int32_t __alps_exact_weight_kick(int32_t context_handle,
   }
   descriptor->dma_credit_owned = 1;
 
-  const _Float16 *row0 = (const _Float16 *)src +
-                         (size_t)tile_row * 32 * (size_t)src_cols +
-                         (size_t)tile_col * 32;
-#ifdef __hexagon__
-  int status = ALPS_DMA_OK;
-  void *stage = stage_offset >= 0 ? (void *)((char *)dest + stage_offset)
-                                  : (void *)alps_exact_stage[flat];
-  int dstAS = stage_offset >= 0 ? ALPS_VTCM : ALPS_DDR;
-  uint64_t issue_start = __atomic_load_n(&alps_p4a_enabled, __ATOMIC_ACQUIRE)
-                             ? alps_read_pcycles()
-                             : 0;
-  descriptor->dma_token = hexagon_runtime_dma2d_start(
-      (void *)row0, ALPS_DDR, stage, dstAS, /*width=*/64, /*height=*/32,
-      (uint32_t)src_cols * 2u, /*dstStride=*/64, /*bypassSrc=*/0,
-      /*bypassDst=*/0, /*isOrdered=*/0, /*cacheAllocationPolicy=*/0, &status);
-  if (__atomic_load_n(&alps_p4a_enabled, __ATOMIC_ACQUIRE))
-    __atomic_fetch_add(&alps_p4a_issue_cycles,
-                       alps_read_pcycles() - issue_start, __ATOMIC_RELAXED);
-  if (status != ALPS_DMA_OK) {
-    descriptor->dma_credit_owned = 0;
-    __atomic_store_n(&alps_exact_dma_credit, 0, __ATOMIC_RELEASE);
-    alps_exact_sync_weight(src, dest, tile_row, tile_col, src_cols,
-                           weight_offset);
-    descriptor->dma_token = 0;
-    __alps_descriptor_transition(
-        descriptor_handle, ALPS_DESC_LOAD_PENDING, ALPS_DESC_LAYOUT_PENDING);
-    __alps_descriptor_transition(
-        descriptor_handle, ALPS_DESC_LAYOUT_PENDING, ALPS_DESC_READY);
-    __atomic_fetch_add(&alps_exact_sync_fallbacks, 1, __ATOMIC_RELAXED);
-    return 1;
-  }
-  /* Token zero is the first valid UserDMA ring token; status, not the numeric
-   * token value, distinguishes a successfully issued transfer. */
-  descriptor->dma_active = 1;
-#else
-  (void)row0;
-  alps_pack_weight_tile_to_stage((const _Float16 *)src, tile_row, tile_col,
-                                 src_cols, alps_exact_stage[flat]);
-#endif
-  __atomic_thread_fence(__ATOMIC_RELEASE);
-  __atomic_fetch_add(&alps_exact_dma_kicks, 1, __ATOMIC_RELAXED);
-  if (__atomic_load_n(&alps_dual_thread_dae, __ATOMIC_ACQUIRE))
-    hexagon_runtime_scout_enqueue(alps_exact_complete,
-                                  (void *)(intptr_t)descriptor_handle);
+  alps_exact_start_transfer(descriptor_handle);
   return 1;
 }
 
@@ -1501,7 +1646,19 @@ int32_t __alps_exact_weight_consume(int32_t context_handle,
   if (!alps_decode_descriptor(descriptor_handle, &context, &descriptor))
     return 0;
   (void)context;
+  int initial_state = __atomic_load_n(&descriptor->state, __ATOMIC_ACQUIRE);
+  /* A synchronous traffic-control fallback is already READY at this point,
+   * but it is not useful Access/Execute overlap.  Count only a tile that was
+   * produced by the independent scout before Execute demand. */
+  if (descriptor->scout_owned && initial_state == ALPS_DESC_READY) {
+    __atomic_fetch_add(&alps_exact_ready_before_consume, 1,
+                       __ATOMIC_RELAXED);
+    __atomic_fetch_add(&alps_exact_ready_before_consume_bytes, 2048,
+                       __ATOMIC_RELAXED);
+  }
   int spins = 0;
+  uint64_t wait_start =
+      initial_state == ALPS_DESC_READY ? 0 : alps_read_pcycles();
   for (;;) {
     int state = __atomic_load_n(&descriptor->state, __ATOMIC_ACQUIRE);
     if (state == ALPS_DESC_READY)
@@ -1513,14 +1670,15 @@ int32_t __alps_exact_weight_consume(int32_t context_handle,
       return 0;
     }
     if (state == ALPS_DESC_LOAD_PENDING) {
-      // If the scout has not claimed this descriptor by demand time, steal
-      // the completion work on the consumer.  The LOAD_PENDING CAS in the
-      // implementation makes this race-safe with the queued scout callback.
-      alps_exact_complete_impl((void *)(intptr_t)descriptor_handle,
-                               /*completed_by_scout=*/0);
-      continue;
-    }
-    if (state != ALPS_DESC_LAYOUT_PENDING) {
+      if (!descriptor->scout_owned) {
+        // Single-thread software-pipeline mode completes on demand.  A
+        // scout-owned request is never stolen: UserDMA start and wait must
+        // remain on the same Access hardware thread.
+        alps_exact_complete_impl((void *)(intptr_t)descriptor_handle,
+                                 /*completed_by_scout=*/0);
+        continue;
+      }
+    } else if (state != ALPS_DESC_LAYOUT_PENDING) {
       alps_descriptor_fail(ALPS_ERROR_DESCRIPTOR_STATE);
       return 0;
     }
@@ -1539,6 +1697,9 @@ int32_t __alps_exact_weight_consume(int32_t context_handle,
     __asm__ volatile("pause(#64)");
 #endif
   }
+  if (initial_state != ALPS_DESC_READY)
+    __atomic_fetch_add(&alps_exact_execute_wait_cycles,
+                       alps_read_pcycles() - wait_start, __ATOMIC_RELAXED);
   __atomic_fetch_add(&alps_exact_consume_waits, (uint64_t)spins,
                      __ATOMIC_RELAXED);
   return __alps_descriptor_consume(
@@ -1576,6 +1737,31 @@ uint64_t __alps_exact_consume_waits(void) {
   return __atomic_load_n(&alps_exact_consume_waits, __ATOMIC_RELAXED);
 }
 
+uint64_t __alps_exact_vdae_counts(void) {
+  uint64_t enqueued =
+      __atomic_load_n(&alps_exact_scout_enqueued, __ATOMIC_RELAXED);
+  uint64_t ready =
+      __atomic_load_n(&alps_exact_ready_before_consume, __ATOMIC_RELAXED);
+  return (enqueued << 32) | (ready & UINT64_C(0xffffffff));
+}
+
+uint64_t __alps_exact_vdae_ready_bytes(void) {
+  return __atomic_load_n(&alps_exact_ready_before_consume_bytes,
+                         __ATOMIC_RELAXED);
+}
+
+uint64_t __alps_exact_vdae_wait_cycles(void) {
+  return __atomic_load_n(&alps_exact_execute_wait_cycles, __ATOMIC_RELAXED);
+}
+
+__attribute__((used)) uint64_t __alps_exact_vdae_cache_counts(void) {
+  uint64_t hits =
+      __atomic_load_n(&alps_exact_wh_cache_hits, __ATOMIC_RELAXED);
+  uint64_t misses =
+      __atomic_load_n(&alps_exact_wh_cache_misses, __ATOMIC_RELAXED);
+  return (hits << 32) | (misses & UINT64_C(0xffffffff));
+}
+
 uint64_t __alps_exact_control_counts(void) {
   uint64_t credit =
       __atomic_load_n(&alps_exact_credit_fallbacks, __ATOMIC_RELAXED);
@@ -1596,6 +1782,20 @@ uint64_t __alps_p4a_decision_counts(void) {
       __atomic_load_n(&alps_p4a_throttle_decisions, __ATOMIC_RELAXED);
   uint64_t hold = __atomic_load_n(&alps_p4a_hold_decisions, __ATOMIC_RELAXED);
   return (throttle << 32) | (hold & UINT64_C(0xffffffff));
+}
+
+uint64_t __alps_p4a_recovery_counts(void) {
+  uint64_t probes =
+      __atomic_load_n(&alps_p4a_probe_decisions, __ATOMIC_RELAXED);
+  uint64_t recoveries =
+      __atomic_load_n(&alps_p4a_recovery_decisions, __ATOMIC_RELAXED);
+  return (probes << 32) | (recoveries & UINT64_C(0xffffffff));
+}
+
+uint64_t __alps_p4a_policy_config(void) {
+  return ((uint64_t)(alps_p4a_window_target & 0xffffu) << 32) |
+         ((uint64_t)(alps_p4a_late_poll_threshold & 0xffffu) << 16) |
+         (uint64_t)(alps_p4a_probe_interval & 0xffffu);
 }
 
 uint64_t __alps_p4a_pmu_status_counts(void) {

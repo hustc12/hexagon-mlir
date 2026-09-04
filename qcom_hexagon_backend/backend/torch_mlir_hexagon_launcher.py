@@ -9,6 +9,7 @@
 
 import os
 import hashlib
+import json
 import shutil
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -32,6 +33,45 @@ from triton.backends.qcom_hexagon_backend.utils import (
     get_shape,
 )
 from triton._C.libtriton import qcom_hexagon_backend, ir  # type: ignore
+
+
+def load_alps_traffic_policy(path: Optional[str] = None) -> dict:
+    """Load the slow-loop sysMon policy used to seed runtime admission.
+
+    The policy is deliberately small and contains no model-name special case.
+    It may reject a measured residual V-DAE contract for the next invocation;
+    same-invocation completion feedback still controls an admitted stream.
+    """
+    defaults = {
+        "version": 1,
+        "residual_vdae_admitted": True,
+        "initial_dma_allowed": True,
+        "window_completions": 64,
+        "late_poll_threshold": 4,
+        "probe_interval": 64,
+        "provenance": "runtime-default",
+    }
+    path = path if path is not None else os.environ.get("ALPS_TRAFFIC_POLICY_JSON")
+    if not path:
+        return defaults
+    policy_path = Path(path)
+    try:
+        supplied = json.loads(policy_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot load ALPS traffic policy {policy_path}: {error}")
+    if supplied.get("version") != 1:
+        raise ValueError("ALPS traffic policy must have version 1")
+    policy = defaults | supplied
+    if not isinstance(policy["initial_dma_allowed"], bool):
+        raise ValueError("initial_dma_allowed must be a JSON boolean")
+    if not isinstance(policy["residual_vdae_admitted"], bool):
+        raise ValueError("residual_vdae_admitted must be a JSON boolean")
+    for key in ("window_completions", "late_poll_threshold", "probe_interval"):
+        value = policy[key]
+        if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 65535:
+            raise ValueError(f"{key} must be an integer in [1, 65535]")
+    policy["provenance"] = str(policy.get("provenance", policy_path.name))
+    return policy
 
 # This file is part of a small subset of python files that uses some type-annotations
 # and it passes type-verification with mypy (a type checker).
@@ -195,6 +235,10 @@ uint64_t exact_dma = __alps_exact_dma_counts();
 uint64_t exact_overlap = __alps_exact_overlap_counts();
 uint64_t exact_waits = __alps_exact_consume_waits();
 uint64_t exact_control = __alps_exact_control_counts();
+uint64_t exact_vdae = __alps_exact_vdae_counts();
+uint64_t exact_vdae_ready_bytes = __alps_exact_vdae_ready_bytes();
+uint64_t exact_vdae_wait_cycles = __alps_exact_vdae_wait_cycles();
+uint64_t exact_vdae_cache = __alps_exact_vdae_cache_counts();
 uint64_t exact_descriptors = __alps_descriptor_counts();
 uint64_t exact_releases = __alps_descriptor_release_failures();
 FILE *exact_report = fopen("{exec_dir}/perf.txt", "a");
@@ -202,13 +246,20 @@ if (exact_report) {
   fprintf(exact_report,
           "ALPSExactOverlap: kicks=%u completed=%u scout_completed=%u "
           "sync_fallbacks=%u consume_spins=%llu acquired=%u consumed=%u "
-          "released=%u failures=%u credit_fallbacks=%u dma_timeouts=%u\\n",
+          "released=%u failures=%u credit_fallbacks=%u dma_timeouts=%u "
+          "access_enqueued=%u ready_before_consume=%u "
+          "ready_before_consume_bytes=%llu execute_wait_cycles=%llu "
+          "consumer_ready_hits=%u consumer_ready_misses=%u\\n",
           (unsigned)(exact_dma >> 32), (unsigned)exact_dma,
           (unsigned)(exact_overlap >> 32), (unsigned)exact_overlap,
           (unsigned long long)exact_waits,
           (unsigned)(exact_descriptors >> 32), (unsigned)exact_descriptors,
           (unsigned)(exact_releases >> 32), (unsigned)exact_releases,
-          (unsigned)(exact_control >> 32), (unsigned)exact_control);
+          (unsigned)(exact_control >> 32), (unsigned)exact_control,
+          (unsigned)(exact_vdae >> 32), (unsigned)exact_vdae,
+          (unsigned long long)exact_vdae_ready_bytes,
+          (unsigned long long)exact_vdae_wait_cycles,
+          (unsigned)(exact_vdae_cache >> 32), (unsigned)exact_vdae_cache);
   fclose(exact_report);
 }
 """.replace("{exec_dir}", exec_dir)
@@ -229,9 +280,12 @@ if (hmx_drain_report) {
 }
 """.replace("{exec_dir}", exec_dir)
         if self.options.get("enableAlpsTrafficControl", False):
+            policy = load_alps_traffic_policy()
             report += """
 uint64_t p4a_windows = __alps_p4a_window_counts();
 uint64_t p4a_decisions = __alps_p4a_decision_counts();
+uint64_t p4a_recovery = __alps_p4a_recovery_counts();
+uint64_t p4a_policy = __alps_p4a_policy_config();
 uint64_t p4a_pmu = __alps_p4a_pmu_status_counts();
 uint64_t p4a_pmu01 = __alps_p4a_pmu_values01();
 uint64_t p4a_pmu23 = __alps_p4a_pmu_values23();
@@ -240,7 +294,9 @@ if (p4a_report) {
   fprintf(p4a_report,
           "ALPSP4A: windows=%u dma_suppressed=%u throttle=%u hold=%u "
           "pmu_status=%u pmu_reads=%u issue_cycles=%llu poll_cycles=%llu "
-          "poll_retries=%llu udma_active=%u dmpoll_cycles=%u "
+          "poll_retries=%llu probes=%u recoveries=%u "
+          "window=%u late_poll_threshold=%u probe_interval=%u "
+          "policy_provenance=%s udma_active=%u dmpoll_cycles=%u "
           "coherent_read_cycles=%u vtcm_write_cycles=%u\\n",
           (unsigned)(p4a_windows >> 32), (unsigned)p4a_windows,
           (unsigned)(p4a_decisions >> 32), (unsigned)p4a_decisions,
@@ -248,11 +304,18 @@ if (p4a_report) {
           (unsigned long long)__alps_p4a_issue_cycles(),
           (unsigned long long)__alps_p4a_poll_cycles(),
           (unsigned long long)__alps_p4a_poll_retries(),
+          (unsigned)(p4a_recovery >> 32), (unsigned)p4a_recovery,
+          (unsigned)(p4a_policy >> 32),
+          (unsigned)((p4a_policy >> 16) & 0xffffu),
+          (unsigned)(p4a_policy & 0xffffu),
+          "{policy_provenance}",
           (unsigned)(p4a_pmu01 >> 32), (unsigned)p4a_pmu01,
           (unsigned)(p4a_pmu23 >> 32), (unsigned)p4a_pmu23);
   fclose(p4a_report);
 }
-""".replace("{exec_dir}", exec_dir)
+""".replace("{exec_dir}", exec_dir).replace(
+                "{policy_provenance}", policy["provenance"].replace('"', "'")
+            )
         return report
 
     def _uses_l2_scheduler(self):
@@ -296,7 +359,16 @@ if (p4a_report) {
                 'fopen("perf.txt", "a")', f'fopen("{exec_dir}/perf.txt", "a")'
             )
             if self.options.get("enableAlpsTrafficControl", False):
-                benchmarking = "__alps_p4a_configure(1);\n" + benchmarking
+                policy = load_alps_traffic_policy()
+                benchmarking = (
+                    "__alps_p4a_configure_policy(1, "
+                    f"{int(policy['initial_dma_allowed'])}, "
+                    f"{policy['window_completions']}u, "
+                    f"{policy['late_poll_threshold']}u, "
+                    f"{policy['probe_interval']}u);\n" + benchmarking
+                )
+            if self.options.get("enableAlpsDualThreadDae", False):
+                benchmarking = "hexagon_runtime_require_scout();\n" + benchmarking
             return benchmarking + self.generate_l2_scheduler_report(exec_dir)
         context = int.from_bytes(
             hashlib.sha256(self.func_name.encode("utf-8")).digest()[:8], "little"
@@ -408,6 +480,14 @@ __alps_exact_consume_waits(void) { return 0; }
 extern "C" __attribute__((weak)) uint64_t
 __alps_exact_control_counts(void) { return 0; }
 extern "C" __attribute__((weak)) uint64_t
+__alps_exact_vdae_counts(void) { return 0; }
+extern "C" __attribute__((weak)) uint64_t
+__alps_exact_vdae_ready_bytes(void) { return 0; }
+extern "C" __attribute__((weak)) uint64_t
+__alps_exact_vdae_wait_cycles(void) { return 0; }
+extern "C" __attribute__((weak)) uint64_t
+__alps_exact_vdae_cache_counts(void) { return 0; }
+extern "C" __attribute__((weak)) uint64_t
 __alps_descriptor_counts(void) { return 0; }
 extern "C" __attribute__((weak)) uint64_t
 __alps_descriptor_release_failures(void) { return 0; }
@@ -425,10 +505,16 @@ alps_hmx_async_drain_sync_fallbacks(void) { return 0; }
             code_headers += """
 extern "C" __attribute__((weak)) void
 __alps_p4a_configure(int32_t) {}
+extern "C" __attribute__((weak)) void
+__alps_p4a_configure_policy(int32_t, int32_t, uint32_t, uint32_t, uint32_t) {}
 extern "C" __attribute__((weak)) uint64_t
 __alps_p4a_window_counts(void) { return 0; }
 extern "C" __attribute__((weak)) uint64_t
 __alps_p4a_decision_counts(void) { return 0; }
+extern "C" __attribute__((weak)) uint64_t
+__alps_p4a_recovery_counts(void) { return 0; }
+extern "C" __attribute__((weak)) uint64_t
+__alps_p4a_policy_config(void) { return 0; }
 extern "C" __attribute__((weak)) uint64_t
 __alps_p4a_pmu_status_counts(void) { return 0; }
 extern "C" __attribute__((weak)) uint64_t
@@ -441,6 +527,10 @@ extern "C" __attribute__((weak)) uint64_t
 __alps_p4a_pmu_values01(void) { return 0; }
 extern "C" __attribute__((weak)) uint64_t
 __alps_p4a_pmu_values23(void) { return 0; }
+"""
+        if self.options.get("enableAlpsDualThreadDae", False):
+            code_headers += """
+extern "C" void hexagon_runtime_require_scout(void);
 """
 
         code_define = self.common_strings.code_define.format(
@@ -708,6 +798,39 @@ class TorchMLIRHexagonLauncher(HexagonLauncherBase):
     ) -> list[Tensor]:
         if options is None:
             options = HexagonOptions().__dict__
+
+        # sysMon is the slow, cross-invocation control loop.  If a previously
+        # measured residual stream regressed, retain the original consumer-
+        # formation lowering rather than compiling exact descriptors and then
+        # executing them synchronously.  The latter is not a true fallback: it
+        # still pays descriptor, queue, and token overhead.  Copy the options
+        # so a caller can safely reuse its configuration object.
+        if options.get("enableAlpsDualThreadDae", False) and options.get(
+            "enableAlpsTrafficControl", False
+        ):
+            traffic_policy = load_alps_traffic_policy()
+            if not traffic_policy["residual_vdae_admitted"]:
+                options = dict(options)
+                for option in (
+                    "enableAlpsDualThreadDae",
+                    "enableAlpsExactOverlap",
+                    "enableAlpsExactReadiness",
+                    "enableAlpsMinimalStaticAdmission",
+                    "enableAlpsZeroCopyAttention",
+                ):
+                    options[option] = False
+                print(
+                    "[ALPS-R2-COMPILE-ADMISSION] residual_vdae=0 "
+                    f"provenance={traffic_policy['provenance']} "
+                    "fallback=consumer_formation",
+                    flush=True,
+                )
+            else:
+                print(
+                    "[ALPS-R2-COMPILE-ADMISSION] residual_vdae=1 "
+                    f"provenance={traffic_policy['provenance']}",
+                    flush=True,
+                )
 
         local_dir_path, kernel_run_id = create_timestamped_folder(
             func_name, base_dir_for_artifacts

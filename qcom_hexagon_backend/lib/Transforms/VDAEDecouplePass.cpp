@@ -7,7 +7,7 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Implements the "Virtual Decoupled Access-Execute" (V-DAE) transformation
+// Implements the "Vectorized Decoupled Access-Execute" (V-DAE) transformation
 // for DNN inference on Hexagon NPU.
 //
 // Motivation

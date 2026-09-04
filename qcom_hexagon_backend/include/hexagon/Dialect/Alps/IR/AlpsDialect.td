@@ -30,7 +30,7 @@ def Alps_Dialect : Dialect {
 
       1. **Semaphore lifecycle** – `create_sem`, `signal`, `wait` ops
          that map to Hexagon hardware semaphore instructions and enable
-         the Virtual Decoupled Access-Execute (V-DAE) execution model.
+         the Vectorized Decoupled Access-Execute (V-DAE) execution model.
 
       2. **Layout-aware prefetch** – `prefetch_in_situ` carries a
          `layout_transform` attribute that instructs the backend to

@@ -1020,6 +1020,10 @@ public:
       // merely changing PrefetchInsert would produce an out-of-budget view.
       decomposeOptions.enableDmaToVtcm =
           alpsExactOverlap || enableAlpsDmaToVtcm;
+      decomposeOptions.exactWeightLookahead =
+          enableAlpsDualThreadDae
+              ? std::clamp(static_cast<int>(alpsLookahead), 1, 7)
+              : 1;
       decomposeOptions.enableDirectOutputFormation =
           enableAlpsHmxDirectOutputFormation;
       decomposeOptions.enableF16BiasEpilogueFormation =
@@ -1150,7 +1154,7 @@ public:
       pm.addNestedPass<func::FuncOp>(hexagon::createLayoutOpsEliminationPass());
     }
 
-    // --- Component 3: V-DAE (Virtual Decoupled Access-Execute) ---
+    // --- V-DAE (Vectorized Decoupled Access-Execute) ---
     // Adds wait/signal semaphore synchronization around prefetch operations.
     // Requires Component 1 to have already inserted prefetch ops.
     if (enableAlpsVDAE) {
