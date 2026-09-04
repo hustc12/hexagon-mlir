@@ -339,12 +339,12 @@ def load_qwen_model(model_name, config):
 def qwen2_5_0_5b(
     enable_hexkl: bool = False,
     enable_hvx_vector: bool = False,
-    enable_omnifetch_vdae: bool = False,
-    enable_omnifetch_layout_aware: bool = True,
-    omnifetch_lookahead: int = 2,
-    enable_omnifetch_adaptive: bool = True,
-    enable_omnifetch_items_1_7: bool = False,
-    enable_omnifetch_kv_cache_prefetch: bool = False,
+    enable_alps_vdae: bool = False,
+    enable_alps_layout_aware: bool = True,
+    alps_lookahead: int = 2,
+    enable_alps_adaptive: bool = True,
+    enable_alps_items_1_7: bool = False,
+    enable_alps_kv_cache_prefetch: bool = False,
     seq_len: Optional[int] = None,
     device_iterations: int = 1,
     model_name: str = "Qwen/Qwen2.5-0.5B",
@@ -464,21 +464,21 @@ def qwen2_5_0_5b(
     options["enableVectorization"] = bool(enable_hvx_vector)
     options["enableHexKL"] = bool(enable_hexkl)
     options["enableConvertToHexagonmem"] = bool(enable_hexkl)
-    cumulative = bool(enable_omnifetch_items_1_7)
+    cumulative = bool(enable_alps_items_1_7)
     options["enablePrefetch"] = bool(
-        enable_omnifetch_vdae
+        enable_alps_vdae
         or cumulative
-        or enable_omnifetch_kv_cache_prefetch
+        or enable_alps_kv_cache_prefetch
     )
-    options["enableOmniFetchLayoutAware"] = bool(enable_omnifetch_layout_aware)
-    options["omniFetchLookahead"] = int(omnifetch_lookahead)
-    options["enableOmniFetchVDAE"] = bool(enable_omnifetch_vdae or cumulative)
-    options["enableOmniFetchAdaptive"] = bool(enable_omnifetch_adaptive)
-    options["enableOmniFetchPersistentWhCache"] = cumulative
-    options["enableOmniFetchTwoDimPipeline"] = cumulative
-    options["enableOmniFetchVtcmColoring"] = cumulative
-    options["enableOmniFetchKvCachePrefetch"] = bool(
-        cumulative or enable_omnifetch_kv_cache_prefetch
+    options["enableAlpsLayoutAware"] = bool(enable_alps_layout_aware)
+    options["alpsLookahead"] = int(alps_lookahead)
+    options["enableAlpsVDAE"] = bool(enable_alps_vdae or cumulative)
+    options["enableAlpsAdaptive"] = bool(enable_alps_adaptive)
+    options["enableAlpsPersistentWhCache"] = cumulative
+    options["enableAlpsTwoDimPipeline"] = cumulative
+    options["enableAlpsVtcmColoring"] = cumulative
+    options["enableAlpsKvCachePrefetch"] = bool(
+        cumulative or enable_alps_kv_cache_prefetch
     )
     options["enablePrefetchKernelHX"] = prefetch_baseline == "prefetch-kernel-hx"
     options["prefetchKernelHxDistance"] = int(prefetch_baseline_distance)
@@ -516,7 +516,7 @@ def qwen2_5_0_5b(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Qwen2.5-0.5B Hexagon smoke (optional HexKL/OmniFetch)."
+        description="Qwen2.5-0.5B Hexagon smoke (optional HexKL/Alps)."
     )
     parser.add_argument(
         "--enable-hexkl",
@@ -529,19 +529,19 @@ if __name__ == "__main__":
         help="Enable the real HVX vector lowering path for controlled baselines.",
     )
     parser.add_argument(
-        "--enable-omnifetch-vdae",
+        "--enable-alps-vdae",
         action="store_true",
-        help="Enable Omni-Fetch Prefetch + V-DAE.",
+        help="Enable ALPS Prefetch + V-DAE.",
     )
     parser.add_argument(
         "--disable-layout-aware",
         action="store_true",
         help="Disable layout-aware prefetch (L2Hint / linear only).",
     )
-    parser.add_argument("--omnifetch-lookahead", type=int, default=2)
-    parser.add_argument("--disable-omnifetch-adaptive", action="store_true")
-    parser.add_argument("--enable-omnifetch-items-1-7", action="store_true")
-    parser.add_argument("--enable-omnifetch-kv-cache-prefetch", action="store_true")
+    parser.add_argument("--alps-lookahead", type=int, default=2)
+    parser.add_argument("--disable-alps-adaptive", action="store_true")
+    parser.add_argument("--enable-alps-items-1-7", action="store_true")
+    parser.add_argument("--enable-alps-kv-cache-prefetch", action="store_true")
     parser.add_argument(
         "--prefetch-baseline",
         choices=("none", "prefetch-kernel-hx", "apt-get-hx"),
@@ -561,13 +561,13 @@ if __name__ == "__main__":
     qwen2_5_0_5b(
         enable_hexkl=args.enable_hexkl,
         enable_hvx_vector=args.enable_hvx_vector,
-        enable_omnifetch_vdae=args.enable_omnifetch_vdae,
-        enable_omnifetch_layout_aware=not args.disable_layout_aware,
-        omnifetch_lookahead=args.omnifetch_lookahead,
-        enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
-        enable_omnifetch_items_1_7=args.enable_omnifetch_items_1_7,
-        enable_omnifetch_kv_cache_prefetch=(
-            args.enable_omnifetch_kv_cache_prefetch
+        enable_alps_vdae=args.enable_alps_vdae,
+        enable_alps_layout_aware=not args.disable_layout_aware,
+        alps_lookahead=args.alps_lookahead,
+        enable_alps_adaptive=not args.disable_alps_adaptive,
+        enable_alps_items_1_7=args.enable_alps_items_1_7,
+        enable_alps_kv_cache_prefetch=(
+            args.enable_alps_kv_cache_prefetch
         ),
         seq_len=args.seq_len,
         device_iterations=args.device_iterations,

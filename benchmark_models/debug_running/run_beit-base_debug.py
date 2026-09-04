@@ -21,9 +21,9 @@ def run(a):
     if a.enable_hexkl:
         q,nb,nf=apply_hexkl_ir_rewrites(ir);p=q if nb or nf else None;print(f"[HexKL] rewrites={nb+nf}")
     options=hexagon_options_phase4(
-        a.enable_hexkl,a.enable_omnifetch_vdae,not a.disable_layout_aware,
-        a.omnifetch_lookahead,not a.disable_omnifetch_adaptive,
-        a.enable_omnifetch_items_1_7,False,
+        a.enable_hexkl,a.enable_alps_vdae,not a.disable_layout_aware,
+        a.alps_lookahead,not a.disable_alps_adaptive,
+        a.enable_alps_items_1_7,False,
         backend_profile=a.backend_profile,
         prefetch_baseline=a.prefetch_baseline,
         prefetch_baseline_distance=a.prefetch_baseline_distance,

@@ -34,13 +34,13 @@ func.func @p2c_hmx_micro(
 // CHECK-SAME: alps.p2c.proven_eliminated_physical_bytes = 0
 // CHECK-SAME: alps.p2c.replaced_ir_ops = 3
 // CHECK-SAME: alps.p2c.weight_sites = 1
-// CHECK: omni_fetch.prefetch_in_situ
+// CHECK: alps.prefetch_in_situ
 // CHECK-SAME: alps.p2c.fused_transform_transfer
 // CHECK-SAME: alps.p2c.kind = "hmx_activation"
 // CHECK-SAME: alps.p2c.synchronous
 // CHECK-SAME: layout_transform = 2 : i32
 // CHECK-SAME: lookahead = 0
-// CHECK: omni_fetch.prefetch_in_situ
+// CHECK: alps.prefetch_in_situ
 // CHECK-SAME: alps.p2c.fused_transform_transfer
 // CHECK-SAME: alps.p2c.kind = "hmx_weight"
 // CHECK-SAME: alps.p2c.synchronous

@@ -4,13 +4,13 @@ set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 project_root=$(cd -- "${script_dir}/../.." && pwd)
-runtime_root=${OMNIFETCH_RUNTIME_ROOT:-${project_root}}
-output_dir=${OUTPUT_DIR:-/tmp/omnifetch-dinov2-codegen-profiles}
-venv=${OMNIFETCH_VENV:-/home/huzq85/2-working/hexagon_npu/mlir-env}
-run_timeout=${OMNIFETCH_TIMEOUT:-600}
-device_iterations=${OMNIFETCH_DEVICE_ITERATIONS:-1}
-selected_cases=${OMNIFETCH_CASES:-all}
-model_variant=${OMNIFETCH_DINOV2_VARIANT:-debug}
+runtime_root=${ALPS_RUNTIME_ROOT:-${project_root}}
+output_dir=${OUTPUT_DIR:-/tmp/alps-dinov2-codegen-profiles}
+venv=${ALPS_VENV:-/home/huzq85/2-working/hexagon_npu/mlir-env}
+run_timeout=${ALPS_TIMEOUT:-600}
+device_iterations=${ALPS_DEVICE_ITERATIONS:-1}
+selected_cases=${ALPS_CASES:-all}
+model_variant=${ALPS_DINOV2_VARIANT:-debug}
 case "${model_variant}" in
   debug)
     runner="${project_root}/benchmark_models/debug_running/run_dinov2-small_debug.py"
@@ -19,17 +19,17 @@ case "${model_variant}" in
     runner="${project_root}/benchmark_models/run_dinov2-small.py"
     ;;
   *)
-    echo "ERROR: OMNIFETCH_DINOV2_VARIANT must be debug or full" >&2
+    echo "ERROR: ALPS_DINOV2_VARIANT must be debug or full" >&2
     exit 2
     ;;
 esac
 
 [[ "${run_timeout}" =~ ^[1-9][0-9]*$ ]] || {
-  echo "ERROR: OMNIFETCH_TIMEOUT must be a positive integer" >&2
+  echo "ERROR: ALPS_TIMEOUT must be a positive integer" >&2
   exit 2
 }
 [[ "${device_iterations}" =~ ^[1-9][0-9]*$ ]] || {
-  echo "ERROR: OMNIFETCH_DEVICE_ITERATIONS must be a positive integer" >&2
+  echo "ERROR: ALPS_DEVICE_ITERATIONS must be a positive integer" >&2
   exit 2
 }
 
@@ -132,30 +132,30 @@ case_selected hexkl_vector_vtcm &&
     --backend-profile hvx-vector-vtcm --enable-hexkl
 case_selected hexkl_prefetch_vdae_vector &&
   run_case hexkl_prefetch_vdae_vector \
-    --backend-profile hvx-vector --enable-hexkl --enable-omnifetch-vdae
+    --backend-profile hvx-vector --enable-hexkl --enable-alps-vdae
 case_selected hexkl_items_4_vector &&
   run_case hexkl_items_4_vector \
-    --backend-profile hvx-vector --enable-hexkl --omnifetch-items-through 4
+    --backend-profile hvx-vector --enable-hexkl --alps-items-through 4
 case_selected hexkl_items_5_vector &&
   run_case hexkl_items_5_vector \
-    --backend-profile hvx-vector --enable-hexkl --omnifetch-items-through 5
+    --backend-profile hvx-vector --enable-hexkl --alps-items-through 5
 case_selected hexkl_items_6_vector &&
   run_case hexkl_items_6_vector \
-    --backend-profile hvx-vector --enable-hexkl --omnifetch-items-through 6
+    --backend-profile hvx-vector --enable-hexkl --alps-items-through 6
 case_selected hexkl_items_7_vector &&
   run_case hexkl_items_7_vector \
-    --backend-profile hvx-vector --enable-hexkl --omnifetch-items-through 7
+    --backend-profile hvx-vector --enable-hexkl --alps-items-through 7
 case_selected hexkl_items_7_vector_vtcm_stage &&
   run_case hexkl_items_7_vector_vtcm_stage \
-    --backend-profile hvx-vector --enable-hexkl --omnifetch-items-through 7 \
-    --enable-omnifetch-kv-vtcm
+    --backend-profile hvx-vector --enable-hexkl --alps-items-through 7 \
+    --enable-alps-kv-vtcm
 case_selected hexkl_items_7_scalar &&
   run_case hexkl_items_7_scalar \
     --backend-profile legacy-scalar --enable-hexkl \
-    --omnifetch-items-through 7
-case_selected hexkl_omnifetch_1_7_vector_vtcm &&
-  run_case hexkl_omnifetch_1_7_vector_vtcm \
+    --alps-items-through 7
+case_selected hexkl_alps_1_7_vector_vtcm &&
+  run_case hexkl_alps_1_7_vector_vtcm \
     --backend-profile hvx-vector-vtcm --enable-hexkl \
-    --enable-omnifetch-items-1-7
+    --enable-alps-items-1-7
 
 echo "COMPLETE results=${results_csv} audit=${audit_csv}"

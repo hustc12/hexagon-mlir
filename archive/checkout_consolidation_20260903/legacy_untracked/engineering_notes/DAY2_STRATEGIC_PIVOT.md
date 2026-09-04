@@ -109,7 +109,7 @@ Total MACs ≈ 12x more
 文件: `benchmark_models/run_dinov2-small.py`
 
 需要添加（like debug 版本）:
-1. 传递 `enable_omnifetch_m_pad_hmx` 到 `hexagon_options_phase4()`
+1. 传递 `enable_alps_m_pad_hmx` 到 `hexagon_options_phase4()`
 2. 传递 `enable_m_pad` 到 `apply_hexkl_ir_rewrites()`
 
 ### Task 2: 测试完整 DINOv2（1 小时）
@@ -126,7 +126,7 @@ python benchmark_models/run_dinov2-small.py \
 # B2: HMX with M-pad
 python benchmark_models/run_dinov2-small.py \
   --backend-profile legacy-scalar --enable-hexkl \
-  --enable-omnifetch-m-pad-hmx --device-iterations 3
+  --enable-alps-m-pad-hmx --device-iterations 3
 ```
 
 **预期**: B2 应该快于 B0（因为 padding overhead 只有 1.12x）

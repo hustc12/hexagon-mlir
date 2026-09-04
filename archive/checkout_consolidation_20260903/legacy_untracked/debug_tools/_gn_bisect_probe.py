@@ -75,9 +75,9 @@ def run(args):
     ir = str(module)
     print(f"[Stage={args.stage}] has_f64={'f64' in ir}")
     options = hexagon_options_phase4(
-        False, args.enable_omnifetch_vdae,
-        not args.disable_layout_aware, args.omnifetch_lookahead,
-        not args.disable_omnifetch_adaptive, args.enable_omnifetch_items_1_7,
+        False, args.enable_alps_vdae,
+        not args.disable_layout_aware, args.alps_lookahead,
+        not args.disable_alps_adaptive, args.enable_alps_items_1_7,
         lower_constants_separate=False,
     )
     out = hex_execution(module, stage.__class__.__name__, inputs, options)

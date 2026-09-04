@@ -14,7 +14,7 @@ from triton.backends.qcom_hexagon_backend import hexagon_launcher_base as _hlb
 from hexkl_utils import patch_full_model_dsp_heap
 
 # HMX tiles are 32-wide; keep DSP heap inside the mapped TLB window (same as
-# verify_omnifetch_Attention.py).
+# verify_alps_Attention.py).
 _QURT_HEAP_1GB = "unsigned int _QURT_MAX_HEAP_SIZE = 1073741824; // 1 GB Max Heap Size"
 _QURT_HEAP_256MB = "unsigned int _QURT_MAX_HEAP_SIZE = 268435456;  // 256 MB Max Heap Size"
 
@@ -392,25 +392,25 @@ def gpt2lmheadmodel(
     enable_hexkl: bool = False,
     enable_vtcm_tiling: bool = False,
     enable_convert_to_hexagonmem: bool = False,
-    enable_omnifetch_vdae: bool = False,
-    enable_omnifetch_layout_aware: bool = True,
-    omnifetch_lookahead: int = 2,
-    enable_omnifetch_adaptive: bool = True,
-    enable_omnifetch_items_1_7: bool = False,
-    enable_omnifetch_dma_to_vtcm: bool = False,
-    enable_omnifetch_weight_prepack: bool = False,
-    enable_omnifetch_dual_thread_dae: bool = False,
-    enable_omnifetch_inter_layer_prefetch: bool = False,
-    enable_omnifetch_attention_hmx: bool = False,
+    enable_alps_vdae: bool = False,
+    enable_alps_layout_aware: bool = True,
+    alps_lookahead: int = 2,
+    enable_alps_adaptive: bool = True,
+    enable_alps_items_1_7: bool = False,
+    enable_alps_dma_to_vtcm: bool = False,
+    enable_alps_weight_prepack: bool = False,
+    enable_alps_dual_thread_dae: bool = False,
+    enable_alps_inter_layer_prefetch: bool = False,
+    enable_alps_attention_hmx: bool = False,
     enable_hexkl_persistent_vtcm: bool = False,
-    # Fixed sequence length for fair ablations (HexKL vs HVX vs OmniFetch).
+    # Fixed sequence length for fair ablations (HexKL vs HVX vs Alps).
     # None → legacy behaviour (short prompt; HexKL uses a hand-tuned 32-token string).
     seq_len: Optional[int] = None,
     device_iterations: int = 1,
     prefetch_baseline: str = "none",
     prefetch_baseline_distance: int = 1,
     apt_get_hx_manual_candidate_ids: str = "",
-    enable_omnifetch_kv_cache_prefetch: bool = False,
+    enable_alps_kv_cache_prefetch: bool = False,
 ):
 
     upstream_strict = os.environ.get("HEXAGON_BASELINE_MODE") == "upstream-strict"
@@ -490,11 +490,11 @@ def gpt2lmheadmodel(
     module = compile_to_linalg(wrapped, encoding["input_ids"])
 
     mlir_text = None
-    cumulative = bool(enable_omnifetch_items_1_7)
+    cumulative = bool(enable_alps_items_1_7)
     if prefetch_baseline not in ("none", "prefetch-kernel-hx", "apt-get-hx"):
         raise ValueError(f"unknown prefetch baseline {prefetch_baseline!r}")
-    if prefetch_baseline != "none" and (enable_omnifetch_vdae or cumulative):
-        raise ValueError("external prefetch baselines cannot be combined with OmniFetch")
+    if prefetch_baseline != "none" and (enable_alps_vdae or cumulative):
+        raise ValueError("external prefetch baselines cannot be combined with Alps")
     if enable_hexkl and not upstream_strict:
         raw = module.operation.get_asm(binary=False)
         mlir_text, n = rewrite_matmul_inputs_to_f16(raw)
@@ -510,25 +510,25 @@ def gpt2lmheadmodel(
             lowerConstantsInSeparateSharedObjects=True,
             enableBufferResultsToOutParams=True,
             enablePrefetch=(
-                enable_omnifetch_vdae
+                enable_alps_vdae
                 or cumulative
-                or enable_omnifetch_kv_cache_prefetch
+                or enable_alps_kv_cache_prefetch
             ),
-            enableOmniFetchLayoutAware=enable_omnifetch_layout_aware,
-            omniFetchLookahead=omnifetch_lookahead,
-            enableOmniFetchVDAE=enable_omnifetch_vdae or cumulative,
-            enableOmniFetchAdaptive=enable_omnifetch_adaptive,
-            enableOmniFetchPersistentWhCache=cumulative,
-            enableOmniFetchTwoDimPipeline=cumulative,
-            enableOmniFetchVtcmColoring=cumulative,
-            enableOmniFetchKvCachePrefetch=(
-                cumulative or enable_omnifetch_kv_cache_prefetch
+            enableAlpsLayoutAware=enable_alps_layout_aware,
+            alpsLookahead=alps_lookahead,
+            enableAlpsVDAE=enable_alps_vdae or cumulative,
+            enableAlpsAdaptive=enable_alps_adaptive,
+            enableAlpsPersistentWhCache=cumulative,
+            enableAlpsTwoDimPipeline=cumulative,
+            enableAlpsVtcmColoring=cumulative,
+            enableAlpsKvCachePrefetch=(
+                cumulative or enable_alps_kv_cache_prefetch
             ),
-            enableOmniFetchDmaToVtcm=enable_omnifetch_dma_to_vtcm,
-            enableOmniFetchWeightPrepack=enable_omnifetch_weight_prepack,
-            enableOmniFetchDualThreadDae=enable_omnifetch_dual_thread_dae,
-            enableOmniFetchInterLayerPrefetch=enable_omnifetch_inter_layer_prefetch,
-            enableOmniFetchAttentionHmx=enable_omnifetch_attention_hmx,
+            enableAlpsDmaToVtcm=enable_alps_dma_to_vtcm,
+            enableAlpsWeightPrepack=enable_alps_weight_prepack,
+            enableAlpsDualThreadDae=enable_alps_dual_thread_dae,
+            enableAlpsInterLayerPrefetch=enable_alps_inter_layer_prefetch,
+            enableAlpsAttentionHmx=enable_alps_attention_hmx,
             enableHexKLPersistentVtcm=enable_hexkl_persistent_vtcm,
         ).__dict__
     elif upstream_strict:
@@ -569,27 +569,27 @@ def gpt2lmheadmodel(
         options["enableVTCMTiling"] = enable_vtcm_tiling
         options["enableConvertToHexagonmem"] = enable_convert_to_hexagonmem
         options["enablePrefetch"] = bool(
-            enable_omnifetch_vdae
+            enable_alps_vdae
             or cumulative
-            or enable_omnifetch_kv_cache_prefetch
+            or enable_alps_kv_cache_prefetch
         )
-        options["enableOmniFetchLayoutAware"] = enable_omnifetch_layout_aware
-        options["omniFetchLookahead"] = omnifetch_lookahead
-        options["enableOmniFetchVDAE"] = enable_omnifetch_vdae or cumulative
-        options["enableOmniFetchAdaptive"] = enable_omnifetch_adaptive
-        options["enableOmniFetchPersistentWhCache"] = cumulative
-        options["enableOmniFetchTwoDimPipeline"] = cumulative
-        options["enableOmniFetchVtcmColoring"] = cumulative
-        options["enableOmniFetchKvCachePrefetch"] = bool(
-            cumulative or enable_omnifetch_kv_cache_prefetch
+        options["enableAlpsLayoutAware"] = enable_alps_layout_aware
+        options["alpsLookahead"] = alps_lookahead
+        options["enableAlpsVDAE"] = enable_alps_vdae or cumulative
+        options["enableAlpsAdaptive"] = enable_alps_adaptive
+        options["enableAlpsPersistentWhCache"] = cumulative
+        options["enableAlpsTwoDimPipeline"] = cumulative
+        options["enableAlpsVtcmColoring"] = cumulative
+        options["enableAlpsKvCachePrefetch"] = bool(
+            cumulative or enable_alps_kv_cache_prefetch
         )
-        options["enableOmniFetchDmaToVtcm"] = enable_omnifetch_dma_to_vtcm
-        options["enableOmniFetchWeightPrepack"] = enable_omnifetch_weight_prepack
-        options["enableOmniFetchDualThreadDae"] = enable_omnifetch_dual_thread_dae
-        options["enableOmniFetchInterLayerPrefetch"] = (
-            enable_omnifetch_inter_layer_prefetch
+        options["enableAlpsDmaToVtcm"] = enable_alps_dma_to_vtcm
+        options["enableAlpsWeightPrepack"] = enable_alps_weight_prepack
+        options["enableAlpsDualThreadDae"] = enable_alps_dual_thread_dae
+        options["enableAlpsInterLayerPrefetch"] = (
+            enable_alps_inter_layer_prefetch
         )
-        options["enableOmniFetchAttentionHmx"] = enable_omnifetch_attention_hmx
+        options["enableAlpsAttentionHmx"] = enable_alps_attention_hmx
         options["enableHexKLPersistentVtcm"] = enable_hexkl_persistent_vtcm
 
     if not upstream_strict:
@@ -633,7 +633,7 @@ def gpt2lmheadmodel(
         process_lwp()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run GPT2 LMHead on Hexagon with optional Omni-Fetch ablation toggles.")
+    parser = argparse.ArgumentParser(description="Run GPT2 LMHead on Hexagon with optional ALPS ablation toggles.")
     parser.add_argument("--enable-lwp", action="store_true", help="Enable lightweight profiling instrumentation.")
     parser.add_argument(
         "--enable-hvx-vector",
@@ -648,16 +648,16 @@ if __name__ == "__main__":
     parser.add_argument("--enable-convert-to-hexagonmem", action="store_true",
                         help="Enable memref->hexagonmem conversion (off by default for GPT2).")
 
-    parser.add_argument("--enable-omnifetch-vdae", action="store_true",
-                        help="Enable Omni-Fetch V-DAE prefetch pass.")
+    parser.add_argument("--enable-alps-vdae", action="store_true",
+                        help="Enable ALPS V-DAE prefetch pass.")
     parser.add_argument("--disable-layout-aware", action="store_true",
                         help="Disable layout-aware in-situ mapping (linear prefetch only).")
-    parser.add_argument("--omnifetch-lookahead", type=int, default=2,
+    parser.add_argument("--alps-lookahead", type=int, default=2,
                         help="Static prefetch look-ahead distance.")
-    parser.add_argument("--disable-omnifetch-adaptive", action="store_true",
+    parser.add_argument("--disable-alps-adaptive", action="store_true",
                         help="Disable PMU-driven adaptive prefetch distance.")
     parser.add_argument(
-        "--enable-omnifetch-items-1-7",
+        "--enable-alps-items-1-7",
         action="store_true",
         help="Enable the cumulative innovation items 1 through 7.",
     )
@@ -669,34 +669,34 @@ if __name__ == "__main__":
     parser.add_argument("--prefetch-baseline-distance", type=int, default=1)
     parser.add_argument("--apt-get-hx-manual-candidate-ids", default="")
     parser.add_argument(
-        "--enable-omnifetch-kv-cache-prefetch",
+        "--enable-alps-kv-cache-prefetch",
         action="store_true",
         help="Enable isolated item-7 attention K/V stream propagation/prefetch.",
     )
     parser.add_argument(
-        "--enable-omnifetch-dma-to-vtcm",
+        "--enable-alps-dma-to-vtcm",
         action="store_true",
-        help="DMA-pack OmniFetch weight tiles into VTCM staging "
+        help="DMA-pack Alps weight tiles into VTCM staging "
              "(default: DDR staging).",
     )
     parser.add_argument(
-        "--enable-omnifetch-weight-prepack",
+        "--enable-alps-weight-prepack",
         action="store_true",
         help="Hoist HexKL RM->WH per column into VTCM (stream M rows). "
              "Win scales with ceil(M/32) — prefer --seq-len 128/256.",
     )
     parser.add_argument(
-        "--enable-omnifetch-dual-thread-dae",
+        "--enable-alps-dual-thread-dae",
         action="store_true",
         help="Run deferred dma_wait+WH on a scout thread (default off).",
     )
     parser.add_argument(
-        "--enable-omnifetch-inter-layer-prefetch",
+        "--enable-alps-inter-layer-prefetch",
         action="store_true",
         help="Allow PrefetchInsert on outer HexKL loops (next-layer weights).",
     )
     parser.add_argument(
-        "--enable-omnifetch-attention-hmx",
+        "--enable-alps-attention-hmx",
         action="store_true",
         help="Pad attention-like (K==M/N==M) matmuls into HexKL.",
     )
@@ -723,23 +723,23 @@ if __name__ == "__main__":
         enable_hexkl=args.enable_hexkl,
         enable_vtcm_tiling=args.enable_vtcm_tiling,
         enable_convert_to_hexagonmem=args.enable_convert_to_hexagonmem,
-        enable_omnifetch_vdae=args.enable_omnifetch_vdae,
-        enable_omnifetch_layout_aware=not args.disable_layout_aware,
-        omnifetch_lookahead=args.omnifetch_lookahead,
-        enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
-        enable_omnifetch_items_1_7=args.enable_omnifetch_items_1_7,
-        enable_omnifetch_dma_to_vtcm=args.enable_omnifetch_dma_to_vtcm,
-        enable_omnifetch_weight_prepack=args.enable_omnifetch_weight_prepack,
-        enable_omnifetch_dual_thread_dae=args.enable_omnifetch_dual_thread_dae,
-        enable_omnifetch_inter_layer_prefetch=args.enable_omnifetch_inter_layer_prefetch,
-        enable_omnifetch_attention_hmx=args.enable_omnifetch_attention_hmx,
+        enable_alps_vdae=args.enable_alps_vdae,
+        enable_alps_layout_aware=not args.disable_layout_aware,
+        alps_lookahead=args.alps_lookahead,
+        enable_alps_adaptive=not args.disable_alps_adaptive,
+        enable_alps_items_1_7=args.enable_alps_items_1_7,
+        enable_alps_dma_to_vtcm=args.enable_alps_dma_to_vtcm,
+        enable_alps_weight_prepack=args.enable_alps_weight_prepack,
+        enable_alps_dual_thread_dae=args.enable_alps_dual_thread_dae,
+        enable_alps_inter_layer_prefetch=args.enable_alps_inter_layer_prefetch,
+        enable_alps_attention_hmx=args.enable_alps_attention_hmx,
         enable_hexkl_persistent_vtcm=args.enable_hexkl_persistent_vtcm,
         seq_len=args.seq_len,
         device_iterations=args.device_iterations,
         prefetch_baseline=args.prefetch_baseline,
         prefetch_baseline_distance=args.prefetch_baseline_distance,
         apt_get_hx_manual_candidate_ids=args.apt_get_hx_manual_candidate_ids,
-        enable_omnifetch_kv_cache_prefetch=(
-            args.enable_omnifetch_kv_cache_prefetch
+        enable_alps_kv_cache_prefetch=(
+            args.enable_alps_kv_cache_prefetch
         ),
     )

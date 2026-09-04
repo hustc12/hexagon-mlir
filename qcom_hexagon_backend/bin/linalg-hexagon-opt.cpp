@@ -29,12 +29,12 @@
 #include "hexagon/Conversion/HexagonMemToLLVM/Passes.h"
 #include "hexagon/Conversion/LinalgToLLVM/Passes.h"
 #include "hexagon/Dialect/Crouton/IR/CroutonDialect.h"
-#include "hexagon/Conversion/OmniFetchToLLVM/Passes.h"
+#include "hexagon/Conversion/AlpsToLLVM/Passes.h"
 #include "hexagon/Dialect/HexKL/IR/HexKLDialect.h"
 #include "hexagon/Dialect/HexKL/Transforms/BufferizableOpInterfaceImpl.h"
 #include "hexagon/Dialect/HexagonMem/IR/HexagonMemDialect.h"
 #include "hexagon/Dialect/HexagonTPtr/IR/HexagonTPtrDialect.h"
-#include "hexagon/Dialect/OmniFetch/IR/OmniFetchDialect.h"
+#include "hexagon/Dialect/Alps/IR/AlpsDialect.h"
 #include "hexagon/Dialect/TTX/IR/TTXDialect.h"
 #include "hexagon/Dialect/TmTensor/IR/TmTensorDialect.h"
 #include "hexagon/Transforms/Passes.h"
@@ -55,7 +55,7 @@ int main(int argc, char **argv) {
   registry.insert<mlir::tptr::HexagonTPtrDialect>();
   registry.insert<mlir::hexagonmem::HexagonMemDialect>();
   registry.insert<mlir::hexkl::HexKLDialect>();
-  registry.insert<mlir::omni_fetch::OmniFetchDialect>();
+  registry.insert<mlir::alps::AlpsDialect>();
 
   mlir::hexagonmem::registerConvertHexagonMemToLLVMInterface(registry);
 
@@ -151,9 +151,9 @@ int main(int argc, char **argv) {
   mlir::hexagon::registerAlpsCrpVtcmFormationPass();
   mlir::hexagon::registerAlpsCrpVtcmWindowPass();
   mlir::hexagon::registerAlpsCrpProducerDirectAnalysisPass();
-  mlir::hexagon::registerOmniFetchVDAEInsertPass();
+  mlir::hexagon::registerAlpsVDAEInsertPass();
   mlir::hexagon::registerLayoutOpsEliminationPass();
-  mlir::omni_fetch::registerOmniFetchToLLVMPass();
+  mlir::alps::registerAlpsToLLVMPass();
 
   // Register all external models.
   mlir::hexkl::registerBufferizableOpInterfaceExternalModels(registry);

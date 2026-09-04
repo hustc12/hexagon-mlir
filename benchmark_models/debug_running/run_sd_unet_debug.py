@@ -57,10 +57,10 @@ def _disable_persistent_wh_replay(options: dict, _module) -> dict:
     # This Debug topology deliberately removes every CrossAttn block. Its
     # residual scalar matmuls are not HexKL WH-cache candidates, so replaying
     # the whole UNet cold/warm/invalidated only exhausts DSP heap.
-    if options.get("enableOmniFetchPersistentWhCache", False):
-        options["enableOmniFetchPersistentWhCache"] = False
+    if options.get("enableAlpsPersistentWhCache", False):
+        options["enableAlpsPersistentWhCache"] = False
         print(
-            "[OmniFetchAdaptiveNoop] Debug UNet has no HexKL WH-cache site; "
+            "[AlpsAdaptiveNoop] Debug UNet has no HexKL WH-cache site; "
             "disabled persistent-WH replay"
         )
     return options
@@ -86,11 +86,11 @@ def main():
     _MOD.test_unet(
         enablelwp=args.lwp,
         enable_hexkl=args.enable_hexkl,
-        enable_omnifetch_vdae=args.enable_omnifetch_vdae,
-        enable_omnifetch_layout_aware=not args.disable_layout_aware,
-        omnifetch_lookahead=args.omnifetch_lookahead,
-        enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
-        enable_omnifetch_items_1_7=args.enable_omnifetch_items_1_7,
+        enable_alps_vdae=args.enable_alps_vdae,
+        enable_alps_layout_aware=not args.disable_layout_aware,
+        alps_lookahead=args.alps_lookahead,
+        enable_alps_adaptive=not args.disable_alps_adaptive,
+        enable_alps_items_1_7=args.enable_alps_items_1_7,
     )
 
 

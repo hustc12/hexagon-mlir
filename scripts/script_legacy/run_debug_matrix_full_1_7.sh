@@ -3,8 +3,8 @@ set -uo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd -- "${SCRIPT_DIR}/../.." && pwd)
-OUT="${OMNIFETCH_RESULTS_DIR:-${ROOT}/benchmark_models/results/debug_matrix_full_1_7}"
-VENV="${OMNIFETCH_VENV:-/home/huzq85/2-working/hexagon_npu/mlir-env}"
+OUT="${ALPS_RESULTS_DIR:-${ROOT}/benchmark_models/results/debug_matrix_full_1_7}"
+VENV="${ALPS_VENV:-/home/huzq85/2-working/hexagon_npu/mlir-env}"
 
 mkdir -p "${OUT}"
 source "${VENV}/bin/activate"
@@ -87,7 +87,7 @@ already_recorded() {
 run_one() {
   local model=$1
   local runner="${ROOT}/benchmark_models/debug_running/run_${model}_debug.py"
-  local log="${OUT}/${model}_hexkl_omnifetch_items_1_7.log"
+  local log="${OUT}/${model}_hexkl_alps_items_1_7.log"
   local -a args=()
   local status perf_us perf_ms
   local eager_kv kv_sites kv_hints vtcm_sites
@@ -100,10 +100,10 @@ run_one() {
   fi
 
   mapfile -t args < <(base_args_for "${model}")
-  args+=(--enable-hexkl --enable-omnifetch-items-1-7)
+  args+=(--enable-hexkl --enable-alps-items-1-7)
 
   echo "START ${model} $(date --iso-8601=seconds)"
-  if timeout --foreground "${OMNIFETCH_TIMEOUT:-900}" \
+  if timeout --foreground "${ALPS_TIMEOUT:-900}" \
       python "${runner}" "${args[@]}" >"${log}" 2>&1; then
     status=PASS
   else

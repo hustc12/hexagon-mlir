@@ -9,7 +9,7 @@ module {
     %producer = linalg.generic {
         indexing_maps = [#map, #map],
         iterator_types = ["parallel"],
-        omni_fetch.kv_cache_role = "key"
+        alps.kv_cache_role = "key"
       } ins(%x : tensor<16xf32>) outs(%empty : tensor<16xf32>) {
     ^bb0(%in: f32, %unused: f32):
       %square = arith.mulf %in, %in : f32
@@ -32,7 +32,7 @@ module {
     %producer = linalg.generic {
         indexing_maps = [#map, #map],
         iterator_types = ["parallel"],
-        omni_fetch.kv_cache_role = "key",
+        alps.kv_cache_role = "key",
         alps.kv_elementwise_fusion_boundary
       } ins(%x : tensor<16xf32>) outs(%empty : tensor<16xf32>) {
     ^bb0(%in: f32, %unused: f32):

@@ -30,8 +30,8 @@ main_object=$(
   exit 2
 }
 
-disassembly=$(mktemp /tmp/omnifetch-disassembly.XXXXXX)
-relocations=$(mktemp /tmp/omnifetch-relocations.XXXXXX)
+disassembly=$(mktemp /tmp/alps-disassembly.XXXXXX)
+relocations=$(mktemp /tmp/alps-relocations.XXXXXX)
 trap 'rm -f "${disassembly}" "${relocations}"' EXIT
 "${objdump}" -d --no-show-raw-insn "${main_object}" >"${disassembly}"
 "${objdump}" -r "${main_object}" >"${relocations}"

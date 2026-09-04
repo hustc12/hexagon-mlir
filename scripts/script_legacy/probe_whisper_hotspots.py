@@ -49,7 +49,7 @@ def options():
     return hexagon_options_phase4(True,False,False,2,False,False,
         lower_constants_separate=True, backend_profile="hvx-vector",
         enable_lwp=True, lwp_loop_depth=1, disable_lwp_loop=False,
-        enable_omnifetch_kv_cache_prefetch=True)
+        enable_alps_kv_cache_prefetch=True)
 
 
 def run_stage(label, stage, inputs, device_inputs=None):

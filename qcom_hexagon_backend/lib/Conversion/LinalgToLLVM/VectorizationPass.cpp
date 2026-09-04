@@ -100,10 +100,10 @@ static LogicalResult vectorizeLinalgOp(linalg::LinalgOp op) {
     vecSizes[numLoops - 1] = innerLoopDim;
   }
 
-  auto role = op->getAttrOfType<StringAttr>("omni_fetch.kv_cache_role");
+  auto role = op->getAttrOfType<StringAttr>("alps.kv_cache_role");
   auto operand =
-      op->getAttrOfType<IntegerAttr>("omni_fetch.kv_cache_operand");
-  auto layout = op->getAttrOfType<StringAttr>("omni_fetch.kv_cache_layout");
+      op->getAttrOfType<IntegerAttr>("alps.kv_cache_operand");
+  auto layout = op->getAttrOfType<StringAttr>("alps.kv_cache_layout");
   Value kvSource;
   if (role && operand && operand.getInt() >= 0 &&
       operand.getInt() < static_cast<int64_t>(op.getDpsInputs().size()))
@@ -136,8 +136,8 @@ static LogicalResult vectorizeLinalgOp(linalg::LinalgOp op) {
     while (created && created != op) {
       if (auto read = dyn_cast<vector::TransferReadOp>(created)) {
         if (read.getBase() == kvSource) {
-          read->setAttr("omni_fetch.kv_cache_role", role);
-          read->setAttr("omni_fetch.kv_cache_layout", layout);
+          read->setAttr("alps.kv_cache_role", role);
+          read->setAttr("alps.kv_cache_layout", layout);
         }
       }
       created = created->getNextNode();

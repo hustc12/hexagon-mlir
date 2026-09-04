@@ -512,7 +512,7 @@ def load_falcon_model(model_name, config):
     )
 
 
-def apply_omnifetch_groupwise_w8(model, group_size: int = 8) -> int:
+def apply_alps_groupwise_w8(model, group_size: int = 8) -> int:
     """Make the CPU reference use the same W8A16 weights as item 8.
 
     Falcon stores projection weights as [output, input], whereas the lowered
@@ -534,7 +534,7 @@ def apply_omnifetch_groupwise_w8(model, group_size: int = 8) -> int:
             parameter.copy_(fake_quant.reshape_as(weight).to(parameter.dtype))
             quantized += 1
     print(
-        f"[OmniFetch-W8] fake-quantized {quantized} rank-2 weights "
+        f"[Alps-W8] fake-quantized {quantized} rank-2 weights "
         f"with K-group={group_size} for the matched CPU reference"
     )
     return quantized
@@ -583,20 +583,20 @@ def falcon_rw_1b(
     enablelwp: bool = False,
     enable_hexkl: bool = False,
     enable_hvx_vector: bool = False,
-    enable_omnifetch_weight_stationary: bool = False,
-    enable_omnifetch_activation_multicast: bool = False,
-    enable_omnifetch_vdae: bool = False,
-    enable_omnifetch_layout_aware: bool = True,
-    omnifetch_lookahead: int = 2,
-    enable_omnifetch_adaptive: bool = True,
-    enable_omnifetch_items_1_7: bool = False,
-    enable_omnifetch_weight_prepack: bool = False,
-    enable_omnifetch_persistent_wh_cache: bool = False,
-    enable_omnifetch_two_dim_pipeline: bool = False,
-    enable_omnifetch_vtcm_coloring: bool = False,
-    enable_omnifetch_kv_cache_prefetch: bool = False,
-    enable_omnifetch_dequant_reshape: bool = False,
-    omnifetch_kv_cache_page_tokens: int = 32,
+    enable_alps_weight_stationary: bool = False,
+    enable_alps_activation_multicast: bool = False,
+    enable_alps_vdae: bool = False,
+    enable_alps_layout_aware: bool = True,
+    alps_lookahead: int = 2,
+    enable_alps_adaptive: bool = True,
+    enable_alps_items_1_7: bool = False,
+    enable_alps_weight_prepack: bool = False,
+    enable_alps_persistent_wh_cache: bool = False,
+    enable_alps_two_dim_pipeline: bool = False,
+    enable_alps_vtcm_coloring: bool = False,
+    enable_alps_kv_cache_prefetch: bool = False,
+    enable_alps_dequant_reshape: bool = False,
+    alps_kv_cache_page_tokens: int = 32,
     device_iterations: int = 1,
     enable_hexkl_persistent_vtcm: bool = False,
     seq_len: Optional[int] = None,
@@ -644,8 +644,8 @@ def falcon_rw_1b(
     _install_alibi_patch()
     model = load_falcon_model(model_name, config)
     model.eval()
-    if enable_omnifetch_dequant_reshape:
-        apply_omnifetch_groupwise_w8(model)
+    if enable_alps_dequant_reshape:
+        apply_alps_groupwise_w8(model)
     func_name = model.__class__.__name__
 
     # Debug may shrink vocab; clamp so embedding / compare stay in-range.
@@ -674,17 +674,17 @@ def falcon_rw_1b(
     options["enableVectorization"] = bool(enable_hvx_vector)
     options["enableHexKL"] = bool(enable_hexkl)
     options["enableConvertToHexagonmem"] = bool(enable_hexkl)
-    options["enableOmniFetchWeightStationary"] = bool(
-        enable_omnifetch_weight_stationary
+    options["enableAlpsWeightStationary"] = bool(
+        enable_alps_weight_stationary
     )
-    options["enableOmniFetchActivationMulticast"] = bool(
-        enable_omnifetch_activation_multicast
+    options["enableAlpsActivationMulticast"] = bool(
+        enable_alps_activation_multicast
     )
-    cumulative = bool(enable_omnifetch_items_1_7)
+    cumulative = bool(enable_alps_items_1_7)
     if prefetch_baseline not in ("none", "prefetch-kernel-hx", "apt-get-hx"):
         raise ValueError(f"unknown prefetch baseline {prefetch_baseline!r}")
-    if prefetch_baseline != "none" and (enable_omnifetch_vdae or cumulative):
-        raise ValueError("external prefetch baselines cannot be combined with OmniFetch")
+    if prefetch_baseline != "none" and (enable_alps_vdae or cumulative):
+        raise ValueError("external prefetch baselines cannot be combined with Alps")
     options["enablePrefetchKernelHX"] = prefetch_baseline == "prefetch-kernel-hx"
     options["prefetchKernelHxDistance"] = int(prefetch_baseline_distance)
     options["enableAPTGetHX"] = prefetch_baseline == "apt-get-hx"
@@ -696,34 +696,34 @@ def falcon_rw_1b(
         f"manual_ids={apt_get_hx_manual_candidate_ids or 'none'}"
     )
     options["enablePrefetch"] = bool(
-        enable_omnifetch_vdae
-        or enable_omnifetch_kv_cache_prefetch
+        enable_alps_vdae
+        or enable_alps_kv_cache_prefetch
         or cumulative
     )
-    options["enableOmniFetchLayoutAware"] = bool(enable_omnifetch_layout_aware)
-    options["omniFetchLookahead"] = int(omnifetch_lookahead)
-    options["enableOmniFetchVDAE"] = bool(enable_omnifetch_vdae or cumulative)
-    options["enableOmniFetchAdaptive"] = bool(enable_omnifetch_adaptive)
-    options["enableOmniFetchWeightPrepack"] = bool(
-        enable_omnifetch_weight_prepack
+    options["enableAlpsLayoutAware"] = bool(enable_alps_layout_aware)
+    options["alpsLookahead"] = int(alps_lookahead)
+    options["enableAlpsVDAE"] = bool(enable_alps_vdae or cumulative)
+    options["enableAlpsAdaptive"] = bool(enable_alps_adaptive)
+    options["enableAlpsWeightPrepack"] = bool(
+        enable_alps_weight_prepack
     )
-    options["enableOmniFetchPersistentWhCache"] = bool(
-        enable_omnifetch_persistent_wh_cache or cumulative
+    options["enableAlpsPersistentWhCache"] = bool(
+        enable_alps_persistent_wh_cache or cumulative
     )
-    options["enableOmniFetchTwoDimPipeline"] = bool(
-        enable_omnifetch_two_dim_pipeline or cumulative
+    options["enableAlpsTwoDimPipeline"] = bool(
+        enable_alps_two_dim_pipeline or cumulative
     )
-    options["enableOmniFetchVtcmColoring"] = bool(
-        enable_omnifetch_vtcm_coloring or cumulative
+    options["enableAlpsVtcmColoring"] = bool(
+        enable_alps_vtcm_coloring or cumulative
     )
-    options["enableOmniFetchKvCachePrefetch"] = bool(
-        enable_omnifetch_kv_cache_prefetch or cumulative
+    options["enableAlpsKvCachePrefetch"] = bool(
+        enable_alps_kv_cache_prefetch or cumulative
     )
-    options["enableOmniFetchDequantReshape"] = bool(
-        enable_omnifetch_dequant_reshape
+    options["enableAlpsDequantReshape"] = bool(
+        enable_alps_dequant_reshape
     )
-    options["omniFetchKvCachePageTokens"] = int(
-        omnifetch_kv_cache_page_tokens
+    options["alpsKvCachePageTokens"] = int(
+        alps_kv_cache_page_tokens
     )
     options["enableHexKLPersistentVtcm"] = bool(enable_hexkl_persistent_vtcm)
 
@@ -756,7 +756,7 @@ def falcon_rw_1b(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Falcon-RW-1B Hexagon smoke (optional HexKL/OmniFetch)."
+        description="Falcon-RW-1B Hexagon smoke (optional HexKL/Alps)."
     )
     parser.add_argument("--enable-lwp", action="store_true")
     parser.add_argument("--enable-hexkl", action="store_true")
@@ -766,20 +766,20 @@ if __name__ == "__main__":
         help="Enable the repaired HVX vector codegen path.",
     )
     parser.add_argument(
-        "--enable-omnifetch-weight-stationary",
+        "--enable-alps-weight-stationary",
         action="store_true",
-        help="Enable OmniFetch N1 weight-stationary projection scheduling.",
+        help="Enable Alps N1 weight-stationary projection scheduling.",
     )
     parser.add_argument(
-        "--enable-omnifetch-activation-multicast",
+        "--enable-alps-activation-multicast",
         action="store_true",
-        help="Enable OmniFetch N2 activation multicast across sibling projections.",
+        help="Enable Alps N2 activation multicast across sibling projections.",
     )
-    parser.add_argument("--enable-omnifetch-vdae", action="store_true")
+    parser.add_argument("--enable-alps-vdae", action="store_true")
     parser.add_argument("--disable-layout-aware", action="store_true")
-    parser.add_argument("--omnifetch-lookahead", type=int, default=2)
-    parser.add_argument("--disable-omnifetch-adaptive", action="store_true")
-    parser.add_argument("--enable-omnifetch-items-1-7", action="store_true")
+    parser.add_argument("--alps-lookahead", type=int, default=2)
+    parser.add_argument("--disable-alps-adaptive", action="store_true")
+    parser.add_argument("--enable-alps-items-1-7", action="store_true")
     parser.add_argument(
         "--prefetch-baseline",
         choices=("none", "prefetch-kernel-hx", "apt-get-hx"),
@@ -788,7 +788,7 @@ if __name__ == "__main__":
     parser.add_argument("--prefetch-baseline-distance", type=int, default=1)
     parser.add_argument("--apt-get-hx-manual-candidate-ids", default="")
     parser.add_argument(
-        "--enable-omnifetch-weight-prepack",
+        "--enable-alps-weight-prepack",
         action="store_true",
         help="Reshape each RM weight tile to WH once per column and reuse it "
              "across sequence-row tiles.",
@@ -798,17 +798,17 @@ if __name__ == "__main__":
         action="store_true",
         help="Reuse one function-scoped VTCM arena across HexKL matmuls.",
     )
-    parser.add_argument("--enable-omnifetch-persistent-wh-cache",
+    parser.add_argument("--enable-alps-persistent-wh-cache",
                         action="store_true")
-    parser.add_argument("--enable-omnifetch-two-dim-pipeline",
+    parser.add_argument("--enable-alps-two-dim-pipeline",
                         action="store_true")
-    parser.add_argument("--enable-omnifetch-vtcm-coloring",
+    parser.add_argument("--enable-alps-vtcm-coloring",
                         action="store_true")
-    parser.add_argument("--enable-omnifetch-kv-cache-prefetch",
+    parser.add_argument("--enable-alps-kv-cache-prefetch",
                         action="store_true")
-    parser.add_argument("--enable-omnifetch-dequant-reshape",
+    parser.add_argument("--enable-alps-dequant-reshape",
                         action="store_true")
-    parser.add_argument("--omnifetch-kv-cache-page-tokens", type=int,
+    parser.add_argument("--alps-kv-cache-page-tokens", type=int,
                         default=32)
     parser.add_argument("--device-iterations", type=int, default=1)
     parser.add_argument(
@@ -822,35 +822,35 @@ if __name__ == "__main__":
         enablelwp=args.enable_lwp,
         enable_hexkl=args.enable_hexkl,
         enable_hvx_vector=args.enable_hvx_vector,
-        enable_omnifetch_weight_stationary=(
-            args.enable_omnifetch_weight_stationary
+        enable_alps_weight_stationary=(
+            args.enable_alps_weight_stationary
         ),
-        enable_omnifetch_activation_multicast=(
-            args.enable_omnifetch_activation_multicast
+        enable_alps_activation_multicast=(
+            args.enable_alps_activation_multicast
         ),
-        enable_omnifetch_vdae=args.enable_omnifetch_vdae,
-        enable_omnifetch_layout_aware=not args.disable_layout_aware,
-        omnifetch_lookahead=args.omnifetch_lookahead,
-        enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
-        enable_omnifetch_items_1_7=args.enable_omnifetch_items_1_7,
-        enable_omnifetch_weight_prepack=args.enable_omnifetch_weight_prepack,
-        enable_omnifetch_persistent_wh_cache=(
-            args.enable_omnifetch_persistent_wh_cache
+        enable_alps_vdae=args.enable_alps_vdae,
+        enable_alps_layout_aware=not args.disable_layout_aware,
+        alps_lookahead=args.alps_lookahead,
+        enable_alps_adaptive=not args.disable_alps_adaptive,
+        enable_alps_items_1_7=args.enable_alps_items_1_7,
+        enable_alps_weight_prepack=args.enable_alps_weight_prepack,
+        enable_alps_persistent_wh_cache=(
+            args.enable_alps_persistent_wh_cache
         ),
-        enable_omnifetch_two_dim_pipeline=(
-            args.enable_omnifetch_two_dim_pipeline
+        enable_alps_two_dim_pipeline=(
+            args.enable_alps_two_dim_pipeline
         ),
-        enable_omnifetch_vtcm_coloring=(
-            args.enable_omnifetch_vtcm_coloring
+        enable_alps_vtcm_coloring=(
+            args.enable_alps_vtcm_coloring
         ),
-        enable_omnifetch_kv_cache_prefetch=(
-            args.enable_omnifetch_kv_cache_prefetch
+        enable_alps_kv_cache_prefetch=(
+            args.enable_alps_kv_cache_prefetch
         ),
-        enable_omnifetch_dequant_reshape=(
-            args.enable_omnifetch_dequant_reshape
+        enable_alps_dequant_reshape=(
+            args.enable_alps_dequant_reshape
         ),
-        omnifetch_kv_cache_page_tokens=(
-            args.omnifetch_kv_cache_page_tokens
+        alps_kv_cache_page_tokens=(
+            args.alps_kv_cache_page_tokens
         ),
         device_iterations=args.device_iterations,
         enable_hexkl_persistent_vtcm=args.enable_hexkl_persistent_vtcm,

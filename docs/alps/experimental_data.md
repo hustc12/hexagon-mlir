@@ -1,4 +1,4 @@
-# OmniFetch Experimental Data Consolidation
+# Alps Experimental Data Consolidation
 
 Last consolidated: 2026-08-14
 
@@ -34,11 +34,11 @@ project.
 Primary sources:
 
 - `../../archive/engineering_notes/plan_todo.md`
-- `benchmark_models/PHASE4_STATUS_AND_OMNIFETCH.md`
+- `benchmark_models/PHASE4_STATUS_AND_ALPS.md`
 - `benchmark_models/debug_running/QWEN_HEXKL_EXIT13_DEBUG.md`
-- `../../archive/engineering_notes/omnifetch-prefetch-insitu-innovation.md`
+- `../../archive/engineering_notes/alps-prefetch-insitu-innovation.md`
 - `../../archive/engineering_notes/engineering_work.md`
-- `../../archive/engineering_notes/omnifetch_history.md`
+- `../../archive/engineering_notes/alps_history.md`
 - `../../archive/engineering_notes/hexagon-prefetch-baselines-plan.md`
 
 The generic user guides and `benchmark_models/micro_bench/*` documentation
@@ -95,12 +95,12 @@ ASR/pre-training head, matching the current Hexagon-MLIR benchmark topology.
 
 The following table expands the current **15 complete-model corpus plus the
 ViT-Base external-baseline vehicle** across the requested policy-by-engine
-dimensions. `HMLIR` means native/no-prefetch Hexagon-MLIR and `OF` means
-OmniFetch. All values are device latency in ms. As of 2026-08-16, PK/APT and
+dimensions. `HMLIR` means native/no-prefetch Hexagon-MLIR and `ALPS` means
+Alps. All values are device latency in ms. As of 2026-08-16, PK/APT and
 item7-only have been measured on all 15 complete models in the primary corpus;
 every still-untested processor/policy combination is explicitly `NA`.
 
-| Date / scope | Model | PK Scalar | PK HVX | PK HMX | APT Scalar | APT HVX | APT HMX | HMLIR Scalar | HMLIR HVX | HMLIR HMX | OF Scalar | OF HVX | OF HMX | Notes |
+| Date / scope | Model | PK Scalar | PK HVX | PK HMX | APT Scalar | APT HVX | APT HMX | HMLIR Scalar | HMLIR HVX | HMLIR HMX | ALPS Scalar | ALPS HVX | ALPS HMX | Notes |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
 | 2026-08-13 strict rerun | DINOv2-small | NA | 10,596.72 (1.78x) | NA | NA | 10,591.11 (1.78x) | NA | 1,281,514.12‡ | 30,031.10 HMLIR HVX (HexKL Off) (5.04x); 10,035.87 HMLIR HVX (HexKL On; 0 HMX rewrites) (1.69x) | NA | 300,484.16‡ | **5,953.59 item7-only (1.00x)** | NA | Ratios are row latency / item7 latency. Items 1–6 are explicitly disabled; all current rows pass correctness. |
 | 2026-08-13 strict rerun | ViT-Base | NA | 21,489.53 (1.52x) | NA | NA | 20,915.64 (1.48x) | NA | NA | 129,979.04 HMLIR HVX (HexKL Off) (9.21x); 20,088.50 HMLIR HVX (HexKL On; 0 HMX rewrites) (1.42x) | NA | NA | **14,115.92 item7-only (1.00x)** | NA | Ratios are row latency / item7 latency. Items 1–6 are explicitly disabled; all current rows pass correctness. |
@@ -169,7 +169,7 @@ With the strict item-7-only policy, DINOv2-small is 1.78x faster than
 Prefetch-Kernel-HX, 1.78x faster than APT-GET-HX, and 1.69x faster than the
 matched HexKL-on/zero-rewrite control. ViT-Base is respectively 1.52x,
 1.48x, and 1.42x faster. The much larger 5.04x and 9.21x ratios against
-HMLIR HVX (HexKL Off) are real timing differences but are not clean OmniFetch attribution,
+HMLIR HVX (HexKL Off) are real timing differences but are not clean Alps attribution,
 because merely enabling HexKL changes lowering even when it reports zero HMX
 rewrites.
 
@@ -177,7 +177,7 @@ For the matched FP16-model/storage staged language rows, item7 is 1.87x faster t
 HexKL On on Qwen2.5-0.5B, 1.60x on TinyLlama-1.1B, and 1.39x on
 SmolLM2-1.7B. It is only 1.02x faster on SD/CLIP and 0.97x on GPT-2. The much
 larger 5.43--70.81x ratios against HexKL Off primarily expose HexKL/HMX-path
-acceleration and must not be claimed as OmniFetch speedup.
+acceleration and must not be claimed as Alps speedup.
 
 ## 4. Chronological experimental record
 
@@ -185,17 +185,17 @@ acceleration and must not be claimed as OmniFetch speedup.
 
 #### Model/debug measurements
 
-| Model / topology | Original HVX label | HexKL | HexKL + OmniFetch | Correctness / qualification |
+| Model / topology | Original HVX label | HexKL | HexKL + Alps | Correctness / qualification |
 |---|---:|---:|---:|---|
-| GPT-2 Debug, 2L, seq 32, fair | 13,332 | 11,110 | 11,111 | Pass; OF approximately equal to HexKL. Early `HVX` label predates the true-vector audit. |
-| Qwen2.5 Debug, 2L, seq 32, first fair run | 1,919 | 155.8 | 153.0 | Pass; top-1 on HexKL/OF. |
-| Qwen2.5 Debug, 2L, seq 32, fresh three-way | 1,951.7 | 156.2 | 150.6 | Pass; OF 1.037x over HexKL. |
-| Falcon Debug, 2L, seq 32 | 2,751 | 113.5 | 109.6 | Pass; OF 1.036x over HexKL. |
+| GPT-2 Debug, 2L, seq 32, fair | 13,332 | 11,110 | 11,111 | Pass; ALPS approximately equal to HexKL. Early `HVX` label predates the true-vector audit. |
+| Qwen2.5 Debug, 2L, seq 32, first fair run | 1,919 | 155.8 | 153.0 | Pass; top-1 on HexKL/ALPS. |
+| Qwen2.5 Debug, 2L, seq 32, fresh three-way | 1,951.7 | 156.2 | 150.6 | Pass; ALPS 1.037x over HexKL. |
+| Falcon Debug, 2L, seq 32 | 2,751 | 113.5 | 109.6 | Pass; ALPS 1.036x over HexKL. |
 | TinyLlama Debug, 2L, seq 32 | 1,910 | 195.3 | 194.6 | Pass; approximately equal. |
-| Mamba Debug, 1L, seq 32 | 1,135 | 130.6 | 127.9 | Pass; OF about 1.02x. |
+| Mamba Debug, 1L, seq 32 | 1,135 | 130.6 | 127.9 | Pass; ALPS about 1.02x. |
 | ViT Debug, 2L, patch 32 | 1,220 | 1,222 | 1,222 | Pass; zero relevant sites. |
 | Swin Debug, `[1,1,1,1]`, width 48 | 67,066 | 67,400–67,700 | 67,400–67,700 | Pass; approximately equal. |
-| GraphSAGE/BERT Debug, 2L | 304 | 124 | 123 | Pass; OF approximately equal. |
+| GraphSAGE/BERT Debug, 2L | 304 | 124 | 123 | Pass; ALPS approximately equal. |
 | SD/CLIP text encoder Debug | ~1.47 | ~1.47 | ~1.47 | Pass; all approximately equal. |
 | Real-ESRGAN reduced 8x8 | 8,000 | 7,894 | 7,920 | Device pass; loose numerical comparison. |
 | SD-VAE Debug `[32,64]` | 8,984 | 488 | 495 | Device pass; loose numerical comparison. |
@@ -212,18 +212,18 @@ had vectorization disabled. They must not be mixed with the true-HVX data from
 |---|---|---:|---|
 | Attention Q/K `1x8x128x64` | HexKL | 41.45–41.70 | Pass; no MicroHMX conversion. |
 | Attention Q/K | HexKL + VTCM | 332–364 | Pass; roughly 8x slower. |
-| Attention Q/K | HexKL + OF, layout off | ~41.6 | Pass; no meaningful insert. |
+| Attention Q/K | HexKL + ALPS, layout off | ~41.6 | Pass; no meaningful insert. |
 | GEMM `256^3` FP16 | HexKL | 14.152 | Pass. |
-| GEMM `256^3` FP16 | HexKL + OF, layout off | 14.286 | Pass; two L2 hints. |
+| GEMM `256^3` FP16 | HexKL + ALPS, layout off | 14.286 | Pass; two L2 hints. |
 | GEMM `256^3` FP16, post-reboot | HexKL | 14.092 | Pass. |
-| GEMM `256^3` FP16, post-reboot | HexKL + OF, layout off | 14.358 | Pass. |
-| GEMM `256^3` FP16 | HexKL + OF, layout on | 14.033 | Pass; one HMXWeight fusion. |
-| GEMM `256^3` FP16 | HexKL + OF, bad gather | ~92–105 | Incorrect/NaN; invalid. |
-| GEMM `256^3` FP16 | HexKL + OF, idle synchronous fill | 15.731 | Pass; slower. |
-| GEMM `256^3` FP16 | HexKL + OF, layout on + async L2 | **13.745** | Pass; about 3% over ~14.2-ms HexKL. |
+| GEMM `256^3` FP16, post-reboot | HexKL + ALPS, layout off | 14.358 | Pass. |
+| GEMM `256^3` FP16 | HexKL + ALPS, layout on | 14.033 | Pass; one HMXWeight fusion. |
+| GEMM `256^3` FP16 | HexKL + ALPS, bad gather | ~92–105 | Incorrect/NaN; invalid. |
+| GEMM `256^3` FP16 | HexKL + ALPS, idle synchronous fill | 15.731 | Pass; slower. |
+| GEMM `256^3` FP16 | HexKL + ALPS, layout on + async L2 | **13.745** | Pass; about 3% over ~14.2-ms HexKL. |
 
 Source: `../../archive/engineering_notes/plan_todo.md`, results log; duplicated summaries in
-`benchmark_models/PHASE4_STATUS_AND_OMNIFETCH.md` and the Qwen exit-13 notes.
+`benchmark_models/PHASE4_STATUS_AND_ALPS.md` and the Qwen exit-13 notes.
 
 ### 2026-07-24 — resumed GEMM and GPT-2 variants
 
@@ -231,10 +231,10 @@ Source: `../../archive/engineering_notes/plan_todo.md`, results log; duplicated 
 |---|---|---:|---|
 | GPT-2 full 12L | HexKL + last-token LM head | 5,413 | Not comparable to the earlier full-sequence 12,049-ms HexKL row because the output boundary changed. |
 | GEMM `64x128x256` | HexKL | 4.292 | Pass. |
-| GEMM `64x128x256` | OF layout off | 4.191 | Pass. |
-| GEMM `64x128x256` | OF layout on + activation fusion + L2 async | 4.283 | Pass. |
-| GEMM `64x128x256` | OF dma2d + WH-on-signal | 4.701 | Pass. |
-| GEMM `64x128x256` | OF DMA-to-VTCM stage | 9.420 | Pass; about 2x slower than DDR staging. |
+| GEMM `64x128x256` | ALPS layout off | 4.191 | Pass. |
+| GEMM `64x128x256` | ALPS layout on + activation fusion + L2 async | 4.283 | Pass. |
+| GEMM `64x128x256` | ALPS dma2d + WH-on-signal | 4.701 | Pass. |
+| GEMM `64x128x256` | ALPS DMA-to-VTCM stage | 9.420 | Pass; about 2x slower than DDR staging. |
 
 Source: `../../archive/engineering_notes/plan_todo.md`.
 
@@ -246,21 +246,21 @@ for a 2-layer Debug model and should not replace the matched 2026-07-23 rows.
 | Configuration | Seq 32 | Seq 128 |
 |---|---:|---:|
 | HexKL | 307,500 | 1,335,900 |
-| HexKL + OF | 345,700 | 1,337,200 |
+| HexKL + ALPS | 345,700 | 1,337,200 |
 | HexKL + prepack | 334,500 | 1,278,200 |
-| OF + dual thread | 316,400 | NA |
-| OF + inter-layer | 322,600 | NA |
+| ALPS + dual thread | 316,400 | NA |
+| ALPS + inter-layer | 322,600 | NA |
 | Attention-HMX | 314,200 | NA |
 
-Source: `benchmark_models/PHASE4_STATUS_AND_OMNIFETCH.md`, section 7.7.
+Source: `benchmark_models/PHASE4_STATUS_AND_ALPS.md`, section 7.7.
 
 ### 2026-07-26 — Falcon Debug cost-model screen
 
-| Model | HexKL | Layout-aware OF | Layout + WH reuse + persistent VTCM | Correctness |
+| Model | HexKL | Layout-aware ALPS | Layout + WH reuse + persistent VTCM | Correctness |
 |---|---:|---:|---:|---|
 | Falcon Debug, 2L, hidden 64, vocab 4096, seq 128 | 1,693.275 | 1,689.758 | 1,701.922 | All top-1 match; max abs 0.0239. |
 
-Source: `../../archive/engineering_notes/omnifetch-prefetch-insitu-innovation.md`, “First
+Source: `../../archive/engineering_notes/alps-prefetch-insitu-innovation.md`, “First
 model result”.
 
 The same date's compiler/runtime validation also recorded:
@@ -268,16 +268,16 @@ The same date's compiler/runtime validation also recorded:
 | Vehicle | Configuration | Latency | Qualification |
 |---|---|---:|---|
 | GEMM `64x128x256` | HexKL | 3.044 | Reference quoted by the short-loop analysis. |
-| GEMM `64x128x256` | Layout-aware OF, short-loop gate | 3.057 | Correct; about 0.4% slower. |
+| GEMM `64x128x256` | Layout-aware ALPS, short-loop gate | 3.057 | Correct; about 0.4% slower. |
 | GEMM `64x256x512` | HexKL | 8.169 | Correct. |
-| GEMM `64x256x512` | Plain OF | 8.227 | Correct. |
-| GEMM `64x256x512` | Async layout-aware OF | 8.442 | Correct; about 3.3% slower than HexKL. |
+| GEMM `64x256x512` | Plain ALPS | 8.227 | Correct. |
+| GEMM `64x256x512` | Async layout-aware ALPS | 8.442 | Correct; about 3.3% slower than HexKL. |
 | GPT-2 full, seq 128 | original `HVX` row | 127,401.804 | Finite/top-1 qualified; matched HexKL host OOM, so no speedup. |
 
-Source: `../../archive/engineering_notes/omnifetch-design-audit-and-roadmap.md` and the M1
-section of `../../archive/engineering_notes/omnifetch-prefetch-insitu-innovation.md`.
+Source: `../../archive/engineering_notes/alps-design-audit-and-roadmap.md` and the M1
+section of `../../archive/engineering_notes/alps-prefetch-insitu-innovation.md`.
 
-### 2026-07-28 — `omnifetch-2x-improvement` Debug matrices
+### 2026-07-28 — `alps-2x-improvement` Debug matrices
 
 #### Initial cross-model cumulative integration
 
@@ -380,7 +380,7 @@ The three LiteRT trials were:
 | XNNPACK CPU | 2 | 1.047 | 0.366 | 0.316 | 0.438 |
 | XNNPACK CPU | 3 | 0.845 | 0.330 | 0.312 | 0.429 |
 
-Source: `../../archive/engineering_notes/omnifetch-prefetch-insitu-innovation.md`, external
+Source: `../../archive/engineering_notes/alps-prefetch-insitu-innovation.md`, external
 baseline and LiteRT sections.
 
 ### 2026-07-29 section — first monolithic full-structure screens
@@ -390,12 +390,12 @@ individual subheadings do not provide separate run dates.
 
 | Full model | HVX | HexKL | Items 1–7 warm | Qualification |
 |---|---:|---:|---:|---|
-| Swin-Tiny | NA | NA | 206,326.114 | OF passed; both baselines exited 13. |
-| SegFormer MiT-B0 | NA | NA | 19,785.205 | OF passed; both baselines exited 13. |
+| Swin-Tiny | NA | NA | 206,326.114 | ALPS passed; both baselines exited 13. |
+| SegFormer MiT-B0 | NA | NA | 19,785.205 | ALPS passed; both baselines exited 13. |
 | DeiT-Small | 913,419.276 | 912,734.553 | 266,291.591 | All outputs NaN; invalid performance claim. |
 | BEiT-base | NA | NA | NA | Baselines exited 13; combo host exit 137. |
 | DINOv2-small | 1,281,514.120 | 1,284,233.665 | 300,484.161 | All correct; HexKL had zero rewrites, combo 4.2739x over it. |
-| Whisper-tiny | NA | NA | 1,093,076.414 | OF correct; HVX eventually exited 13 and HexKL immediately exited 13. |
+| Whisper-tiny | NA | NA | 1,093,076.414 | ALPS correct; HVX eventually exited 13 and HexKL immediately exited 13. |
 
 #### Full DINOv2 direct-QNN checkpoint
 
@@ -407,7 +407,7 @@ individual subheadings do not provide separate run dates.
 | QNN CPU | 472.936 | FP32, default scheduler; not single-thread controlled. |
 | QNN HTP | **99.520** | FP16, one HVX thread, default profile. |
 
-Source: `../../archive/engineering_notes/omnifetch-prefetch-insitu-innovation.md`, full-model
+Source: `../../archive/engineering_notes/alps-prefetch-insitu-innovation.md`, full-model
 screening and Direct-QNN checkpoint.
 
 ### 2026-07-30 — true-vector audit and interleaved percentiles
@@ -441,7 +441,7 @@ screening and Direct-QNN checkpoint.
 | HexKL/HMX + items 1–7 | 1.320 | 2.365 | 2.382 |
 
 Source: `../../archive/engineering_notes/plan_todo.md` and
-`../../archive/engineering_notes/omnifetch-design-audit-and-roadmap.md`.
+`../../archive/engineering_notes/alps-design-audit-and-roadmap.md`.
 
 ### Date not stated; recorded by the 2026-08-07 history snapshot
 
@@ -450,16 +450,16 @@ Source: `../../archive/engineering_notes/plan_todo.md` and
 | Falcon Debug item 4 persistent-WH | HexKL 1,628.410 | 1,612.315 | 1.010x; 99.31% warm hit. |
 | Falcon Debug item 5 2-D pipeline | HexKL 1,622.670 | 1,586.580 | 1.023x. |
 | Falcon Debug item 6 VTCM coloring | HexKL 1,619.855 | 1,598.756 | 1.013x; static peak 45,056 to 16,384 bytes. |
-| Old `omnifetch-2x-improvement` Falcon | original `HVX` 11,742.816; HexKL 1,614.896 | items 1–7 599.969 | Large mixed-policy signal; old `HVX` is scalar-like, so not a true-HVX claim. |
+| Old `alps-2x-improvement` Falcon | original `HVX` 11,742.816; HexKL 1,614.896 | items 1–7 599.969 | Large mixed-policy signal; old `HVX` is scalar-like, so not a true-HVX claim. |
 | DINOv2 Debug audit | scalar 174.832 | true HVX 21.258 | 8.224x baseline correction. |
-| DINOv2 Debug cumulative item 7 | true HVX 21.258 | scalar items 1–7 60.927 | Different compute mappings; OF is 2.866x slower than true HVX. |
+| DINOv2 Debug cumulative item 7 | true HVX 21.258 | scalar items 1–7 60.927 | Different compute mappings; ALPS is 2.866x slower than true HVX. |
 | DINOv2 Debug K/V L2 hint | true HVX 21.258 | HVX + hint 20.663 | 1.029x; four hints. |
 | Falcon Debug seq 128 K/V hint | HVX 509.019 | HVX + hint 510.438 | 0.997x; no benefit. |
 | DINOv2 Debug whole-stream VTCM | HVX 21.258 | synchronous 40.150; asynchronous 41.552 | Both regress by about 2x; no useful overlap window. |
 | Falcon Debug N1 stationary prototype | HVX 509.019 | N1 661.809 | Correct but 1.300x slower. |
 | Falcon Debug N2 candidate run | HVX reference 509.019 | N2-enabled 491.355 | Zero N2 candidates; difference is noise and not attributable to N2. |
 
-Sources: `../../archive/engineering_notes/omnifetch_history.md` and
+Sources: `../../archive/engineering_notes/alps_history.md` and
 `../../archive/engineering_notes/engineering_work.md`.
 
 ### 2026-08-06 — full HuBERT and two-prefetch-baseline checkpoint
@@ -515,8 +515,8 @@ Source: `../../archive/engineering_notes/engineering_work.md`, section 17.
 
 ### 2026-08-13 — full-model prefetch baselines and item-7-only convergence
 
-The required PK/APT/native/OmniFetch engine matrix is in Section 2. The raw
-OmniFetch ablation is reproduced here because it determines the current
+The required PK/APT/native/Alps engine matrix is in Section 2. The raw
+Alps ablation is reproduced here because it determines the current
 conclusion.
 
 | Full model | Configuration | Latency | Runtime issued | Issued bytes | Correctness |
@@ -541,7 +541,7 @@ Before item 4 was disabled, the original cumulative cold/warm/invalidated
 protocol reported DINOv2 19,061.970 ms and ViT 48,344.123 ms. Those rows issued
 171,041,329 / 398,320,594 cumulative requests and 287,102,337,728 /
 669,108,840,110 cumulative bytes respectively across the three calls. They are
-historical evidence of a traffic storm, not the current OmniFetch result.
+historical evidence of a traffic storm, not the current Alps result.
 
 For these eager vision graphs, item 7 rejected all internally produced K/V
 sources and emitted zero hardware K/V hints. Its measured benefit therefore
@@ -643,13 +643,13 @@ nano:/home/huzq85/2-working/working_set/alps_p5m_gpt2_stridefix_20260828
    HVX-versus-HexKL full-model corpus. Do not combine it with the much slower
    2026-07-29 monolithic screening numbers.
 2. Use the **2026-08-13 matched HexKL-on/zero-rewrite control** when computing
-   OmniFetch speedup for the full DINOv2/ViT external-prefetch comparison.
-   Pure HVX remains useful as a framework diagnostic, not the causal OF base.
+   Alps speedup for the full DINOv2/ViT external-prefetch comparison.
+   Pure HVX remains useful as a framework diagnostic, not the causal ALPS base.
 3. The 2026-08-06 PK/APT Debug rows show traffic selectivity but only small
    latency differences. The 2026-08-13 full rows make PK and APT logically
    equivalent because both consume the same allowlist and distance-one plan;
    their small latency difference is noise/run order, not an algorithmic win.
-4. Early `omnifetch-2x-improvement` results remain valuable historical signals
+4. Early `alps-2x-improvement` results remain valuable historical signals
    but are not true-HVX evidence. Later audits showed that the old baseline was
    scalar-like and that multiple cumulative policies were entangled.
 5. DeiT/BEiT NaN rows, SD-VAE/SD-UNet loose-comparison rows, timeouts, and exit
@@ -1401,3 +1401,38 @@ V75/V79 and that representative graphs execute correctly with consistent
 relative trends.  It does not replace physical-device measurements.  Exact
 raw values are preserved in
 `data/alps_hexsim_portability_20260902.csv`.
+
+## ALPS rename ablation reproduction check (2026-09-03)
+
+After the compiler dialect, runtime ABI, Python options, scripts, and tests
+were renamed consistently to ALPS, the release ablation entry point was run
+again on the same five complete FP16 models.  The direct comparison below uses
+the 2026-09-01 A0--A4 run as its control because that run already contains the
+later Swin and Whisper fixes.  The older 2026-08-31 table predates those fixes
+and is therefore not a matched rename-regression control.
+
+Each cell reports the new latency followed by its percentage difference from
+the matched 2026-09-01 result.  All 25 configurations passed the same
+model-specific correctness gate as before.
+
+| Complete model | A0: HexKL On | A1: +C | A2: +full E | A3: +P | A4: +R / final ALPS | A0/A4 |
+|---|---:|---:|---:|---:|---:|---:|
+| DINOv2-small | 9,881.72 ms (+0.60%) | 9,880.87 ms (-0.56%) | 3,339.78 ms (+0.88%) | 3,035.50 ms (+1.20%) | **3,034.95 ms (+2.12%)** | **3.26x** |
+| Swin Transformer | 73,451.33 ms (+0.14%) | 73,228.17 ms (-0.12%) | 26,180.04 ms (-0.43%) | 26,021.12 ms (+0.31%) | **25,892.94 ms (-0.11%)** | **2.84x** |
+| SegFormer MiT-B0 | 9,297.58 ms (-0.16%) | 7,045.36 ms (-1.13%) | 4,962.54 ms (+0.16%) | 4,913.40 ms (+1.04%) | **4,893.70 ms (+0.80%)** | **1.90x** |
+| DeiT-Small | 8,323.09 ms (-0.14%) | 8,318.14 ms (-3.99%) | 2,853.34 ms (-1.95%) | 2,581.08 ms (-0.21%) | **2,581.43 ms (+0.24%)** | **3.22x** |
+| Whisper-Tiny | 112,454.26 ms (+0.13%) | 107,415.57 ms (-0.15%) | 61,290.27 ms (-0.04%) | 60,318.82 ms (-0.20%) | **60,441.99 ms (-0.07%)** | **1.86x** |
+
+The final A4 endpoints differ by only -0.11% to +2.12%.  Across all stages,
+the largest change is the -3.99% A1 fluctuation on DeiT; its matched A0 and A4
+move by only -0.14% and +0.24%, respectively.  More importantly, every row
+retains exactly the same static-materialization byte count and runtime DMA
+issued-byte count as the 2026-09-01 run.  The rename therefore preserves both
+the generated mechanism and end-to-end performance within ordinary run-to-run
+variation; no rename-induced regression is observed.
+
+The generated CSV and per-configuration logs are stored under:
+
+```text
+nano:/home/huzq85/2-working/working_set/alps_reproduce_b0b783d/02_ablation_selected_models
+```

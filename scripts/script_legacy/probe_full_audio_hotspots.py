@@ -106,7 +106,7 @@ def make_options():
         enable_lwp=True,
         lwp_loop_depth=1,
         disable_lwp_loop=False,
-        enable_omnifetch_kv_cache_prefetch=True,
+        enable_alps_kv_cache_prefetch=True,
     )
 
 

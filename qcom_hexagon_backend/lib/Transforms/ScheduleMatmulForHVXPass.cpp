@@ -48,18 +48,18 @@ using namespace hexagon;
 
 namespace {
 
-static void copyOmniFetchAttrs(Operation *from, Operation *to) {
+static void copyAlpsAttrs(Operation *from, Operation *to) {
   for (StringRef name :
-       {"omni_fetch.kv_cache_role", "omni_fetch.kv_cache_operand",
-        "omni_fetch.kv_cache_layout", "alps.kv_fusion_boundary",
+       {"alps.kv_cache_role", "alps.kv_cache_operand",
+        "alps.kv_cache_layout", "alps.kv_fusion_boundary",
         "alps.kv_elementwise_fusion_boundary",
         "alps.kv_multi_use_fusion_boundary",
         "alps.kv_split_reduction_boundary",
-        "omni_fetch.n1_weight_stationary", "omni_fetch.n1_mkn",
-        "omni_fetch.n1_baseline_weight_bytes",
-        "omni_fetch.n1_stationary_weight_bytes",
-        "omni_fetch.n1_added_transpose_bytes",
-        "omni_fetch.n1_predicted_saved_bytes"})
+        "alps.n1_weight_stationary", "alps.n1_mkn",
+        "alps.n1_baseline_weight_bytes",
+        "alps.n1_stationary_weight_bytes",
+        "alps.n1_added_transpose_bytes",
+        "alps.n1_predicted_saved_bytes"})
     if (Attribute attr = from->getAttr(name))
       to->setAttr(name, attr);
 }
@@ -113,8 +113,8 @@ static bool rewriteActivationMulticast(IRRewriter &rewriter,
       !first->isBeforeInBlock(second) || !first.hasPureTensorSemantics() ||
       !second.hasPureTensorSemantics() ||
       first->getNumResults() != 1 || second->getNumResults() != 1 ||
-      first->hasAttr("omni_fetch.n2_activation_multicast") ||
-      second->hasAttr("omni_fetch.n2_activation_multicast") ||
+      first->hasAttr("alps.n2_activation_multicast") ||
+      second->hasAttr("alps.n2_activation_multicast") ||
       first.getInputs()[0] != second.getInputs()[0])
     return false;
 
@@ -188,13 +188,13 @@ static bool rewriteActivationMulticast(IRRewriter &rewriter,
         Value sum1 = b.create<arith::AddFOp>(loc, args[4], product1);
         b.create<linalg::YieldOp>(loc, ValueRange{sum0, sum1});
       });
-  fused->setAttr("omni_fetch.n2_activation_multicast",
+  fused->setAttr("alps.n2_activation_multicast",
                  rewriter.getUnitAttr());
-  fused->setAttr("omni_fetch.n2_mkn",
+  fused->setAttr("alps.n2_mkn",
                  rewriter.getDenseI64ArrayAttr({m, k, n}));
   int64_t vectorChunks = (n + kF16HvxElements - 1) / kF16HvxElements;
   int64_t savedBytes = m * k * vectorChunks * 2;
-  fused->setAttr("omni_fetch.n2_estimated_vector_activation_bytes_saved",
+  fused->setAttr("alps.n2_estimated_vector_activation_bytes_saved",
                  rewriter.getI64IntegerAttr(savedBytes));
 
   rewriter.replaceOp(first, fused.getResult(0));
@@ -218,7 +218,7 @@ static bool rewriteWeightStationary(IRRewriter &rewriter,
                                     linalg::MatmulOp op,
                                     WeightStationaryLedger &ledger) {
   if (!op.hasPureTensorSemantics() || op->getNumResults() != 1 ||
-      op->hasAttr("omni_fetch.n1_weight_stationary"))
+      op->hasAttr("alps.n1_weight_stationary"))
     return false;
 
   auto aType = dyn_cast<RankedTensorType>(op.getInputs()[0].getType());
@@ -283,19 +283,19 @@ static bool rewriteWeightStationary(IRRewriter &rewriter,
       RankedTensorType::get({n, m}, cType.getElementType());
   auto stationary = rewriter.create<linalg::MatmulOp>(
       loc, ctType, ValueRange{bt, at}, ValueRange{ctInit});
-  stationary->setAttr("omni_fetch.n1_weight_stationary",
+  stationary->setAttr("alps.n1_weight_stationary",
                       rewriter.getUnitAttr());
-  stationary->setAttr("omni_fetch.n1_mkn",
+  stationary->setAttr("alps.n1_mkn",
                       rewriter.getDenseI64ArrayAttr({m, k, n}));
   stationary->setAttr(
-      "omni_fetch.n1_baseline_weight_bytes",
+      "alps.n1_baseline_weight_bytes",
       rewriter.getI64IntegerAttr(baselineWeightBytes));
   stationary->setAttr(
-      "omni_fetch.n1_stationary_weight_bytes",
+      "alps.n1_stationary_weight_bytes",
       rewriter.getI64IntegerAttr(stationaryWeightBytes));
-  stationary->setAttr("omni_fetch.n1_added_transpose_bytes",
+  stationary->setAttr("alps.n1_added_transpose_bytes",
                       rewriter.getI64IntegerAttr(transposeBytes));
-  stationary->setAttr("omni_fetch.n1_predicted_saved_bytes",
+  stationary->setAttr("alps.n1_predicted_saved_bytes",
                       rewriter.getI64IntegerAttr(predictedSaved));
 
   Value result = makeTranspose(stationary.getResult(0), {m, n},
@@ -321,7 +321,7 @@ ScheduleMatmulForHVXPass::GeneralizeOp(IRRewriter &rewriter,
     signalPassFailure();
     return failure(); // Return a failure result
   }
-  copyOmniFetchAttrs(linalgOp, *generalizedOp);
+  copyAlpsAttrs(linalgOp, *generalizedOp);
   return generalizedOp;
 }
 
@@ -350,17 +350,17 @@ void ScheduleMatmulForHVXPass::runOnOperation() {
       }
     }
     Builder b(&getContext());
-    funcOp->setAttr("omni_fetch.n2_candidates",
+    funcOp->setAttr("alps.n2_candidates",
                     b.getI64IntegerAttr(n2Ledger.candidates));
-    funcOp->setAttr("omni_fetch.n2_admitted",
+    funcOp->setAttr("alps.n2_admitted",
                     b.getI64IntegerAttr(n2Ledger.admitted));
     funcOp->setAttr(
-        "omni_fetch.n2_estimated_vector_activation_bytes_saved",
+        "alps.n2_estimated_vector_activation_bytes_saved",
         b.getI64IntegerAttr(
             n2Ledger.estimatedVectorActivationBytesSaved));
     std::string ledgerLine;
     llvm::raw_string_ostream ledgerStream(ledgerLine);
-    ledgerStream << "[OmniFetchN2] function=" << funcOp.getName()
+    ledgerStream << "[AlpsN2] function=" << funcOp.getName()
                  << " candidates=" << n2Ledger.candidates
                  << " admitted=" << n2Ledger.admitted
                  << " consumers_fused=" << n2Ledger.consumersFused
@@ -379,16 +379,16 @@ void ScheduleMatmulForHVXPass::runOnOperation() {
       rewriteWeightStationary(rewriter, op, n1Ledger);
 
     Builder b(&getContext());
-    funcOp->setAttr("omni_fetch.n1_candidates",
+    funcOp->setAttr("alps.n1_candidates",
                     b.getI64IntegerAttr(n1Ledger.candidates));
-    funcOp->setAttr("omni_fetch.n1_admitted",
+    funcOp->setAttr("alps.n1_admitted",
                     b.getI64IntegerAttr(n1Ledger.admitted));
     funcOp->setAttr(
-        "omni_fetch.n1_predicted_saved_bytes",
+        "alps.n1_predicted_saved_bytes",
         b.getI64IntegerAttr(n1Ledger.predictedSavedBytes));
     std::string ledgerLine;
     llvm::raw_string_ostream ledgerStream(ledgerLine);
-    ledgerStream << "[OmniFetchN1] function=" << funcOp.getName()
+    ledgerStream << "[AlpsN1] function=" << funcOp.getName()
                  << " candidates=" << n1Ledger.candidates
                  << " admitted=" << n1Ledger.admitted
                  << " baseline_weight_bytes="
@@ -410,7 +410,7 @@ void ScheduleMatmulForHVXPass::runOnOperation() {
   //   linalg.batch_matmul(transpose_a, b) -> linalg.batch_matmul_transpose_a
   funcOp.walk([&](linalg::LinalgOp linalgOp) {
     if (isa_and_nonnull<linalg::MatmulOp>(linalgOp.getOperation()) &&
-        !linalgOp->hasAttr("omni_fetch.n1_weight_stationary") &&
+        !linalgOp->hasAttr("alps.n1_weight_stationary") &&
         !linalgOp->getAttrOfType<StringAttr>("library_call")) {
       auto firstOperandDef = linalgOp.getDpsInputs()[0].getDefiningOp();
       auto secondOperandDef = linalgOp.getDpsInputs()[1].getDefiningOp();
@@ -424,7 +424,7 @@ void ScheduleMatmulForHVXPass::runOnOperation() {
             linalgOp.getOperation()->getResultTypes(),
             ValueRange{linalgOp.getDpsInputs()[0], transposeOp.getOperand(0)},
             linalgOp.getDpsInits());
-        copyOmniFetchAttrs(linalgOp, matmulTransposeBOp);
+        copyAlpsAttrs(linalgOp, matmulTransposeBOp);
         rewriter.replaceOp(linalgOp, matmulTransposeBOp);
         rewriter.eraseOp(transposeOp);
       } else if (firstOperandDef && isa<linalg::TransposeOp>(firstOperandDef)) {
@@ -436,7 +436,7 @@ void ScheduleMatmulForHVXPass::runOnOperation() {
             linalgOp.getOperation()->getResultTypes(),
             ValueRange{transposeOp.getOperand(0), linalgOp.getDpsInputs()[1]},
             linalgOp.getDpsInits());
-        copyOmniFetchAttrs(linalgOp, matmulTransposeAOp);
+        copyAlpsAttrs(linalgOp, matmulTransposeAOp);
         rewriter.replaceOp(linalgOp, matmulTransposeAOp);
         rewriter.eraseOp(transposeOp);
       }
@@ -457,7 +457,7 @@ void ScheduleMatmulForHVXPass::runOnOperation() {
                 ValueRange{linalgOp.getDpsInputs()[0],
                            transposeOp.getOperand(0)},
                 linalgOp.getDpsInits());
-        copyOmniFetchAttrs(linalgOp, matmulTransposeBOp);
+        copyAlpsAttrs(linalgOp, matmulTransposeBOp);
         rewriter.replaceOp(linalgOp, matmulTransposeBOp);
         rewriter.eraseOp(transposeOp);
       } else if (firstOperandDef && isa<linalg::TransposeOp>(firstOperandDef)) {
@@ -471,7 +471,7 @@ void ScheduleMatmulForHVXPass::runOnOperation() {
                 ValueRange{transposeOp.getOperand(0),
                            linalgOp.getDpsInputs()[1]},
                 linalgOp.getDpsInits());
-        copyOmniFetchAttrs(linalgOp, matmulTransposeAOp);
+        copyAlpsAttrs(linalgOp, matmulTransposeAOp);
         rewriter.replaceOp(linalgOp, matmulTransposeAOp);
         rewriter.eraseOp(transposeOp);
       }

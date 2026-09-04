@@ -23,7 +23,7 @@
 // Prerequisites
 // -------------
 // This pass requires that prefetch operations have already been inserted
-// by the PrefetchInsertPass. It detects existing `omni_fetch.prefetch_in_situ`
+// by the PrefetchInsertPass. It detects existing `alps.prefetch_in_situ`
 // operations and adds synchronization around them.
 //
 // Transformation overview
@@ -33,20 +33,20 @@
 //   A. CREATES a hardware semaphore for synchronization.
 //
 //   B. EMITS PROLOGUE before the loop:
-//        %sem = omni_fetch.create_sem
+//        %sem = alps.create_sem
 //        <existing prefetch operations>
-//        omni_fetch.signal %sem
+//        alps.signal %sem
 //
 //   C. REWRITES THE LOOP BODY:
-//        omni_fetch.wait %sem           // ensure tile[i] ready
+//        alps.wait %sem           // ensure tile[i] ready
 //        <original HMX compute on vtcm_tile[i]>
 //        <existing prefetch for tile[i+K]>
-//        omni_fetch.signal %sem         // notify tile[i+K] ready
-//        %dist = omni_fetch.adaptive_control(%dist)  // optional
+//        alps.signal %sem         // notify tile[i+K] ready
+//        %dist = alps.adaptive_control(%dist)  // optional
 //
 //===----------------------------------------------------------------------===//
 
-#include "hexagon/Dialect/OmniFetch/IR/OmniFetchDialect.h"
+#include "hexagon/Dialect/Alps/IR/AlpsDialect.h"
 #include "hexagon/Transforms/Passes.h"
 #include "hexagon/Transforms/Transforms.h"
 
@@ -58,13 +58,13 @@
 
 #include "llvm/Support/Debug.h"
 
-#define DEBUG_TYPE "omni-fetch-vdae-decouple"
+#define DEBUG_TYPE "alps-vdae-decouple"
 
 using namespace mlir;
-using namespace mlir::omni_fetch;
+using namespace mlir::alps;
 using namespace hexagon;
 
-#define GEN_PASS_DEF_OMNIFETCHVDAEINSERT
+#define GEN_PASS_DEF_ALPSVDAEINSERT
 #include "hexagon/Transforms/Passes.h.inc"
 
 namespace {
@@ -154,7 +154,7 @@ static void addSynchronizationToLoop(scf::ForOp loop, bool enableAdaptive) {
 
   // Sync-only in-situ prefetches (lookahead==0) complete before signal would
   // fire; wrapping them in wait/signal is pure overhead and — worse — wait()
-  // drains OmniFetchRuntime async DMA jobs belonging to sibling loops
+  // drains AlpsRuntime async DMA jobs belonging to sibling loops
   // (e.g. activation loop wait completing a weight-loop deferred WH).
   auto hasAsyncPrefetch = [](ArrayRef<PrefetchInSituOp> ops) {
     return llvm::any_of(ops,
@@ -214,12 +214,12 @@ static void addSynchronizationToLoop(scf::ForOp loop, bool enableAdaptive) {
 // Pass
 //===----------------------------------------------------------------------===//
 
-struct OmniFetchVDAEInsertPass
-    : public ::impl::OmniFetchVDAEInsertBase<OmniFetchVDAEInsertPass> {
+struct AlpsVDAEInsertPass
+    : public ::impl::AlpsVDAEInsertBase<AlpsVDAEInsertPass> {
 
-  explicit OmniFetchVDAEInsertPass() = default;
-  explicit OmniFetchVDAEInsertPass(const OmniFetchVDAEInsertOptions &options)
-      : OmniFetchVDAEInsertBase(options) {}
+  explicit AlpsVDAEInsertPass() = default;
+  explicit AlpsVDAEInsertPass(const AlpsVDAEInsertOptions &options)
+      : AlpsVDAEInsertBase(options) {}
 
   void runOnOperation() override {
     auto func = cast<func::FuncOp>(getOperation());
@@ -247,7 +247,7 @@ struct OmniFetchVDAEInsertPass
 //===----------------------------------------------------------------------===//
 
 std::unique_ptr<InterfacePass<FunctionOpInterface>>
-hexagon::createOmniFetchVDAEInsertPass(
-    const OmniFetchVDAEInsertOptions &options) {
-  return std::make_unique<OmniFetchVDAEInsertPass>(options);
+hexagon::createAlpsVDAEInsertPass(
+    const AlpsVDAEInsertOptions &options) {
+  return std::make_unique<AlpsVDAEInsertPass>(options);
 }

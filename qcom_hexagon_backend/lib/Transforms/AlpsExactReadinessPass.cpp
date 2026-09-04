@@ -1,6 +1,6 @@
 //===- AlpsExactReadinessPass.cpp - ALPS P3a contract audit -------------===//
 
-#include "hexagon/Dialect/OmniFetch/IR/OmniFetchDialect.h"
+#include "hexagon/Dialect/Alps/IR/AlpsDialect.h"
 #include "hexagon/Transforms/Passes.h"
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -11,7 +11,7 @@
 #include <string>
 
 using namespace mlir;
-using namespace mlir::omni_fetch;
+using namespace mlir::alps;
 using namespace mlir::hexagon;
 
 #define GEN_PASS_DEF_ALPSEXACTREADINESS

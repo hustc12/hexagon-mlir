@@ -39,7 +39,7 @@ class GemmModel(nn.Module):
 def run(args: argparse.Namespace) -> None:
     assert args.k % 32 == 0 and args.n % 32 == 0, (
         "K/N must be divisible by 32 for the HMX tile; M may be unaligned "
-        "when --enable-omnifetch-m-pad-hmx is set"
+        "when --enable-alps-m-pad-hmx is set"
     )
     assert args.k != args.m and args.n != args.m, (
         "shape must be non-attention-like (K!=M and N!=M) to admit plain HMX"
@@ -101,18 +101,18 @@ def run(args: argparse.Namespace) -> None:
             print("[HexKL] WARNING: 0 rewrites - no HMX coverage for this shape")
     options = hexagon_options_phase4(
         args.enable_hexkl,
-        args.enable_omnifetch_vdae,
+        args.enable_alps_vdae,
         not args.disable_layout_aware,
-        args.omnifetch_lookahead,
-        not args.disable_omnifetch_adaptive,
-        args.enable_omnifetch_items_1_7,
+        args.alps_lookahead,
+        not args.disable_alps_adaptive,
+        args.enable_alps_items_1_7,
         lower_constants_separate=True,
         backend_profile=args.backend_profile,
         enable_lwp=args.enable_lwp,
         lwp_loop_depth=args.lwp_loop_depth,
         disable_lwp_loop=args.disable_lwp_loop,
-        omnifetch_items_through=args.omnifetch_items_through,
-        enable_omnifetch_m_pad_hmx=args.enable_omnifetch_m_pad_hmx,
+        alps_items_through=args.alps_items_through,
+        enable_alps_m_pad_hmx=args.enable_alps_m_pad_hmx,
     )
     output = hex_execution(
         module,

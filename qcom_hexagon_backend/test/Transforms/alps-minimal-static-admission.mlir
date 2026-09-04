@@ -19,9 +19,9 @@ func.func @p2d_kv(
   linalg.generic {
       indexing_maps = [#q, #k, #o],
       iterator_types = ["parallel", "parallel", "parallel", "reduction"],
-      omni_fetch.kv_cache_operand = 1 : i64,
-      omni_fetch.kv_cache_role = "key",
-      omni_fetch.kv_cache_layout = "bshd"}
+      alps.kv_cache_operand = 1 : i64,
+      alps.kv_cache_role = "key",
+      alps.kv_cache_layout = "bshd"}
       ins(%q, %persistent_k : memref<1x32x32xf16>, memref<1x32x32xf16>)
       outs(%score : memref<1x32x32xf16>) {
     ^bb0(%a: f16, %b: f16, %acc: f16):
@@ -34,9 +34,9 @@ func.func @p2d_kv(
   linalg.generic {
       indexing_maps = [#q, #k, #o],
       iterator_types = ["parallel", "parallel", "parallel", "reduction"],
-      omni_fetch.kv_cache_operand = 1 : i64,
-      omni_fetch.kv_cache_role = "value",
-      omni_fetch.kv_cache_layout = "bshd"}
+      alps.kv_cache_operand = 1 : i64,
+      alps.kv_cache_role = "value",
+      alps.kv_cache_layout = "bshd"}
       ins(%q, %produced_k : memref<1x32x32xf16>, memref<1x32x32xf16>)
       outs(%score : memref<1x32x32xf16>) {
     ^bb0(%a: f16, %b: f16, %acc: f16):
@@ -63,7 +63,7 @@ func.func @p2d_kv(
 // MATERIALIZE-SAME: alps.p2d.l2_hint = 1
 // MATERIALIZE-SAME: alps.p2d.materialized = 1
 // MATERIALIZE-SAME: alps.p2d.native = 1
-// MATERIALIZE-COUNT-1: omni_fetch.l2_hint
+// MATERIALIZE-COUNT-1: alps.l2_hint
 
 func.func @p2d_hexkl(
     %hmx: memref<?xi8, 1>,

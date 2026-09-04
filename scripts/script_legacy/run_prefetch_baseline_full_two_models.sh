@@ -9,7 +9,7 @@ set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "${script_dir}/../.." && pwd)
 parent_dir=$(cd -- "${repo_root}/.." && pwd)
-venv=${OMNIFETCH_VENV:-${parent_dir}/mlir-env}
+venv=${ALPS_VENV:-${parent_dir}/mlir-env}
 python_version=$("${venv}/bin/python" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
 triton_build_dir=${TRITON_BUILD_DIR:-${repo_root}/triton/build/cmake.linux-x86_64-cpython-${python_version}}
 output_dir=${OUTPUT_DIR:-${parent_dir}/run_artifacts/full_prefetch_baselines_$(date +%Y%m%d_%H%M%S)}
@@ -28,7 +28,7 @@ export HEXAGON_SDK_ROOT=${HEXAGON_SDK_ROOT:-${parent_dir}/HEXAGON_SDK/Hexagon_SD
 export HEXAGON_TOOLS=${HEXAGON_TOOLS:-${parent_dir}/HEXAGON_TOOLS/Tools}
 export HEXKL_ROOT=${HEXKL_ROOT:-${parent_dir}/HEXKL_DIR/hexkl_addon}
 export HEXAGON_RUNTIME_LIBS_DIR=${HEXAGON_RUNTIME_LIBS_DIR:-${triton_build_dir}/third_party/qcom_hexagon_backend/bin/runtime}
-export OMNIFETCH_DSP_HEAP_MB=${OMNIFETCH_DSP_HEAP_MB:-512}
+export ALPS_DSP_HEAP_MB=${ALPS_DSP_HEAP_MB:-512}
 
 mkdir -p "${output_dir}"
 printf 'model,scheme,status,perf_us,p50_us,p90_us,min_us,hints,issued,requested_bytes,issued_bytes,correctness\n' > "${output_dir}/results.csv"

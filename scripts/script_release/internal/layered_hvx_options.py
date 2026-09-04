@@ -38,7 +38,7 @@ def add_layered_hvx_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--prefetch-baseline-distance", type=int, default=1)
     parser.add_argument("--apt-get-hx-manual-candidate-ids", default="")
     parser.add_argument(
-        "--enable-omnifetch-kv-cache-prefetch",
+        "--enable-alps-kv-cache-prefetch",
         action="store_true",
         help="Legacy umbrella alias for the complete historical item-7 policy.",
     )
@@ -55,7 +55,7 @@ def add_layered_hvx_args(parser: argparse.ArgumentParser) -> None:
     # Accepted explicitly so the unified driver uses exactly the same item-7
     # command line for monolithic and layered model families.
     parser.add_argument("--disable-layout-aware", action="store_true")
-    parser.add_argument("--disable-omnifetch-adaptive", action="store_true")
+    parser.add_argument("--disable-alps-adaptive", action="store_true")
 
 
 def make_layered_hvx_options(args: argparse.Namespace) -> dict:
@@ -65,7 +65,7 @@ def make_layered_hvx_options(args: argparse.Namespace) -> dict:
         raise ValueError("prefetch baseline distance must be positive")
     if args.lwp_loop_depth < 0:
         raise ValueError("LWP loop depth must be non-negative")
-    item7 = bool(args.enable_omnifetch_kv_cache_prefetch)
+    item7 = bool(args.enable_alps_kv_cache_prefetch)
     alps_mode = str(args.alps_p0_mode)
     if item7 and alps_mode != "none":
         raise ValueError("legacy item7 and --alps-p0-mode are mutually exclusive")
@@ -73,11 +73,11 @@ def make_layered_hvx_options(args: argparse.Namespace) -> dict:
     if args.prefetch_baseline != "none" and (item7 or alps_enabled):
         raise ValueError("external prefetch baselines cannot be combined with ALPS")
     if (item7 or alps_enabled) and not (
-        args.disable_layout_aware and args.disable_omnifetch_adaptive
+        args.disable_layout_aware and args.disable_alps_adaptive
     ):
         raise ValueError(
             "ALPS P0 requires --disable-layout-aware and "
-            "--disable-omnifetch-adaptive"
+            "--disable-alps-adaptive"
         )
 
     options = HexagonOptions().__dict__.copy()
@@ -112,13 +112,13 @@ def make_layered_hvx_options(args: argparse.Namespace) -> dict:
 
     runtime_prefetch = alps_mode in ("runtime", "legacy-all")
     options["enablePrefetch"] = item7 or runtime_prefetch
-    options["enableOmniFetchLayoutAware"] = False
-    options["enableOmniFetchVDAE"] = False
-    options["enableOmniFetchAdaptive"] = False
-    options["enableOmniFetchPersistentWhCache"] = False
-    options["enableOmniFetchTwoDimPipeline"] = False
-    options["enableOmniFetchVtcmColoring"] = False
-    options["enableOmniFetchKvCachePrefetch"] = item7
+    options["enableAlpsLayoutAware"] = False
+    options["enableAlpsVDAE"] = False
+    options["enableAlpsAdaptive"] = False
+    options["enableAlpsPersistentWhCache"] = False
+    options["enableAlpsTwoDimPipeline"] = False
+    options["enableAlpsVtcmColoring"] = False
+    options["enableAlpsKvCachePrefetch"] = item7
     options["enableAlpsKvSemanticTracking"] = alps_enabled
     options["enableAlpsKvFusionPolicy"] = alps_mode in ("fusion", "legacy-all")
     options["enableAlpsKvElementwiseFusionPolicy"] = (
@@ -240,7 +240,7 @@ def make_layered_hvx_options(args: argparse.Namespace) -> dict:
     # Keep P3b issuer-owned: UserDMA start/poll must remain on the same
     # Hexagon hardware thread.  Dual-thread DAE remains an independent switch
     # for schemes whose completion work is safe to execute on the scout.
-    options["enableOmniFetchDmaToVtcm"] = False
+    options["enableAlpsDmaToVtcm"] = False
     options["enableHexagonmemCopyToDMA"] = (
         options["enableAlpsCrpVtcmFormation"]
         or options["enableAlpsCrpVtcmWindow"]

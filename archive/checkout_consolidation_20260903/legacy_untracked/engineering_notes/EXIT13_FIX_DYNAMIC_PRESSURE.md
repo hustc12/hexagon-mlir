@@ -170,17 +170,17 @@ bash scripts/build_hexagon_mlir_incremental.sh --jobs 12
 # Test 1 layer
 source /home/huzq85/2-working/hexagon_npu/mlir-env/bin/activate
 python benchmark_models/debug_running/run_dinov2-small_debug.py \
-  --backend-profile legacy-scalar --enable-hexkl --enable-omnifetch-m-pad-hmx \
+  --backend-profile legacy-scalar --enable-hexkl --enable-alps-m-pad-hmx \
   --num-layers 1 --device-iterations 3
 
 # Test 2 layers (should work without Exit 13)
 python benchmark_models/debug_running/run_dinov2-small_debug.py \
-  --backend-profile legacy-scalar --enable-hexkl --enable-omnifetch-m-pad-hmx \
+  --backend-profile legacy-scalar --enable-hexkl --enable-alps-m-pad-hmx \
   --num-layers 2 --device-iterations 3
 
 # Test 3 layers (partial conversion)
 python benchmark_models/debug_running/run_dinov2-small_debug.py \
-  --backend-profile legacy-scalar --enable-hexkl --enable-omnifetch-m-pad-hmx \
+  --backend-profile legacy-scalar --enable-hexkl --enable-alps-m-pad-hmx \
   --num-layers 3 --device-iterations 2
 ```
 

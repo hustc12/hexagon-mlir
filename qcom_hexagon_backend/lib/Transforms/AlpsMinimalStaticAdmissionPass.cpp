@@ -118,7 +118,7 @@ static Value kvSource(Operation *op) {
   if (auto read = dyn_cast<vector::TransferReadOp>(op))
     return read.getBase();
   if (auto operand =
-          op->getAttrOfType<IntegerAttr>("omni_fetch.kv_cache_operand")) {
+          op->getAttrOfType<IntegerAttr>("alps.kv_cache_operand")) {
     int64_t index = operand.getInt();
     if (index >= 0 && index < static_cast<int64_t>(op->getNumOperands()))
       return op->getOperand(index);
@@ -229,7 +229,7 @@ struct AlpsMinimalStaticAdmissionPass final
             "alps.p2a.eliminated_transpose_materialization_bytes");
         decision.bytes = eliminated ? eliminated.getInt() : -1;
         decision.rejected = false;
-      } else if (op->hasAttr("omni_fetch.kv_cache_role")) {
+      } else if (op->hasAttr("alps.kv_cache_role")) {
         source = peelViews(kvSource(op));
         if (!source)
           return;

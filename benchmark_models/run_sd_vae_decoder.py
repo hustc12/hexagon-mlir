@@ -168,11 +168,11 @@ def test_vae_decoder(
     enablelwp: bool = False,
     disable_mid_attn: bool = False,
     enable_hexkl: bool = False,
-    enable_omnifetch_vdae: bool = False,
-    enable_omnifetch_layout_aware: bool = True,
-    omnifetch_lookahead: int = 2,
-    enable_omnifetch_adaptive: bool = True,
-    enable_omnifetch_items_1_7: bool = False,
+    enable_alps_vdae: bool = False,
+    enable_alps_layout_aware: bool = True,
+    alps_lookahead: int = 2,
+    enable_alps_adaptive: bool = True,
+    enable_alps_items_1_7: bool = False,
 ):
     print("\n=== Stable Diffusion — VAE Decoder ===")
 
@@ -213,11 +213,11 @@ def test_vae_decoder(
     args = _Args()
     args.lwp = enablelwp
     args.enable_hexkl = enable_hexkl
-    args.enable_omnifetch_vdae = enable_omnifetch_vdae
-    args.disable_layout_aware = not enable_omnifetch_layout_aware
-    args.omnifetch_lookahead = omnifetch_lookahead
-    args.disable_omnifetch_adaptive = not enable_omnifetch_adaptive
-    args.enable_omnifetch_items_1_7 = enable_omnifetch_items_1_7
+    args.enable_alps_vdae = enable_alps_vdae
+    args.disable_layout_aware = not enable_alps_layout_aware
+    args.alps_lookahead = alps_lookahead
+    args.disable_alps_adaptive = not enable_alps_adaptive
+    args.enable_alps_items_1_7 = enable_alps_items_1_7
     options = options_from_args(args)
 
     print("Running VAE Decoder on Hexagon NPU …")
@@ -259,9 +259,9 @@ if __name__ == "__main__":
         enablelwp=args.lwp,
         disable_mid_attn=args.no_mid_attn,
         enable_hexkl=args.enable_hexkl,
-        enable_omnifetch_vdae=args.enable_omnifetch_vdae,
-        enable_omnifetch_layout_aware=not args.disable_layout_aware,
-        omnifetch_lookahead=args.omnifetch_lookahead,
-        enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
-        enable_omnifetch_items_1_7=args.enable_omnifetch_items_1_7,
+        enable_alps_vdae=args.enable_alps_vdae,
+        enable_alps_layout_aware=not args.disable_layout_aware,
+        alps_lookahead=args.alps_lookahead,
+        enable_alps_adaptive=not args.disable_alps_adaptive,
+        enable_alps_items_1_7=args.enable_alps_items_1_7,
     )

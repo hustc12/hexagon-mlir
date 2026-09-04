@@ -5,7 +5,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "hexagon/Dialect/OmniFetch/IR/OmniFetchDialect.h"
+#include "hexagon/Dialect/Alps/IR/AlpsDialect.h"
 #include "hexagon/Dialect/HexKL/IR/HexKLDialect.h"
 #include "hexagon/Transforms/Passes.h"
 
@@ -1344,7 +1344,7 @@ struct AlpsLayoutSupplyPrefetchPass final
             futureOffsets[ivDimension] = futureIv;
             Value futureView = thenBuilder.create<memref::SubViewOp>(
                 thenLoc, view.getSource(), futureOffsets, sizes, strides);
-            auto hint = thenBuilder.create<omni_fetch::L2HintOp>(
+            auto hint = thenBuilder.create<alps::L2HintOp>(
                 thenLoc, futureView, static_cast<int32_t>(distance));
             hint->setAttr("alps.p5c.layout_supply", thenBuilder.getUnitAttr());
             hint->setAttr("alps.p5c.requested_bytes",
@@ -1847,7 +1847,7 @@ struct AlpsCrpSupplyPrefetchPass final
             futureOffsets[ivDimension] = futureIv;
             Value futureView = thenBuilder.create<memref::SubViewOp>(
                 thenLoc, view.getSource(), futureOffsets, sizes, strides);
-            auto hint = thenBuilder.create<omni_fetch::L2HintOp>(
+            auto hint = thenBuilder.create<alps::L2HintOp>(
                 thenLoc, futureView, static_cast<int32_t>(lead));
             hint->setAttr("alps.p5f_b.crp_supply", thenBuilder.getUnitAttr());
             hint->setAttr("alps.p5f_b.requested_bytes",

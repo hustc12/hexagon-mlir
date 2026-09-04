@@ -10,7 +10,7 @@
 // This pass eliminates redundant layout transformation operations when
 // in-situ reshape is enabled during prefetch.
 //
-// When `omni_fetch.prefetch_in_situ` is used with `layout_transform != None`,
+// When `alps.prefetch_in_situ` is used with `layout_transform != None`,
 // the hardware performs the layout transformation during the DDR→VTCM
 // transfer. This makes explicit transpose/permute/slice operations in the
 // graph redundant.
@@ -27,7 +27,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "hexagon/Dialect/OmniFetch/IR/OmniFetchDialect.h"
+#include "hexagon/Dialect/Alps/IR/AlpsDialect.h"
 #include "hexagon/Transforms/Passes.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -49,7 +49,7 @@
 #define DEBUG_TYPE "layout-ops-elimination"
 
 using namespace mlir;
-using namespace mlir::omni_fetch;
+using namespace mlir::alps;
 using namespace hexagon;
 
 #define GEN_PASS_DEF_LAYOUTOPSELIMINATION
@@ -142,9 +142,9 @@ carryActivationLayoutToProducer(ArrayRef<PrefetchInSituOp> prefetches) {
 
     prefetch->setOperand(0, source);
     Builder builder(prefetch.getContext());
-    prefetch->setAttr("omni_fetch.layout_carried_from_producer",
+    prefetch->setAttr("alps.layout_carried_from_producer",
                       builder.getUnitAttr());
-    prefetch->setAttr("omni_fetch.layout_carried_view_depth",
+    prefetch->setAttr("alps.layout_carried_view_depth",
                       builder.getI64IntegerAttr(bypassed.size()));
     ++stats.fusedSites;
     stats.bypassedViews += bypassed.size();
@@ -269,26 +269,26 @@ static void annotateLayoutValueSites(FunctionOpInterface func,
 
   for (auto [prefetch, siteId] : llvm::zip(prefetches, opSiteIds)) {
     const LayoutValueSite &site = sites[siteId];
-    prefetch->setAttr("omni_fetch.layout_value_id",
+    prefetch->setAttr("alps.layout_value_id",
                       builder.getI64IntegerAttr(site.id));
-    prefetch->setAttr("omni_fetch.layout_site_occurrences",
+    prefetch->setAttr("alps.layout_site_occurrences",
                       builder.getI64IntegerAttr(site.occurrences));
-    prefetch->setAttr("omni_fetch.layout_estimated_executions",
+    prefetch->setAttr("alps.layout_estimated_executions",
                       builder.getI64IntegerAttr(site.estimatedExecutions));
-    prefetch->setAttr("omni_fetch.layout_source_kind",
+    prefetch->setAttr("alps.layout_source_kind",
                       builder.getStringAttr(classifyLayoutSource(site.root)));
     Value dest = prefetch->getOperand(1);
     prefetch->setAttr(
-        "omni_fetch.layout_dest_users",
+        "alps.layout_dest_users",
         builder.getI64IntegerAttr(static_cast<int64_t>(
             std::distance(dest.user_begin(), dest.user_end()))));
   }
 
-  func->setAttr("omni_fetch.layout_value_sites",
+  func->setAttr("alps.layout_value_sites",
                 builder.getI64IntegerAttr(sites.size()));
-  func->setAttr("omni_fetch.layout_reusable_sites",
+  func->setAttr("alps.layout_reusable_sites",
                 builder.getI64IntegerAttr(reusableSites));
-  func->setAttr("omni_fetch.layout_prefetch_instances",
+  func->setAttr("alps.layout_prefetch_instances",
                 builder.getI64IntegerAttr(prefetches.size()));
 
   llvm::errs() << "[LayoutValueAnalysis] function=" << func.getName()
@@ -430,7 +430,7 @@ static bool canSafelyRemove(Operation *op) {
       Operation *user = use.getOwner();
 
       // If user is also marked redundant, it's safe
-      if (user->hasAttr("omni_fetch.redundant"))
+      if (user->hasAttr("alps.redundant"))
         continue;
 
       // If user is a memref cast/subview, it's safe
@@ -453,12 +453,12 @@ static bool canSafelyRemove(Operation *op) {
   for (OpOperand &use : op->getUses()) {
     Operation *user = use.getOwner();
 
-    // Never delete a value still consumed by OmniFetch prefetch.
+    // Never delete a value still consumed by Alps prefetch.
     if (isa<PrefetchInSituOp>(user))
       return false;
 
     // If user is also marked redundant, it's safe
-    if (user->hasAttr("omni_fetch.redundant"))
+    if (user->hasAttr("alps.redundant"))
       continue;
 
     // If user is a memref cast/subview, it's safe
@@ -512,7 +512,7 @@ static void markRedundantLayoutOps(Value memref, LayoutTransform lt,
     // Check if this is a redundant layout op
     if (isRedundantLayoutOp(defOp, lt)) {
       llvm::dbgs() << "[LayoutOpsElimination]       ✓ Marked as redundant\n";
-      defOp->setAttr("omni_fetch.redundant",
+      defOp->setAttr("alps.redundant",
                      UnitAttr::get(defOp->getContext()));
       opsMarked++;
 
@@ -605,9 +605,9 @@ struct LayoutOpsEliminationPass
     // producer views before assigning layout identities.
     LayoutCarryStats carryStats = carryActivationLayoutToProducer(prefetches);
     Builder builder(func.getContext());
-    func->setAttr("omni_fetch.layout_carried_sites",
+    func->setAttr("alps.layout_carried_sites",
                   builder.getI64IntegerAttr(carryStats.fusedSites));
-    func->setAttr("omni_fetch.layout_carried_views",
+    func->setAttr("alps.layout_carried_views",
                   builder.getI64IntegerAttr(carryStats.bypassedViews));
     llvm::errs() << "[LayoutCarryFusion] function=" << func.getName()
                  << " fused_sites=" << carryStats.fusedSites
@@ -633,7 +633,7 @@ struct LayoutOpsEliminationPass
     // Step 5: Collect all ops marked as redundant
     SmallVector<Operation*> toDelete;
     func.walk([&](Operation *op) {
-      if (op->hasAttr("omni_fetch.redundant")) {
+      if (op->hasAttr("alps.redundant")) {
         llvm::dbgs() << "[LayoutOpsElimination] Marked redundant: " 
                      << op->getName() << "\n";
         if (canSafelyRemove(op)) {

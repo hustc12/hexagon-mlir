@@ -284,11 +284,11 @@ def create_dinov2_medium_model_and_input(
 # Test scale progression
 python benchmark_models/run_dinov2_medium.py \
   --num-layers 2 --image-size 56 \  # 50 tokens
-  --enable-hexkl --enable-omnifetch-m-pad-hmx
+  --enable-hexkl --enable-alps-m-pad-hmx
 
 python benchmark_models/run_dinov2_medium.py \
   --num-layers 4 --image-size 80 \  # 101 tokens
-  --enable-hexkl --enable-omnifetch-m-pad-hmx
+  --enable-hexkl --enable-alps-m-pad-hmx
 ```
 
 **目标**: 找到能稳定运行的最大规模，建立 scaling law。

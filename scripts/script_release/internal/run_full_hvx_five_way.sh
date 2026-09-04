@@ -9,14 +9,14 @@ set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "${script_dir}/../../.." && pwd)
 parent_dir=$(cd -- "${repo_root}/.." && pwd)
-venv=${OMNIFETCH_VENV:-${parent_dir}/mlir-env}
+venv=${ALPS_VENV:-${parent_dir}/mlir-env}
 python_version=$("${venv}/bin/python" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
 triton_build=${TRITON_BUILD_DIR:-${repo_root}/triton/build/cmake.linux-x86_64-cpython-${python_version}}
 
 output_dir=${OUTPUT_DIR:-${parent_dir}/run_artifacts/full_hvx_five_way_$(date +%Y%m%d_%H%M%S)}
 remote_dir=${REMOTE_RESULTS_DIR:-/home/huzq85/2-working/working_set/full_hvx_five_way_$(date +%Y%m%d_%H%M%S)}
 iterations=${DEVICE_ITERATIONS:-1}
-seq_len=${OMNIFETCH_SEQ_LEN:-32}
+seq_len=${ALPS_SEQ_LEN:-32}
 compile_threads=${HEXAGON_MLIR_COMPILE_THREADS:-auto}
 reuse_valid=${REUSE_VALID_LOGS:-1}
 list_only=0
@@ -525,7 +525,7 @@ export HEXAGON_SDK_ROOT=${HEXAGON_SDK_ROOT:-${parent_dir}/HEXAGON_SDK/Hexagon_SD
 export HEXAGON_TOOLS=${HEXAGON_TOOLS:-${parent_dir}/HEXAGON_TOOLS/Tools}
 export HEXKL_ROOT=${HEXKL_ROOT:-${parent_dir}/HEXKL_DIR/hexkl_addon}
 export HEXAGON_RUNTIME_LIBS_DIR=${HEXAGON_RUNTIME_LIBS_DIR:-${triton_build}/third_party/qcom_hexagon_backend/bin/runtime}
-export OMNIFETCH_DSP_HEAP_MB=${OMNIFETCH_DSP_HEAP_MB:-512}
+export ALPS_DSP_HEAP_MB=${ALPS_DSP_HEAP_MB:-512}
 export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
 export TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
 export PYTHONUNBUFFERED=1
@@ -735,9 +735,9 @@ scheme_args_for() {
     hmlir-hvx-hexkl-on) printf '%s\n' --enable-hexkl ;;
     alps-final)
       printf '%s\n' --enable-hexkl --enable-alps-hvx-widening-conv \
-        --disable-layout-aware --disable-omnifetch-adaptive
+        --disable-layout-aware --disable-alps-adaptive
       if [[ ${ALPS_DISABLE_ATTENTION_TOPOLOGY:-0} != 1 ]]; then
-        printf '%s\n' --enable-omnifetch-kv-cache-prefetch
+        printf '%s\n' --enable-alps-kv-cache-prefetch
       fi
       ;;
     alps-fp16-hvx-arithmetic)
@@ -751,42 +751,42 @@ scheme_args_for() {
       ;;
     alps-c-e-hmx-direct-output|alps-c-e-hmx-async-drain|alps-c-e-hmx-async-drain-traffic-control)
       printf '%s\n' --enable-hexkl --enable-alps-hvx-widening-conv \
-        --disable-layout-aware --disable-omnifetch-adaptive
+        --disable-layout-aware --disable-alps-adaptive
       if [[ ${ALPS_DISABLE_ATTENTION_TOPOLOGY:-0} != 1 ]]; then
-        printf '%s\n' --enable-omnifetch-kv-cache-prefetch
+        printf '%s\n' --enable-alps-kv-cache-prefetch
       fi
       ;;
     item7-only)
-      printf '%s\n' --enable-hexkl --enable-omnifetch-kv-cache-prefetch \
-        --disable-layout-aware --disable-omnifetch-adaptive
+      printf '%s\n' --enable-hexkl --enable-alps-kv-cache-prefetch \
+        --disable-layout-aware --disable-alps-adaptive
       ;;
     alps-semantic|alps-fusion|alps-elementwise-fusion|alps-multi-use-fusion|alps-split-reduction|alps-slicing|alps-runtime|alps-legacy-all)
       printf '%s\n' --enable-hexkl \
         --alps-p0-mode "${scheme#alps-}" \
-        --disable-layout-aware --disable-omnifetch-adaptive
+        --disable-layout-aware --disable-alps-adaptive
       ;;
     alps-elementwise-zero-copy)
       printf '%s\n' --enable-hexkl --alps-p0-mode elementwise-fusion \
-        --disable-layout-aware --disable-omnifetch-adaptive
+        --disable-layout-aware --disable-alps-adaptive
       ;;
     alps-elementwise-producer-direct)
       printf '%s\n' --enable-hexkl --alps-p0-mode elementwise-fusion \
-        --disable-layout-aware --disable-omnifetch-adaptive
+        --disable-layout-aware --disable-alps-adaptive
       ;;
     alps-elementwise-fused-transfer)
       printf '%s\n' --enable-hexkl --alps-p0-mode elementwise-fusion \
-        --disable-layout-aware --disable-omnifetch-adaptive
+        --disable-layout-aware --disable-alps-adaptive
       ;;
     alps-consumer-driven-layout|alps-consumer-layout-propagation|alps-continuity-audit|alps-loop-interchanged-direct|alps-register-tile-direct|alps-crp-supply-analysis|alps-crp-supply-prefetch|alps-crp-segmented-supply|alps-crp-vtcm-formation|alps-crp-vtcm-window|alps-crp-vtcm-async-window|alps-crp-producer-direct-analysis|alps-crp-producer-direct-vtcm|alps-crp-producer-direct-head-major|alps-crp-producer-head-major-contiguous|alps-attention-destination-formation|alps-patch-conv-formation|alps-hmx-f16-epilogue-formation|alps-hmx-direct-output-formation|alps-hmx-f16-bias-epilogue-formation|alps-hmx-async-drain-analysis|alps-hmx-async-drain|alps-contract-discharge-ledger|alps-representation-supply-analysis|alps-layout-supply-prefetch)
-      printf '%s\n' --enable-hexkl --disable-layout-aware --disable-omnifetch-adaptive
+      printf '%s\n' --enable-hexkl --disable-layout-aware --disable-alps-adaptive
       ;;
     alps-elementwise-admission|alps-elementwise-exact-readiness|alps-elementwise-exact-overlap|alps-elementwise-traffic-control)
       printf '%s\n' --enable-hexkl --alps-p0-mode elementwise-fusion \
-        --disable-layout-aware --disable-omnifetch-adaptive
+        --disable-layout-aware --disable-alps-adaptive
       ;;
   esac
   if ((include_item7)); then
-    printf '%s\n' --enable-omnifetch-kv-cache-prefetch
+    printf '%s\n' --enable-alps-kv-cache-prefetch
   fi
 }
 

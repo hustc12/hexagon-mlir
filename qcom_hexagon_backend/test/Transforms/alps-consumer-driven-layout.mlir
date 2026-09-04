@@ -157,7 +157,7 @@ func.func @p5fa_register_tile_supply(%input: memref<8x4x16xf16>,
 // P5FB-SAME: alps.p5f_b.matched = 1
 // P5FB-SAME: alps.p5f_b.requested_bytes = 128
 // P5FB: scf.if
-// P5FB: omni_fetch.l2_hint
+// P5FB: alps.l2_hint
 // P5FB-SAME: alps.p5f_b.crp_supply
 
 // P5FC-LABEL: func.func @p5fa_register_tile_supply
@@ -165,7 +165,7 @@ func.func @p5fa_register_tile_supply(%input: memref<8x4x16xf16>,
 // P5FC-SAME: alps.p5f_c.physical_rows = 4
 // P5FC-SAME: alps.p5f_c.rejected_segment_utilization = 0
 // P5FC-SAME: alps.p5f_c.segmented_hints = 0
-// P5FC: omni_fetch.l2_hint
+// P5FC: alps.l2_hint
 // P5FC-SAME: alps.p5f_c.page_safe_segmented
 // P5FC-SAME: alps.p5f_c.physical_rows = 4
 // P5FC-SAME: alps.p5f_c.physically_contiguous = true
@@ -202,7 +202,7 @@ func.func @p5fc_sparse_segment_rejected(
 // P5FC-LABEL: func.func @p5fc_sparse_segment_rejected
 // P5FC-SAME: alps.p5f_b.admitted = 0
 // P5FC-SAME: alps.p5f_c.rejected_segment_utilization = 1
-// P5FC-NOT: omni_fetch.l2_hint
+// P5FC-NOT: alps.l2_hint
 
 func.func @p5ga_sparse_vtcm_formation(
     %input: memref<8x16x1x32xf16, strided<[6144, 384, 32, 1]>>,
@@ -291,7 +291,7 @@ func.func @p5gb_coalesced_vtcm_window(
 // P5C-SAME: alps.p5c.matched = 1
 // P5C-SAME: alps.p5c.requested_bytes = 256
 // P5C: scf.if
-// P5C: omni_fetch.l2_hint
+// P5C: alps.l2_hint
 
 // Moving the innermost dimension would turn a unit-stride stream into a
 // strided one.  The contract remains auditable, but native materialization is

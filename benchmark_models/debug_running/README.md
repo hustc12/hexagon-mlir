@@ -6,7 +6,7 @@ fast DSP smoke and Phase-4 A/B. **Do not use them for fair full-structure number
 ```bash
 python benchmark_models/debug_running/run_qwen2.5-0.5b_debug.py --seq-len 32
 python benchmark_models/debug_running/run_qwen2.5-0.5b_debug.py --seq-len 32 --enable-hexkl
-python benchmark_models/debug_running/run_qwen2.5-0.5b_debug.py --seq-len 32 --enable-hexkl --enable-omnifetch-vdae
+python benchmark_models/debug_running/run_qwen2.5-0.5b_debug.py --seq-len 32 --enable-hexkl --enable-alps-vdae
 ```
 
 Full published topology: `benchmark_models/run_*.py` (parent directory).
@@ -19,12 +19,12 @@ Use the repository script rather than invoking the runners separately:
 ANDROID_SERIAL=49d1c7b2 scripts/script_legacy/run_debug_matrix.sh \
   --seq-len 32 \
   --timeout 600 \
-  --output-dir /tmp/omnifetch-debug-matrix \
+  --output-dir /tmp/alps-debug-matrix \
   qwen2.5-0.5b graphsage mamba-130m gpt2lmheadmodel
 ```
 
 Each selected model runs in the fixed order HVX, HexKL, and HexKL + cumulative
-OmniFetch items 1–7.  `results.csv` retains every attempt and `summary.csv`
+Alps items 1–7.  `results.csv` retains every attempt and `summary.csv`
 contains the latest statuses, timings, speedups, and compiler-mechanism hit
 counts.  Re-running the same command skips successful rows and retries failed
 ones; use `--force` to repeat successful rows.

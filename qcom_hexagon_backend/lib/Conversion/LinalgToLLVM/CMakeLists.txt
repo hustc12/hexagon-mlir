@@ -42,6 +42,6 @@ add_mlir_conversion_library(LinalgToLLVM
   MLIRRegisterAllExtensions
 
   Transforms
-  OmniFetch
-  OmniFetchToLLVM
+  Alps
+  AlpsToLLVM
 )

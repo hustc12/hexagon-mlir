@@ -129,12 +129,12 @@ def default_options(
     enablelwp: bool = False,
     enable_hvx_vector: bool = False,
     enable_hexkl: bool = False,
-    enable_omnifetch_vdae: bool = False,
-    enable_omnifetch_layout_aware: bool = True,
-    omnifetch_lookahead: int = 2,
-    enable_omnifetch_adaptive: bool = True,
-    enable_omnifetch_items_1_7: bool = False,
-    enable_omnifetch_kv_cache_prefetch: bool = False,
+    enable_alps_vdae: bool = False,
+    enable_alps_layout_aware: bool = True,
+    alps_lookahead: int = 2,
+    enable_alps_adaptive: bool = True,
+    enable_alps_items_1_7: bool = False,
+    enable_alps_kv_cache_prefetch: bool = False,
     prefetch_baseline: str = "none",
     prefetch_baseline_distance: int = 1,
     apt_get_hx_manual_candidate_ids: str = "",
@@ -146,21 +146,21 @@ def default_options(
     opts["enableVectorization"] = bool(enable_hvx_vector)
     opts["enableHexKL"] = bool(enable_hexkl)
     opts["enableConvertToHexagonmem"] = bool(enable_hexkl)
-    cumulative = bool(enable_omnifetch_items_1_7)
+    cumulative = bool(enable_alps_items_1_7)
     opts["enablePrefetch"] = bool(
-        enable_omnifetch_vdae
+        enable_alps_vdae
         or cumulative
-        or enable_omnifetch_kv_cache_prefetch
+        or enable_alps_kv_cache_prefetch
     )
-    opts["enableOmniFetchLayoutAware"] = bool(enable_omnifetch_layout_aware)
-    opts["omniFetchLookahead"] = int(omnifetch_lookahead)
-    opts["enableOmniFetchVDAE"] = bool(enable_omnifetch_vdae or cumulative)
-    opts["enableOmniFetchAdaptive"] = bool(enable_omnifetch_adaptive)
-    opts["enableOmniFetchPersistentWhCache"] = cumulative
-    opts["enableOmniFetchTwoDimPipeline"] = cumulative
-    opts["enableOmniFetchVtcmColoring"] = cumulative
-    opts["enableOmniFetchKvCachePrefetch"] = bool(
-        cumulative or enable_omnifetch_kv_cache_prefetch
+    opts["enableAlpsLayoutAware"] = bool(enable_alps_layout_aware)
+    opts["alpsLookahead"] = int(alps_lookahead)
+    opts["enableAlpsVDAE"] = bool(enable_alps_vdae or cumulative)
+    opts["enableAlpsAdaptive"] = bool(enable_alps_adaptive)
+    opts["enableAlpsPersistentWhCache"] = cumulative
+    opts["enableAlpsTwoDimPipeline"] = cumulative
+    opts["enableAlpsVtcmColoring"] = cumulative
+    opts["enableAlpsKvCachePrefetch"] = bool(
+        cumulative or enable_alps_kv_cache_prefetch
     )
     opts["enablePrefetchKernelHX"] = prefetch_baseline == "prefetch-kernel-hx"
     opts["prefetchKernelHxDistance"] = int(prefetch_baseline_distance)
@@ -169,7 +169,7 @@ def default_options(
     opts["aptGetHxManualCandidateIds"] = apt_get_hx_manual_candidate_ids
     if cumulative:
         print(
-            "[OmniFetchItems1To7] enabled: layout/cost/fusion + "
+            "[AlpsItems1To7] enabled: layout/cost/fusion + "
             "persistent-WH + two-dimensional-pipeline + "
             "VTCM-coloring + KV-aware-prefetch"
         )
@@ -182,16 +182,16 @@ def add_phase4_cli(parser):
     parser.add_argument("--lwp", action="store_true")
     parser.add_argument("--enable-hvx-vector", action="store_true")
     parser.add_argument("--enable-hexkl", action="store_true")
-    parser.add_argument("--enable-omnifetch-vdae", action="store_true")
+    parser.add_argument("--enable-alps-vdae", action="store_true")
     parser.add_argument("--disable-layout-aware", action="store_true")
-    parser.add_argument("--omnifetch-lookahead", type=int, default=2)
-    parser.add_argument("--disable-omnifetch-adaptive", action="store_true")
+    parser.add_argument("--alps-lookahead", type=int, default=2)
+    parser.add_argument("--disable-alps-adaptive", action="store_true")
     parser.add_argument(
-        "--enable-omnifetch-items-1-7",
+        "--enable-alps-items-1-7",
         action="store_true",
         help="Enable the cumulative innovation items 1 through 7.",
     )
-    parser.add_argument("--enable-omnifetch-kv-cache-prefetch", action="store_true")
+    parser.add_argument("--enable-alps-kv-cache-prefetch", action="store_true")
     parser.add_argument(
         "--prefetch-baseline",
         choices=("none", "prefetch-kernel-hx", "apt-get-hx"),
@@ -208,15 +208,15 @@ def options_from_args(args, enablelwp: bool = None):
         enablelwp=args.lwp if enablelwp is None else enablelwp,
         enable_hvx_vector=getattr(args, "enable_hvx_vector", False),
         enable_hexkl=getattr(args, "enable_hexkl", False),
-        enable_omnifetch_vdae=getattr(args, "enable_omnifetch_vdae", False),
-        enable_omnifetch_layout_aware=not getattr(args, "disable_layout_aware", False),
-        omnifetch_lookahead=getattr(args, "omnifetch_lookahead", 2),
-        enable_omnifetch_adaptive=not getattr(args, "disable_omnifetch_adaptive", False),
-        enable_omnifetch_items_1_7=getattr(
-            args, "enable_omnifetch_items_1_7", False
+        enable_alps_vdae=getattr(args, "enable_alps_vdae", False),
+        enable_alps_layout_aware=not getattr(args, "disable_layout_aware", False),
+        alps_lookahead=getattr(args, "alps_lookahead", 2),
+        enable_alps_adaptive=not getattr(args, "disable_alps_adaptive", False),
+        enable_alps_items_1_7=getattr(
+            args, "enable_alps_items_1_7", False
         ),
-        enable_omnifetch_kv_cache_prefetch=getattr(
-            args, "enable_omnifetch_kv_cache_prefetch", False
+        enable_alps_kv_cache_prefetch=getattr(
+            args, "enable_alps_kv_cache_prefetch", False
         ),
         prefetch_baseline=getattr(args, "prefetch_baseline", "none"),
         prefetch_baseline_distance=getattr(args, "prefetch_baseline_distance", 1),

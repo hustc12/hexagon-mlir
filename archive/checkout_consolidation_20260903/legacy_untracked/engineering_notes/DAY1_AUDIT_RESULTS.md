@@ -165,8 +165,8 @@ struct MatmulToHexKLPass : public ::impl::MatmulToHexKLBase<MatmulToHexKLPass> {
 
 // 在 LinalgToLLVMPass.cpp line 241-245 被调用:
 MatmulToHexKLOptions hexklOpts{};
-hexklOpts.enableAttentionHmx = enableOmniFetchAttentionHmx;
-hexklOpts.enableMPadHmx = enableOmniFetchMPadHmx;
+hexklOpts.enableAttentionHmx = enableAlpsAttentionHmx;
+hexklOpts.enableMPadHmx = enableAlpsMPadHmx;
 pm.addNestedPass<func::FuncOp>(createMatmulToHexKLPass(hexklOpts));
 ```
 
@@ -190,13 +190,13 @@ pm.addNestedPass<func::FuncOp>(createMatmulToHexKLPass(hexklOpts));
 ```
 Python runner (run_dinov2-small_debug.py)
   --enable-hexkl flag
-  --enable-omnifetch-attention-hmx flag (未使用)
+  --enable-alps-attention-hmx flag (未使用)
   ↓
 triton_utils.compile_model()
   ↓
 LinalgToLLVMPass.cpp (line 241-246)
-  enableOmniFetchAttentionHmx = args.enable_omnifetch_attention_hmx
-  enableOmniFetchMPadHmx = args.enable_omnifetch_m_pad_hmx (未传递！)
+  enableAlpsAttentionHmx = args.enable_alps_attention_hmx
+  enableAlpsMPadHmx = args.enable_alps_m_pad_hmx (未传递！)
   ↓
 MatmulToHexKLPass.cpp
   检查 enableMPadHmx (默认 false)
@@ -213,7 +213,7 @@ MatmulToHexKLPass.cpp
 **发现**: `enableMPadHmx` flag 已经存在，但没有从 Python 传递！
 
 **修复步骤**:
-1. 在 `run_dinov2-small_debug.py` 添加 `--enable-omnifetch-m-pad-hmx` flag
+1. 在 `run_dinov2-small_debug.py` 添加 `--enable-alps-m-pad-hmx` flag
 2. 传递给编译器选项
 3. 重新测试
 
@@ -257,7 +257,7 @@ static int hvx_fallback_count = 0;
 ### 明天（Day 3）
 
 **上午: 快速验证**
-- [ ] 检查 Python runner 是否已有 `--enable-omnifetch-m-pad-hmx` 参数
+- [ ] 检查 Python runner 是否已有 `--enable-alps-m-pad-hmx` 参数
 - [ ] 如果没有，添加参数传递
 - [ ] 重跑 DINOv2: 预期 6-7 rewrites, 延迟 < 100 ms
 

@@ -61,27 +61,27 @@ def main():
     )
     parser.add_argument("--enable-hexkl", action="store_true")
     parser.add_argument("--enable-hvx-vector", action="store_true")
-    parser.add_argument("--enable-omnifetch-activation-multicast",
+    parser.add_argument("--enable-alps-activation-multicast",
                         action="store_true")
-    parser.add_argument("--enable-omnifetch-vdae", action="store_true")
+    parser.add_argument("--enable-alps-vdae", action="store_true")
     parser.add_argument("--disable-layout-aware", action="store_true")
-    parser.add_argument("--omnifetch-lookahead", type=int, default=2)
-    parser.add_argument("--disable-omnifetch-adaptive", action="store_true")
-    parser.add_argument("--enable-omnifetch-items-1-7", action="store_true")
+    parser.add_argument("--alps-lookahead", type=int, default=2)
+    parser.add_argument("--disable-alps-adaptive", action="store_true")
+    parser.add_argument("--enable-alps-items-1-7", action="store_true")
     parser.add_argument("--device-iterations", type=int, default=1)
     parser.add_argument("--seq-len", type=int, default=None)
     args = parser.parse_args()
     _MOD.tinyllama_1_1b(
         enable_hexkl=args.enable_hexkl,
         enable_hvx_vector=args.enable_hvx_vector,
-        enable_omnifetch_activation_multicast=(
-            args.enable_omnifetch_activation_multicast
+        enable_alps_activation_multicast=(
+            args.enable_alps_activation_multicast
         ),
-        enable_omnifetch_vdae=args.enable_omnifetch_vdae,
-        enable_omnifetch_layout_aware=not args.disable_layout_aware,
-        omnifetch_lookahead=args.omnifetch_lookahead,
-        enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
-        enable_omnifetch_items_1_7=args.enable_omnifetch_items_1_7,
+        enable_alps_vdae=args.enable_alps_vdae,
+        enable_alps_layout_aware=not args.disable_layout_aware,
+        alps_lookahead=args.alps_lookahead,
+        enable_alps_adaptive=not args.disable_alps_adaptive,
+        enable_alps_items_1_7=args.enable_alps_items_1_7,
         device_iterations=args.device_iterations,
         seq_len=args.seq_len,
     )

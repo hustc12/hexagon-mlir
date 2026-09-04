@@ -146,7 +146,7 @@ def run_full_audio_encoder(
     patched = None
     if args.enable_hexkl:
         candidate, n_batch, n_f16 = apply_hexkl_ir_rewrites(
-            ir, enable_m_pad=args.enable_omnifetch_m_pad_hmx
+            ir, enable_m_pad=args.enable_alps_m_pad_hmx
         )
         patched = candidate if n_batch or n_f16 else None
         print(
@@ -155,28 +155,28 @@ def run_full_audio_encoder(
         )
     options = hexagon_options_phase4(
         args.enable_hexkl,
-        args.enable_omnifetch_vdae,
+        args.enable_alps_vdae,
         not args.disable_layout_aware,
-        args.omnifetch_lookahead,
-        not args.disable_omnifetch_adaptive,
-        args.enable_omnifetch_items_1_7,
+        args.alps_lookahead,
+        not args.disable_alps_adaptive,
+        args.enable_alps_items_1_7,
         lower_constants_separate=True,
         backend_profile=args.backend_profile,
         enable_lwp=args.enable_lwp,
         lwp_loop_depth=args.lwp_loop_depth,
         disable_lwp_loop=args.disable_lwp_loop,
-        omnifetch_items_through=args.omnifetch_items_through,
-        enable_omnifetch_kv_cache_prefetch=(
-            args.enable_omnifetch_kv_cache_prefetch
+        alps_items_through=args.alps_items_through,
+        enable_alps_kv_cache_prefetch=(
+            args.enable_alps_kv_cache_prefetch
         ),
-        enable_omnifetch_kv_vtcm=args.enable_omnifetch_kv_vtcm,
-        enable_omnifetch_m_pad_hmx=args.enable_omnifetch_m_pad_hmx,
+        enable_alps_kv_vtcm=args.enable_alps_kv_vtcm,
+        enable_alps_m_pad_hmx=args.enable_alps_m_pad_hmx,
         enable_out_params=args.enable_out_params,
         prefetch_baseline=args.prefetch_baseline,
         prefetch_baseline_distance=args.prefetch_baseline_distance,
         apt_get_hx_manual_candidate_ids=args.apt_get_hx_manual_candidate_ids,
-        disable_omnifetch_persistent_wh_cache=(
-            args.disable_omnifetch_persistent_wh_cache
+        disable_alps_persistent_wh_cache=(
+            args.disable_alps_persistent_wh_cache
         ),
         alps_p0_mode=args.alps_p0_mode,
         enable_alps_fp16_hvx_arithmetic=(

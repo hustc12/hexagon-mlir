@@ -134,7 +134,7 @@ void setLinalgToLLVMOptions(
         (it != arch_kwargs.end() && !it->second.compare(TRUE));
   }
 
-  // OmniFetch options (Plan-A: three independent components)
+  // Alps options (Plan-A: three independent components)
   {
     auto it = arch_kwargs.find("enablePrefetchKernelHX");
     options.enablePrefetchKernelHX =
@@ -166,36 +166,36 @@ void setLinalgToLLVMOptions(
       options.aptGetHxManualCandidateIds = it->second;
   }
   options.enablePrefetch = !arch_kwargs.at("enablePrefetch").compare(TRUE);
-  options.enableOmniFetchLayoutAware =
-      !arch_kwargs.at("enableOmniFetchLayoutAware").compare(TRUE);
-  options.omniFetchLookahead = std::stoi(arch_kwargs.at("omniFetchLookahead"));
+  options.enableAlpsLayoutAware =
+      !arch_kwargs.at("enableAlpsLayoutAware").compare(TRUE);
+  options.alpsLookahead = std::stoi(arch_kwargs.at("alpsLookahead"));
   {
-    auto it = arch_kwargs.find("enableOmniFetchDmaToVtcm");
-    options.enableOmniFetchDmaToVtcm =
+    auto it = arch_kwargs.find("enableAlpsDmaToVtcm");
+    options.enableAlpsDmaToVtcm =
         (it != arch_kwargs.end() && !it->second.compare(TRUE));
   }
-  options.enableOmniFetchVDAE =
-      !arch_kwargs.at("enableOmniFetchVDAE").compare(TRUE);
-  options.enableOmniFetchAdaptive =
-      !arch_kwargs.at("enableOmniFetchAdaptive").compare(TRUE);
+  options.enableAlpsVDAE =
+      !arch_kwargs.at("enableAlpsVDAE").compare(TRUE);
+  options.enableAlpsAdaptive =
+      !arch_kwargs.at("enableAlpsAdaptive").compare(TRUE);
   {
-    auto it = arch_kwargs.find("enableOmniFetchWeightPrepack");
-    options.enableOmniFetchWeightPrepack =
-        (it != arch_kwargs.end() && !it->second.compare(TRUE));
-  }
-  {
-    auto it = arch_kwargs.find("enableOmniFetchPersistentWhCache");
-    options.enableOmniFetchPersistentWhCache =
+    auto it = arch_kwargs.find("enableAlpsWeightPrepack");
+    options.enableAlpsWeightPrepack =
         (it != arch_kwargs.end() && !it->second.compare(TRUE));
   }
   {
-    auto it = arch_kwargs.find("enableOmniFetchTwoDimPipeline");
-    options.enableOmniFetchTwoDimPipeline =
+    auto it = arch_kwargs.find("enableAlpsPersistentWhCache");
+    options.enableAlpsPersistentWhCache =
         (it != arch_kwargs.end() && !it->second.compare(TRUE));
   }
   {
-    auto it = arch_kwargs.find("enableOmniFetchVtcmColoring");
-    options.enableOmniFetchVtcmColoring =
+    auto it = arch_kwargs.find("enableAlpsTwoDimPipeline");
+    options.enableAlpsTwoDimPipeline =
+        (it != arch_kwargs.end() && !it->second.compare(TRUE));
+  }
+  {
+    auto it = arch_kwargs.find("enableAlpsVtcmColoring");
+    options.enableAlpsVtcmColoring =
         (it != arch_kwargs.end() && !it->second.compare(TRUE));
   }
   {
@@ -414,48 +414,48 @@ void setLinalgToLLVMOptions(
       options.alpsLedgerVtcmBudgetBytes = std::stoll(it->second);
   }
   {
-    auto it = arch_kwargs.find("enableOmniFetchKvCachePrefetch");
-    options.enableOmniFetchKvCachePrefetch =
+    auto it = arch_kwargs.find("enableAlpsKvCachePrefetch");
+    options.enableAlpsKvCachePrefetch =
         (it != arch_kwargs.end() && !it->second.compare(TRUE));
   }
   {
-    auto it = arch_kwargs.find("enableOmniFetchWeightStationary");
-    options.enableOmniFetchWeightStationary =
+    auto it = arch_kwargs.find("enableAlpsWeightStationary");
+    options.enableAlpsWeightStationary =
         (it != arch_kwargs.end() && !it->second.compare(TRUE));
   }
   {
-    auto it = arch_kwargs.find("enableOmniFetchActivationMulticast");
-    options.enableOmniFetchActivationMulticast =
+    auto it = arch_kwargs.find("enableAlpsActivationMulticast");
+    options.enableAlpsActivationMulticast =
         (it != arch_kwargs.end() && !it->second.compare(TRUE));
   }
   {
-    auto it = arch_kwargs.find("enableOmniFetchDequantReshape");
-    options.enableOmniFetchDequantReshape =
+    auto it = arch_kwargs.find("enableAlpsDequantReshape");
+    options.enableAlpsDequantReshape =
         (it != arch_kwargs.end() && !it->second.compare(TRUE));
   }
   {
-    auto it = arch_kwargs.find("omniFetchKvCachePageTokens");
+    auto it = arch_kwargs.find("alpsKvCachePageTokens");
     if (it != arch_kwargs.end())
-      options.omniFetchKvCachePageTokens = std::stoi(it->second);
+      options.alpsKvCachePageTokens = std::stoi(it->second);
   }
   {
-    auto it = arch_kwargs.find("enableOmniFetchDualThreadDae");
-    options.enableOmniFetchDualThreadDae =
+    auto it = arch_kwargs.find("enableAlpsDualThreadDae");
+    options.enableAlpsDualThreadDae =
         (it != arch_kwargs.end() && !it->second.compare(TRUE));
   }
   {
-    auto it = arch_kwargs.find("enableOmniFetchInterLayerPrefetch");
-    options.enableOmniFetchInterLayerPrefetch =
+    auto it = arch_kwargs.find("enableAlpsInterLayerPrefetch");
+    options.enableAlpsInterLayerPrefetch =
         (it != arch_kwargs.end() && !it->second.compare(TRUE));
   }
   {
-    auto it = arch_kwargs.find("enableOmniFetchAttentionHmx");
-    options.enableOmniFetchAttentionHmx =
+    auto it = arch_kwargs.find("enableAlpsAttentionHmx");
+    options.enableAlpsAttentionHmx =
         (it != arch_kwargs.end() && !it->second.compare(TRUE));
   }
   {
-    auto it = arch_kwargs.find("enableOmniFetchMPadHmx");
-    options.enableOmniFetchMPadHmx =
+    auto it = arch_kwargs.find("enableAlpsMPadHmx");
+    options.enableAlpsMPadHmx =
         (it != arch_kwargs.end() && !it->second.compare(TRUE));
   }
   {

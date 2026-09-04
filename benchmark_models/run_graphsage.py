@@ -53,11 +53,11 @@ def load_graphsage_model(_model_name, config):
 
 def graphsage_bert(
     enable_hexkl: bool = False,
-    enable_omnifetch_vdae: bool = False,
-    enable_omnifetch_layout_aware: bool = True,
-    omnifetch_lookahead: int = 2,
-    enable_omnifetch_adaptive: bool = True,
-    enable_omnifetch_items_1_7: bool = False,
+    enable_alps_vdae: bool = False,
+    enable_alps_layout_aware: bool = True,
+    alps_lookahead: int = 2,
+    enable_alps_adaptive: bool = True,
+    enable_alps_items_1_7: bool = False,
     seq_len: Optional[int] = None,
 ):
     patch_dsp_heap_256mb()
@@ -126,11 +126,11 @@ def graphsage_bert(
 
     options = hexagon_options_phase4(
         enable_hexkl,
-        enable_omnifetch_vdae,
-        enable_omnifetch_layout_aware,
-        omnifetch_lookahead,
-        enable_omnifetch_adaptive,
-        enable_omnifetch_items_1_7,
+        enable_alps_vdae,
+        enable_alps_layout_aware,
+        alps_lookahead,
+        enable_alps_adaptive,
+        enable_alps_items_1_7,
     )
     hex_outputs = hex_execution(
         module, func_name, inputs, options, mlir_text=mlir_text
@@ -149,7 +149,7 @@ def graphsage_bert(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="GraphSAGE/GeBERT Hexagon smoke (optional HexKL/OmniFetch)."
+        description="GraphSAGE/GeBERT Hexagon smoke (optional HexKL/Alps)."
     )
     add_phase4_args(parser)
     args = parser.parse_args()

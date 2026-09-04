@@ -79,7 +79,7 @@ def main():
     patched = None
     if args.enable_hexkl:
         candidate, n_batch, n_f16 = apply_hexkl_ir_rewrites(
-            ir, enable_m_pad=args.enable_omnifetch_m_pad_hmx
+            ir, enable_m_pad=args.enable_alps_m_pad_hmx
         )
         patched = candidate if n_batch or n_f16 else None
         print(f"[HexKL] batch_matmul→matmul={n_batch}, f16-input rewrite={n_f16}")
@@ -87,13 +87,13 @@ def main():
     # Hexagon options
     options = hexagon_options_phase4(
         args.enable_hexkl,
-        args.enable_omnifetch_vdae,
+        args.enable_alps_vdae,
         not args.disable_layout_aware,
-        args.omnifetch_lookahead,
-        not args.disable_omnifetch_adaptive,
-        args.enable_omnifetch_items_1_7,
+        args.alps_lookahead,
+        not args.disable_alps_adaptive,
+        args.enable_alps_items_1_7,
         backend_profile=args.backend_profile or "legacy-scalar",
-        enable_omnifetch_m_pad_hmx=args.enable_omnifetch_m_pad_hmx,
+        enable_alps_m_pad_hmx=args.enable_alps_m_pad_hmx,
     )
     
     # Run

@@ -237,7 +237,7 @@ struct HexagonSlicingPass
       // the K/V operations which survived the model-independent admission
       // decision; every unmarked operation retains native slicing.
       if (preserveKvContracts &&
-          op->hasAttr("omni_fetch.kv_cache_role")) {
+          op->hasAttr("alps.kv_cache_role")) {
         DBG("-> Slicing skipped for admitted K/V contract\n");
         return WalkResult::advance();
       }

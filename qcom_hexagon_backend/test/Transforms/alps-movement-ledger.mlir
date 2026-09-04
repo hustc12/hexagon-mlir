@@ -15,8 +15,8 @@ func.func @ledger(%src: memref<4x8xf32>, %dst: memref<8x4xf32>,
   %empty = tensor.empty() : tensor<4x8xf32>
   %candidate = linalg.generic {
       indexing_maps = [#id, #id], iterator_types = ["parallel", "parallel"],
-      omni_fetch.kv_cache_role = "key",
-      omni_fetch.kv_cache_operand = 0 : i64,
+      alps.kv_cache_role = "key",
+      alps.kv_cache_operand = 0 : i64,
       alps.kv_elementwise_fusion_boundary
     } ins(%tensor : tensor<4x8xf32>) outs(%empty : tensor<4x8xf32>) {
   ^bb0(%in: f32, %out: f32):

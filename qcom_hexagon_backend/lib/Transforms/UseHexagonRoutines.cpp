@@ -14,7 +14,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "hexagon/Conversion/LinalgToLLVM/Common.h"
-#include "hexagon/Dialect/OmniFetch/IR/OmniFetchDialect.h"
+#include "hexagon/Dialect/Alps/IR/AlpsDialect.h"
 #include "hexagon/Transforms/Transforms.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"

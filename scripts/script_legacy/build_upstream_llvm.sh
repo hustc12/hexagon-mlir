@@ -29,7 +29,7 @@ actual="$(git -C "${llvm_src}" rev-parse HEAD)"
 export CC="${host_toolchain}/bin/clang"
 export CXX="${host_toolchain}/bin/clang++"
 export PATH="${host_toolchain}/bin:${PATH}"
-export CCACHE_DIR="${CCACHE_DIR:-/tmp/omnifetch_upstream_llvm_ccache_${UID}}"
+export CCACHE_DIR="${CCACHE_DIR:-/tmp/alps_upstream_llvm_ccache_${UID}}"
 mkdir -p "${CCACHE_DIR}" "${llvm_build}"
 
 cmake -G Ninja -S "${llvm_src}/llvm" -B "${llvm_build}" \

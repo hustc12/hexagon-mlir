@@ -17,7 +17,7 @@ Device used in this work: `adb -s 49d1c7b2`. Venv: `mlir-env`.
 **Important (status as of 2026-07-23):**
 
 - Main harnesses keep **full published structure** (including layer count). Hooks `customize_*_config` are identity unless a `*_debug.py` overrides them.
-- Phase-4 / three-way **measured** numbers (HVX / HexKL / HexKL+OF) so far used the **debug** topologies (GPT-2 2L, Qwen tiny 2L), same practical reason: full Qwen host lowering ~2 GB mlirbc / RAM thrash; full GPT-2 12L is heavy on DSP time/VA.
+- Phase-4 / three-way **measured** numbers (HVX / HexKL / HexKL+ALPS) so far used the **debug** topologies (GPT-2 2L, Qwen tiny 2L), same practical reason: full Qwen host lowering ~2 GB mlirbc / RAM thrash; full GPT-2 12L is heavy on DSP time/VA.
 - Do **not** treat those fair tables as “full-depth model” numbers. Re-measure on main scripts when capacity allows.
 
 Fair Phase-4 numbers that claim “Qwen” / “GPT-2” must say **debug vs full**.
@@ -26,10 +26,10 @@ Three-way ablation (same protocol as GPT-2 fair `seq=32`; default helper uses **
 
 ```bash
 bash benchmark_models/python benchmark_models/debug_running/run_qwen2.5-0.5b_debug.py
-# or: python benchmark_models/debug_running/run_qwen2.5-0.5b_debug.py --seq-len 32 [--enable-hexkl] [--enable-omnifetch-vdae]
+# or: python benchmark_models/debug_running/run_qwen2.5-0.5b_debug.py --seq-len 32 [--enable-hexkl] [--enable-alps-vdae]
 ```
 
-**Full 24L capacity:** main harness is unshrunk; host lowering ~2 GB `.mlirbc` / RAM thrash blocked on-device finish in this session. Prefer `*_debug.py` for the HVX / HexKL / OF matrix until capacity allows.
+**Full 24L capacity:** main harness is unshrunk; host lowering ~2 GB `.mlirbc` / RAM thrash blocked on-device finish in this session. Prefer `*_debug.py` for the HVX / HexKL / ALPS matrix until capacity allows.
 
 ---
 
@@ -163,7 +163,7 @@ Fault PC   : ... _mlir_ciface_GPT2LogitsWrapper+0x14
 |-------------|---------------------------|---------------------|---------------------|
 | F | F | F | HVX Pass (~1.9 s) |
 | T | T | F | HexKL Pass (~156 ms) |
-| T + OmniFetch | T | F | Pass (~153 ms, prefetch sites > 0) |
+| T + Alps | T | F | Pass (~153 ms, prefetch sites > 0) |
 | * | * | T | Avoid on Qwen until Bad VA 0x28 cleared |
 
 ---
@@ -175,7 +175,7 @@ Fault PC   : ... _mlir_ciface_GPT2LogitsWrapper+0x14
 3. HexKL with **vec off**; `nm -u` for `hexkl_micro_*`.
 4. If TLB fault: check whether attention `M/K/N` with `K==M` or `N==M` are still becoming `hexkl.matmul` (dump after `MatmulToHexKL` or count micros vs expected projection/FFN count).
 5. If Bad VA `0x18`: grep kernel for async / forall lowering.
-6. Only then enable OmniFetch (`--enable-omnifetch-vdae`); require PrefetchInsert `hexkl_func≥1` and inserts > 0.
+6. Only then enable Alps (`--enable-alps-vdae`); require PrefetchInsert `hexkl_func≥1` and inserts > 0.
 
 ---
 
@@ -190,7 +190,7 @@ Fault PC   : ... _mlir_ciface_GPT2LogitsWrapper+0x14
 
 ## Related results log
 
-See `plan_todo.md` Phase 4 / Results table (HVX vs HexKL vs HexKL+OF for Qwen tiny and GPT-2).
+See `plan_todo.md` Phase 4 / Results table (HVX vs HexKL vs HexKL+ALPS for Qwen tiny and GPT-2).
 
 ### Fresh 3-way (2026-07-23, `python benchmark_models/debug_running/run_qwen2.5-0.5b_debug.py`, seq=32, tiny debug)
 
@@ -198,6 +198,6 @@ See `plan_todo.md` Phase 4 / Results table (HVX vs HexKL vs HexKL+OF for Qwen ti
 |--------|----------|-------------|
 | HVX | **1951.7 ms** | top-5 match |
 | HexKL | **156.2 ms** (~12.5× vs HVX) | Top-1 |
-| HexKL + OmniFetch | **150.6 ms** (~3.6% vs HexKL) | Top-1 |
+| HexKL + Alps | **150.6 ms** (~3.6% vs HexKL) | Top-1 |
 
-Logs: `/tmp/omnifetch_qwen/ablation_3way/`.
+Logs: `/tmp/alps_qwen/ablation_3way/`.

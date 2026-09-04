@@ -166,15 +166,15 @@ class TorchMlirHexagonWrapperGenerator(HexagonWrapperGenerator):
         if not self._uses_l2_scheduler():
             return ""
         report = """
-uint64_t l2_scheduler_counts = __omni_fetch_l2_scheduler_counts();
-uint64_t l2_scheduler_limits = __omni_fetch_l2_scheduler_limits();
-uint64_t l2_requested_bytes = __omni_fetch_l2_requested_bytes();
-uint64_t l2_issued_bytes = __omni_fetch_l2_issued_bytes();
-uint64_t l2_policy_suppressed = __omni_fetch_l2_policy_suppressed();
+uint64_t l2_scheduler_counts = __alps_l2_scheduler_counts();
+uint64_t l2_scheduler_limits = __alps_l2_scheduler_limits();
+uint64_t l2_requested_bytes = __alps_l2_requested_bytes();
+uint64_t l2_issued_bytes = __alps_l2_issued_bytes();
+uint64_t l2_policy_suppressed = __alps_l2_policy_suppressed();
 FILE *l2_scheduler_report = fopen("{exec_dir}/perf.txt", "a");
 if (l2_scheduler_report) {
   fprintf(l2_scheduler_report,
-          "OmniFetchL2Scheduler: issued=%u busy_suppressed=%u "
+          "AlpsL2Scheduler: issued=%u busy_suppressed=%u "
           "page_clipped=%u unsupported=%u requested_bytes=%llu "
           "issued_bytes=%llu budget_suppressed=%u "
           "duplicate_suppressed=%u\\n",
@@ -191,12 +191,12 @@ if (l2_scheduler_report) {
 """.replace("{exec_dir}", exec_dir)
         if self.options.get("enableAlpsExactOverlap", False):
             report += """
-uint64_t exact_dma = __omni_fetch_exact_dma_counts();
-uint64_t exact_overlap = __omni_fetch_exact_overlap_counts();
-uint64_t exact_waits = __omni_fetch_exact_consume_waits();
-uint64_t exact_control = __omni_fetch_exact_control_counts();
-uint64_t exact_descriptors = __omni_fetch_descriptor_counts();
-uint64_t exact_releases = __omni_fetch_descriptor_release_failures();
+uint64_t exact_dma = __alps_exact_dma_counts();
+uint64_t exact_overlap = __alps_exact_overlap_counts();
+uint64_t exact_waits = __alps_exact_consume_waits();
+uint64_t exact_control = __alps_exact_control_counts();
+uint64_t exact_descriptors = __alps_descriptor_counts();
+uint64_t exact_releases = __alps_descriptor_release_failures();
 FILE *exact_report = fopen("{exec_dir}/perf.txt", "a");
 if (exact_report) {
   fprintf(exact_report,
@@ -230,11 +230,11 @@ if (hmx_drain_report) {
 """.replace("{exec_dir}", exec_dir)
         if self.options.get("enableAlpsTrafficControl", False):
             report += """
-uint64_t p4a_windows = __omni_fetch_p4a_window_counts();
-uint64_t p4a_decisions = __omni_fetch_p4a_decision_counts();
-uint64_t p4a_pmu = __omni_fetch_p4a_pmu_status_counts();
-uint64_t p4a_pmu01 = __omni_fetch_p4a_pmu_values01();
-uint64_t p4a_pmu23 = __omni_fetch_p4a_pmu_values23();
+uint64_t p4a_windows = __alps_p4a_window_counts();
+uint64_t p4a_decisions = __alps_p4a_decision_counts();
+uint64_t p4a_pmu = __alps_p4a_pmu_status_counts();
+uint64_t p4a_pmu01 = __alps_p4a_pmu_values01();
+uint64_t p4a_pmu23 = __alps_p4a_pmu_values23();
 FILE *p4a_report = fopen("{exec_dir}/perf.txt", "a");
 if (p4a_report) {
   fprintf(p4a_report,
@@ -245,9 +245,9 @@ if (p4a_report) {
           (unsigned)(p4a_windows >> 32), (unsigned)p4a_windows,
           (unsigned)(p4a_decisions >> 32), (unsigned)p4a_decisions,
           (unsigned)(p4a_pmu >> 32), (unsigned)p4a_pmu,
-          (unsigned long long)__omni_fetch_p4a_issue_cycles(),
-          (unsigned long long)__omni_fetch_p4a_poll_cycles(),
-          (unsigned long long)__omni_fetch_p4a_poll_retries(),
+          (unsigned long long)__alps_p4a_issue_cycles(),
+          (unsigned long long)__alps_p4a_poll_cycles(),
+          (unsigned long long)__alps_p4a_poll_retries(),
           (unsigned)(p4a_pmu01 >> 32), (unsigned)p4a_pmu01,
           (unsigned)(p4a_pmu23 >> 32), (unsigned)p4a_pmu23);
   fclose(p4a_report);
@@ -259,8 +259,8 @@ if (p4a_report) {
         return any(
             self.options.get(option, False)
             for option in (
-                "enableOmniFetchVDAE",
-                "enableOmniFetchKvCachePrefetch",
+                "enableAlpsVDAE",
+                "enableAlpsKvCachePrefetch",
                 "enableAlpsKvRuntimePrefetch",
                 "enablePrefetchKernelHX",
                 "enableAPTGetHX",
@@ -272,22 +272,22 @@ if (p4a_report) {
         )
 
     def generate_benchmarking_and_reporting(self, function_call, exec_dir):
-        if not self.options.get("enableOmniFetchPersistentWhCache", False):
+        if not self.options.get("enableAlpsPersistentWhCache", False):
             benchmarking = super().generate_benchmarking_and_reporting(
                 function_call, exec_dir
             )
             if any(
                 self.options.get(option, False)
                 for option in (
-                    "enableOmniFetchVDAE",
-                    "enableOmniFetchKvCachePrefetch",
+                    "enableAlpsVDAE",
+                    "enableAlpsKvCachePrefetch",
                     "enableAlpsKvRuntimePrefetch",
                     "enableAlpsCrpSupplyPrefetch",
                     "enableAlpsCrpSegmentedSupply",
                 )
             ):
                 benchmarking = (
-                    "__omni_fetch_l2_configure(4096u, UINT64_C(8388608), 64u);\n"
+                    "__alps_l2_configure(4096u, UINT64_C(8388608), 64u);\n"
                     + benchmarking
                 )
             # TestReport already uses exec_dir, but the additive percentile
@@ -296,37 +296,37 @@ if (p4a_report) {
                 'fopen("perf.txt", "a")', f'fopen("{exec_dir}/perf.txt", "a")'
             )
             if self.options.get("enableAlpsTrafficControl", False):
-                benchmarking = "__omni_fetch_p4a_configure(1);\n" + benchmarking
+                benchmarking = "__alps_p4a_configure(1);\n" + benchmarking
             return benchmarking + self.generate_l2_scheduler_report(exec_dir)
         context = int.from_bytes(
             hashlib.sha256(self.func_name.encode("utf-8")).digest()[:8], "little"
         )
-        generation = int(self.options.get("omniFetchWhCacheGeneration", 1))
+        generation = int(self.options.get("alpsWhCacheGeneration", 1))
         return f"""
-__omni_fetch_wh_cache_set_context(UINT64_C({context}), {generation}u);
+__alps_wh_cache_set_context(UINT64_C({context}), {generation}u);
 uint64_t cold_time_us = benchmark_time_us(1, [&]() {{
     {function_call}
 }});
-uint64_t cold_stats = __omni_fetch_wh_cache_stats();
-uint64_t cold_w8_stats = __omni_fetch_w8_cache_stats();
+uint64_t cold_stats = __alps_wh_cache_stats();
+uint64_t cold_w8_stats = __alps_w8_cache_stats();
 std::vector<uint64_t> __warm_samples;
 uint64_t warm_time_us = benchmark_samples_us({self.iterations}, __warm_samples, [&]() {{
     {function_call}
 }});
-uint64_t wh_cache_stats = __omni_fetch_wh_cache_stats();
-uint64_t w8_cache_stats = __omni_fetch_w8_cache_stats();
-__omni_fetch_wh_cache_invalidate(UINT64_C({context}), {generation}u);
+uint64_t wh_cache_stats = __alps_wh_cache_stats();
+uint64_t w8_cache_stats = __alps_w8_cache_stats();
+__alps_wh_cache_invalidate(UINT64_C({context}), {generation}u);
 uint64_t invalidated_time_us = benchmark_time_us(1, [&]() {{
     {function_call}
 }});
-uint64_t invalidated_stats = __omni_fetch_wh_cache_stats();
+uint64_t invalidated_stats = __alps_wh_cache_stats();
 TestReport tr("{self.func_name}", warm_time_us, "us", Result::Pass,
               "{exec_dir}/perf.txt");
 tr.save();
 FILE *wh_cache_report = fopen("{exec_dir}/perf.txt", "a");
 if (wh_cache_report) {{
   fprintf(wh_cache_report,
-          "OmniFetchWHCache: cold_us=%llu warm_avg_us=%llu "
+          "AlpsWHCache: cold_us=%llu warm_avg_us=%llu "
           "cold_hits=%u cold_misses=%u total_hits=%u total_misses=%u "
           "invalidated_us=%llu "
           "post_invalidate_hits=%u post_invalidate_misses=%u\\n",
@@ -341,7 +341,7 @@ if (wh_cache_report) {{
 FILE *w8_cache_report = fopen("{exec_dir}/perf.txt", "a");
 if (w8_cache_report) {{
   fprintf(w8_cache_report,
-          "OmniFetchW8Cache: cold_hits=%u cold_misses=%u "
+          "AlpsW8Cache: cold_hits=%u cold_misses=%u "
           "total_hits=%u total_misses=%u\\n",
           (unsigned)(cold_w8_stats >> 32), (unsigned)cold_w8_stats,
           (unsigned)(w8_cache_stats >> 32), (unsigned)w8_cache_stats);
@@ -367,50 +367,50 @@ if (w8_cache_report) {{
         Generates skeleton cpp file which launches the kernel.
         """
         code_headers = self.common_strings.code_headers
-        if self.options.get("enableOmniFetchPersistentWhCache", False):
+        if self.options.get("enableAlpsPersistentWhCache", False):
             code_headers += """
-// If the cost model selects no persistent site, no OmniFetch op pulls the
+// If the cost model selects no persistent site, no Alps op pulls the
 // device runtime bitcode into the kernel object.  Keep reporting calls
 // loadable in that legitimate no-op case.  Strong runtime definitions replace
 // these weak fallbacks whenever a transformed site actually exists.
 extern "C" __attribute__((weak)) void
-__omni_fetch_wh_cache_set_context(uint64_t, uint32_t) {}
+__alps_wh_cache_set_context(uint64_t, uint32_t) {}
 extern "C" __attribute__((weak)) void
-__omni_fetch_wh_cache_invalidate(uint64_t, uint32_t) {}
+__alps_wh_cache_invalidate(uint64_t, uint32_t) {}
 extern "C" __attribute__((weak)) uint64_t
-__omni_fetch_wh_cache_stats(void) { return 0; }
+__alps_wh_cache_stats(void) { return 0; }
 extern "C" __attribute__((weak)) uint64_t
-__omni_fetch_w8_cache_stats(void) { return 0; }
+__alps_w8_cache_stats(void) { return 0; }
 """
         if self._uses_l2_scheduler():
             code_headers += """
 extern "C" __attribute__((weak)) uint64_t
-__omni_fetch_l2_scheduler_counts(void) { return 0; }
+__alps_l2_scheduler_counts(void) { return 0; }
 extern "C" __attribute__((weak)) uint64_t
-__omni_fetch_l2_scheduler_limits(void) { return 0; }
+__alps_l2_scheduler_limits(void) { return 0; }
 extern "C" __attribute__((weak)) uint64_t
-__omni_fetch_l2_requested_bytes(void) { return 0; }
+__alps_l2_requested_bytes(void) { return 0; }
 extern "C" __attribute__((weak)) uint64_t
-__omni_fetch_l2_issued_bytes(void) { return 0; }
+__alps_l2_issued_bytes(void) { return 0; }
 extern "C" __attribute__((weak)) uint64_t
-__omni_fetch_l2_policy_suppressed(void) { return 0; }
+__alps_l2_policy_suppressed(void) { return 0; }
 extern "C" __attribute__((weak)) void
-__omni_fetch_l2_configure(uint32_t, uint64_t, uint32_t) {}
+__alps_l2_configure(uint32_t, uint64_t, uint32_t) {}
 """
         if self.options.get("enableAlpsExactOverlap", False):
             code_headers += """
 extern "C" __attribute__((weak)) uint64_t
-__omni_fetch_exact_dma_counts(void) { return 0; }
+__alps_exact_dma_counts(void) { return 0; }
 extern "C" __attribute__((weak)) uint64_t
-__omni_fetch_exact_overlap_counts(void) { return 0; }
+__alps_exact_overlap_counts(void) { return 0; }
 extern "C" __attribute__((weak)) uint64_t
-__omni_fetch_exact_consume_waits(void) { return 0; }
+__alps_exact_consume_waits(void) { return 0; }
 extern "C" __attribute__((weak)) uint64_t
-__omni_fetch_exact_control_counts(void) { return 0; }
+__alps_exact_control_counts(void) { return 0; }
 extern "C" __attribute__((weak)) uint64_t
-__omni_fetch_descriptor_counts(void) { return 0; }
+__alps_descriptor_counts(void) { return 0; }
 extern "C" __attribute__((weak)) uint64_t
-__omni_fetch_descriptor_release_failures(void) { return 0; }
+__alps_descriptor_release_failures(void) { return 0; }
 """
         if self.options.get("enableAlpsHmxAsyncDrain", False):
             code_headers += """
@@ -424,23 +424,23 @@ alps_hmx_async_drain_sync_fallbacks(void) { return 0; }
         if self.options.get("enableAlpsTrafficControl", False):
             code_headers += """
 extern "C" __attribute__((weak)) void
-__omni_fetch_p4a_configure(int32_t) {}
+__alps_p4a_configure(int32_t) {}
 extern "C" __attribute__((weak)) uint64_t
-__omni_fetch_p4a_window_counts(void) { return 0; }
+__alps_p4a_window_counts(void) { return 0; }
 extern "C" __attribute__((weak)) uint64_t
-__omni_fetch_p4a_decision_counts(void) { return 0; }
+__alps_p4a_decision_counts(void) { return 0; }
 extern "C" __attribute__((weak)) uint64_t
-__omni_fetch_p4a_pmu_status_counts(void) { return 0; }
+__alps_p4a_pmu_status_counts(void) { return 0; }
 extern "C" __attribute__((weak)) uint64_t
-__omni_fetch_p4a_issue_cycles(void) { return 0; }
+__alps_p4a_issue_cycles(void) { return 0; }
 extern "C" __attribute__((weak)) uint64_t
-__omni_fetch_p4a_poll_cycles(void) { return 0; }
+__alps_p4a_poll_cycles(void) { return 0; }
 extern "C" __attribute__((weak)) uint64_t
-__omni_fetch_p4a_poll_retries(void) { return 0; }
+__alps_p4a_poll_retries(void) { return 0; }
 extern "C" __attribute__((weak)) uint64_t
-__omni_fetch_p4a_pmu_values01(void) { return 0; }
+__alps_p4a_pmu_values01(void) { return 0; }
 extern "C" __attribute__((weak)) uint64_t
-__omni_fetch_p4a_pmu_values23(void) { return 0; }
+__alps_p4a_pmu_values23(void) { return 0; }
 """
 
         code_define = self.common_strings.code_define.format(

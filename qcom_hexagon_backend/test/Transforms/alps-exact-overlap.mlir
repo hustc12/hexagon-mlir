@@ -26,12 +26,12 @@ func.func @p3b_weight(
 // CHECK: [ALPS-P3A-SUMMARY] function=p3b_weight async_candidates=1 exact_contracts=1 rejected=0
 // CHECK-LABEL: func.func @p3b_weight
 // CHECK-SAME: alps.p3a.exact_contracts = 1
-// CHECK: %[[CTX:.*]] = omni_fetch.invocation_begin
-// CHECK: omni_fetch.exact_weight_consume %[[CTX]]
-// CHECK: omni_fetch.exact_weight_kick %[[CTX]]
+// CHECK: %[[CTX:.*]] = alps.invocation_begin
+// CHECK: alps.exact_weight_consume %[[CTX]]
+// CHECK: alps.exact_weight_kick %[[CTX]]
 // CHECK: hexkl.micro_hmx_mm_f16
-// CHECK: omni_fetch.exact_weight_release %[[CTX]]
-// CHECK: omni_fetch.invocation_end %[[CTX]]
-// CHECK-NOT: omni_fetch.create_sem
-// CHECK-NOT: omni_fetch.wait
-// CHECK-NOT: omni_fetch.signal
+// CHECK: alps.exact_weight_release %[[CTX]]
+// CHECK: alps.invocation_end %[[CTX]]
+// CHECK-NOT: alps.create_sem
+// CHECK-NOT: alps.wait
+// CHECK-NOT: alps.signal

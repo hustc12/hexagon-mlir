@@ -83,15 +83,15 @@ def load_swin_model(_model_name, config):
 
 def swin_transformer(
     enable_hexkl: bool = False,
-    enable_omnifetch_vdae: bool = False,
-    enable_omnifetch_layout_aware: bool = True,
-    omnifetch_lookahead: int = 2,
-    enable_omnifetch_adaptive: bool = True,
-    enable_omnifetch_items_1_7: bool = False,
+    enable_alps_vdae: bool = False,
+    enable_alps_layout_aware: bool = True,
+    alps_lookahead: int = 2,
+    enable_alps_adaptive: bool = True,
+    enable_alps_items_1_7: bool = False,
     seq_len: Optional[int] = None,
     device_iterations: int = 1,
     backend_profile: str = "hvx-vector",
-    enable_omnifetch_m_pad_hmx: bool = False,
+    enable_alps_m_pad_hmx: bool = False,
     enable_out_params: bool = False,
     prefetch_baseline: str = "none",
     prefetch_baseline_distance: int = 1,
@@ -99,9 +99,9 @@ def swin_transformer(
     enable_lwp: bool = False,
     lwp_loop_depth: int = 1,
     disable_lwp_loop: bool = False,
-    omnifetch_items_through: int = 0,
-    enable_omnifetch_kv_cache_prefetch: bool = False,
-    disable_omnifetch_persistent_wh_cache: bool = False,
+    alps_items_through: int = 0,
+    enable_alps_kv_cache_prefetch: bool = False,
+    disable_alps_persistent_wh_cache: bool = False,
     model_layers: Optional[int] = None,
     input_size: int = 224,
 ):
@@ -156,21 +156,21 @@ def swin_transformer(
     mlir_text = None
     if enable_hexkl:
         ir2, n_bm, n_f16 = apply_hexkl_ir_rewrites(
-            ir, enable_m_pad=enable_omnifetch_m_pad_hmx
+            ir, enable_m_pad=enable_alps_m_pad_hmx
         )
         mlir_text = ir2
         print(f"[HexKL] batch_matmul→matmul={n_bm}, f16-input rewrite={n_f16}")
 
     options = hexagon_options_phase4(
         enable_hexkl,
-        enable_omnifetch_vdae,
-        enable_omnifetch_layout_aware,
-        omnifetch_lookahead,
-        enable_omnifetch_adaptive,
-        enable_omnifetch_items_1_7,
+        enable_alps_vdae,
+        enable_alps_layout_aware,
+        alps_lookahead,
+        enable_alps_adaptive,
+        enable_alps_items_1_7,
         lower_constants_separate=LOWER_CONSTANTS_SEPARATE,
         backend_profile=backend_profile,
-        enable_omnifetch_m_pad_hmx=enable_omnifetch_m_pad_hmx,
+        enable_alps_m_pad_hmx=enable_alps_m_pad_hmx,
         enable_out_params=enable_out_params,
         prefetch_baseline=prefetch_baseline,
         prefetch_baseline_distance=prefetch_baseline_distance,
@@ -178,10 +178,10 @@ def swin_transformer(
         enable_lwp=enable_lwp,
         lwp_loop_depth=lwp_loop_depth,
         disable_lwp_loop=disable_lwp_loop,
-        omnifetch_items_through=omnifetch_items_through,
-        enable_omnifetch_kv_cache_prefetch=enable_omnifetch_kv_cache_prefetch,
-        disable_omnifetch_persistent_wh_cache=(
-            disable_omnifetch_persistent_wh_cache
+        alps_items_through=alps_items_through,
+        enable_alps_kv_cache_prefetch=enable_alps_kv_cache_prefetch,
+        disable_alps_persistent_wh_cache=(
+            disable_alps_persistent_wh_cache
         ),
     )
     inputs = rel_pos_indices + [pixel_values]
@@ -210,7 +210,7 @@ def swin_transformer(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Swin-Tiny Hexagon smoke (optional HexKL/OmniFetch)."
+        description="Swin-Tiny Hexagon smoke (optional HexKL/Alps)."
     )
     add_phase4_args(parser)
     parser.add_argument("--device-iterations", type=int, default=1)
@@ -221,15 +221,15 @@ if __name__ == "__main__":
     args = parser.parse_args()
     swin_transformer(
         enable_hexkl=args.enable_hexkl,
-        enable_omnifetch_vdae=args.enable_omnifetch_vdae,
-        enable_omnifetch_layout_aware=not args.disable_layout_aware,
-        omnifetch_lookahead=args.omnifetch_lookahead,
-        enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
-        enable_omnifetch_items_1_7=args.enable_omnifetch_items_1_7,
+        enable_alps_vdae=args.enable_alps_vdae,
+        enable_alps_layout_aware=not args.disable_layout_aware,
+        alps_lookahead=args.alps_lookahead,
+        enable_alps_adaptive=not args.disable_alps_adaptive,
+        enable_alps_items_1_7=args.enable_alps_items_1_7,
         seq_len=args.seq_len,
         device_iterations=args.device_iterations,
         backend_profile=args.backend_profile,
-        enable_omnifetch_m_pad_hmx=args.enable_omnifetch_m_pad_hmx,
+        enable_alps_m_pad_hmx=args.enable_alps_m_pad_hmx,
         enable_out_params=args.enable_out_params,
         prefetch_baseline=args.prefetch_baseline,
         prefetch_baseline_distance=args.prefetch_baseline_distance,
@@ -237,12 +237,12 @@ if __name__ == "__main__":
         enable_lwp=args.enable_lwp,
         lwp_loop_depth=args.lwp_loop_depth,
         disable_lwp_loop=args.disable_lwp_loop,
-        omnifetch_items_through=args.omnifetch_items_through,
-        enable_omnifetch_kv_cache_prefetch=(
-            args.enable_omnifetch_kv_cache_prefetch
+        alps_items_through=args.alps_items_through,
+        enable_alps_kv_cache_prefetch=(
+            args.enable_alps_kv_cache_prefetch
         ),
-        disable_omnifetch_persistent_wh_cache=(
-            args.disable_omnifetch_persistent_wh_cache
+        disable_alps_persistent_wh_cache=(
+            args.disable_alps_persistent_wh_cache
         ),
         model_layers=args.model_layers,
     )

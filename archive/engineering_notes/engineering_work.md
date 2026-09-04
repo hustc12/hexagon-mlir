@@ -1,17 +1,17 @@
-# OmniFetch / Hexagon-MLIR Engineering Work
+# Alps / Hexagon-MLIR Engineering Work
 
 ## Purpose
 
 This document records the engineering diagnosis and remediation plan for the
 unexpectedly long DINOv2-small latency observed with the current
-Hexagon-MLIR-based HVX, HexKL, and HexKL + OmniFetch items 1–7 paths.
+Hexagon-MLIR-based HVX, HexKL, and HexKL + Alps items 1–7 paths.
 
 The immediate objective is to separate three effects that were previously
 mixed together:
 
 1. benchmark configuration errors that disable backend optimizations;
 2. limitations or bugs in the current Hexagon-MLIR fork;
-3. the real incremental benefit of OmniFetch.
+3. the real incremental benefit of Alps.
 
 No latency result is considered valid unless the run completes, produces a
 device-side `Perf` result, and passes the numerical correctness gate.
@@ -70,7 +70,7 @@ enableVTCMTiling = True
 enableConvertToHexagonmem = True
 ```
 
-The shared OmniFetch benchmark helper currently overrides them:
+The shared Alps benchmark helper currently overrides them:
 
 ```python
 options["enableVectorization"] = False
@@ -169,7 +169,7 @@ The safe strategy is a separate branch/worktree rooted at official
 `9b4b8fc`, followed by layered porting:
 
 1. deterministic DINOv2 runner and correctness harness;
-2. OmniFetch dialect and runtime registration;
+2. Alps dialect and runtime registration;
 3. core prefetch/in-situ/V-DAE passes;
 4. items 1–7;
 5. tests, scripts, and documentation.
@@ -257,7 +257,7 @@ not block the immediate investigation.
    - HVX vectorization only;
    - HVX vectorization plus VTCM;
    - HexKL micro;
-   - HexKL plus OmniFetch items 1–7.
+   - HexKL plus Alps items 1–7.
 3. Keep multithreading disabled during the first isolation experiments.
 4. Run DINOv2 Debug serially with correctness gates.
 5. Perform static IR/object audits for every configuration.
@@ -269,14 +269,14 @@ not block the immediate investigation.
 1. Create a separate worktree at official `9b4b8fc`.
 2. Build with the official dependency/patch flow.
 3. Port only the deterministic DINOv2 Debug runner first.
-4. Compare official HVX and HexKL before porting OmniFetch.
+4. Compare official HVX and HexKL before porting Alps.
 5. Verify actual vector/HMX coverage from IR and assembly.
-6. Port OmniFetch in layers, with unit tests after each layer.
+6. Port Alps in layers, with unit tests after each layer.
 7. Compare:
    - legacy current configuration;
    - repaired current configuration;
    - official upstream baseline;
-   - official upstream plus OmniFetch.
+   - official upstream plus Alps.
 
 ## 7. Interpretation rule
 
@@ -305,13 +305,13 @@ The current branch now contains the following engineering repairs:
    `enableLinalgToHexagonMem=false`.  The requested backend configuration is
    now preserved.
 2. The runners expose explicit scalar, HVX, VTCM, HexKL, LWP, and cumulative
-   OmniFetch item 1--7 controls.
+   Alps item 1--7 controls.
 3. Both DINOv2 runners perform finite-output, maximum-difference, and top-1
    correctness checks.  The full runner also uses the correct device ABI:
    fixed position embeddings and pixels are passed to the compiled wrapper,
    while the PyTorch reference receives pixels only.
 4. A late `ub.poison` rewrite and UB-to-LLVM conversion were added to the
-   Linalg-to-LLVM pipeline.  This is necessary because OmniFetch item 7 can
+   Linalg-to-LLVM pipeline.  This is necessary because Alps item 7 can
    introduce poison values after the earlier cleanup point.
 5. `scripts/run_dinov2_codegen_profiles.sh` runs configurations strictly
    serially and records status, latency, correctness, artifacts, and logs.
@@ -479,7 +479,7 @@ performance:
   aligned-frame defect described above.
 
 Scalar speedup is not the target result.  Item 7 is accepted as a useful
-OmniFetch optimization only if all of the following hold:
+Alps optimization only if all of the following hold:
 
 1. both pure HVX and HVX + item 7 use real vector code;
 2. both pass identical correctness gates;
@@ -521,8 +521,8 @@ The previously reported scalar comparison was:
 | cumulative items 1--7, scalar | 60.927 ms |
 
 Those configurations were not a controlled item-7 ablation.  The legacy case
-disabled HexagonMem, HexKL, and all OmniFetch components.  The cumulative case
-enabled HexagonMem, HexKL, items 1--7, and the special OmniFetch runtime
+disabled HexagonMem, HexKL, and all Alps components.  The cumulative case
+enabled HexagonMem, HexKL, items 1--7, and the special Alps runtime
 measurement path.  More importantly, the old K/V metadata handling caused the
 entire function to skip Hexagon fusion.
 
@@ -716,7 +716,7 @@ next prefill implementation should use a weight-stationary or
 consumer-stationary vector schedule: retain a weight/vector tile in VRF or
 VTCM across multiple sequence positions, prefetch the next tile while the
 current tile computes, and fold transpose/reshape formation into producer
-stores.  This stays within OmniFetch's unified objective of moving data
+stores.  This stays within Alps's unified objective of moving data
 earlier or avoiding the movement entirely.
 
 ## 14. New design space after the vector item-7 result
@@ -763,7 +763,7 @@ An MAR groups compatible consumers of the same source version.  It decides:
 
 This creates one coherent story:
 
-> OmniFetch schedules a tile before its first unavoidable use, forms its
+> Alps schedules a tile before its first unavoidable use, forms its
 > required physical layout during that movement, and amortizes the tile across
 > all compatible consumers before releasing its hierarchy residency.
 
@@ -861,7 +861,7 @@ tile state suffices:
 - pooling/statistics: combine reduction epilogue with the following transform
   or projection.
 
-For attention this is an OmniFetch-compatible, hierarchy-specific online
+For attention this is an Alps-compatible, hierarchy-specific online
 attention path:
 
 ```text
@@ -1052,8 +1052,8 @@ This replaces blind feature trials with falsifiable, byte-level predictions.
 
 ### 15.1 What the independent prefetch baselines established
 
-The two-model Debug comparison did establish a useful OmniFetch advantage, but
-the claim must stay scoped to those workloads.  For DINOv2 Debug, OmniFetch
+The two-model Debug comparison did establish a useful Alps advantage, but
+the claim must stay scoped to those workloads.  For DINOv2 Debug, Alps
 issued 36 runtime prefetch requests versus 122,843 for the independent
 baseline.  For ViT Debug it issued 72 versus 36,274.  Latency improved only
 slightly, but the several-orders-of-magnitude reduction in commands is evidence
@@ -1293,7 +1293,7 @@ scripts/run_full_model_matrix.sh \
   --config hvx_kv_prefetch \
   --dsp-heap-mb 512 \
   --timeout 1200 \
-  --output-dir /tmp/omnifetch-full-hubert-kv-result-20260806 \
+  --output-dir /tmp/alps-full-hubert-kv-result-20260806 \
   hubert-base
 ```
 
@@ -1332,8 +1332,8 @@ was possible:
    a Bad VA at function entry.
 
 These are baseline correctness/compatibility repairs and must not be counted
-as OmniFetch speedups.  They are maintained as reversible patches rather than
-mixed into the OmniFetch optimization implementation.
+as Alps speedups.  They are maintained as reversible patches rather than
+mixed into the Alps optimization implementation.
 
 ### 17.3 Full-graph VTCM staging failure and baseline policy
 
@@ -1356,7 +1356,7 @@ the audited LLVM IR still contains 1,723 Hexagon HVX intrinsic references,
 including 128-byte `V6.vmpy`, `V6.vadd`, and `V6.vlut` operations.  HexKL's
 own local VTCM allocations are introduced later and explicitly deallocated.
 A bounded lifetime-aware VTCM coloring/planning implementation remains a
-separate OmniFetch optimization candidate.
+separate Alps optimization candidate.
 
 ### 17.4 Complete DINOv2-small result on the latest native baseline
 
@@ -1371,7 +1371,7 @@ FP16, output `[1,1000]`, one device iteration, a 512 MB DSP heap, and v73.
 
 HexKL is 3.078x faster than native HVX for this model.  The strict HexKL row
 does not apply the project's host-side batch-matmul rewrite, so this is an
-upstream-native baseline rather than OmniFetch.  Logs and CSV output are under
+upstream-native baseline rather than Alps.  Logs and CSV output are under
 `/tmp/hexagon-mlir-native-v73-smoke-dinov2`; generated files are deliberately
 not tracked by Git.
 
@@ -1428,7 +1428,7 @@ shares.  Logs and CSV output are under
 
 The remaining validation is strictly serial, uses one measured device
 invocation, a 512 MB DSP heap, no host timeout, v73 artifacts, and the same
-correctness gate for HVX and HexKL.  `--native-only` disables all OmniFetch
+correctness gate for HVX and HexKL.  `--native-only` disables all Alps
 passes and host-side matrix rewrites.  The current dual-PASS set is:
 
 | Domain | Complete model | HVX vector (ms) | HexKL (ms) | HVX / HexKL |
@@ -1452,7 +1452,7 @@ without updating the Linalg region argument and rejected the resulting IR.
 The shared model harness now explicitly performs GroupNorm accumulation in
 f32 and casts back to the original fp16 dtype.  This preserves the operation,
 learned parameters, layer count, and output structure; it is an export
-compatibility repair, not an OmniFetch optimization.  Both native baselines
+compatibility repair, not an Alps optimization.  Both native baselines
 use it identically.
 
 All four speech graphs contain 98 `linalg.batch_matmul` operations and zero
@@ -1460,7 +1460,7 @@ plain `linalg.matmul` operations at the audited boundary.  Strict-native mode
 does not apply the project's batch-matmul-to-matmul rewrite.  The observed
 1.14--1.24x HexKL improvement is therefore consistent with limited HMX
 coverage and substantial non-matrix work; this is evidence for the separate
-"batch/non-aligned MatMul to HMX" Next Paper Idea, not an OmniFetch result.
+"batch/non-aligned MatMul to HMX" Next Paper Idea, not an Alps result.
 
 Logs and CSV files are kept under the corresponding
 `/tmp/hexagon-mlir-native-v73-smoke-*` directories and are intentionally not
@@ -1916,7 +1916,7 @@ The recommended next order is therefore:
    SiLU and device-state machinery;
 2. run its full HVX and HexKL baselines serially with sequence length 32;
 3. keep full Falcon repair as a separate compiler-numerics investigation;
-4. revisit Falcon only after the main 15-model corpus and OmniFetch comparison
+4. revisit Falcon only after the main 15-model corpus and Alps comparison
    are complete, unless Falcon-specific coverage becomes a paper requirement.
 
 ### 17.17 Uniform-f16 GPT-2/CLIP comparison and full SmolLM2 replacement

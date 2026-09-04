@@ -14,7 +14,7 @@
 
 #include "hexagon/Dialect/HexKL/IR/HexKLDialect.h"
 #include "hexagon/Dialect/HexagonMem/IR/HexagonMemDialect.h"
-#include "hexagon/Dialect/OmniFetch/IR/OmniFetchDialect.h"
+#include "hexagon/Dialect/Alps/IR/AlpsDialect.h"
 #include "hexagon/Transforms/Transforms.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -555,7 +555,7 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
             b.create<scf::YieldOp>(loc);
           });
     } else {
-      // Default: M-outer with dual ping-pong weight slots for OmniFetch.
+      // Default: M-outer with dual ping-pong weight slots for Alps.
       (void)wOff1;
       outerFor = rewriter.create<scf::ForOp>(
           loc, idx0, dimM, idx32, ValueRange{},
@@ -959,7 +959,7 @@ struct DecomposeHexKLMatmulPass
   void getDependentDialects(DialectRegistry &registry) const override {
     registry
         .insert<hexkl::HexKLDialect, hexagonmem::HexagonMemDialect,
-                omni_fetch::OmniFetchDialect, arith::ArithDialect,
+                alps::AlpsDialect, arith::ArithDialect,
                 scf::SCFDialect, memref::MemRefDialect>();
   }
 
@@ -1065,14 +1065,14 @@ struct DecomposeHexKLMatmulPass
     });
     if (enableVtcmLifetimeColoring && staticSites > 0) {
       Builder b(func.getContext());
-      func->setAttr("omni_fetch.vtcm_coloring_enabled", b.getUnitAttr());
-      func->setAttr("omni_fetch.vtcm_legacy_peak_bytes",
+      func->setAttr("alps.vtcm_coloring_enabled", b.getUnitAttr());
+      func->setAttr("alps.vtcm_legacy_peak_bytes",
                     b.getI64IntegerAttr(legacyPeak));
-      func->setAttr("omni_fetch.vtcm_colored_peak_bytes",
+      func->setAttr("alps.vtcm_colored_peak_bytes",
                     b.getI64IntegerAttr(coloredPeak));
-      func->setAttr("omni_fetch.vtcm_saved_peak_bytes",
+      func->setAttr("alps.vtcm_saved_peak_bytes",
                     b.getI64IntegerAttr(legacyPeak - coloredPeak));
-      func->setAttr("omni_fetch.vtcm_colored_sites",
+      func->setAttr("alps.vtcm_colored_sites",
                     b.getI64IntegerAttr(staticSites));
       llvm::errs() << "[VTCMLifetimeColoring] function=" << func.getName()
                    << " sites=" << staticSites

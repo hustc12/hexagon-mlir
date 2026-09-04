@@ -63,7 +63,7 @@ class HexagonOptions:
     enableHexKL: bool = False  # use HexKL to lower matmul and convolutions
     hexKLMode: str = "micro"  # possible options "macro", "micro"
     # Isolated external baseline: static safe affine address-kernel prefetch.
-    # It never enables OmniFetch staging, layout elimination, or V-DAE.
+    # It never enables Alps staging, layout elimination, or V-DAE.
     enablePrefetchKernelHX: bool = False
     prefetchKernelHxDistance: int = 1
     prefetchKernelHxMaxCommandBytes: int = 8191
@@ -72,26 +72,26 @@ class HexagonOptions:
     enableAPTGetHX: bool = False
     aptGetHxDistance: int = 1
     aptGetHxManualCandidateIds: str = ""
-    # Omni-Fetch ablation toggles (Plan-A: three independent components)
+    # ALPS ablation toggles (Plan-A: three independent components)
     # Component 1 – Prefetch insertion (base; required by the other two)
     enablePrefetch: bool = False  # insert prefetch_in_situ ops in loop prologue/body
     # Component 2 – In-Situ Reshape (depends on enablePrefetch)
-    enableOmniFetchLayoutAware: bool = True  # enable in-situ layout-aware prefetch mapping
-    omniFetchLookahead: int = 2  # static prefetch look-ahead distance
+    enableAlpsLayoutAware: bool = True  # enable in-situ layout-aware prefetch mapping
+    alpsLookahead: int = 2  # static prefetch look-ahead distance
     # DMA pack destination for HexKL weight async: False=DDR stage, True=VTCM stage
-    enableOmniFetchDmaToVtcm: bool = False
+    enableAlpsDmaToVtcm: bool = False
     # Component 3 – V-DAE (depends on enablePrefetch)
-    enableOmniFetchVDAE: bool = False  # decouple Access/Execute via hardware semaphores
-    enableOmniFetchAdaptive: bool = True  # enable PMU-based adaptive control
+    enableAlpsVDAE: bool = False  # decouple Access/Execute via hardware semaphores
+    enableAlpsAdaptive: bool = True  # enable PMU-based adaptive control
     # Hoist the HexKL RM->WH weight layout transform out of the M-loop: pre-pack
     # every (kt,colTile) weight tile once into a DDR WH buffer, then the inner
     # K-loop only DMA/copies the pre-packed tile into the VTCM slot. Requires
     # enableHexKL. Win scales with numMTiles = ceil(M/32).
-    enableOmniFetchWeightPrepack: bool = False
-    enableOmniFetchPersistentWhCache: bool = False
-    enableOmniFetchTwoDimPipeline: bool = False
-    enableOmniFetchVtcmColoring: bool = False
-    # ALPS P0 causal controls.  The legacy OmniFetch item-7 switch below is
+    enableAlpsWeightPrepack: bool = False
+    enableAlpsPersistentWhCache: bool = False
+    enableAlpsTwoDimPipeline: bool = False
+    enableAlpsVtcmColoring: bool = False
+    # ALPS P0 causal controls.  The legacy Alps item-7 switch below is
     # retained as an umbrella alias that enables all four controls.
     enableAlpsKvSemanticTracking: bool = False
     # Coarse P0 umbrella retained for reproduction; P0b controls below isolate
@@ -143,23 +143,23 @@ class HexagonOptions:
     enableAlpsTrafficControl: bool = False
     alpsLedgerPageBytes: int = 4096
     alpsLedgerVtcmBudgetBytes: int = 2 * 1024 * 1024
-    enableOmniFetchKvCachePrefetch: bool = False
-    enableOmniFetchWeightStationary: bool = False
-    enableOmniFetchActivationMulticast: bool = False
-    enableOmniFetchDequantReshape: bool = False
-    omniFetchKvCachePageTokens: int = 32
-    # True dual-thread DAE scout (default off). Flag off ≡ current single-thread OF.
-    enableOmniFetchDualThreadDae: bool = False
+    enableAlpsKvCachePrefetch: bool = False
+    enableAlpsWeightStationary: bool = False
+    enableAlpsActivationMulticast: bool = False
+    enableAlpsDequantReshape: bool = False
+    alpsKvCachePageTokens: int = 32
+    # True dual-thread DAE scout (default off). Flag off ≡ current single-thread ALPS.
+    enableAlpsDualThreadDae: bool = False
     # Prefetch next-layer weights from outer HexKL loops (default off).
-    enableOmniFetchInterLayerPrefetch: bool = False
+    enableAlpsInterLayerPrefetch: bool = False
     # Pad attention-like (K==M/N==M) matmuls into HexKL (default off).
-    enableOmniFetchAttentionHmx: bool = False
+    enableAlpsAttentionHmx: bool = False
     # Pad the M (rows/tokens) dimension up to a multiple of 32 so unaligned-token
     # encoders (DINOv2/BEiT/DeiT/Whisper) become HexKL-eligible (default off).
-    enableOmniFetchMPadHmx: bool = False
+    enableAlpsMPadHmx: bool = False
     # Reuse one max-sized VTCM slab across HexKL matmuls in a function
     # (DecomposeHexKLMatmul). Off by default — measured gain is ~noise and
-    # OmniFetch combo needs more validation.
+    # Alps combo needs more validation.
     enableHexKLPersistentVtcm: bool = False
     enableMultiThreading: bool = (
         False  # linalg-generic based multi-threading (FormVirtualThreadsPass)

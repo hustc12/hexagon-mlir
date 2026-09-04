@@ -1,4 +1,4 @@
-"""Shared Phase-4 HexKL / OmniFetch harness helpers for benchmark_models."""
+"""Shared Phase-4 HexKL / Alps harness helpers for benchmark_models."""
 from __future__ import annotations
 
 from typing import Optional
@@ -40,7 +40,7 @@ def patch_dsp_heap_256mb():
 
 def patch_full_model_dsp_heap(default_mb: int = 512):
     """Patch the full-model DSP heap, with an auditable environment override."""
-    heap_mb = int(os.environ.get("OMNIFETCH_DSP_HEAP_MB", str(default_mb)))
+    heap_mb = int(os.environ.get("ALPS_DSP_HEAP_MB", str(default_mb)))
     print(f"[DSPHeap] full_model_heap_mb={heap_mb}")
     patch_dsp_heap_mb(heap_mb)
 
@@ -305,27 +305,27 @@ def apply_hexkl_ir_rewrites(ir: str, enable_m_pad: bool = False) -> tuple[str, i
 
 def hexagon_options_phase4(
     enable_hexkl: bool,
-    enable_omnifetch_vdae: bool = False,
-    enable_omnifetch_layout_aware: bool = True,
-    omnifetch_lookahead: int = 2,
-    enable_omnifetch_adaptive: bool = True,
-    enable_omnifetch_items_1_7: bool = False,
+    enable_alps_vdae: bool = False,
+    enable_alps_layout_aware: bool = True,
+    alps_lookahead: int = 2,
+    enable_alps_adaptive: bool = True,
+    enable_alps_items_1_7: bool = False,
     lower_constants_separate: bool = True,
     backend_profile: Optional[str] = None,
     enable_lwp: bool = False,
     lwp_loop_depth: int = 1,
     disable_lwp_loop: bool = False,
     instrument_lwp_hexkl_phases: bool = False,
-    omnifetch_items_through: int = 0,
-    enable_omnifetch_kv_vtcm: bool = False,
-    enable_omnifetch_activation_multicast: bool = False,
-    enable_omnifetch_m_pad_hmx: bool = False,
+    alps_items_through: int = 0,
+    enable_alps_kv_vtcm: bool = False,
+    enable_alps_activation_multicast: bool = False,
+    enable_alps_m_pad_hmx: bool = False,
     enable_out_params: bool = False,
     prefetch_baseline: str = "none",
     prefetch_baseline_distance: int = 1,
     apt_get_hx_manual_candidate_ids: str = "",
-    enable_omnifetch_kv_cache_prefetch: bool = False,
-    disable_omnifetch_persistent_wh_cache: bool = False,
+    enable_alps_kv_cache_prefetch: bool = False,
+    disable_alps_persistent_wh_cache: bool = False,
     alps_p0_mode: str = "none",
     enable_alps_fp16_hvx_arithmetic: Optional[bool] = None,
     enable_alps_hvx_widening_conv: Optional[bool] = None,
@@ -334,7 +334,7 @@ def hexagon_options_phase4(
 
     options = HexagonOptions().__dict__
     profile = backend_profile or os.environ.get(
-        "OMNIFETCH_BACKEND_PROFILE", "legacy-scalar"
+        "ALPS_BACKEND_PROFILE", "legacy-scalar"
     )
     valid_profiles = {
         "legacy-scalar",
@@ -348,8 +348,8 @@ def hexagon_options_phase4(
         )
     if lwp_loop_depth < 0:
         raise ValueError("LWP loop depth must be non-negative")
-    if not 0 <= omnifetch_items_through <= 7:
-        raise ValueError("OmniFetch cumulative item level must be in [0, 7]")
+    if not 0 <= alps_items_through <= 7:
+        raise ValueError("Alps cumulative item level must be in [0, 7]")
     if prefetch_baseline not in ("none", "prefetch-kernel-hx", "apt-get-hx"):
         raise ValueError(f"unknown prefetch baseline {prefetch_baseline!r}")
     if prefetch_baseline_distance <= 0:
@@ -364,7 +364,7 @@ def hexagon_options_phase4(
             f"unknown ALPS P0 mode {alps_p0_mode!r}; "
             f"expected one of {sorted(valid_alps_p0_modes)}"
         )
-    if enable_omnifetch_kv_cache_prefetch and alps_p0_mode != "none":
+    if enable_alps_kv_cache_prefetch and alps_p0_mode != "none":
         raise ValueError("legacy item7 and ALPS P0 mode are mutually exclusive")
     alps_p0_enabled = alps_p0_mode != "none"
     if enable_alps_fp16_hvx_arithmetic is None:
@@ -394,15 +394,15 @@ def hexagon_options_phase4(
         options["enableVectorization"] = True
         options["enableVTCMTiling"] = True
         options["enableConvertToHexagonmem"] = True
-    cumulative_level = 7 if enable_omnifetch_items_1_7 else omnifetch_items_through
+    cumulative_level = 7 if enable_alps_items_1_7 else alps_items_through
     if os.environ.get("HEXAGON_BASELINE_MODE") == "upstream-strict":
         if (
-            enable_omnifetch_vdae
+            enable_alps_vdae
             or cumulative_level
-            or enable_omnifetch_kv_vtcm
-            or enable_omnifetch_activation_multicast
-            or enable_omnifetch_m_pad_hmx
-            or enable_omnifetch_kv_cache_prefetch
+            or enable_alps_kv_vtcm
+            or enable_alps_activation_multicast
+            or enable_alps_m_pad_hmx
+            or enable_alps_kv_cache_prefetch
             or alps_p0_enabled
             or enable_alps_fp16_hvx_arithmetic
             or enable_alps_hvx_widening_conv
@@ -444,7 +444,7 @@ def hexagon_options_phase4(
         )
         return native_options
     if prefetch_baseline != "none" and (
-        enable_omnifetch_vdae or cumulative_level > 0 or alps_p0_enabled
+        enable_alps_vdae or cumulative_level > 0 or alps_p0_enabled
     ):
         raise ValueError("external prefetch baselines cannot be combined with ALPS")
     options["enablePrefetchKernelHX"] = prefetch_baseline == "prefetch-kernel-hx"
@@ -459,28 +459,28 @@ def hexagon_options_phase4(
     options["aptGetHxDistance"] = int(prefetch_baseline_distance)
     options["aptGetHxManualCandidateIds"] = apt_get_hx_manual_candidate_ids
     options["enablePrefetch"] = bool(
-        enable_omnifetch_vdae
+        enable_alps_vdae
         or cumulative_level >= 1
-        or enable_omnifetch_kv_cache_prefetch
+        or enable_alps_kv_cache_prefetch
         or alps_p0_mode in ("runtime", "legacy-all")
     )
-    options["enableOmniFetchLayoutAware"] = bool(enable_omnifetch_layout_aware)
-    options["omniFetchLookahead"] = int(omnifetch_lookahead)
-    options["enableOmniFetchVDAE"] = bool(
-        enable_omnifetch_vdae or cumulative_level >= 3
+    options["enableAlpsLayoutAware"] = bool(enable_alps_layout_aware)
+    options["alpsLookahead"] = int(alps_lookahead)
+    options["enableAlpsVDAE"] = bool(
+        enable_alps_vdae or cumulative_level >= 3
     )
-    options["enableOmniFetchAdaptive"] = bool(enable_omnifetch_adaptive)
-    options["enableOmniFetchPersistentWhCache"] = bool(
-        cumulative_level >= 4 and not disable_omnifetch_persistent_wh_cache
+    options["enableAlpsAdaptive"] = bool(enable_alps_adaptive)
+    options["enableAlpsPersistentWhCache"] = bool(
+        cumulative_level >= 4 and not disable_alps_persistent_wh_cache
     )
-    options["enableOmniFetchTwoDimPipeline"] = cumulative_level >= 5
-    options["enableOmniFetchVtcmColoring"] = cumulative_level >= 6
+    options["enableAlpsTwoDimPipeline"] = cumulative_level >= 5
+    options["enableAlpsVtcmColoring"] = cumulative_level >= 6
     # Item 7 covers page-aware prefetch of compiler-identified attention K/V
     # streams.  For autoregressive decoders those streams may be persistent
     # K/V cache pages; for encoders they are the current invocation's ordinary
     # attention K/V tensors.  Both are valid early-data-movement opportunities.
-    options["enableOmniFetchKvCachePrefetch"] = bool(
-        cumulative_level >= 7 or enable_omnifetch_kv_cache_prefetch
+    options["enableAlpsKvCachePrefetch"] = bool(
+        cumulative_level >= 7 or enable_alps_kv_cache_prefetch
     )
     options["enableAlpsKvSemanticTracking"] = alps_p0_enabled
     options["enableAlpsKvFusionPolicy"] = alps_p0_mode in ("fusion", "legacy-all")
@@ -606,25 +606,25 @@ def hexagon_options_phase4(
     # UserDMA completion state is thread-contextual, so exact overlap must not
     # implicitly move completion polling to the optional scout thread.  The
     # DMA still overlaps the intervening HMX work between kick and consume.
-    options["enableOmniFetchActivationMulticast"] = bool(
-        enable_omnifetch_activation_multicast
+    options["enableAlpsActivationMulticast"] = bool(
+        enable_alps_activation_multicast
     )
-    options["enableOmniFetchMPadHmx"] = bool(enable_omnifetch_m_pad_hmx)
+    options["enableAlpsMPadHmx"] = bool(enable_alps_m_pad_hmx)
     options["enableBufferResultsToOutParams"] = bool(enable_out_params)
-    options["enableOmniFetchDmaToVtcm"] = bool(enable_omnifetch_kv_vtcm)
+    options["enableAlpsDmaToVtcm"] = bool(enable_alps_kv_vtcm)
     options["enableHexagonmemCopyToDMA"] = bool(
-        enable_omnifetch_kv_vtcm
+        enable_alps_kv_vtcm
         or options["enableAlpsCrpVtcmFormation"]
         or options["enableAlpsCrpVtcmWindow"]
         or options["enableAlpsCrpVtcmAsyncWindow"]
     )
     if cumulative_level:
         print(
-            f"[OmniFetchCumulative] items_through={cumulative_level}: "
+            f"[AlpsCumulative] items_through={cumulative_level}: "
             "prefetch/layout/V-DAE + persistent-WH + "
             "two-dimensional-pipeline + VTCM-coloring + "
             "attention-K/V-stream-prefetch (features gated by level)"
-            + (" + K/V DMA-to-VTCM staging" if enable_omnifetch_kv_vtcm else "")
+            + (" + K/V DMA-to-VTCM staging" if enable_alps_kv_vtcm else "")
         )
     print(
         "[BackendConfig] "
@@ -674,7 +674,7 @@ def hexagon_options_phase4(
 
 def add_phase4_args(parser):
     parser.add_argument("--enable-hexkl", action="store_true")
-    parser.add_argument("--enable-omnifetch-vdae", action="store_true")
+    parser.add_argument("--enable-alps-vdae", action="store_true")
     parser.add_argument(
         "--enable-alps-fp16-hvx-arithmetic",
         action="store_true",
@@ -710,23 +710,23 @@ def add_phase4_args(parser):
         help="Comma-separated manually qualified stable candidate IDs.",
     )
     parser.add_argument("--disable-layout-aware", action="store_true")
-    parser.add_argument("--omnifetch-lookahead", type=int, default=2)
-    parser.add_argument("--disable-omnifetch-adaptive", action="store_true")
+    parser.add_argument("--alps-lookahead", type=int, default=2)
+    parser.add_argument("--disable-alps-adaptive", action="store_true")
     parser.add_argument(
-        "--enable-omnifetch-items-1-7",
+        "--enable-alps-items-1-7",
         action="store_true",
         help="Enable the cumulative innovation items 1 through 7.",
     )
     parser.add_argument(
-        "--omnifetch-items-through",
+        "--alps-items-through",
         type=int,
         choices=range(0, 8),
         default=0,
         metavar="N",
-        help="Ablation: enable cumulative OmniFetch items through N (0-7).",
+        help="Ablation: enable cumulative Alps items through N (0-7).",
     )
     parser.add_argument(
-        "--enable-omnifetch-kv-cache-prefetch",
+        "--enable-alps-kv-cache-prefetch",
         action="store_true",
         help="Legacy umbrella switch reproducing the complete historical item 7.",
     )
@@ -744,7 +744,7 @@ def add_phase4_args(parser):
         ),
     )
     parser.add_argument(
-        "--disable-omnifetch-persistent-wh-cache",
+        "--disable-alps-persistent-wh-cache",
         action="store_true",
         help=(
             "Ablation: keep later cumulative items enabled but disable item 4 "
@@ -752,7 +752,7 @@ def add_phase4_args(parser):
         ),
     )
     parser.add_argument(
-        "--enable-omnifetch-kv-vtcm",
+        "--enable-alps-kv-vtcm",
         action="store_true",
         help=(
             "Stage item-7 K/V streams into VTCM through synchronous DMA "
@@ -760,12 +760,12 @@ def add_phase4_args(parser):
         ),
     )
     parser.add_argument(
-        "--enable-omnifetch-activation-multicast",
+        "--enable-alps-activation-multicast",
         action="store_true",
-        help="Enable OmniFetch N2 activation multicast for sibling projections.",
+        help="Enable Alps N2 activation multicast for sibling projections.",
     )
     parser.add_argument(
-        "--enable-omnifetch-m-pad-hmx",
+        "--enable-alps-m-pad-hmx",
         action="store_true",
         help=(
             "Pad the M (rows/tokens) dimension up to a multiple of 32 so "
@@ -787,7 +787,7 @@ def add_phase4_args(parser):
     parser.add_argument(
         "--backend-profile",
         choices=("legacy-scalar", "hvx-vector", "hvx-vector-vtcm"),
-        default=os.environ.get("OMNIFETCH_BACKEND_PROFILE", "legacy-scalar"),
+        default=os.environ.get("ALPS_BACKEND_PROFILE", "legacy-scalar"),
         help=(
             "Backend codegen profile. legacy-scalar reproduces historical "
             "results; hvx-vector enables vectorization; hvx-vector-vtcm also "
@@ -824,7 +824,7 @@ def add_phase4_args(parser):
             "Comma-separated profiles to measure interleaved (compile once, "
             "round-robin execute). Valid labels: legacy-scalar, hvx-vector, "
             "hvx-vector-vtcm, hexkl (hvx-vector-vtcm + HexKL overlay), "
-            "hexkl-items17 (hexkl + OmniFetch items 1-7)."
+            "hexkl-items17 (hexkl + Alps items 1-7)."
         ),
     )
     parser.add_argument(
@@ -875,10 +875,10 @@ def build_interleave_configs(args, ir: str):
         spec = INTERLEAVE_PROFILE_SPECS[label]
         options = hexagon_options_phase4(
             spec["enable_hexkl"],
-            args.enable_omnifetch_vdae,
+            args.enable_alps_vdae,
             not args.disable_layout_aware,
-            args.omnifetch_lookahead,
-            not args.disable_omnifetch_adaptive,
+            args.alps_lookahead,
+            not args.disable_alps_adaptive,
             spec["items_1_7"],
             lower_constants_separate=True,
             backend_profile=spec["backend_profile"],
@@ -886,10 +886,10 @@ def build_interleave_configs(args, ir: str):
             lwp_loop_depth=args.lwp_loop_depth,
             disable_lwp_loop=args.disable_lwp_loop,
             instrument_lwp_hexkl_phases=args.lwp_hexkl_phases,
-            omnifetch_items_through=args.omnifetch_items_through,
-            enable_omnifetch_m_pad_hmx=(
+            alps_items_through=args.alps_items_through,
+            enable_alps_m_pad_hmx=(
                 spec["enable_hexkl"]
-                and getattr(args, "enable_omnifetch_m_pad_hmx", False)
+                and getattr(args, "enable_alps_m_pad_hmx", False)
             ),
         )
         mlir_text = None
@@ -898,7 +898,7 @@ def build_interleave_configs(args, ir: str):
                 candidate, n_batch, n_f16 = apply_hexkl_ir_rewrites(
                     ir,
                     enable_m_pad=getattr(
-                        args, "enable_omnifetch_m_pad_hmx", False
+                        args, "enable_alps_m_pad_hmx", False
                     ),
                 )
                 if n_batch or n_f16:
@@ -920,10 +920,10 @@ def build_interleave_configs(args, ir: str):
 def phase4_kwargs_from_args(args):
     return dict(
         enable_hexkl=args.enable_hexkl,
-        enable_omnifetch_vdae=args.enable_omnifetch_vdae,
-        enable_omnifetch_layout_aware=not args.disable_layout_aware,
-        omnifetch_lookahead=args.omnifetch_lookahead,
-        enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
-        enable_omnifetch_items_1_7=args.enable_omnifetch_items_1_7,
+        enable_alps_vdae=args.enable_alps_vdae,
+        enable_alps_layout_aware=not args.disable_layout_aware,
+        alps_lookahead=args.alps_lookahead,
+        enable_alps_adaptive=not args.disable_alps_adaptive,
+        enable_alps_items_1_7=args.enable_alps_items_1_7,
         seq_len=getattr(args, "seq_len", None),
     )

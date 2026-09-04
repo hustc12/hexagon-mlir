@@ -81,5 +81,5 @@ add_mlir_library(Transforms
   MLIRMathTransforms
   MLIRSupport
   HexagonCommon
-  OmniFetch
+  Alps
 )

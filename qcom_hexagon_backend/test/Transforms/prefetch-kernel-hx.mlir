@@ -17,7 +17,7 @@
 // CHECK: %[[FUTURE:.+]] = arith.addi %arg1, %{{.+}} : index
 // CHECK: scf.if
 // CHECK: %[[VIEW:.+]] = memref.subview %arg0[%[[FUTURE]]] [64] [1]
-// CHECK: omni_fetch.l2_hint %[[VIEW]]
+// CHECK: alps.l2_hint %[[VIEW]]
 // CHECK-SAME: prefetch_baseline.address_class = "affine_1d"
 // CHECK-SAME: prefetch_baseline.candidate_id = "affine_1d:loop0:view0"
 // CHECK-SAME: prefetch_baseline.distance = 2
@@ -43,7 +43,7 @@ func.func @affine_1d(%src: memref<256xf16>) {
 // CHECK-SAME: prefetch_kernel_hx.hints = 1
 // CHECK-SAME: prefetch_kernel_hx.requested_bytes = 512
 // CHECK: memref.subview %arg0[0, %{{.+}}] [8, 32] [1, 1]
-// CHECK: omni_fetch.l2_hint
+// CHECK: alps.l2_hint
 // CHECK-SAME: prefetch_baseline.address_class = "affine_2d"
 func.func @affine_2d(%src: memref<8x128xf16>) {
   %c0 = arith.constant 0 : index
@@ -62,7 +62,7 @@ func.func @affine_2d(%src: memref<8x128xf16>) {
 // CHECK-LABEL: func.func @reject_write
 // CHECK-SAME: prefetch_kernel_hx.hints = 0
 // CHECK-SAME: prefetch_kernel_hx.rejected_write = 1
-// CHECK-NOT: omni_fetch.l2_hint
+// CHECK-NOT: alps.l2_hint
 func.func @reject_write(%dst: memref<256xf16>, %value: f16) {
   %c0 = arith.constant 0 : index
   %c64 = arith.constant 64 : index
@@ -81,7 +81,7 @@ func.func @reject_write(%dst: memref<256xf16>, %value: f16) {
 // CHECK-LABEL: func.func @reject_oversize
 // CHECK-SAME: prefetch_kernel_hx.hints = 0
 // CHECK-SAME: prefetch_kernel_hx.rejected_oversize = 1
-// CHECK-NOT: omni_fetch.l2_hint
+// CHECK-NOT: alps.l2_hint
 func.func @reject_oversize(%src: memref<128x128xf16>) {
   %c0 = arith.constant 0 : index
   %c64 = arith.constant 64 : index
@@ -101,12 +101,12 @@ func.func @reject_oversize(%src: memref<128x128xf16>) {
 // marker and is evaluated independently from Prefetch-Kernel-HX.
 // CHECK-LABEL: func.func @apt_manual_safe
 // CHECK-SAME: prefetch_kernel_hx.hints = 1
-// CHECK: omni_fetch.l2_hint
+// CHECK: alps.l2_hint
 // APT-LABEL: func.func @apt_manual_safe
 // APT-SAME: prefetch_kernel_hx.hints = 1
 // APT-SAME: prefetch_kernel_hx.policy = "apt-get-hx"
 // APT-SAME: prefetch_kernel_hx.rejected_unmarked = 0
-// APT: omni_fetch.l2_hint
+// APT: alps.l2_hint
 // APT-SAME: prefetch_baseline.candidate_id = "apt_manual_safe:loop0:view0"
 // APT-SAME: prefetch_baseline.kind = "apt-get-hx"
 func.func @apt_manual_safe(%src: memref<256xf16>) {
@@ -126,13 +126,13 @@ func.func @apt_manual_safe(%src: memref<256xf16>) {
 // APT-LABEL: func.func @apt_unmarked
 // CHECK-LABEL: func.func @apt_unmarked
 // CHECK-SAME: prefetch_kernel_hx.hints = 1
-// CHECK: omni_fetch.l2_hint
+// CHECK: alps.l2_hint
 // APT-SAME: prefetch_kernel_hx.hints = 0
 // APT-SAME: prefetch_kernel_hx.rejected_unmarked = 1
-// APT-NOT: omni_fetch.l2_hint
+// APT-NOT: alps.l2_hint
 // ALLOW-LABEL: func.func @apt_unmarked
 // ALLOW-SAME: prefetch_kernel_hx.hints = 1
-// ALLOW: omni_fetch.l2_hint
+// ALLOW: alps.l2_hint
 // ALLOW-SAME: prefetch_baseline.candidate_id = "apt_unmarked:loop0:view0"
 // ALLOW-SAME: prefetch_baseline.kind = "apt-get-hx"
 func.func @apt_unmarked(%src: memref<256xf16>) {

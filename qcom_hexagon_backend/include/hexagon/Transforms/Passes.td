@@ -304,7 +304,7 @@ def DecomposeHexKLMatmul :
            "Allocate one function-scoped VTCM slab sized to the max HexKL matmul "
            "requirement and reuse it across matmuls (avoids per-matmul "
            "alloc/dealloc churn). Falls back to per-matmul alloc when any K is "
-           "dynamic. Default off: measured gain is noise-level and OmniFetch "
+           "dynamic. Default off: measured gain is noise-level and Alps "
            "interaction needs more validation.">,
     Option<"enableVtcmLifetimeColoring", "enable-vtcm-lifetime-coloring", "bool",
            /*default=*/"false",
@@ -312,7 +312,7 @@ def DecomposeHexKLMatmul :
            "activation, flat-output, and accumulator regions reuse storage.">,
     Option<"enableDmaToVtcm", "enable-dma-to-vtcm", "bool",
            /*default=*/"false",
-           "Reserve a non-aliasing VTCM staging tile for OmniFetch DMA.">,
+           "Reserve a non-aliasing VTCM staging tile for Alps DMA.">,
     Option<"enableDirectOutputFormation", "enable-direct-output-formation", "bool",
            /*default=*/"false",
            "ALPS P5k: use the HexKL epilogue's valid-row/column clipping to write non-aligned results directly into their final destination">,
@@ -489,11 +489,11 @@ def ScheduleMatmulForHVX :
   let options = [
     Option<"enableWeightStationary", "enable-weight-stationary", "bool",
            /*default=*/"false",
-           "Enable OmniFetch N1 transpose-equivalent weight-stationary "
+           "Enable Alps N1 transpose-equivalent weight-stationary "
            "scheduling for profitable static FP16 projection matmuls">,
     Option<"enableActivationMulticast", "enable-activation-multicast", "bool",
            /*default=*/"false",
-           "Enable OmniFetch N2 fusion of equal-shape sibling FP16 "
+           "Enable Alps N2 fusion of equal-shape sibling FP16 "
            "projections so one activation load feeds both consumers">,
   ];
 
@@ -702,7 +702,7 @@ def SCFLoopUnroll : Pass<"scf-loop-unroll", "func::FuncOp"> {
 }
 
 //===----------------------------------------------------------------------===//
-// Omni-Fetch: Prefetch insertion pass
+// ALPS: Prefetch insertion pass
 //===----------------------------------------------------------------------===//
 
 def PrefetchInsert :
@@ -777,7 +777,7 @@ def PrefetchInsert :
   let constructor = "hexagon::createPrefetchInsertPass()";
 
   let dependentDialects = [
-    "mlir::omni_fetch::OmniFetchDialect",
+    "mlir::alps::AlpsDialect",
     "mlir::scf::SCFDialect",
     "mlir::arith::ArithDialect",
     "mlir::memref::MemRefDialect",
@@ -794,9 +794,9 @@ def PrefetchKernelHX :
   let description = [{
     Implements the load-free affine/2-D subset of the software prefetcher from
     "Classifying Memory Access Patterns for Prefetching".  This is an external
-    baseline, not an OmniFetch cumulative component: it reconstructs a future
+    baseline, not an Alps cumulative component: it reconstructs a future
     memref.subview from the loop induction value and emits only
-    omni_fetch.l2_hint.  It never allocates shadow storage, rewires consumers,
+    alps.l2_hint.  It never allocates shadow storage, rewires consumers,
     performs layout conversion, uses DMA/VTCM, or enables V-DAE.
   }];
   let options = [
@@ -821,7 +821,7 @@ def PrefetchKernelHX :
   ];
   let constructor = "hexagon::createPrefetchKernelHXPass()";
   let dependentDialects = [
-    "mlir::omni_fetch::OmniFetchDialect",
+    "mlir::alps::AlpsDialect",
     "mlir::scf::SCFDialect",
     "mlir::arith::ArithDialect",
     "mlir::memref::MemRefDialect",
@@ -926,17 +926,17 @@ def AlpsExactReadiness :
   }];
   let constructor = "hexagon::createAlpsExactReadinessPass()";
   let dependentDialects = [
-    "mlir::omni_fetch::OmniFetchDialect",
+    "mlir::alps::AlpsDialect",
     "mlir::scf::SCFDialect",
   ];
 }
 
 //===----------------------------------------------------------------------===//
-// Omni-Fetch: V-DAE (Virtual Decoupled Access-Execute) pass
+// ALPS: V-DAE (Virtual Decoupled Access-Execute) pass
 //===----------------------------------------------------------------------===//
 
-def OmniFetchVDAEInsert :
-    InterfacePass<"omni-fetch-vdae-insert", "mlir::FunctionOpInterface"> {
+def AlpsVDAEInsert :
+    InterfacePass<"alps-vdae-insert", "mlir::FunctionOpInterface"> {
   let summary = "Decouple Memory Access and Compute Execution using semaphores";
   let description = [{
     Implements the Virtual Decoupled Access-Execute (V-DAE) transformation
@@ -949,20 +949,20 @@ def OmniFetchVDAEInsert :
     **Solution**: Decouple Memory Access and Compute Execution using hardware
     semaphores, allowing Access Thread and Execute Thread to run in parallel.
 
-    The pass walks loops that already have `omni_fetch.prefetch_in_situ`
+    The pass walks loops that already have `alps.prefetch_in_situ`
     operations (inserted by PrefetchInsertPass) and adds synchronization:
 
       Prologue:
-        %sem = omni_fetch.create_sem
+        %sem = alps.create_sem
         <existing prefetch operations>
-        omni_fetch.signal %sem
+        alps.signal %sem
 
       Loop body (per iteration i):
-        omni_fetch.wait %sem           -- ensure tile [i] is ready
+        alps.wait %sem           -- ensure tile [i] is ready
         <existing HMX compute on tile[i]>
         <existing prefetch for tile[i + lookahead]>
-        omni_fetch.signal %sem         -- notify tile [i + lookahead] ready
-        %dist = omni_fetch.adaptive_control(%dist)  -- optional
+        alps.signal %sem         -- notify tile [i + lookahead] ready
+        %dist = alps.adaptive_control(%dist)  -- optional
 
     **Key design**: This pass does NOT insert prefetch operations. It only
     adds synchronization around existing prefetch operations. The prefetch
@@ -976,20 +976,20 @@ def OmniFetchVDAEInsert :
   let options = [
     Option<"enableAdaptive", "enable-adaptive", "bool",
            /*default=*/"true",
-           "Emit omni_fetch.adaptive_control ops for runtime PMU tuning.">,
+           "Emit alps.adaptive_control ops for runtime PMU tuning.">,
   ];
 
-  let constructor = "hexagon::createOmniFetchVDAEInsertPass()";
+  let constructor = "hexagon::createAlpsVDAEInsertPass()";
 
   let dependentDialects = [
-    "mlir::omni_fetch::OmniFetchDialect",
+    "mlir::alps::AlpsDialect",
     "mlir::scf::SCFDialect",
     "mlir::arith::ArithDialect",
   ];
 }
 
 //===----------------------------------------------------------------------===//
-// Omni-Fetch: Layout Ops Elimination pass
+// ALPS: Layout Ops Elimination pass
 //===----------------------------------------------------------------------===//
 
 def LayoutOpsElimination :
@@ -1001,7 +1001,7 @@ def LayoutOpsElimination :
     prefetch operations.
 
     The pass works by:
-    1. Finding all `omni_fetch.prefetch_in_situ` operations with
+    1. Finding all `alps.prefetch_in_situ` operations with
        `layout_transform != None`
     2. Walking backward from each prefetch's `src` operand to find
        layout ops that match the in-situ transform
@@ -1024,7 +1024,7 @@ def LayoutOpsElimination :
   let constructor = "hexagon::createLayoutOpsEliminationPass()";
 
   let dependentDialects = [
-    "mlir::omni_fetch::OmniFetchDialect",
+    "mlir::alps::AlpsDialect",
     "mlir::linalg::LinalgDialect",
     "mlir::memref::MemRefDialect",
     "mlir::tensor::TensorDialect",
@@ -1186,7 +1186,7 @@ def AlpsLayoutSupplyPrefetch :
   let dependentDialects = [
     "mlir::arith::ArithDialect",
     "mlir::memref::MemRefDialect",
-    "mlir::omni_fetch::OmniFetchDialect",
+    "mlir::alps::AlpsDialect",
     "mlir::scf::SCFDialect",
     "mlir::vector::VectorDialect",
   ];
@@ -1243,7 +1243,7 @@ def AlpsCrpSupplyPrefetch :
   let dependentDialects = [
     "mlir::arith::ArithDialect",
     "mlir::memref::MemRefDialect",
-    "mlir::omni_fetch::OmniFetchDialect",
+    "mlir::alps::AlpsDialect",
     "mlir::scf::SCFDialect",
     "mlir::vector::VectorDialect",
   ];

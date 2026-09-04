@@ -194,9 +194,9 @@ struct LowerAttentionOp : public OpRewritePattern<AttentionOp> {
     // consumes this marker after bufferization to insert page-coalesced cache
     // hints without guessing from generic contraction indexing maps.
     if (emitKvCacheMetadata) {
-      qkOp->setAttr("omni_fetch.kv_cache_role",
+      qkOp->setAttr("alps.kv_cache_role",
                     rewriter.getStringAttr("key"));
-      qkOp->setAttr("omni_fetch.kv_cache_operand",
+      qkOp->setAttr("alps.kv_cache_operand",
                     rewriter.getI64IntegerAttr(1));
       attachTopologyAttrs(qkOp.getOperation(), rewriter);
     }
@@ -291,9 +291,9 @@ struct LowerAttentionOp : public OpRewritePattern<AttentionOp> {
     auto avOp = rewriter.create<linalg::BatchMatmulOp>(
         loc, outType, ValueRange{softmaxResult, value}, ValueRange{opsInit});
     if (emitKvCacheMetadata) {
-      avOp->setAttr("omni_fetch.kv_cache_role",
+      avOp->setAttr("alps.kv_cache_role",
                     rewriter.getStringAttr("value"));
-      avOp->setAttr("omni_fetch.kv_cache_operand",
+      avOp->setAttr("alps.kv_cache_operand",
                     rewriter.getI64IntegerAttr(1));
       attachTopologyAttrs(avOp.getOperation(), rewriter);
     }
@@ -433,7 +433,7 @@ static bool dependsOnMarkedAttentionKey(Value value, Operation *consumer,
   if (!def)
     return false;
   if (auto role =
-          def->getAttrOfType<StringAttr>("omni_fetch.kv_cache_role"))
+          def->getAttrOfType<StringAttr>("alps.kv_cache_role"))
     if (role.getValue() == "key")
       return true;
   return llvm::any_of(def->getOperands(), [&](Value operand) {
@@ -475,7 +475,7 @@ static int64_t annotateEagerAttentionKvStreams(
     // Earlier scheduling/generalization may preserve semantic identity but
     // intentionally omit the independent topology policy.  Apply the ALPS
     // fusion marker without re-running shape inference in that case.
-    if (op->hasAttr("omni_fetch.kv_cache_role")) {
+    if (op->hasAttr("alps.kv_cache_role")) {
       if (emitKvFusionBoundary)
         op->setAttr("alps.kv_fusion_boundary",
                     UnitAttr::get(op.getContext()));
@@ -610,10 +610,10 @@ static int64_t annotateEagerAttentionKvStreams(
       return;
 
     Builder bld(op.getContext());
-    op->setAttr("omni_fetch.kv_cache_role", bld.getStringAttr(role));
-    op->setAttr("omni_fetch.kv_cache_operand",
+    op->setAttr("alps.kv_cache_role", bld.getStringAttr(role));
+    op->setAttr("alps.kv_cache_operand",
                 bld.getI64IntegerAttr(operandIndex));
-    op->setAttr("omni_fetch.kv_cache_layout", bld.getStringAttr(layout));
+    op->setAttr("alps.kv_cache_layout", bld.getStringAttr(layout));
     if (emitKvFusionBoundary)
       op->setAttr("alps.kv_fusion_boundary", bld.getUnitAttr());
     if (emitKvElementwiseFusionBoundary)

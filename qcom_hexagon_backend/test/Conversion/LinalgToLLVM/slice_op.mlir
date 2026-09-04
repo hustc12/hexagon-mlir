@@ -19,7 +19,7 @@ func.func @slice_kv_contract(
   %0 = linalg.generic {
       indexing_maps = [#map, #map, #map],
       iterator_types = ["parallel"],
-      omni_fetch.kv_cache_role = "key"}
+      alps.kv_cache_role = "key"}
       ins(%arg0, %arg1 : tensor<1000xf32>, tensor<1000xf32>)
       outs(%arg2 : tensor<1000xf32>) {
     ^bb0(%in: f32, %in_0: f32, %out: f32):
@@ -50,6 +50,6 @@ func.func @slice_kv_contract(
 // KV-LABEL: func.func @slice_kv_contract
 // KV-NOT: tensor.extract_slice
 // KV: linalg.generic
-// KV-SAME: omni_fetch.kv_cache_role = "key"
+// KV-SAME: alps.kv_cache_role = "key"
 // KV-NOT: tensor.concat
 // KV: return

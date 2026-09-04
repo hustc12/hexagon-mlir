@@ -224,7 +224,7 @@ B2 (HMX, large model): legacy-scalar + HMX = ? ms (预期 > 2x B0)
 
 ```bash
 python benchmark_models/debug_running/run_gpt2lmheadmodel_debug.py \
-  --backend-profile legacy-scalar --enable-hexkl --enable-omnifetch-m-pad-hmx \
+  --backend-profile legacy-scalar --enable-hexkl --enable-alps-m-pad-hmx \
   --device-iterations 5
 ```
 

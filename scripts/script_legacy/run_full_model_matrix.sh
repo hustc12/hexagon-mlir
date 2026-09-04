@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
-# Serial full-model screening for the balanced OmniFetch 15-model set.
+# Serial full-model screening for the balanced Alps 15-model set.
 #
 # This is intentionally distinct from run_debug_matrix.sh:
 # - no layer/width/input reduction is allowed;
-# - every model is run in HVX, HexKL, then HexKL+OmniFetch-items-1-7 order;
+# - every model is run in HVX, HexKL, then HexKL+Alps-items-1-7 order;
 # - missing runners/checkpoints are recorded instead of silently substituted
 #   with a Debug proxy.
 set -uo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd -- "${SCRIPT_DIR}/../.." && pwd)
-RUNTIME_ROOT="${OMNIFETCH_RUNTIME_ROOT:-${ROOT}}"
-OUT="${OMNIFETCH_RESULTS_DIR:-${ROOT}/benchmark_models/results/full_matrix_items_1_7}"
-VENV="${OMNIFETCH_VENV:-/home/huzq85/2-working/hexagon_npu/mlir-env}"
-SEQ_LEN="${OMNIFETCH_SEQ_LEN:-32}"
-RUN_TIMEOUT="${OMNIFETCH_TIMEOUT:-3600}"
-NO_TIMEOUT="${OMNIFETCH_NO_TIMEOUT:-0}"
-DSP_HEAP_MB="${OMNIFETCH_DSP_HEAP_MB:-512}"
-DEVICE_ITERATIONS="${OMNIFETCH_DEVICE_ITERATIONS:-1}"
+RUNTIME_ROOT="${ALPS_RUNTIME_ROOT:-${ROOT}}"
+OUT="${ALPS_RESULTS_DIR:-${ROOT}/benchmark_models/results/full_matrix_items_1_7}"
+VENV="${ALPS_VENV:-/home/huzq85/2-working/hexagon_npu/mlir-env}"
+SEQ_LEN="${ALPS_SEQ_LEN:-32}"
+RUN_TIMEOUT="${ALPS_TIMEOUT:-3600}"
+NO_TIMEOUT="${ALPS_NO_TIMEOUT:-0}"
+DSP_HEAP_MB="${ALPS_DSP_HEAP_MB:-512}"
+DEVICE_ITERATIONS="${ALPS_DEVICE_ITERATIONS:-1}"
 FORCE=0
 LIST_ONLY=0
 NATIVE_ONLY=0
@@ -41,7 +41,7 @@ all_models=(
   unispeech-sat-base
 )
 models=()
-configs=(hvx hexkl hexkl_omnifetch_item7)
+configs=(hvx hexkl hexkl_alps_item7)
 
 runner_for() {
   case "$1" in
@@ -96,7 +96,7 @@ Options:
   --dsp-heap-mb N   QuRT heap reservation for full graphs (default: ${DSP_HEAP_MB})
   --device-iterations N
                     Serial in-process measured calls (screening default: ${DEVICE_ITERATIONS})
-  --config NAME     Run hvx, hexkl, hexkl_omnifetch_item7, or hvx_kv_prefetch
+  --config NAME     Run hvx, hexkl, hexkl_alps_item7, or hvx_kv_prefetch
   --native-only     Run only strict upstream HVX and HexKL configurations
   --output-dir DIR  Result directory (default: ${OUT})
   --runtime-root DIR
@@ -127,7 +127,7 @@ while (($#)); do
     --device-iterations) DEVICE_ITERATIONS=$2; shift 2 ;;
     --config)
       case "$2" in
-        hvx|hexkl|hexkl_omnifetch_item7|hvx_kv_prefetch)
+        hvx|hexkl|hexkl_alps_item7|hvx_kv_prefetch)
           configs=("$2")
           CONFIG_EXPLICIT=1
           ;;
@@ -166,7 +166,7 @@ fi
   exit 2
 }
 [[ "${NO_TIMEOUT}" == 0 || "${NO_TIMEOUT}" == 1 ]] || {
-  echo "ERROR: OMNIFETCH_NO_TIMEOUT must be 0 or 1" >&2
+  echo "ERROR: ALPS_NO_TIMEOUT must be 0 or 1" >&2
   exit 2
 }
 [[ "${DSP_HEAP_MB}" =~ ^[1-9][0-9]*$ ]] && ((DSP_HEAP_MB < 1024)) || {
@@ -227,7 +227,7 @@ export ANDROID_HOST="${ANDROID_HOST:-}"
 export ANDROID_SERIAL="${ANDROID_SERIAL:-49d1c7b2}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
-export OMNIFETCH_DSP_HEAP_MB="${DSP_HEAP_MB}"
+export ALPS_DSP_HEAP_MB="${DSP_HEAP_MB}"
 export PYTHONUNBUFFERED=1
 # Full graphs can run for tens of minutes.  Never repeat a failed device run;
 # preserve the first failure for diagnosis.  A known FastRPC teardown quirk may
@@ -281,13 +281,13 @@ config_args_for() {
   case "$1" in
     hvx) ;;
     hexkl) printf '%s\n' --enable-hexkl ;;
-    hexkl_omnifetch_item7)
-      printf '%s\n' --enable-hexkl --enable-omnifetch-kv-cache-prefetch \
-        --disable-layout-aware --disable-omnifetch-adaptive
+    hexkl_alps_item7)
+      printf '%s\n' --enable-hexkl --enable-alps-kv-cache-prefetch \
+        --disable-layout-aware --disable-alps-adaptive
       ;;
     hvx_kv_prefetch)
-      printf '%s\n' --enable-omnifetch-kv-cache-prefetch \
-        --disable-layout-aware --disable-omnifetch-adaptive
+      printf '%s\n' --enable-alps-kv-cache-prefetch \
+        --disable-layout-aware --disable-alps-adaptive
       ;;
   esac
 }
@@ -337,8 +337,8 @@ run_one() {
   # that is consistent with cold_us + warm + invalidated_us and the enclosing
   # ADB wall time.  Some long V73 runs return a corrupted outer warm_avg timer,
   # so do not use that duplicate for the combination row.
-  if [[ "${config}" == hexkl_omnifetch_item7 ]] && \
-      grep -q '^OmniFetchWHCache:' "${log}"; then
+  if [[ "${config}" == hexkl_alps_item7 ]] && \
+      grep -q '^AlpsWHCache:' "${log}"; then
     perf_p50_us=$(awk -F: '/^[[:space:]]*PerfP50:/{gsub(/[[:space:]]/,"",$2);v=$2}END{print v}' "${log}")
     if [[ -n "${perf_p50_us}" ]]; then
       if [[ -n "${perf_us}" && "${perf_us}" != "${perf_p50_us}" ]]; then
@@ -393,8 +393,8 @@ write_summary() {
     hm=$(awk -F, -v m="${model}" '$1==m&&$4=="hvx"{v=$8}END{print v}' "${CSV}")
     ks=$(awk -F, -v m="${model}" '$1==m&&$4=="hexkl"{v=$6}END{print v}' "${CSV}")
     km=$(awk -F, -v m="${model}" '$1==m&&$4=="hexkl"{v=$8}END{print v}' "${CSV}")
-    cs=$(awk -F, -v m="${model}" '$1==m&&$4=="hexkl_omnifetch_item7"{v=$6}END{print v}' "${CSV}")
-    cm=$(awk -F, -v m="${model}" '$1==m&&$4=="hexkl_omnifetch_item7"{v=$8}END{print v}' "${CSV}")
+    cs=$(awk -F, -v m="${model}" '$1==m&&$4=="hexkl_alps_item7"{v=$6}END{print v}' "${CSV}")
+    cm=$(awk -F, -v m="${model}" '$1==m&&$4=="hexkl_alps_item7"{v=$8}END{print v}' "${CSV}")
     [[ -n "${hs}${ks}${cs}" ]] || continue
     speedup=NA
     if [[ "${ks}" == PASS && "${cs}" == PASS && "${km}" != NA && "${cm}" != NA ]]; then

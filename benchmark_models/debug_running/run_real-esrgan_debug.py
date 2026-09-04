@@ -26,7 +26,7 @@ _SPEC.loader.exec_module(_MOD)
 def _load_tiny_model(device):
     # Import the pure-PyTorch architecture without executing RealESRGAN's
     # package __init__, which imports the optional cv2 inference wrapper.
-    package_name = "_omnifetch_realesrgan_arch"
+    package_name = "_alps_realesrgan_arch"
     package_spec = importlib.util.find_spec("RealESRGAN")
     assert package_spec is not None and package_spec.origin is not None
     package_root = Path(package_spec.origin).parent
@@ -79,11 +79,11 @@ def main():
     args = parser.parse_args()
     _MOD.real_esrgan(
         enable_hexkl=args.enable_hexkl,
-        enable_omnifetch_vdae=args.enable_omnifetch_vdae,
-        enable_omnifetch_layout_aware=not args.disable_layout_aware,
-        omnifetch_lookahead=args.omnifetch_lookahead,
-        enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
-        enable_omnifetch_items_1_7=args.enable_omnifetch_items_1_7,
+        enable_alps_vdae=args.enable_alps_vdae,
+        enable_alps_layout_aware=not args.disable_layout_aware,
+        alps_lookahead=args.alps_lookahead,
+        enable_alps_adaptive=not args.disable_alps_adaptive,
+        enable_alps_items_1_7=args.enable_alps_items_1_7,
         seq_len=args.seq_len,
         input_size=args.input_size,
         backend_profile=args.backend_profile,

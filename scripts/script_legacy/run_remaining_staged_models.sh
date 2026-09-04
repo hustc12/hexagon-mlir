@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-RUN_ROOT=${OMNIFETCH_STAGED_RUN_ROOT:-/tmp/omnifetch-native-v73-staged}
+RUN_ROOT=${ALPS_STAGED_RUN_ROOT:-/tmp/alps-native-v73-staged}
 
 mkdir -p "${RUN_ROOT}"
 

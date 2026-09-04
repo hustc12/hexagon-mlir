@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the OmniFetch overlay and run the complete 15-model evaluation matrix.
+# Build the Alps overlay and run the complete 15-model evaluation matrix.
 #
 # The matrix is deliberately serial: one model and one backend configuration
 # are active at a time. No `timeout` process or host-side deadline is used.
@@ -8,20 +8,20 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd -- "${SCRIPT_DIR}/../.." && pwd)
 BUILD_JOBS="${BUILD_JOBS:-4}"
-RESULTS_DIR="${OMNIFETCH_RESULTS_DIR:-/tmp/omnifetch-upstream-full-models}"
+RESULTS_DIR="${ALPS_RESULTS_DIR:-/tmp/alps-upstream-full-models}"
 
 usage() {
   cat <<EOF
 Usage: scripts/script_legacy/run_all_models_no_timeout.sh [--skip-build] [matrix options/model ...]
 
-Builds the official-upstream-based OmniFetch overlay, runs its test suite, and
+Builds the official-upstream-based Alps overlay, runs its test suite, and
 then invokes run_full_model_matrix.sh with --no-timeout. Remaining arguments
 are passed to the matrix runner. Successful rows are skipped on restart unless
 --force is supplied.
 
 Environment:
   BUILD_JOBS=N              Parallelism for compilation only (default: 4)
-  OMNIFETCH_RESULTS_DIR=DIR Persistent matrix logs/CSV (default: ${RESULTS_DIR})
+  ALPS_RESULTS_DIR=DIR Persistent matrix logs/CSV (default: ${RESULTS_DIR})
 EOF
 }
 
@@ -37,7 +37,7 @@ done
 
 if [[ "${skip_build}" -eq 0 ]]; then
   BUILD_JOBS="${BUILD_JOBS}" LLVM_BUILD_JOBS="${LLVM_BUILD_JOBS:-${BUILD_JOBS}}" \
-    "${SCRIPT_DIR}/build_omnifetch_upstream.sh"
+    "${SCRIPT_DIR}/build_alps_upstream.sh"
 fi
 
 adb devices | awk 'NR>1 && $2=="device" {found=1} END {exit !found}' || {
@@ -45,5 +45,5 @@ adb devices | awk 'NR>1 && $2=="device" {found=1} END {exit !found}' || {
   exit 1
 }
 
-OMNIFETCH_RESULTS_DIR="${RESULTS_DIR}" \
+ALPS_RESULTS_DIR="${RESULTS_DIR}" \
   "${SCRIPT_DIR}/run_full_model_matrix.sh" --no-timeout "${forward[@]}"

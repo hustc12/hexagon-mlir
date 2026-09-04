@@ -301,8 +301,8 @@ class HexagonExecutor:
         hexkl_micro_a = os.path.join(hexkl_dir, "libhexkl_micro.a")
         hexkl_macro_a = os.path.join(hexkl_dir, "libhexkl_macro.a")
 
-        # LinkRuntimeModules pulls OmniFetchRuntime into a kernel whenever an
-        # __omni_fetch_* call is present.  That runtime also contains optional
+        # LinkRuntimeModules pulls AlpsRuntime into a kernel whenever an
+        # __alps_* call is present.  That runtime also contains optional
         # HMX layout helpers which reference hexkl_micro.  Consequently an HVX
         # pipeline can need libhexkl_micro even when enableHexKL is false.  Do
         # not infer this native link dependency from the pass switch: inspect
@@ -322,7 +322,7 @@ class HexagonExecutor:
                     needs_hexkl_micro = True
                     if not self.enable_hexkl:
                         print(
-                            "==> Linking libhexkl_micro.a for an OmniFetch/ALPS "
+                            "==> Linking libhexkl_micro.a for an Alps/ALPS "
                             "runtime dependency (enableHexKL is false)"
                         )
             except (OSError, subprocess.CalledProcessError) as error:

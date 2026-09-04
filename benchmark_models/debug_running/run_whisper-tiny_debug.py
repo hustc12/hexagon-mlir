@@ -86,13 +86,13 @@ def run(args):
             # registered; reparsing textual IR loses that custom dialect.
             patched = None
     options = hexagon_options_phase4(
-        args.enable_hexkl, args.enable_omnifetch_vdae,
-        not args.disable_layout_aware, args.omnifetch_lookahead,
-        not args.disable_omnifetch_adaptive, args.enable_omnifetch_items_1_7,
+        args.enable_hexkl, args.enable_alps_vdae,
+        not args.disable_layout_aware, args.alps_lookahead,
+        not args.disable_alps_adaptive, args.enable_alps_items_1_7,
         lower_constants_separate=False,
         backend_profile=args.backend_profile,
-        enable_omnifetch_activation_multicast=(
-            args.enable_omnifetch_activation_multicast
+        enable_alps_activation_multicast=(
+            args.enable_alps_activation_multicast
         ),
         prefetch_baseline=args.prefetch_baseline,
         prefetch_baseline_distance=args.prefetch_baseline_distance,

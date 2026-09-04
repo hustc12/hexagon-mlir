@@ -28,7 +28,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "hexagon/Dialect/HexKL/IR/HexKLDialect.h"
-#include "hexagon/Dialect/OmniFetch/IR/OmniFetchDialect.h"
+#include "hexagon/Dialect/Alps/IR/AlpsDialect.h"
 #include "hexagon/Transforms/Passes.h"
 #include "hexagon/Transforms/Transforms.h"
 
@@ -57,7 +57,7 @@
 #define DEBUG_TYPE "prefetch-insert"
 
 using namespace mlir;
-using namespace mlir::omni_fetch;
+using namespace mlir::alps;
 using namespace hexagon;
 
 #define GEN_PASS_DEF_PREFETCHINSERT
@@ -220,16 +220,16 @@ static TransformDecision decideWeightTransform(scf::ForOp loop,
 static void annotateTransformDecision(Operation *op,
                                       const TransformDecision &decision) {
   Builder builder(op->getContext());
-  op->setAttr("omni_fetch.transform_mode",
+  op->setAttr("alps.transform_mode",
               builder.getStringAttr(stringifyTransformMode(decision.mode)));
-  op->setAttr("omni_fetch.transform_score",
+  op->setAttr("alps.transform_score",
               builder.getI64IntegerAttr(decision.score));
-  op->setAttr("omni_fetch.transform_useful_tiles",
+  op->setAttr("alps.transform_useful_tiles",
               builder.getI64IntegerAttr(decision.usefulTiles));
-  op->setAttr("omni_fetch.transform_outer_reuse",
+  op->setAttr("alps.transform_outer_reuse",
               builder.getI64IntegerAttr(decision.outerReuse));
   if (decision.persistentCandidate)
-    op->setAttr("omni_fetch.persistent_candidate", builder.getUnitAttr());
+    op->setAttr("alps.persistent_candidate", builder.getUnitAttr());
 }
 
 static void annotateAlpsP2c(Operation *op, StringRef kind) {
@@ -796,10 +796,10 @@ insertKvCachePrefetchHints(func::FuncOp func, int64_t kvCachePageTokens,
   int64_t markedLinalg = 0;
   int64_t markedVector = 0;
   func.walk([&](linalg::LinalgOp op) {
-    if (!op->hasAttr("omni_fetch.kv_cache_role"))
+    if (!op->hasAttr("alps.kv_cache_role"))
       return;
     auto operandAttr =
-        op->getAttrOfType<IntegerAttr>("omni_fetch.kv_cache_operand");
+        op->getAttrOfType<IntegerAttr>("alps.kv_cache_operand");
     if (!operandAttr)
       return;
     int64_t index = operandAttr.getInt();
@@ -813,14 +813,14 @@ insertKvCachePrefetchHints(func::FuncOp func, int64_t kvCachePageTokens,
   // reads before one-shot bufferization. The vectorizer propagates item-7
   // identity to the K/V read so it remains recoverable on final memref IR.
   func.walk([&](vector::TransferReadOp read) {
-    if (read->hasAttr("omni_fetch.kv_cache_role"))
+    if (read->hasAttr("alps.kv_cache_role"))
       consumers.push_back({read, read.getBase(), nullptr});
-    if (read->hasAttr("omni_fetch.kv_cache_role"))
+    if (read->hasAttr("alps.kv_cache_role"))
       ++markedVector;
   });
   int64_t markedLoops = 0;
   func.walk([&](scf::ForOp loop) {
-    if (!loop->hasAttr("omni_fetch.kv_cache_role"))
+    if (!loop->hasAttr("alps.kv_cache_role"))
       return;
     Value src;
     Operation *sourceConsumer = nullptr;
@@ -847,10 +847,10 @@ insertKvCachePrefetchHints(func::FuncOp func, int64_t kvCachePageTokens,
     consumers.push_back({sourceConsumer ? sourceConsumer : loop.getOperation(),
                          src, nullptr});
     consumers.back().op->setAttr(
-        "omni_fetch.kv_cache_role",
-        loop->getAttr("omni_fetch.kv_cache_role"));
-    if (Attribute layout = loop->getAttr("omni_fetch.kv_cache_layout"))
-      consumers.back().op->setAttr("omni_fetch.kv_cache_layout", layout);
+        "alps.kv_cache_role",
+        loop->getAttr("alps.kv_cache_role"));
+    if (Attribute layout = loop->getAttr("alps.kv_cache_layout"))
+      consumers.back().op->setAttr("alps.kv_cache_layout", layout);
     ++markedLoops;
   });
   llvm::errs() << "[KVPropagation] final_linalg=" << markedLinalg
@@ -862,9 +862,9 @@ insertKvCachePrefetchHints(func::FuncOp func, int64_t kvCachePageTokens,
   for (KvConsumer candidate : consumers) {
     Operation *consumer = candidate.op;
     auto role =
-        consumer->getAttrOfType<StringAttr>("omni_fetch.kv_cache_role");
+        consumer->getAttrOfType<StringAttr>("alps.kv_cache_role");
     auto layout =
-        consumer->getAttrOfType<StringAttr>("omni_fetch.kv_cache_layout");
+        consumer->getAttrOfType<StringAttr>("alps.kv_cache_layout");
     if (!role)
       continue;
     if (requireAlpsAdmission) {
@@ -998,7 +998,7 @@ insertKvCachePrefetchHints(func::FuncOp func, int64_t kvCachePageTokens,
       // matching subview reconstruction. Keep the initial causal experiment
       // L2-only; the DMA/VTCM variant is admitted for untiled linalg consumers.
       candidate.replaceOperand->set(shadow);
-      consumer->setAttr("omni_fetch.kv_layout",
+      consumer->setAttr("alps.kv_layout",
                         b.getStringAttr(enableAsyncOverlap
                                             ? "vtcm_dma_overlapped"
                                             : "vtcm_staged"));
@@ -1074,11 +1074,11 @@ insertKvCachePrefetchHints(func::FuncOp func, int64_t kvCachePageTokens,
       ++stats.hints;
     }
 
-    consumer->setAttr("omni_fetch.kv_page_tokens",
+    consumer->setAttr("alps.kv_page_tokens",
                       b.getI64IntegerAttr(kvCachePageTokens));
-    consumer->setAttr("omni_fetch.kv_pages",
+    consumer->setAttr("alps.kv_pages",
                       b.getI64IntegerAttr(streams * pagesPerStream));
-    consumer->setAttr("omni_fetch.kv_layout",
+    consumer->setAttr("alps.kv_layout",
                       b.getStringAttr("budgeted_first_demand_line"));
     ++stats.sites;
     ++stats.directLayoutSites;
@@ -1087,23 +1087,23 @@ insertKvCachePrefetchHints(func::FuncOp func, int64_t kvCachePageTokens,
   }
 
   Builder b(func.getContext());
-  func->setAttr("omni_fetch.kv_prefetch_sites",
+  func->setAttr("alps.kv_prefetch_sites",
                 b.getI64IntegerAttr(stats.sites));
-  func->setAttr("omni_fetch.kv_prefetch_hints",
+  func->setAttr("alps.kv_prefetch_hints",
                 b.getI64IntegerAttr(stats.hints));
-  func->setAttr("omni_fetch.kv_prefetch_pages",
+  func->setAttr("alps.kv_prefetch_pages",
                 b.getI64IntegerAttr(stats.pages));
-  func->setAttr("omni_fetch.kv_prefetch_bytes",
+  func->setAttr("alps.kv_prefetch_bytes",
                 b.getI64IntegerAttr(stats.bytes));
-  func->setAttr("omni_fetch.kv_direct_layout_sites",
+  func->setAttr("alps.kv_direct_layout_sites",
                 b.getI64IntegerAttr(stats.directLayoutSites));
-  func->setAttr("omni_fetch.kv_vtcm_stages",
+  func->setAttr("alps.kv_vtcm_stages",
                 b.getI64IntegerAttr(stats.vtcmStages));
-  func->setAttr("omni_fetch.kv_async_stages",
+  func->setAttr("alps.kv_async_stages",
                 b.getI64IntegerAttr(stats.asyncStages));
-  func->setAttr("omni_fetch.kv_hoisted_sites",
+  func->setAttr("alps.kv_hoisted_sites",
                 b.getI64IntegerAttr(stats.hoistedSites));
-  func->setAttr("omni_fetch.kv_rejected_produced_sites",
+  func->setAttr("alps.kv_rejected_produced_sites",
                 b.getI64IntegerAttr(stats.rejectedProducedSites));
   llvm::errs() << "[KVCachePrefetch] function=" << func.getName()
                << " sites=" << stats.sites << " hints=" << stats.hints
@@ -1116,7 +1116,7 @@ insertKvCachePrefetchHints(func::FuncOp func, int64_t kvCachePageTokens,
   return stats;
 }
 
-/// HexKL OmniFetch insertion.
+/// HexKL Alps insertion.
 /// - layoutAware=false: L2Hint warmup (Phase 1; no HexKL op removal)
 /// - layoutAware=true:  replace RmToWh / (Copy+RmToAh) with in-situ HMX layout
 ///   prefetch into the VTCM tile slot (Phase 2a).  With lookahead>=1, emit a
@@ -1301,7 +1301,7 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
       Value ubI32 = b.create<arith::IndexCastOp>(loc, i32Ty, ub);
 
       // Optional VTCM DMA stage at flatOff=(kTiles+2)*4096.  When disabled,
-      // runtime packs into DDR omni_stage instead (tile_params size 4).
+      // runtime packs into DDR alps_stage instead (tile_params size 4).
       SmallVector<Value, 5> syncParams = {ktVal, colVal, wtCols, curOff};
       Value stageOff;
       if (enableDmaToVtcm) {
@@ -1789,19 +1789,19 @@ struct PrefetchInsertPass
     }
 
     Builder builder(func.getContext());
-    func->setAttr("omni_fetch.cost_native_sites",
+    func->setAttr("alps.cost_native_sites",
                   builder.getI64IntegerAttr(stats.native));
-    func->setAttr("omni_fetch.cost_sync_sites",
+    func->setAttr("alps.cost_sync_sites",
                   builder.getI64IntegerAttr(stats.sync));
-    func->setAttr("omni_fetch.cost_async_sites",
+    func->setAttr("alps.cost_async_sites",
                   builder.getI64IntegerAttr(stats.async));
-    func->setAttr("omni_fetch.cost_persistent_candidates",
+    func->setAttr("alps.cost_persistent_candidates",
                   builder.getI64IntegerAttr(stats.persistentCandidates));
-    func->setAttr("omni_fetch.cost_persistent_sites",
+    func->setAttr("alps.cost_persistent_sites",
                   builder.getI64IntegerAttr(stats.persistent));
-    func->setAttr("omni_fetch.dequant_reshape_enabled",
+    func->setAttr("alps.dequant_reshape_enabled",
                   builder.getBoolAttr(enableDequantReshape));
-    func->setAttr("omni_fetch.dequant_reshape_sites",
+    func->setAttr("alps.dequant_reshape_sites",
                   builder.getI64IntegerAttr(stats.dequant));
     func->setAttr("alps.p2c.weight_sites",
                   builder.getI64IntegerAttr(stats.alpsP2cWeightSites));

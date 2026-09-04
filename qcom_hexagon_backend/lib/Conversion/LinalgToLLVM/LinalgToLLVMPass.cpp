@@ -17,12 +17,12 @@
 #include "hexagon/Conversion/LinalgToLLVM/Common.h"
 #include "hexagon/Conversion/LinalgToLLVM/LinalgToLLVM.h"
 #include "hexagon/Conversion/LinalgToLLVM/Passes.h"
-#include "hexagon/Conversion/OmniFetchToLLVM/OmniFetchToLLVM.h"
+#include "hexagon/Conversion/AlpsToLLVM/AlpsToLLVM.h"
 #include "hexagon/Dialect/Crouton/IR/CroutonDialect.h"
 #include "hexagon/Dialect/HexKL/IR/HexKLDialect.h"
 #include "hexagon/Dialect/HexagonMem/IR/HexagonMemDialect.h"
 #include "hexagon/Dialect/HexagonTPtr/IR/HexagonTPtrDialect.h"
-#include "hexagon/Dialect/OmniFetch/IR/OmniFetchDialect.h"
+#include "hexagon/Dialect/Alps/IR/AlpsDialect.h"
 #include "hexagon/Dialect/TTX/IR/TTXDialect.h"
 #include "hexagon/Transforms/Passes.h"
 
@@ -164,29 +164,29 @@ public:
                     vector::VectorDialect, memref::MemRefDialect,
                     LLVM::LLVMDialect, crouton::CroutonDialect, ttx::TTXDialect,
                     tptr::HexagonTPtrDialect, hexagonmem::HexagonMemDialect,
-                    hexkl::HexKLDialect, omni_fetch::OmniFetchDialect,
+                    hexkl::HexKLDialect, alps::AlpsDialect,
                     quant::QuantDialect>();
   }
 
   void runOnOperation() override {
     // DEBUG (disabled): pass entry banner and option dump
     // llvm::errs() << "\n[LinalgToLLVM] ========== Pass Starting ==========\n";
-    // llvm::errs() << "[LinalgToLLVM] enableOmniFetchVDAE = " <<
-    // enableOmniFetchVDAE << "\n"; llvm::errs() << "[LinalgToLLVM] enableHexKL
+    // llvm::errs() << "[LinalgToLLVM] enableAlpsVDAE = " <<
+    // enableAlpsVDAE << "\n"; llvm::errs() << "[LinalgToLLVM] enableHexKL
     // = " << enableHexKL << "\n"; llvm::errs() << "[LinalgToLLVM]
-    // omniFetchLookahead = " << omniFetchLookahead << "\n"; llvm::errs() <<
-    // "[LinalgToLLVM] enableOmniFetchAdaptive = " << enableOmniFetchAdaptive <<
-    // "\n"; llvm::errs() << "[LinalgToLLVM] enableOmniFetchLayoutAware = " <<
-    // enableOmniFetchLayoutAware << "\n"; llvm::errs() << "[LinalgToLLVM]
+    // alpsLookahead = " << alpsLookahead << "\n"; llvm::errs() <<
+    // "[LinalgToLLVM] enableAlpsAdaptive = " << enableAlpsAdaptive <<
+    // "\n"; llvm::errs() << "[LinalgToLLVM] enableAlpsLayoutAware = " <<
+    // enableAlpsLayoutAware << "\n"; llvm::errs() << "[LinalgToLLVM]
     // ==========================================\n\n";
 
     auto moduleOp = getOperation();
     MLIRContext *context = moduleOp.getContext();
 
-    // ALPS P0 causal split.  The legacy OmniFetch item-7 option remains an
+    // ALPS P0 causal split.  The legacy Alps item-7 option remains an
     // umbrella alias so archived scripts reproduce their original topology.
     const bool alpsKvFusionPolicy =
-        enableOmniFetchKvCachePrefetch || enableAlpsKvFusionPolicy;
+        enableAlpsKvCachePrefetch || enableAlpsKvFusionPolicy;
     const bool alpsKvElementwiseFusionPolicy =
         alpsKvFusionPolicy || enableAlpsKvElementwiseFusionPolicy;
     const bool alpsKvMultiUseFusionPolicy =
@@ -194,9 +194,9 @@ public:
     const bool alpsKvSplitReductionPolicy =
         alpsKvFusionPolicy || enableAlpsKvSplitReductionPolicy;
     const bool alpsKvSlicingPolicy =
-        enableOmniFetchKvCachePrefetch || enableAlpsKvSlicingPolicy;
+        enableAlpsKvCachePrefetch || enableAlpsKvSlicingPolicy;
     const bool alpsKvRuntimePrefetch =
-        enableOmniFetchKvCachePrefetch || enableAlpsKvRuntimePrefetch;
+        enableAlpsKvCachePrefetch || enableAlpsKvRuntimePrefetch;
     const bool alpsMinimalStaticAdmission = enableAlpsMinimalStaticAdmission;
     const bool alpsExactReadiness = enableAlpsExactReadiness;
     const bool alpsExactOverlap = enableAlpsExactOverlap;
@@ -206,14 +206,14 @@ public:
     const bool alpsP2eContracts =
         alpsContractLedger || enableAlpsContinuityAudit;
     const bool alpsKvSemanticTracking =
-        enableOmniFetchKvCachePrefetch || enableAlpsKvSemanticTracking ||
+        enableAlpsKvCachePrefetch || enableAlpsKvSemanticTracking ||
         alpsKvElementwiseFusionPolicy || alpsKvMultiUseFusionPolicy ||
         alpsKvSplitReductionPolicy || alpsKvSlicingPolicy ||
         alpsKvRuntimePrefetch || alpsMinimalStaticAdmission;
     const bool alpsPrefetchPipeline = enablePrefetch || alpsKvRuntimePrefetch ||
                                       enableAlpsFusedTransformTransfer ||
                                       alpsMinimalStaticAdmission;
-    const bool alpsLayoutAware = enableOmniFetchLayoutAware ||
+    const bool alpsLayoutAware = enableAlpsLayoutAware ||
                                  enableAlpsFusedTransformTransfer ||
                                  alpsExactOverlap;
 
@@ -433,8 +433,8 @@ public:
                                  phase == "post-bufferization";
       return passOption;
     };
-    auto setOmniFetchVDAE = [&](auto passOption) {
-      passOption.enableAdaptive = enableOmniFetchAdaptive;
+    auto setAlpsVDAE = [&](auto passOption) {
+      passOption.enableAdaptive = enableAlpsAdaptive;
       return passOption;
     };
 
@@ -650,9 +650,9 @@ public:
     // the best HVX reducers on zero-HMX-coverage models (e.g. DINOv2 with 0
     // HexKL rewrites), leaving hexkl-items17 no faster than plain hvx-vector.
     scheduleOpts.enableWeightStationary =
-        enableOmniFetchWeightStationary && enableVectorization;
+        enableAlpsWeightStationary && enableVectorization;
     scheduleOpts.enableActivationMulticast =
-        enableOmniFetchActivationMulticast && enableVectorization;
+        enableAlpsActivationMulticast && enableVectorization;
     pm.addNestedPass<func::FuncOp>(
         createScheduleMatmulForHVXPass(scheduleOpts));
     pm.addNestedPass<func::FuncOp>(createLinalgGeneralizePass());
@@ -764,13 +764,13 @@ public:
     }
 
     // Validate the dependencies of the independently selectable components.
-    if (enableOmniFetchLayoutAware && !enablePrefetch &&
+    if (enableAlpsLayoutAware && !enablePrefetch &&
         !enableAlpsFusedTransformTransfer)
       moduleOp->emitWarning(
-          "[OmniFetch] layout-aware mode requires prefetch; no-op");
-    if (enableOmniFetchVDAE && !enablePrefetch)
+          "[Alps] layout-aware mode requires prefetch; no-op");
+    if (enableAlpsVDAE && !enablePrefetch)
       moduleOp->emitWarning(
-          "[OmniFetch] V-DAE requires prefetch operations; no-op");
+          "[Alps] V-DAE requires prefetch operations; no-op");
 
     // VTCMTilingPass must run when scratch > 0 to create the VTCM allocs
     // that MemoryOffsetsPass will replace with views into the scratch buffer.
@@ -940,7 +940,7 @@ public:
       // dealloc to the block terminator, keeping all buffers live at once and
       // exhausting DSP VTLB mappings. Sink each dealloc to right after its
       // buffer's last user to bound the peak concurrent working set.
-      // Allocation-lifetime shortening is an OmniFetch memory-planning
+      // Allocation-lifetime shortening is an Alps memory-planning
       // optimization, not part of either external prefetch baseline.  Keep
       // the native/Prefetch-Kernel-HX/APT-GET-HX rows on the upstream
       // ownership path so their output ABI and latency are not confounded.
@@ -1011,15 +1011,15 @@ public:
     // MicroHMX DDR→VTCM copies (tile_row/tile_col) in innermost loops.
     if (enableHexKL && hexKLMode != "macro") {
       auto decomposeOptions = DecomposeHexKLMatmulOptions{};
-      decomposeOptions.enableWeightPrepack = enableOmniFetchWeightPrepack;
+      decomposeOptions.enableWeightPrepack = enableAlpsWeightPrepack;
       decomposeOptions.enablePersistentVtcm = enableHexKLPersistentVtcm;
-      decomposeOptions.enableVtcmLifetimeColoring = enableOmniFetchVtcmColoring;
+      decomposeOptions.enableVtcmLifetimeColoring = enableAlpsVtcmColoring;
       // P3b's descriptor-bound producer must stage the incoming RM tile in
       // VTCM before the scout performs the WH transform.  Enabling this at
       // decomposition time also reserves the extra, non-aliasing VTCM bank;
       // merely changing PrefetchInsert would produce an out-of-budget view.
       decomposeOptions.enableDmaToVtcm =
-          alpsExactOverlap || enableOmniFetchDmaToVtcm;
+          alpsExactOverlap || enableAlpsDmaToVtcm;
       decomposeOptions.enableDirectOutputFormation =
           enableAlpsHmxDirectOutputFormation;
       decomposeOptions.enableF16BiasEpilogueFormation =
@@ -1032,9 +1032,9 @@ public:
     }
 
     // External baseline: infer safe future affine tile addresses and emit only
-    // destination-free L2 hints. Keep this outside the OmniFetch gates so a
+    // destination-free L2 hints. Keep this outside the Alps gates so a
     // baseline run cannot inherit shadow buffers, DMA/VTCM staging, in-situ
-    // layout elimination, V-DAE, or adaptive OmniFetch policy.
+    // layout elimination, V-DAE, or adaptive Alps policy.
     if (enablePrefetchKernelHX || enableAPTGetHX) {
       auto kernelOptions = PrefetchKernelHXOptions{};
       kernelOptions.distance =
@@ -1050,16 +1050,16 @@ public:
           hexagon::createPrefetchKernelHXPass(kernelOptions));
     }
 
-    // ===== Omni-Fetch: Plan-A 3-component architecture =====
+    // ===== ALPS: Plan-A 3-component architecture =====
     //
     //  Component 1 – Prefetch Insertion   (gate: enablePrefetch)
     //  Component 2 – In-Situ Reshape      (gate: enablePrefetch &&
-    //  enableOmniFetchLayoutAware)
+    //  enableAlpsLayoutAware)
     //                Layout Ops Elim      (gate: enablePrefetch &&
-    //                enableOmniFetchLayoutAware)
-    //  Component 3 – V-DAE Decouple       (gate: enableOmniFetchVDAE)
+    //                enableAlpsLayoutAware)
+    //  Component 3 – V-DAE Decouple       (gate: enableAlpsVDAE)
     //
-    // OmniFetchToLLVM lowers all omni_fetch dialect ops.  P5f-b emits its
+    // AlpsToLLVM lowers all alps dialect ops.  P5f-b emits its
     // already-admitted CRP hints before this section and therefore requires
     // lowering, but must not activate the broad legacy PrefetchInsert pass.
 
@@ -1099,40 +1099,40 @@ public:
       // deliberately synchronous and cannot accidentally enter the legacy
       // async/persistent pipelines.
       prefetchOptions.lookahead =
-          enableAlpsFusedTransformTransfer ? 0 : omniFetchLookahead;
+          enableAlpsFusedTransformTransfer ? 0 : alpsLookahead;
       // Layout-aware flag controls in-situ reshape during prefetch.
       prefetchOptions.enableLayoutAware = alpsLayoutAware;
       prefetchOptions.enableDmaToVtcm =
-          alpsExactOverlap || enableOmniFetchDmaToVtcm;
+          alpsExactOverlap || enableAlpsDmaToVtcm;
       prefetchOptions.enableInterLayerPrefetch =
           enableAlpsFusedTransformTransfer ? false
-                                           : enableOmniFetchInterLayerPrefetch;
+                                           : enableAlpsInterLayerPrefetch;
       prefetchOptions.enablePersistentWhCache =
           enableAlpsFusedTransformTransfer ? false
-                                           : enableOmniFetchPersistentWhCache;
+                                           : enableAlpsPersistentWhCache;
       prefetchOptions.enableTwoDimPipeline =
           alpsExactOverlap ? true
                            : (enableAlpsFusedTransformTransfer
                                   ? false
-                                  : enableOmniFetchTwoDimPipeline);
+                                  : enableAlpsTwoDimPipeline);
       prefetchOptions.enableKvCachePrefetch =
           alpsKvRuntimePrefetch || alpsMinimalStaticAdmission;
-      // An independently enabled item-7 has no other OmniFetch components.
+      // An independently enabled item-7 has no other Alps components.
       // Keep that experiment causal by excluding ordinary loop prefetch;
       // cumulative items 1-7 still execute the complete pipeline.
       prefetchOptions.kvCacheOnly =
           (alpsKvRuntimePrefetch || alpsMinimalStaticAdmission) &&
-          !alpsExactOverlap && !enableOmniFetchVDAE &&
-          !enableOmniFetchPersistentWhCache && !enableOmniFetchTwoDimPipeline &&
-          !enableOmniFetchVtcmColoring;
+          !alpsExactOverlap && !enableAlpsVDAE &&
+          !enableAlpsPersistentWhCache && !enableAlpsTwoDimPipeline &&
+          !enableAlpsVtcmColoring;
       prefetchOptions.enableDequantReshape =
           enableAlpsFusedTransformTransfer ? false
-                                           : enableOmniFetchDequantReshape;
+                                           : enableAlpsDequantReshape;
       prefetchOptions.enableAlpsFusedTransformTransfer =
           enableAlpsFusedTransformTransfer;
       prefetchOptions.requireAlpsAdmission = alpsMinimalStaticAdmission;
       prefetchOptions.enableAlpsExactOverlap = alpsExactOverlap;
-      prefetchOptions.kvCachePageTokens = omniFetchKvCachePageTokens;
+      prefetchOptions.kvCachePageTokens = alpsKvCachePageTokens;
       pm.addNestedPass<func::FuncOp>(
           hexagon::createPrefetchInsertPass(prefetchOptions));
       pm.addPass(createCanonicalizerPass());
@@ -1153,9 +1153,9 @@ public:
     // --- Component 3: V-DAE (Virtual Decoupled Access-Execute) ---
     // Adds wait/signal semaphore synchronization around prefetch operations.
     // Requires Component 1 to have already inserted prefetch ops.
-    if (enableOmniFetchVDAE) {
-      pm.addNestedPass<func::FuncOp>(hexagon::createOmniFetchVDAEInsertPass(
-          setOmniFetchVDAE(OmniFetchVDAEInsertOptions{})));
+    if (enableAlpsVDAE) {
+      pm.addNestedPass<func::FuncOp>(hexagon::createAlpsVDAEInsertPass(
+          setAlpsVDAE(AlpsVDAEInsertOptions{})));
       if (mlir::hexagon::isEnvTrue("DUMP_AFTER_VDAE"))
         pm.addPass(createCanonicalizerPass());
     }
@@ -1200,17 +1200,17 @@ public:
     pm.addPass(hexagonmem::createHexagonMemToLLVMPass(
         setDeviceType(hexagonmem::HexagonMemToLLVMOptions{})));
     pm.addPass(hexkl::createHexKLToLLVMPass());
-    // Lower omni_fetch dialect ops to extern-C runtime calls.
+    // Lower alps dialect ops to extern-C runtime calls.
     // Required whenever Prefetch (Component 1) has emitted prefetch_in_situ
     // ops, or when weight prepack emitted prefetch_in_situ copies in
     // DecomposeHexKL.
     if (alpsPrefetchPipeline || enableAlpsCrpSupplyPrefetch ||
-        enableAlpsLayoutSupplyPrefetch || enableOmniFetchWeightPrepack ||
+        enableAlpsLayoutSupplyPrefetch || enableAlpsWeightPrepack ||
         enablePrefetchKernelHX || enableAPTGetHX) {
-      mlir::omni_fetch::OmniFetchToLLVMOptions ofOpts{};
-      ofOpts.enableDualThreadDae = enableOmniFetchDualThreadDae &&
-                                   (enableOmniFetchVDAE || alpsExactOverlap);
-      pm.addPass(omni_fetch::createOmniFetchToLLVMPass(ofOpts));
+      mlir::alps::AlpsToLLVMOptions ofOpts{};
+      ofOpts.enableDualThreadDae = enableAlpsDualThreadDae &&
+                                   (enableAlpsVDAE || alpsExactOverlap);
+      pm.addPass(alps::createAlpsToLLVMPass(ofOpts));
     }
 
     if (enableCollapseAddressSpace) {

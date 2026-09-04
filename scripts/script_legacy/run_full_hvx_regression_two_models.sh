@@ -14,7 +14,7 @@ iterations=${DEVICE_ITERATIONS:-1}
 skip_baselines=${SKIP_BASELINES:-0}
 
 baseline_dir=${result_root}/prefetch-baselines
-native_omni_dir=${result_root}/native-and-item7
+native_alps_dir=${result_root}/native-and-item7
 mkdir -p "${result_root}"
 
 if [[ "${skip_baselines}" == 1 ]]; then
@@ -31,18 +31,18 @@ else
     "${script_dir}/run_prefetch_baseline_full_two_models.sh"
 fi
 
-echo "[HVXRegression] phase=native-hexkl-item7 output=${native_omni_dir}"
-OUTPUT_DIR="${native_omni_dir}" \
+echo "[HVXRegression] phase=native-hexkl-item7 output=${native_alps_dir}"
+OUTPUT_DIR="${native_alps_dir}" \
 DEVICE_ITERATIONS="${iterations}" \
 ONLY_SCHEMES="hvx hexkl-control item7-only" \
 REUSE_VALID_LOGS=0 \
 REMOTE_RESULTS_DIR="${remote_root:+${remote_root}/native-and-item7}" \
-  "${script_dir}/run_omnifetch_full_no_item4_ablation.sh"
+  "${script_dir}/run_alps_full_no_item4_ablation.sh"
 
-python_bin=${OMNIFETCH_VENV:-${parent_dir}/mlir-env}/bin/python
+python_bin=${ALPS_VENV:-${parent_dir}/mlir-env}/bin/python
 "${python_bin}" - \
   "${baseline_dir}/results.csv" \
-  "${native_omni_dir}/results.csv" \
+  "${native_alps_dir}/results.csv" \
   "${result_root}/hvx_regression.csv" \
   "${result_root}/hvx_regression.md" <<'PY'
 import csv
@@ -64,7 +64,7 @@ schemes = (
     ("hexkl-zero-hmx", "Hexagon-MLIR HVX + HexKL pipeline (0 HMX rewrites)", "hexkl-control"),
     ("prefetch-kernel-hx", "Prefetch-Kernel-HX on HVX", "prefetch-kernel-hx"),
     ("apt-get-hx", "APT-GET-HX global-plan MVP on HVX", "apt-get-hx"),
-    ("omnifetch-item7", "OmniFetch item7-only on HVX", "item7-only"),
+    ("alps-item7", "Alps item7-only on HVX", "item7-only"),
 )
 models = ("dinov2-small", "vit-base")
 
@@ -90,7 +90,7 @@ lines = [
     "# Full-model HVX regression",
     "",
     "All latency values and ratios use two decimal places. A ratio is the row's "
-    "latency divided by OmniFetch item7 latency, so item7 is 1.00x and larger "
+    "latency divided by Alps item7 latency, so item7 is 1.00x and larger "
     "values mean a larger item7 speedup.",
     "",
     "| Model | Configuration | Latency (item7 = 1.00x) |",

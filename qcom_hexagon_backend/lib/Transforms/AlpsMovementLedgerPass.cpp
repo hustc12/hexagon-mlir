@@ -179,7 +179,7 @@ static StringRef layoutFor(Type type) {
 }
 
 static StringRef kvRole(Operation *op) {
-  if (auto role = op->getAttrOfType<StringAttr>("omni_fetch.kv_cache_role"))
+  if (auto role = op->getAttrOfType<StringAttr>("alps.kv_cache_role"))
     return role.getValue();
   return "none";
 }
@@ -194,7 +194,7 @@ static bool hasTopologyCandidate(Operation *op) {
 static Value getPrimaryShapedValue(Operation *op, bool candidate) {
   if (candidate) {
     if (auto operand =
-            op->getAttrOfType<IntegerAttr>("omni_fetch.kv_cache_operand")) {
+            op->getAttrOfType<IntegerAttr>("alps.kv_cache_operand")) {
       int64_t index = operand.getInt();
       if (index >= 0 && index < static_cast<int64_t>(op->getNumOperands()) &&
           isa<ShapedType>(op->getOperand(index).getType()))

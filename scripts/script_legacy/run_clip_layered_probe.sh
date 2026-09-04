@@ -3,15 +3,15 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd -- "${SCRIPT_DIR}/../.." && pwd)
-RUNTIME_ROOT=${OMNIFETCH_RUNTIME_ROOT:-/home/huzq85/2-working/hexagon_npu/hexagon-mlir-native}
-VENV=${OMNIFETCH_VENV:-/home/huzq85/2-working/hexagon_npu/mlir-env}
+RUNTIME_ROOT=${ALPS_RUNTIME_ROOT:-/home/huzq85/2-working/hexagon_npu/hexagon-mlir-native}
+VENV=${ALPS_VENV:-/home/huzq85/2-working/hexagon_npu/mlir-env}
 PYTHON_VERSION=$("${VENV}/bin/python" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
 TRITON_BUILD_DIR=${TRITON_BUILD_DIR:-${RUNTIME_ROOT}/triton/build/cmake.linux-x86_64-cpython-${PYTHON_VERSION}}
 
 export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
 export TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
 export PYTHONPATH="${RUNTIME_ROOT}/triton/python:${ROOT}/benchmark_models"
-export OMNIFETCH_DSP_HEAP_MB=${OMNIFETCH_DSP_HEAP_MB:-512}
+export ALPS_DSP_HEAP_MB=${ALPS_DSP_HEAP_MB:-512}
 export ANDROID_SERIAL=${ANDROID_SERIAL:-49d1c7b2}
 export ANDROID_HOST=${ANDROID_HOST:-}
 export HEXAGON_ARCH_VERSION=${HEXAGON_ARCH_VERSION:-73}

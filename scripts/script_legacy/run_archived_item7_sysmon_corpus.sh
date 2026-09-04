@@ -24,7 +24,7 @@ artifact_root_for() {
     deit-small)
       echo "${archive_root}/deit_hvx_retest_20260815/item7-only/artifacts/DeiTSmallWrapper-2026-08-15_08-41-50-434862" ;;
     dinov2-small)
-      echo "${archive_root}/full_hvx_four_way_20260815/dinov2-small/omnifetch-item7/artifacts/Dinov2SmallWrapper-2026-08-15_06-46-01-152125" ;;
+      echo "${archive_root}/full_hvx_four_way_20260815/dinov2-small/alps-item7/artifacts/Dinov2SmallWrapper-2026-08-15_06-46-01-152125" ;;
     *) echo "Unknown model: $1" >&2; return 2 ;;
   esac
 }

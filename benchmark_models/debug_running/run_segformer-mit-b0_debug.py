@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reduced offline SegFormer MiT-B0 candidate for OmniFetch screening."""
+"""Reduced offline SegFormer MiT-B0 candidate for Alps screening."""
 from __future__ import annotations
 
 import argparse
@@ -57,9 +57,9 @@ def run(args):
         patched, n_bm, n_f16 = apply_hexkl_ir_rewrites(ir)
         print(f"[HexKL] batch_matmul→matmul={n_bm}, f16-input rewrite={n_f16}")
     options = hexagon_options_phase4(
-        args.enable_hexkl, args.enable_omnifetch_vdae,
-        not args.disable_layout_aware, args.omnifetch_lookahead,
-        not args.disable_omnifetch_adaptive, args.enable_omnifetch_items_1_7,
+        args.enable_hexkl, args.enable_alps_vdae,
+        not args.disable_layout_aware, args.alps_lookahead,
+        not args.disable_alps_adaptive, args.enable_alps_items_1_7,
         lower_constants_separate=False,
         backend_profile=args.backend_profile,
         prefetch_baseline=args.prefetch_baseline,

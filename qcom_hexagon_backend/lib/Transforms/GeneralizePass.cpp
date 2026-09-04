@@ -55,8 +55,8 @@ struct LinalgGeneralizePass
 FailureOr<linalg::GenericOp>
 LinalgGeneralizePass::GeneralizeOp(IRRewriter &rewriter,
                                    linalg::LinalgOp linalgOp) {
-  Attribute kvRole = linalgOp->getAttr("omni_fetch.kv_cache_role");
-  Attribute kvOperand = linalgOp->getAttr("omni_fetch.kv_cache_operand");
+  Attribute kvRole = linalgOp->getAttr("alps.kv_cache_role");
+  Attribute kvOperand = linalgOp->getAttr("alps.kv_cache_operand");
   Attribute kvFusionBoundary =
       linalgOp->getAttr("alps.kv_fusion_boundary");
   Attribute kvElementwiseFusionBoundary =
@@ -70,9 +70,9 @@ LinalgGeneralizePass::GeneralizeOp(IRRewriter &rewriter,
       linalg::generalizeNamedOp(rewriter, linalgOp);
   if (succeeded(generalizedOp)) {
     if (kvRole)
-      (*generalizedOp)->setAttr("omni_fetch.kv_cache_role", kvRole);
+      (*generalizedOp)->setAttr("alps.kv_cache_role", kvRole);
     if (kvOperand)
-      (*generalizedOp)->setAttr("omni_fetch.kv_cache_operand", kvOperand);
+      (*generalizedOp)->setAttr("alps.kv_cache_operand", kvOperand);
     if (kvFusionBoundary)
       (*generalizedOp)->setAttr("alps.kv_fusion_boundary", kvFusionBoundary);
     if (kvElementwiseFusionBoundary)

@@ -65,15 +65,15 @@ def main():
     parser.add_argument("--enable-lwp", action="store_true")
     parser.add_argument("--enable-hexkl", action="store_true")
     parser.add_argument("--enable-hvx-vector", action="store_true")
-    parser.add_argument("--enable-omnifetch-weight-stationary",
+    parser.add_argument("--enable-alps-weight-stationary",
                         action="store_true")
-    parser.add_argument("--enable-omnifetch-activation-multicast",
+    parser.add_argument("--enable-alps-activation-multicast",
                         action="store_true")
-    parser.add_argument("--enable-omnifetch-vdae", action="store_true")
+    parser.add_argument("--enable-alps-vdae", action="store_true")
     parser.add_argument("--disable-layout-aware", action="store_true")
-    parser.add_argument("--omnifetch-lookahead", type=int, default=2)
-    parser.add_argument("--disable-omnifetch-adaptive", action="store_true")
-    parser.add_argument("--enable-omnifetch-items-1-7", action="store_true")
+    parser.add_argument("--alps-lookahead", type=int, default=2)
+    parser.add_argument("--disable-alps-adaptive", action="store_true")
+    parser.add_argument("--enable-alps-items-1-7", action="store_true")
     parser.add_argument(
         "--prefetch-baseline",
         choices=("none", "prefetch-kernel-hx", "apt-get-hx"),
@@ -81,18 +81,18 @@ def main():
     )
     parser.add_argument("--prefetch-baseline-distance", type=int, default=1)
     parser.add_argument("--apt-get-hx-manual-candidate-ids", default="")
-    parser.add_argument("--enable-omnifetch-weight-prepack", action="store_true")
-    parser.add_argument("--enable-omnifetch-persistent-wh-cache",
+    parser.add_argument("--enable-alps-weight-prepack", action="store_true")
+    parser.add_argument("--enable-alps-persistent-wh-cache",
                         action="store_true")
-    parser.add_argument("--enable-omnifetch-two-dim-pipeline",
+    parser.add_argument("--enable-alps-two-dim-pipeline",
                         action="store_true")
-    parser.add_argument("--enable-omnifetch-vtcm-coloring",
+    parser.add_argument("--enable-alps-vtcm-coloring",
                         action="store_true")
-    parser.add_argument("--enable-omnifetch-kv-cache-prefetch",
+    parser.add_argument("--enable-alps-kv-cache-prefetch",
                         action="store_true")
-    parser.add_argument("--enable-omnifetch-dequant-reshape",
+    parser.add_argument("--enable-alps-dequant-reshape",
                         action="store_true")
-    parser.add_argument("--omnifetch-kv-cache-page-tokens", type=int,
+    parser.add_argument("--alps-kv-cache-page-tokens", type=int,
                         default=32)
     parser.add_argument("--device-iterations", type=int, default=1)
     parser.add_argument("--enable-hexkl-persistent-vtcm", action="store_true")
@@ -102,35 +102,35 @@ def main():
         enablelwp=args.enable_lwp,
         enable_hexkl=args.enable_hexkl,
         enable_hvx_vector=args.enable_hvx_vector,
-        enable_omnifetch_weight_stationary=(
-            args.enable_omnifetch_weight_stationary
+        enable_alps_weight_stationary=(
+            args.enable_alps_weight_stationary
         ),
-        enable_omnifetch_activation_multicast=(
-            args.enable_omnifetch_activation_multicast
+        enable_alps_activation_multicast=(
+            args.enable_alps_activation_multicast
         ),
-        enable_omnifetch_vdae=args.enable_omnifetch_vdae,
-        enable_omnifetch_layout_aware=not args.disable_layout_aware,
-        omnifetch_lookahead=args.omnifetch_lookahead,
-        enable_omnifetch_adaptive=not args.disable_omnifetch_adaptive,
-        enable_omnifetch_items_1_7=args.enable_omnifetch_items_1_7,
-        enable_omnifetch_weight_prepack=args.enable_omnifetch_weight_prepack,
-        enable_omnifetch_persistent_wh_cache=(
-            args.enable_omnifetch_persistent_wh_cache
+        enable_alps_vdae=args.enable_alps_vdae,
+        enable_alps_layout_aware=not args.disable_layout_aware,
+        alps_lookahead=args.alps_lookahead,
+        enable_alps_adaptive=not args.disable_alps_adaptive,
+        enable_alps_items_1_7=args.enable_alps_items_1_7,
+        enable_alps_weight_prepack=args.enable_alps_weight_prepack,
+        enable_alps_persistent_wh_cache=(
+            args.enable_alps_persistent_wh_cache
         ),
-        enable_omnifetch_two_dim_pipeline=(
-            args.enable_omnifetch_two_dim_pipeline
+        enable_alps_two_dim_pipeline=(
+            args.enable_alps_two_dim_pipeline
         ),
-        enable_omnifetch_vtcm_coloring=(
-            args.enable_omnifetch_vtcm_coloring
+        enable_alps_vtcm_coloring=(
+            args.enable_alps_vtcm_coloring
         ),
-        enable_omnifetch_kv_cache_prefetch=(
-            args.enable_omnifetch_kv_cache_prefetch
+        enable_alps_kv_cache_prefetch=(
+            args.enable_alps_kv_cache_prefetch
         ),
-        enable_omnifetch_dequant_reshape=(
-            args.enable_omnifetch_dequant_reshape
+        enable_alps_dequant_reshape=(
+            args.enable_alps_dequant_reshape
         ),
-        omnifetch_kv_cache_page_tokens=(
-            args.omnifetch_kv_cache_page_tokens
+        alps_kv_cache_page_tokens=(
+            args.alps_kv_cache_page_tokens
         ),
         device_iterations=args.device_iterations,
         enable_hexkl_persistent_vtcm=args.enable_hexkl_persistent_vtcm,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reduced SwinV2-Tiny structural candidate for Hexagon/OmniFetch."""
+"""Reduced SwinV2-Tiny structural candidate for Hexagon/Alps."""
 from __future__ import annotations
 
 import argparse
@@ -84,11 +84,11 @@ def run(args):
 
     options = hexagon_options_phase4(
         args.enable_hexkl,
-        args.enable_omnifetch_vdae,
+        args.enable_alps_vdae,
         not args.disable_layout_aware,
-        args.omnifetch_lookahead,
-        not args.disable_omnifetch_adaptive,
-        args.enable_omnifetch_items_1_7,
+        args.alps_lookahead,
+        not args.disable_alps_adaptive,
+        args.enable_alps_items_1_7,
         lower_constants_separate=False,
     )
     outputs = hex_execution(

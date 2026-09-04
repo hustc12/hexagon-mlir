@@ -1,6 +1,6 @@
 // RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(func.func(alps-exact-readiness))' 2>&1 | FileCheck %s
 
-#weight = #omni_fetch.layout_transform<hmx_weight>
+#weight = #alps.layout_transform<hmx_weight>
 
 func.func @p3a_contract(%src: memref<64x64xf16>, %dst: memref<?xi8, 1>) {
   %c0 = arith.constant 0 : index
@@ -10,13 +10,13 @@ func.func @p3a_contract(%src: memref<64x64xf16>, %dst: memref<?xi8, 1>) {
   %cols = arith.constant 64 : i32
   scf.for %tile = %c0 to %c4 step %c1 {
     %tile_i32 = arith.index_cast %tile : index to i32
-    omni_fetch.prefetch_in_situ %src, %dst
+    alps.prefetch_in_situ %src, %dst
         tile_params(%tile_i32, %zero, %cols, %zero : i32, i32, i32, i32)
         {alps.p2d.action = "dma_vtcm_async",
          layout_transform = #weight,
          lookahead = 1 : i32}
         : memref<64x64xf16>, memref<?xi8, 1>
-    omni_fetch.prefetch_in_situ %src, %dst
+    alps.prefetch_in_situ %src, %dst
         tile_params(%tile_i32, %zero, %cols, %zero : i32, i32, i32, i32)
         {layout_transform = #weight,
          lookahead = 1 : i32}

@@ -19,7 +19,7 @@ def run(a):
     m=compile_to_linalg(w,tuple(ins),decomp_pow=False);ir=str(m);p=None;print(f"[DebugCandidate] CLAP-HTSAT batch_matmul={ir.count('linalg.batch_matmul')}")
     if a.enable_hexkl:
       q,nb,nf=apply_hexkl_ir_rewrites(ir);p=q if nb or nf else None
-    o=hex_execution(m,w.__class__.__name__,ins,hexagon_options_phase4(a.enable_hexkl,a.enable_omnifetch_vdae,not a.disable_layout_aware,a.omnifetch_lookahead,not a.disable_omnifetch_adaptive,a.enable_omnifetch_items_1_7,False),mlir_text=p)
+    o=hex_execution(m,w.__class__.__name__,ins,hexagon_options_phase4(a.enable_hexkl,a.enable_alps_vdae,not a.disable_layout_aware,a.alps_lookahead,not a.disable_alps_adaptive,a.enable_alps_items_1_7,False),mlir_text=p)
     with torch.no_grad():r=w(*ins)
     print(f"[Compare] max_abs_diff={(o[0].float()-r.float()).abs().max().item():.4f}")
 if __name__=="__main__":

@@ -76,11 +76,11 @@ def load_mamba_model(model_name, config):
 
 def mamba_130m(
     enable_hexkl: bool = False,
-    enable_omnifetch_vdae: bool = False,
-    enable_omnifetch_layout_aware: bool = True,
-    omnifetch_lookahead: int = 2,
-    enable_omnifetch_adaptive: bool = True,
-    enable_omnifetch_items_1_7: bool = False,
+    enable_alps_vdae: bool = False,
+    enable_alps_layout_aware: bool = True,
+    alps_lookahead: int = 2,
+    enable_alps_adaptive: bool = True,
+    enable_alps_items_1_7: bool = False,
     seq_len: Optional[int] = None,
     device_iterations: int = 1,
     backend_profile: str = "legacy-scalar",
@@ -153,11 +153,11 @@ def mamba_130m(
 
     options = hexagon_options_phase4(
         enable_hexkl,
-        enable_omnifetch_vdae,
-        enable_omnifetch_layout_aware,
-        omnifetch_lookahead,
-        enable_omnifetch_adaptive,
-        enable_omnifetch_items_1_7,
+        enable_alps_vdae,
+        enable_alps_layout_aware,
+        alps_lookahead,
+        enable_alps_adaptive,
+        enable_alps_items_1_7,
         backend_profile=backend_profile,
         prefetch_baseline=prefetch_baseline,
         prefetch_baseline_distance=prefetch_baseline_distance,
@@ -188,7 +188,7 @@ def mamba_130m(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Mamba-130M Hexagon smoke (optional HexKL/OmniFetch)."
+        description="Mamba-130M Hexagon smoke (optional HexKL/Alps)."
     )
     add_phase4_args(parser)
     parser.add_argument("--device-iterations", type=int, default=1)

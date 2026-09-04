@@ -84,9 +84,9 @@ def run(args):
           f"batch_matmul={ir.count('linalg.batch_matmul')} "
           f"matmul={ir.count('linalg.matmul')}")
     options = hexagon_options_phase4(
-        False, args.enable_omnifetch_vdae,
-        not args.disable_layout_aware, args.omnifetch_lookahead,
-        not args.disable_omnifetch_adaptive, args.enable_omnifetch_items_1_7,
+        False, args.enable_alps_vdae,
+        not args.disable_layout_aware, args.alps_lookahead,
+        not args.disable_alps_adaptive, args.enable_alps_items_1_7,
         lower_constants_separate=True,
         backend_profile=args.backend_profile,
         enable_out_params=args.enable_out_params,

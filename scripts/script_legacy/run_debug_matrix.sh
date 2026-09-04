@@ -4,17 +4,17 @@
 # Every selected model is run in exactly these three configurations:
 #   1. HVX
 #   2. HexKL
-#   3. HexKL + cumulative OmniFetch items 1-7
+#   3. HexKL + cumulative Alps items 1-7
 set -uo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd -- "${SCRIPT_DIR}/../.." && pwd)
-RUNTIME_ROOT="${OMNIFETCH_RUNTIME_ROOT:-${ROOT}}"
-OUT="${OMNIFETCH_RESULTS_DIR:-${ROOT}/benchmark_models/results/debug_matrix_items_1_7}"
-VENV="${OMNIFETCH_VENV:-/home/huzq85/2-working/hexagon_npu/mlir-env}"
-SEQ_LEN="${OMNIFETCH_SEQ_LEN:-32}"
-RUN_TIMEOUT="${OMNIFETCH_TIMEOUT:-600}"
-REAL_ESRGAN_INPUT_SIZE="${OMNIFETCH_REAL_ESRGAN_INPUT_SIZE:-8}"
+RUNTIME_ROOT="${ALPS_RUNTIME_ROOT:-${ROOT}}"
+OUT="${ALPS_RESULTS_DIR:-${ROOT}/benchmark_models/results/debug_matrix_items_1_7}"
+VENV="${ALPS_VENV:-/home/huzq85/2-working/hexagon_npu/mlir-env}"
+SEQ_LEN="${ALPS_SEQ_LEN:-32}"
+RUN_TIMEOUT="${ALPS_TIMEOUT:-600}"
+REAL_ESRGAN_INPUT_SIZE="${ALPS_REAL_ESRGAN_INPUT_SIZE:-8}"
 FORCE=0
 
 all_models=(
@@ -59,7 +59,7 @@ usage() {
   cat <<EOF
 Usage: scripts/script_legacy/run_debug_matrix.sh [options] [model ...]
 
-Run HVX, HexKL, and HexKL+OmniFetch-items-1-7 for every selected Debug model.
+Run HVX, HexKL, and HexKL+Alps-items-1-7 for every selected Debug model.
 With no model arguments, all Debug models are selected.
 
 Options:
@@ -217,9 +217,9 @@ config_args_for() {
   case "$1" in
     hvx) ;;
     hexkl) printf '%s\n' '--enable-hexkl' ;;
-    hexkl_omnifetch_item7)
-      printf '%s\n' '--enable-hexkl' '--enable-omnifetch-kv-cache-prefetch' \
-        '--disable-layout-aware' '--disable-omnifetch-adaptive'
+    hexkl_alps_item7)
+      printf '%s\n' '--enable-hexkl' '--enable-alps-kv-cache-prefetch' \
+        '--disable-layout-aware' '--disable-alps-adaptive'
       ;;
   esac
 }
@@ -369,21 +369,21 @@ write_summary() {
   for model in "${all_models[@]}"; do
     hvx_status=$(last_result_field "${model}" hvx 4)
     hexkl_status=$(last_result_field "${model}" hexkl 4)
-    combo_status=$(last_result_field "${model}" hexkl_omnifetch_item7 4)
+    combo_status=$(last_result_field "${model}" hexkl_alps_item7 4)
     [[ -n "${hvx_status}${hexkl_status}${combo_status}" ]] || continue
     hvx_ms=$(last_result_field "${model}" hvx 6)
     hexkl_ms=$(last_result_field "${model}" hexkl 6)
-    combo_ms=$(last_result_field "${model}" hexkl_omnifetch_item7 6)
+    combo_ms=$(last_result_field "${model}" hexkl_alps_item7 6)
     hvx_over_hexkl=$(speedup "${hvx_status}" "${hvx_ms}" "${hexkl_status}" "${hexkl_ms}")
     hexkl_over_combo=$(speedup "${hexkl_status}" "${hexkl_ms}" "${combo_status}" "${combo_ms}")
     hvx_over_combo=$(speedup "${hvx_status}" "${hvx_ms}" "${combo_status}" "${combo_ms}")
-    prefetch_sites=$(last_result_field "${model}" hexkl_omnifetch_item7 8)
-    in_situ_ops=$(last_result_field "${model}" hexkl_omnifetch_item7 9)
-    async_choices=$(last_result_field "${model}" hexkl_omnifetch_item7 10)
-    persistent_choices=$(last_result_field "${model}" hexkl_omnifetch_item7 11)
-    vtcm_saved_bytes=$(last_result_field "${model}" hexkl_omnifetch_item7 12)
-    kv_prefetch_sites=$(last_result_field "${model}" hexkl_omnifetch_item7 13)
-    eager_kv_inferred=$(last_result_field "${model}" hexkl_omnifetch_item7 14)
+    prefetch_sites=$(last_result_field "${model}" hexkl_alps_item7 8)
+    in_situ_ops=$(last_result_field "${model}" hexkl_alps_item7 9)
+    async_choices=$(last_result_field "${model}" hexkl_alps_item7 10)
+    persistent_choices=$(last_result_field "${model}" hexkl_alps_item7 11)
+    vtcm_saved_bytes=$(last_result_field "${model}" hexkl_alps_item7 12)
+    kv_prefetch_sites=$(last_result_field "${model}" hexkl_alps_item7 13)
+    eager_kv_inferred=$(last_result_field "${model}" hexkl_alps_item7 14)
     printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
       "${model}" "${hvx_status:-NA}" "${hvx_ms:-NA}" \
       "${hexkl_status:-NA}" "${hexkl_ms:-NA}" \
@@ -402,7 +402,7 @@ echo "SOURCE_ROOT=${ROOT}"
 echo "RUNTIME_ROOT=${RUNTIME_ROOT}"
 echo "RESULTS=${OUT}"
 for model in "${models[@]}"; do
-  for config in hvx hexkl hexkl_omnifetch_item7; do
+  for config in hvx hexkl hexkl_alps_item7; do
     run_one "${model}" "${config}"
   done
 done

@@ -50,14 +50,14 @@ def create_dinov2_small_full_model_and_input(num_hidden_layers: int = 12):
             interpolation_probe, 224, 224
         ).to(torch.float16).detach()
     embeddings.register_buffer(
-        "omnifetch_fixed_position_embeddings",
+        "alps_fixed_position_embeddings",
         fixed_position_embeddings,
         persistent=False,
     )
 
     def fixed_position_encoding(self, token_embeddings, height, width):
         del token_embeddings, height, width
-        return self.omnifetch_fixed_position_embeddings
+        return self.alps_fixed_position_embeddings
 
     embeddings.interpolate_pos_encoding = types.MethodType(
         fixed_position_encoding, embeddings

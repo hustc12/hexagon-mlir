@@ -3,7 +3,7 @@
 更新时间：2026-08-19
 分析对象：以 `baseline_5_upstream_v73` 为基线的新 `alps_v73` 分支、`experimental_data.md` 中最新的完整模型数据，以及 Hexagon V73 / HVX memory hierarchy。
 
-命名约定：从 `alps_v73` 开始，论文、实验配置和新增编译器接口统一使用 **ALPS**。已有 `omni_fetch` dialect、runtime ABI、历史 CLI 和日志字段暂时作为兼容层保留；只有在 ALPS 行为稳定并具备迁移测试后才分阶段更名，避免把命名迁移与性能改动混在同一个因果实验中。本文中的“历史 OmniFetch/item 1–7”特指更名前的实现和数据。
+命名约定：从 `alps_v73` 开始，论文、实验配置和编译器接口统一使用 **ALPS**。2026-09-03 完成了源码路径、`alps` dialect、runtime ABI、CLI、环境变量、测试与文档的整体命名迁移；这次迁移只改变命名，不改变优化机制或实验配置。为保持可恢复性，归档目录中的原始 Git 补丁仍逐字保留其创建时的旧名称；Git 历史、已有 tag 和远端历史产物目录也不属于源码重命名范围。本文中的“历史 ALPS/item 1–7”特指命名迁移前产生的实现与数据。
 
 ## 0. 核心结论
 
@@ -26,13 +26,13 @@
 item 7 对应：
 
 ```text
-enableOmniFetchKvCachePrefetch = true
+enableAlpsKvCachePrefetch = true
 ```
 
 在当前严格 item7-only 配置中：
 
 - `enablePrefetch = true`；
-- `enableOmniFetchKvCachePrefetch = true`；
+- `enableAlpsKvCachePrefetch = true`；
 - layout-aware、V-DAE、adaptive lookahead、persistent WH、two-dimensional pipeline、VTCM coloring 等 item 1–6 均关闭；
 - `kvCacheOnly = true`，不插入普通 loop prefetch。
 
@@ -79,9 +79,9 @@ page-safe first-demand-line L2 hint（若有合法 site）
 
 它附加：
 
-- `omni_fetch.kv_cache_role = key | value`
-- `omni_fetch.kv_cache_operand`
-- `omni_fetch.kv_cache_layout = bshd | shd | sequence_head | ...`
+- `alps.kv_cache_role = key | value`
+- `alps.kv_cache_operand`
+- `alps.kv_cache_layout = bshd | shd | sequence_head | ...`
 
 为了使语义跨过 generalize、fusion、tiling、vectorization 和 bufferization，pipeline 会多次重新执行识别或复制属性。这一部分是有价值的基础设施：它使优化基于“逻辑 K/V stream”，而不是依赖某个脆弱的 op 名称。
 
@@ -109,7 +109,7 @@ page-safe first-demand-line L2 hint（若有合法 site）
 
 `FusionPass.cpp` 中：
 
-- consumer 或 producer 带 `omni_fetch.kv_cache_role` 时，拒绝部分 elementwise fusion；
+- consumer 或 producer 带 `alps.kv_cache_role` 时，拒绝部分 elementwise fusion；
 - reshape expansion fusion 同样保留该边界；
 - 函数中只要存在任意 K/V boundary，就跳过整个 multi-use fusion 阶段。
 
@@ -213,7 +213,7 @@ S = 1 / ((1 - f) + f / r)
 4. **重复读取流量**：相同 weight/tile 被多个 head、consumer 或相邻算子重复读取；
 5. **等待时间**：上述流量未及时到达导致 HVX/HMX stall。
 
-普通 prefetch 只直接处理第 5 类，而且可能增加第 1/3 类流量。OmniFetch 要达到 1.8x，应优先处理第 2–4 类，再用 prefetch 处理剩余第 5 类。
+普通 prefetch 只直接处理第 5 类，而且可能增加第 1/3 类流量。Alps 要达到 1.8x，应优先处理第 2–4 类，再用 prefetch 处理剩余第 5 类。
 
 ### 2.3 V73/HVX memory hierarchy 的限制
 
@@ -297,7 +297,7 @@ Prefetch canonical tensor 并不会消除 transform 的 read/write。
 
 #### 阻碍 F：HMX/HVX compute coverage
 
-未进入 HMX 的 matmul、低效率 vectorization、softmax/norm/conv 等 compute bottleneck 不能被 prefetch 修复。为了正确归因，OmniFetch 实验必须冻结相同的 HVX/HMX mapping，并报告 HMX rewrite 数和最终指令证据。
+未进入 HMX 的 matmul、低效率 vectorization、softmax/norm/conv 等 compute bottleneck 不能被 prefetch 修复。为了正确归因，Alps 实验必须冻结相同的 HVX/HMX mapping，并报告 HMX rewrite 数和最终指令证据。
 
 #### 阻碍 G：测量边界
 
@@ -352,7 +352,7 @@ staged language 数据是各 stage 的 device Perf 求和，不包含 host 往�
 
 当前代码已有三个局部构件：
 
-1. `omni_fetch.prefetch_in_situ`：DDR→VTCM 时带 `layout_transform`；
+1. `alps.prefetch_in_situ`：DDR→VTCM 时带 `layout_transform`；
 2. `LayoutAwareMapping.cpp`：支持 HMX weight deep-interleaved、HMX activation channel-interleaved 和 custom index map；
 3. `LayoutOpsEliminationPass.cpp`：从 layout-aware prefetch 向 producer 反向查找冗余 layout op，并能穿过安全的 `memref.cast` 和静态连续 `collapse_shape`。
 
@@ -551,7 +551,7 @@ LAP 同时作用于三项：
 
 FlashAttention 的关键不是“更积极地 prefetch”，而是用 tiling 和 online reduction 避免完整 attention score matrix 在层次间读写。它证明了：降低 memory traffic 往往比只隐藏 memory latency 更有效。
 
-对 OmniFetch 的借鉴：
+对 Alps 的借鉴：
 
 - QK tile、online softmax、AV 在一个 movement region 内完成；
 - score 不落 DDR/L2；
@@ -626,7 +626,7 @@ Prefetch 不仅要决定“取什么”，还要决定“保护什么”：
 - page/set-aware placement 降低 set aliasing；
 - request coalescing 防止新 L2FETCH 取消旧请求。
 
-这能把 OmniFetch 已表现出的“少发请求”优势转化为更稳定的 latency 收益。
+这能把 Alps 已表现出的“少发请求”优势转化为更稳定的 latency 收益。
 
 ### 4.8 Recompute-versus-materialize
 
@@ -667,7 +667,7 @@ recompute cycles  vs.  store + load + cache/TLB + lifetime pressure
 
 ## 5. 统一的论文故事线
 
-可以把原 OmniFetch、item 7、in-situ reshape 和新的 LAP 合成一条逻辑完整的故事线：
+可以把原 Alps、item 7、in-situ reshape 和新的 LAP 合成一条逻辑完整的故事线：
 
 ### 问题
 
@@ -685,7 +685,7 @@ recompute cycles  vs.  store + load + cache/TLB + lifetime pressure
 
 ### 方法
 
-OmniFetch 建立一个 **future representation contract**：
+Alps 建立一个 **future representation contract**：
 
 1. **Eliminate**：不物化 descriptor-only/layout-intermediate；
 2. **Form in situ**：producer 或必要 transfer 直接形成 consumer layout；
@@ -742,7 +742,7 @@ OmniFetch 建立一个 **future representation contract**：
 6. zero-copy layout elimination；
 7. producer-direct layout；
 8. fused transform-transfer；
-9. 完整 OmniFetch。
+9. 完整 Alps。
 
 ### 6.2 每阶段验收
 
@@ -782,13 +782,13 @@ online/fused compute
 - `qcom_hexagon_backend/lib/Transforms/LowerTmTensor.cpp`
 - `qcom_hexagon_backend/lib/Transforms/PrefetchInsertPass.cpp`
 - `qcom_hexagon_backend/lib/Transforms/LayoutOpsEliminationPass.cpp`
-- `qcom_hexagon_backend/lib/Dialect/OmniFetch/IR/LayoutAwareMapping.cpp`
+- `qcom_hexagon_backend/lib/Dialect/Alps/IR/LayoutAwareMapping.cpp`
 - `qcom_hexagon_backend/lib/Conversion/LinalgToLLVM/FusionPass.cpp`
 - `qcom_hexagon_backend/lib/Conversion/LinalgToLLVM/LinalgToLLVMPass.cpp`
-- `qcom_hexagon_backend/include/hexagon/Dialect/OmniFetch/IR/OmniFetchOps.td`
+- `qcom_hexagon_backend/include/hexagon/Dialect/Alps/IR/AlpsOps.td`
 - `../../archive/engineering_notes/engineering_work.md`
-- `../../archive/engineering_notes/omnifetch_history.md`
-- `../../archive/engineering_notes/omnifetch-prefetch-insitu-innovation.md`
+- `../../archive/engineering_notes/alps_history.md`
+- `../../archive/engineering_notes/alps-prefetch-insitu-innovation.md`
 
 ### V73 手册
 
@@ -832,7 +832,7 @@ online/fused compute
 
 `VDAEDecouplePass.cpp` 会：
 
-- 找到已有 `omni_fetch.prefetch_in_situ` 的 loop；
+- 找到已有 `alps.prefetch_in_situ` 的 loop；
 - 跳过 fire-and-forget 的 L2 hint；
 - 跳过 `lookahead == 0` 的同步-only transfer，避免无意义 wait/signal；
 - 为异步 transfer 插入 `create_sem`、loop-entry `wait`、loop-tail `signal`；
@@ -917,7 +917,7 @@ Movement plan
 
 #### 已经真实工作的 traffic control
 
-`OmniFetchRuntime.c` 已实现 V73-aware L2 scheduler：
+`AlpsRuntime.c` 已实现 V73-aware L2 scheduler：
 
 - `issued`、`busy_suppressed`、`page_clipped`、`unsupported`；
 - requested/issued bytes；
@@ -925,14 +925,14 @@ Movement plan
 - recent-request duplicate suppression；
 - 检查 `USR.PFA`，已有 l2fetch active 时不覆盖旧请求；
 - 每次请求限制到推荐的 8 KiB 内，并裁剪到起始 4 KiB page；
-- launcher 对 OmniFetch 配置静态 envelope：4096 commands、8 MiB、64-entry recent window；
+- launcher 对 Alps 配置静态 envelope：4096 commands、8 MiB、64-entry recent window；
 - 运行后把 counters 写入 `perf.txt`。
 
 这部分符合论文中的 traffic control，而且 bounded DINO 实验确实把 runtime issued 从 186,624 降到 4,096、issued bytes 从约 41 MiB 降到约 0.9 MiB。
 
 #### PMU monitor 尚未实现
 
-当前源代码没有读取 V73 PMU events。`__omni_fetch_update_distance` 明确使用 `__omni_fetch_wait` 的 spin counts，而不是：
+当前源代码没有读取 V73 PMU events。`__alps_update_distance` 明确使用 `__alps_wait` 的 spin counts，而不是：
 
 - HVX L2 load/store outstanding stall；
 - L2 miss/hit；
@@ -948,7 +948,7 @@ Movement plan
 
 - V-DAE pass 在每次 loop iteration 尾部创建一个常量 `initDist`；
 - `AdaptiveControlOp` 的返回结果没有成为 `scf.for` iter_arg，也没有更新后续 `prefetch_in_situ` 的 lookahead；
-- runtime 虽把计算结果写入 `omni_eff_lookahead`，但当前 prefetch issue 路径没有用它改变 IR 中已经固定的 next-tile address/距离；源码中相关使用主要停留在状态和注释层面。
+- runtime 虽把计算结果写入 `alps_eff_lookahead`，但当前 prefetch issue 路径没有用它改变 IR 中已经固定的 next-tile address/距离；源码中相关使用主要停留在状态和注释层面。
 
 所以当前控制链实际是：
 
@@ -1522,8 +1522,8 @@ H0  冻结 ALPS substrate、baseline 和 candidate IR
 - 基线分支：`baseline_5_upstream_v73`；
 - 分叉基线：`fc06df1 Add staged FP16 five-way language benchmarks`；
 - 新增用户接口、实验名称和论文叙事使用 `ALPS`；
-- 历史 `enableOmniFetch*` 选项继续用于复现实验，`enableOmniFetchKvCachePrefetch` 被保留为完整历史 item 7 的 umbrella alias；
-- 现有 `omni_fetch` MLIR dialect 和 runtime symbol 暂不做破坏性改名。它们属于内部兼容 ABI，不代表新实验仍把不同机制耦合在一起。
+- 历史 `enableAlps*` 选项继续用于复现实验，`enableAlpsKvCachePrefetch` 被保留为完整历史 item 7 的 umbrella alias；
+- 现有 `alps` MLIR dialect 和 runtime symbol 暂不做破坏性改名。它们属于内部兼容 ABI，不代表新实验仍把不同机制耦合在一起。
 
 ### 11.2 P0 已完成的第一阶段
 
@@ -1538,7 +1538,7 @@ H0  冻结 ALPS substrate、baseline 和 candidate IR
 
 关键因果修复：
 
-1. `omni_fetch.kv_cache_role` 现在只表示语义，不再自动禁止 fusion 或 split reduction；
+1. `alps.kv_cache_role` 现在只表示语义，不再自动禁止 fusion 或 split reduction；
 2. topology policy 使用独立的 `alps.kv_fusion_boundary` 属性；
 3. slicing 只受独立 slicing policy 控制；
 4. runtime K/V 请求只受 runtime-prefetch 控制；
@@ -2700,7 +2700,7 @@ supply。该路径默认关闭且独立可控，只有同时满足以下条件�
   intermediate，也不创建 transpose。
 
 定向 IR 测试证明该 pass 能为一个 256 B 的合法 future tile 生成带 bounds guard 的
-`omni_fetch.l2_hint`。完整 DINOv2-small 的 matched HexKL-on 实验得到：
+`alps.l2_hint`。完整 DINOv2-small 的 matched HexKL-on 实验得到：
 
 | 配置 | Latency | P2e contracts | P5c matched/admitted | Static tile bytes | 正确性 |
 |---|---:|---:|---:|---:|---|
@@ -3215,12 +3215,12 @@ P2g-c 显式恢复到 post-bufferization vector read 的
    `PrefetchInsert`。有效 plugin 下的第一轮虽然静态 `P5f-b hints=12`，runtime 却
    `issued=4096` 并命中命令预算上限；日志还出现 144 个 loop 的 HexKL L2 hint。
    该轮约 `6404.82 ms` 是混合策略结果，不能归因给 P5f-b。现已将“是否运行通用
-   PrefetchInsert”和“是否运行 OmniFetch dialect lowering”拆开：P5f-b 只触发后者。
+   PrefetchInsert”和“是否运行 Alps dialect lowering”拆开：P5f-b 只触发后者。
 
 同时，wrapper 的 L2 scheduler 白名单原本没有
 `enableAlpsCrpSupplyPrefetch`，导致 runtime counter 不可见且未配置 traffic envelope。
 现已把 P5f-b 接入相同的 4096-command、8 MiB、64-entry duplicate window 配置和
-`OmniFetchL2Scheduler` 报告。增量构建脚本也会在登录环境仍指向已删除
+`AlpsL2Scheduler` 报告。增量构建脚本也会在登录环境仍指向已删除
 无效的旧路径时自动回退到规范的 `LLVM_DIR`。迁移期间保留的
 `LLVM_DIR_upstream` 仅是兼容已有 CMake/Ninja 绝对路径的软链接，不再是第二份 LLVM。
 
@@ -3291,7 +3291,7 @@ row_bytes=8, physical_rows=16, tile_bytes=128
 检查 V73 Programmer's Reference Manual 后发现，runtime 原来用 `USR` bit 3 判断
 prefetch active，而 V73 的 `USR:PFA` 实际是 **bit 31**。这解释了 P5f-b telemetry
 中 `busy_suppressed=0`：代码声称的 single-flight 实际从未生效。现已把
-`OMNI_USR_PFA_BIT` 修正为 31，并在 configure 时重置新增的 segmented-site cursor。
+`ALPS_USR_PFA_BIT` 修正为 31，并在 configure 时重置新增的 segmented-site cursor。
 这是一项独立的 V73 正确性修复，但下面的设备结果证明它不是 P5f-c exception 的
 唯一根因。
 
@@ -3357,8 +3357,8 @@ proof**，在任何新 hint 发射前必须同时证明：
 时，这个装载失败被 FastRPC 外显为 `0x8000040d`，因此三轮失败实际上都没有进入
 segmented `l2fetch` 执行，不能用于证明物理行地址非法。
 
-根因是 `LinkRuntimeModules` 会在 ALPS/OmniFetch 路径中链接
-`OmniFetchRuntime`，而该 runtime 同时包含可选 HMX layout helper，对
+根因是 `LinkRuntimeModules` 会在 ALPS/Alps 路径中链接
+`AlpsRuntime`，而该 runtime 同时包含可选 HMX layout helper，对
 `libhexkl_micro.a` 有 native link 依赖；旧 `HexagonExecutor` 却只在
 `enableHexKL=true` 时链接 HexKL archive。于是“HVX + ALPS、HexKL off”可以生成
 含未解析 HexKL micro PLT 的 SO。修复后 executor 不再从 pass 开关猜测 native

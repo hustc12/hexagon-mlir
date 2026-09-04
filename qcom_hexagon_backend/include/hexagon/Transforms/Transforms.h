@@ -247,8 +247,8 @@ createAlpsAttentionDestinationFormationPass();
 
 /// V-DAE: decouples Memory Access and Compute Execution using semaphores.
 std::unique_ptr<InterfacePass<FunctionOpInterface>>
-createOmniFetchVDAEInsertPass(
-    const OmniFetchVDAEInsertOptions &options = OmniFetchVDAEInsertOptions());
+createAlpsVDAEInsertPass(
+    const AlpsVDAEInsertOptions &options = AlpsVDAEInsertOptions());
 
 /// Layout Ops Elimination: eliminates redundant layout ops when in-situ
 /// reshape is enabled.

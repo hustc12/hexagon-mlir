@@ -102,8 +102,8 @@ static LogicalResult applyTiling(IRRewriter &rewriter, linalg::LinalgOp op,
     return failure();
   }
   for (StringRef name :
-       {"omni_fetch.kv_cache_role", "omni_fetch.kv_cache_operand",
-        "omni_fetch.kv_cache_layout", "alps.kv_fusion_boundary",
+       {"alps.kv_cache_role", "alps.kv_cache_operand",
+        "alps.kv_cache_layout", "alps.kv_fusion_boundary",
         "alps.kv_elementwise_fusion_boundary",
         "alps.kv_multi_use_fusion_boundary",
         "alps.kv_split_reduction_boundary",
@@ -332,7 +332,7 @@ struct HexagonTilingPass : public ::impl::HexagonTilingBase<HexagonTilingPass> {
       }
       if (!appliedSplitReduction) {
         DBG("tiling candidate: " << op);
-        bool isKv = op->hasAttr("omni_fetch.kv_cache_role");
+        bool isKv = op->hasAttr("alps.kv_cache_role");
         bool isP2f = op->hasAttr("alps.p2f.consumer_layout_contract");
         bool isP2gRegister =
             op->hasAttr("alps.p2g.register_tile_contract");

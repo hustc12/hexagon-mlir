@@ -148,8 +148,8 @@ run_case() {
     hmlir-hvx-hexkl-on) args+=(--enable-hexkl) ;;
     alps-final)
       args+=(--enable-hexkl --enable-alps-hvx-widening-conv
-             --enable-omnifetch-kv-cache-prefetch
-             --disable-layout-aware --disable-omnifetch-adaptive)
+             --enable-alps-kv-cache-prefetch
+             --disable-layout-aware --disable-alps-adaptive)
       ;;
     *) return 2 ;;
   esac

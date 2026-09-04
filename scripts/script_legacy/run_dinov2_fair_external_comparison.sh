@@ -5,7 +5,7 @@ set -euo pipefail
 # one HVX execution thread, default performance mode, and 20 measured calls.
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-result_root="${OUTPUT_DIR:-/tmp/omnifetch-baselines/dinov2-debug-fair}"
+result_root="${OUTPUT_DIR:-/tmp/alps-baselines/dinov2-debug-fair}"
 iterations="${ITERATIONS:-20}"
 device_serial="${ANDROID_SERIAL:-49d1c7b2}"
 python_bin="${PROJECT_PYTHON:-${project_root}/../mlir-env/bin/python}"
@@ -26,9 +26,9 @@ run_hexagon_case() {
 
 run_hexagon_case hvx
 run_hexagon_case hexkl --enable-hexkl
-run_hexagon_case hexkl_omnifetch_item7 \
-  --enable-hexkl --enable-omnifetch-kv-cache-prefetch \
-  --disable-layout-aware --disable-omnifetch-adaptive
+run_hexagon_case hexkl_alps_item7 \
+  --enable-hexkl --enable-alps-kv-cache-prefetch \
+  --disable-layout-aware --disable-alps-adaptive
 
 echo "===== qnn: serial ${iterations}-iteration run ====="
 QNN_ITERATIONS="${iterations}" \
@@ -47,7 +47,7 @@ ANDROID_SERIAL="${device_serial}" \
   2>&1 | tee "${result_root}/litert.log"
 
 echo "===== Summary (microseconds) ====="
-for name in hvx hexkl hexkl_omnifetch_item7; do
+for name in hvx hexkl hexkl_alps_item7; do
   value="$(
     awk '/Perf:/{gsub(/[^0-9.]/, "", $0); print $0; exit}' \
       "${result_root}/${name}.log"

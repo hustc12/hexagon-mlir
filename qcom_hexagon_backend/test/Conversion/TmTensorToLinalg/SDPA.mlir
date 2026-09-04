@@ -50,7 +50,7 @@ func.func @SDPA_covered(
 // CHECK-SAME:                  permutation = [0, 2, 1]
 
 // CHECK: %[[QK:.*]] = linalg.batch_matmul
-// CHECK-SAME:                 {omni_fetch.kv_cache_operand = 1 : i64, omni_fetch.kv_cache_role = "key"}
+// CHECK-SAME:                 {alps.kv_cache_operand = 1 : i64, alps.kv_cache_role = "key"}
 // CHECK-SAME:                 ins(%arg0, %[[TRANSPOSED]] : tensor<2x4x8xf32>, tensor<2x8x4xf32>)
 // CHECK-SAME:                 outs(%{{.*}} : tensor<2x4x4xf32>) -> tensor<2x4x4xf32>
 
@@ -85,7 +85,7 @@ func.func @SDPA_covered(
 // CHECK-NEXT: %{{.*}} = arith.divf %[[IN]], %[[IN_3]] : f32
 
 // CHECK: %[[RESULT:.*]] = linalg.batch_matmul
-// CHECK-SAME:                {omni_fetch.kv_cache_operand = 1 : i64, omni_fetch.kv_cache_role = "value"}
+// CHECK-SAME:                {alps.kv_cache_operand = 1 : i64, alps.kv_cache_role = "value"}
 // CHECK-SAME:                ins(%[[SOFTMAX]], %arg2 : tensor<2x4x4xf32>, tensor<2x4x8xf32>)
 // CHECK-SAME:                outs(%{{.*}} : tensor<2x4x8xf32>) -> tensor<2x4x8xf32>
 // CHECK: return %[[RESULT]] : tensor<2x4x8xf32>
@@ -113,10 +113,10 @@ func.func @SDPA_covered(
 // P0B-SPLIT: return
 
 // NO-KV-LABEL: func.func @SDPA
-// NO-KV-NOT: omni_fetch.kv_cache_role
+// NO-KV-NOT: alps.kv_cache_role
 // NO-KV: return
 
 // CHECK-LABEL: func.func @SDPA_covered
 // CHECK-SAME: alps.kv_topology_admission = "covered_by_consumer_formation"
-// CHECK-NOT: omni_fetch.kv_cache_role
+// CHECK-NOT: alps.kv_cache_role
 // CHECK: return

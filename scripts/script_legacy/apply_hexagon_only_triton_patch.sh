@@ -4,7 +4,7 @@ set -euo pipefail
 
 ROOT=$(git rev-parse --show-toplevel)
 TRITON_ROOT="${ROOT}/triton"
-PATCH="${ROOT}/omnifetch/patches/triton/0001-make-gpu-backends-optional.patch"
+PATCH="${ROOT}/alps/patches/triton/0001-make-gpu-backends-optional.patch"
 
 [[ -d "${TRITON_ROOT}/.git" ]] || {
   echo "ERROR: Triton checkout is missing; run ci/setup_submodules.sh first" >&2

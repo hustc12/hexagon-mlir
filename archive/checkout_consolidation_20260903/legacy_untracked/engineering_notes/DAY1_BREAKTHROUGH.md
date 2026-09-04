@@ -31,7 +31,7 @@ HMX Rewrites: 0 → 6 (6/9 矩阵操作 = 67%)
 **根本原因**: M-padding 机制已在代码中实现，但被以下两个问题阻止：
 
 1. **Python runner 未传递参数**
-   - `run_dinov2-small_debug.py` 调用 `hexagon_options_phase4()` 时缺少 `enable_omnifetch_m_pad_hmx`
+   - `run_dinov2-small_debug.py` 调用 `hexagon_options_phase4()` 时缺少 `enable_alps_m_pad_hmx`
    
 2. **IR 重写未启用**
    - `apply_hexkl_ir_rewrites()` 调用缺少 `enable_m_pad` 参数
@@ -45,8 +45,8 @@ HMX Rewrites: 0 → 6 (6/9 矩阵操作 = 67%)
 # Before:
 options = hexagon_options_phase4(
     ...
-    enable_omnifetch_kv_vtcm=args.enable_omnifetch_kv_vtcm,
-    # enable_omnifetch_m_pad_hmx 缺失！
+    enable_alps_kv_vtcm=args.enable_alps_kv_vtcm,
+    # enable_alps_m_pad_hmx 缺失！
     prefetch_baseline=args.prefetch_baseline,
     ...
 )
@@ -54,8 +54,8 @@ options = hexagon_options_phase4(
 # After:
 options = hexagon_options_phase4(
     ...
-    enable_omnifetch_kv_vtcm=args.enable_omnifetch_kv_vtcm,
-    enable_omnifetch_m_pad_hmx=args.enable_omnifetch_m_pad_hmx,  # ← 添加
+    enable_alps_kv_vtcm=args.enable_alps_kv_vtcm,
+    enable_alps_m_pad_hmx=args.enable_alps_m_pad_hmx,  # ← 添加
     prefetch_baseline=args.prefetch_baseline,
     ...
 )
@@ -68,7 +68,7 @@ candidate, n_batch, n_f16 = apply_hexkl_ir_rewrites(ir)
 
 # After:
 candidate, n_batch, n_f16 = apply_hexkl_ir_rewrites(
-    ir, enable_m_pad=args.enable_omnifetch_m_pad_hmx  # ← 添加
+    ir, enable_m_pad=args.enable_alps_m_pad_hmx  # ← 添加
 )
 ```
 
@@ -192,7 +192,7 @@ HMX vs 真实 HVX = 21 / 23.6 = 0.89x (略慢？)
 
 测试配置：
 ```bash
---backend-profile hvx-vector --enable-hexkl --enable-omnifetch-m-pad-hmx
+--backend-profile hvx-vector --enable-hexkl --enable-alps-m-pad-hmx
 ```
 
 结果：
