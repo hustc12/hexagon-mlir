@@ -285,6 +285,10 @@ def LinalgToLLVM : Pass<"linalg-to-llvm", "mlir::ModuleOp"> {
     Option<"enableAlpsExactOverlap", "enable-alps-exact-overlap", "bool",
           /*default=*/"false",
           "ALPS P3b: execute one-tile descriptor-bound HMX weight DMA/scout overlap">,
+    Option<"alpsVdaePanelTiles", "alps-vdae-panel-tiles", "int",
+          /*default=*/"1",
+          "Coalesce this many adjacent HMX weight tiles into one V-DAE "
+          "Access descriptor/token (1..8; default preserves the frozen path)">,
     Option<"alpsLedgerPageBytes", "alps-ledger-page-bytes", "int64_t",
           /*default=*/"4096",
           "Page size used for ALPS P1 static page-footprint estimates">,

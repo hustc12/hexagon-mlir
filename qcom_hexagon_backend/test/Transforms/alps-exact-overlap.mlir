@@ -1,15 +1,18 @@
 // RUN: linalg-hexagon-opt %s \
 // RUN:   -pass-pipeline='builtin.module(func.func(alps-minimal-static-admission{min-dma-bytes=2048 min-overlap-ops=2 enable-p3-exact-readiness=true},prefetch-insert{lookahead=2 enable-layout-aware=true enable-two-dim-pipeline=true enable-alps-exact-overlap=true},alps-exact-readiness))' \
 // RUN:   2>&1 | FileCheck %s
+// RUN: linalg-hexagon-opt %s \
+// RUN:   -pass-pipeline='builtin.module(func.func(alps-minimal-static-admission{min-dma-bytes=2048 min-overlap-ops=2 enable-p3-exact-readiness=true},prefetch-insert{lookahead=2 enable-layout-aware=true enable-two-dim-pipeline=true enable-alps-exact-overlap=true exact-weight-panel-tiles=4},alps-exact-readiness))' \
+// RUN:   2>&1 | FileCheck %s --check-prefix=PANEL
 
 func.func @p3b_weight(
     %hmx: memref<?xi8, 1>, %weight: memref<256x256xf16>) {
   %c0 = arith.constant 0 : index
-  %c8 = arith.constant 8 : index
+  %c16 = arith.constant 16 : index
   %c1 = arith.constant 1 : index
   %zero = arith.constant 0 : i32
   %cols = arith.constant 256 : i32
-  scf.for %i = %c0 to %c8 step %c1 {
+  scf.for %i = %c0 to %c16 step %c1 {
     %kt = arith.index_cast %i : index to i32
     %phase = arith.remui %kt, %cols : i32
     hexkl.micro_hmx_rm_to_wh_f16(
@@ -37,3 +40,15 @@ func.func @p3b_weight(
 // CHECK-NOT: alps.create_sem
 // CHECK-NOT: alps.wait
 // CHECK-NOT: alps.signal
+
+// PANEL: [ALPS-P2D-SITE] function=p3b_weight
+// PANEL-SAME: action=dma_vtcm_async reason=p3_exact_weight_pipeline
+// PANEL-NOT: [ALPS-VDAE-PANEL] decision=reject
+// PANEL-LABEL: func.func @p3b_weight
+// PANEL: %[[FOUR:.*]] = arith.constant 4 : i32
+// PANEL: alps.exact_weight_consume
+// PANEL: %[[TAIL:.*]] = arith.select {{.*}}, {{.*}}, %[[FOUR]] : i32
+// PANEL: alps.exact_weight_kick
+// PANEL-SAME: %[[TAIL]]
+// PANEL-SAME: alps.p3b.panel_tiles = 4
+// PANEL: alps.exact_weight_release

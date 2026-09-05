@@ -223,7 +223,9 @@ getOrInsertExactWeightKick(ModuleOp module,
   auto ptrTy = LLVM::LLVMPointerType::get(ctx);
   return LLVM::lookupOrCreateFn(
       rewriter, module, getExactWeightKickFnName(),
-      {i32Ty, i64Ty, ptrTy, ptrTy, i32Ty, i32Ty, i32Ty, i32Ty, i32Ty}, i32Ty);
+      {i32Ty, i64Ty, ptrTy, ptrTy, i32Ty, i32Ty, i32Ty, i32Ty, i32Ty,
+       i32Ty},
+      i32Ty);
 }
 
 static FailureOr<LLVM::LLVMFuncOp>
@@ -505,7 +507,8 @@ struct LowerExactWeightKick : public ConvertOpToLLVMPattern<ExactWeightKickOp> {
         adaptor.getTileCol(),
         adaptor.getSourceCols(),
         adaptor.getWeightOffset(),
-        adaptor.getStageOffset()};
+        adaptor.getStageOffset(),
+        adaptor.getPanelTiles()};
     Value result =
         rewriter.create<LLVM::CallOp>(op.getLoc(), *fn, args).getResult();
     rewriter.replaceOp(op, runtimeSuccess(rewriter, op.getLoc(), result));

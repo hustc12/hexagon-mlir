@@ -404,6 +404,11 @@ void setLinalgToLLVMOptions(
         (it != arch_kwargs.end() && !it->second.compare(TRUE));
   }
   {
+    auto it = arch_kwargs.find("alpsVdaePanelTiles");
+    if (it != arch_kwargs.end())
+      options.alpsVdaePanelTiles = std::stoi(it->second);
+  }
+  {
     auto it = arch_kwargs.find("alpsLedgerPageBytes");
     if (it != arch_kwargs.end())
       options.alpsLedgerPageBytes = std::stoll(it->second);

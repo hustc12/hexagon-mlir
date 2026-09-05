@@ -466,6 +466,9 @@ def hexagon_options_phase4(
     )
     options["enableAlpsLayoutAware"] = bool(enable_alps_layout_aware)
     options["alpsLookahead"] = int(alps_lookahead)
+    options["alpsVdaePanelTiles"] = max(
+        1, min(8, int(os.environ.get("ALPS_VDAE_PANEL_TILES", "1")))
+    )
     options["enableAlpsVDAE"] = bool(
         enable_alps_vdae or cumulative_level >= 3
     )
@@ -672,6 +675,7 @@ def hexagon_options_phase4(
         f"alps_p5n_hmx_async_drain={int(options['enableAlpsHmxAsyncDrain'])} "
         f"alps_p4a_traffic={int(options['enableAlpsTrafficControl'])} "
         f"alps_vector_dae={int(options['enableAlpsDualThreadDae'])} "
+        f"alps_vdae_panel_tiles={options['alpsVdaePanelTiles']} "
         f"alps_fp16_hvx={int(options['enableAlpsFP16HVXArithmetic'])} "
         f"alps_hvx_widening_conv={int(options['enableAlpsHVXWideningConv'])}"
     )

@@ -315,9 +315,13 @@ def DecomposeHexKLMatmul :
            "Reserve a non-aliasing VTCM staging tile for Alps DMA.">,
     Option<"exactWeightLookahead", "exact-weight-lookahead", "int",
            /*default=*/"1",
-           "Number of future exact HMX weight tiles kept in the bounded "
+           "Number of future exact HMX weight panels kept in the bounded "
            "vectorized DAE queue (1..7). The decomposition reserves "
-           "lookahead+1 non-aliasing WH slots.">,
+           "lookahead+1 non-aliasing panel slots.">,
+    Option<"exactWeightPanelTiles", "exact-weight-panel-tiles", "int",
+           /*default=*/"1",
+           "Number of adjacent HMX weight tiles represented by one exact "
+           "V-DAE descriptor/token (1..8). Values above one are experimental.">,
     Option<"enableDirectOutputFormation", "enable-direct-output-formation", "bool",
            /*default=*/"false",
            "ALPS P5k: use the HexKL epilogue's valid-row/column clipping to write non-aligned results directly into their final destination">,
@@ -774,6 +778,10 @@ def PrefetchInsert :
     Option<"enableAlpsExactOverlap", "enable-alps-exact-overlap", "bool",
            /*default=*/"false",
            "ALPS P3b: emit descriptor-bound one-tile HMX weight DMA/scout overlap.">,
+    Option<"exactWeightPanelTiles", "exact-weight-panel-tiles", "int",
+           /*default=*/"1",
+           "Number of adjacent HMX weight tiles covered by one exact V-DAE "
+           "descriptor/token (1..8).">,
     Option<"kvCachePageTokens", "kv-cache-page-tokens", "int",
            /*default=*/"32",
            "Logical K/V cache page size in sequence tokens used for accounting and coalescing.">,

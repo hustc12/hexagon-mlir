@@ -140,6 +140,7 @@ class HexagonOptions:
     enableAlpsMinimalStaticAdmission: bool = False
     enableAlpsExactReadiness: bool = False
     enableAlpsExactOverlap: bool = False
+    alpsVdaePanelTiles: int = 1
     enableAlpsTrafficControl: bool = False
     alpsLedgerPageBytes: int = 4096
     alpsLedgerVtcmBudgetBytes: int = 2 * 1024 * 1024

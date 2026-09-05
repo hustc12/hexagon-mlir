@@ -1131,6 +1131,7 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
                                          bool enableDequantReshape,
                                          bool enableAlpsFusedTransformTransfer,
                                          bool enableAlpsExactOverlap,
+                                         int exactWeightPanelTiles,
                                          TransformStats &stats) {
   if (!enableLayoutAware) {
     // ----- Phase 1 path: L2 hints only -----
@@ -1245,6 +1246,22 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
     auto p2dAction = wh->getAttrOfType<StringAttr>("alps.p2d.action");
     bool exactAdmitted = hasExactWeight && p2dAction &&
                          p2dAction.getValue() == "dma_vtcm_async";
+    const int panelTiles = exactAdmitted
+                               ? std::clamp(exactWeightPanelTiles, 1, 8)
+                               : 1;
+    const int64_t staticTripCount = getStaticTripCount(loop).value_or(0);
+    // A panel is an amortization unit, not another tuning knob.  Do not emit
+    // an experimental 2-tile panel (only 4 KiB useful source data), or a
+    // queue that cannot contain the prologue plus one steady-state panel.
+    // panelTiles==1 preserves the frozen per-tile implementation exactly.
+    if (exactAdmitted && panelTiles > 1 &&
+        (panelTiles < 4 ||
+         staticTripCount < panelTiles * (std::clamp(lookahead, 1, 7) + 1))) {
+      exactAdmitted = false;
+      llvm::errs() << "[ALPS-VDAE-PANEL] decision=reject panel_tiles="
+                   << panelTiles << " trip_count=" << staticTripCount
+                   << " reason=descriptor_amortization\n";
+    }
     // Item 5 composes with item 4: profitable sites use the load/reshape/
     // compute pipeline, while the runtime cache services or populates each
     // pipelined tile using the compiler-assigned site identity.
@@ -1292,6 +1309,10 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
           loc, i32Ty, exactLookahead);
       Value cSlotCount = b.create<arith::ConstantIntOp>(
           loc, i32Ty, exactSlotCount);
+      Value cPanelTiles = b.create<arith::ConstantIntOp>(
+          loc, i32Ty, panelTiles);
+      Value cPanelBytes = b.create<arith::ConstantIntOp>(
+          loc, i32Ty, panelTiles * 4096);
       Value c4096 = b.create<arith::ConstantIntOp>(loc, i32Ty, 4096);
       Value version;
       if (exactAdmitted) {
@@ -1308,8 +1329,10 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
       SmallVector<Value, 5> syncParams = {ktVal, colVal, wtCols, curOff};
       Value stageOff;
       if (enableDmaToVtcm) {
-        Value kTilesPlusSlots = b.create<arith::AddIOp>(loc, ubI32,
-                                                        cSlotCount);
+        Value physicalSlots = b.create<arith::MulIOp>(
+            loc, cSlotCount, cPanelTiles);
+        Value kTilesPlusSlots =
+            b.create<arith::AddIOp>(loc, ubI32, physicalSlots);
         stageOff =
             b.create<arith::MulIOp>(loc, kTilesPlusSlots, c4096);
         syncParams.push_back(stageOff);
@@ -1344,29 +1367,51 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
         // must only consume the matching descriptor-produced WH slot.
         Value lbI32 =
             b.create<arith::IndexCastOp>(loc, i32Ty, loop.getLowerBound());
+        Value panelLead = b.create<arith::MulIOp>(
+            loc, cLookahead, cPanelTiles);
         Value prologueEnd =
-            b.create<arith::AddIOp>(loc, lbI32, cLookahead);
+            b.create<arith::AddIOp>(loc, lbI32, panelLead);
         Value isPrologue = b.create<arith::CmpIOp>(
             loc, arith::CmpIPredicate::slt, ktVal, prologueEnd);
         if (exactAdmitted) {
+          Value panelLane = b.create<arith::RemUIOp>(loc, ktVal, cPanelTiles);
+          Value panelStart =
+              b.create<arith::SubIOp>(loc, ktVal, panelLane);
+          Value zero = b.create<arith::ConstantIntOp>(loc, i32Ty, 0);
+          Value one = b.create<arith::ConstantIntOp>(loc, i32Ty, 1);
+          Value isPanelFirst = b.create<arith::CmpIOp>(
+              loc, arith::CmpIPredicate::eq, panelLane, zero);
+          Value lastLane = b.create<arith::ConstantIntOp>(
+              loc, i32Ty, panelTiles - 1);
+          Value isFullPanelLast = b.create<arith::CmpIOp>(
+              loc, arith::CmpIPredicate::eq, panelLane, lastLane);
+          Value nextKt = b.create<arith::AddIOp>(loc, ktVal, one);
+          Value isLoopLast = b.create<arith::CmpIOp>(
+              loc, arith::CmpIPredicate::eq, nextKt, ubI32);
+          Value isPanelLast = b.create<arith::OrIOp>(
+              loc, isFullPanelLast, isLoopLast);
           Value isSteadyState = b.create<arith::CmpIOp>(
-              loc, arith::CmpIPredicate::sge, ktVal, prologueEnd);
+              loc, arith::CmpIPredicate::sge, panelStart, prologueEnd);
+          Value shouldConsume = b.create<arith::AndIOp>(
+              loc, isSteadyState, isPanelFirst);
           b.create<scf::IfOp>(
-              loc, isSteadyState,
+              loc, shouldConsume,
               [&](OpBuilder &thenBuilder, Location thenLoc) {
                 thenBuilder.create<ExactWeightConsumeOp>(
                     thenLoc, thenBuilder.getI1Type(), exactContext, version,
-                    ktVal, colVal);
+                    panelStart, colVal);
                 thenBuilder.create<scf::YieldOp>(thenLoc);
               });
           OpBuilder afterMm(mmOp);
           afterMm.setInsertionPointAfter(mmOp);
+          Value shouldRelease = afterMm.create<arith::AndIOp>(
+              loc, isSteadyState, isPanelLast);
           afterMm.create<scf::IfOp>(
-              loc, isSteadyState,
+              loc, shouldRelease,
               [&](OpBuilder &thenBuilder, Location thenLoc) {
                 thenBuilder.create<ExactWeightReleaseOp>(
                     thenLoc, thenBuilder.getI1Type(), exactContext, version,
-                    ktVal, colVal);
+                    panelStart, colVal);
                 thenBuilder.create<scf::YieldOp>(thenLoc);
               });
         }
@@ -1380,23 +1425,33 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
       }
       ++inserted;
 
-      Value nextKtRaw =
-          b.create<arith::AddIOp>(loc, ktVal, cLookahead);
-      Value hasNext = b.create<arith::CmpIOp>(
+      Value panelLane = b.create<arith::RemUIOp>(loc, ktVal, cPanelTiles);
+      Value panelStart = b.create<arith::SubIOp>(loc, ktVal, panelLane);
+      Value panelLead = b.create<arith::MulIOp>(loc, cLookahead, cPanelTiles);
+      Value nextKtRaw = b.create<arith::AddIOp>(loc, panelStart, panelLead);
+      Value futureExists = b.create<arith::CmpIOp>(
           loc, arith::CmpIPredicate::slt, nextKtRaw, ubI32);
+      Value zero = b.create<arith::ConstantIntOp>(loc, i32Ty, 0);
+      Value isPanelFirst = b.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::eq, panelLane, zero);
+      Value hasNext = b.create<arith::AndIOp>(loc, futureExists, isPanelFirst);
       b.create<scf::IfOp>(
           loc, hasNext,
           [&](OpBuilder &thenBuilder, Location thenLoc) {
+            Value currentPanel = thenBuilder.create<arith::DivUIOp>(
+                thenLoc, panelStart, cPanelTiles);
+            Value nextPanel = thenBuilder.create<arith::DivUIOp>(
+                thenLoc, nextKtRaw, cPanelTiles);
             Value currentSlot = thenBuilder.create<arith::RemUIOp>(
-                thenLoc, ktVal, cSlotCount);
+                thenLoc, currentPanel, cSlotCount);
             Value nextSlot = thenBuilder.create<arith::RemUIOp>(
-                thenLoc, nextKtRaw, cSlotCount);
+                thenLoc, nextPanel, cSlotCount);
             Value slotDelta = thenBuilder.create<arith::SubIOp>(
                 thenLoc, nextSlot, currentSlot);
             Value nextOff = thenBuilder.create<arith::AddIOp>(
                 thenLoc, curOff,
                 thenBuilder.create<arith::MulIOp>(thenLoc, slotDelta,
-                                                  c4096));
+                                                  cPanelBytes));
 
             SmallVector<Value, 5> asyncParams = {nextKtRaw, colVal, wtCols,
                                                  nextOff};
@@ -1409,14 +1464,22 @@ static int insertHexKLMicroPrefetchHints(OpBuilder &builder, scf::ForOp loop,
               asyncParams.push_back(hybridSiteId);
             }
             if (exactAdmitted) {
+              Value remaining = thenBuilder.create<arith::SubIOp>(
+                  thenLoc, ubI32, nextKtRaw);
+              Value shortPanel = thenBuilder.create<arith::CmpIOp>(
+                  thenLoc, arith::CmpIPredicate::slt, remaining, cPanelTiles);
+              Value actualPanelTiles = thenBuilder.create<arith::SelectOp>(
+                  thenLoc, shortPanel, remaining, cPanelTiles);
               auto kick = thenBuilder.create<ExactWeightKickOp>(
                   thenLoc, thenBuilder.getI1Type(), exactContext, version,
                   srcMem, vtcmMem, nextKtRaw, colVal, wtCols, nextOff,
-                  stageOff);
+                  stageOff, actualPanelTiles);
               kick->setAttr("alps.p2d.action",
                             thenBuilder.getStringAttr("dma_vtcm_async"));
               kick->setAttr("alps.p3b.lookahead",
                             thenBuilder.getI64IntegerAttr(exactLookahead));
+              kick->setAttr("alps.p3b.panel_tiles",
+                            thenBuilder.getI64IntegerAttr(panelTiles));
             } else {
               auto asyncPrefetch = thenBuilder.create<PrefetchInSituOp>(
                   thenLoc, srcMem, vtcmMem,
@@ -1537,6 +1600,7 @@ static void insertPrefetchForLoop(scf::ForOp loop, int lookahead,
                                   bool enableDequantReshape,
                                   bool enableAlpsFusedTransformTransfer,
                                   bool enableAlpsExactOverlap,
+                                  int exactWeightPanelTiles,
                                   TransformStats &stats) {
   OpBuilder builder(loop);
   Location loc = loop.getLoc();
@@ -1553,6 +1617,7 @@ static void insertPrefetchForLoop(scf::ForOp loop, int lookahead,
                                           enableDequantReshape,
                                           enableAlpsFusedTransformTransfer,
                                           enableAlpsExactOverlap,
+                                          exactWeightPanelTiles,
                                           stats);
     llvm::errs() << "[PrefetchInsert] Total prefetch sites: " << n
                  << " shadow_kb=0\n";
@@ -1795,7 +1860,10 @@ struct PrefetchInsertPass
                             enableDmaToVtcm, enablePersistentWhCache,
                             enableTwoDimPipeline, enableDequantReshape,
                             enableAlpsFusedTransformTransfer,
-                            enableAlpsExactOverlap, stats);
+                            enableAlpsExactOverlap,
+                            std::clamp(static_cast<int>(exactWeightPanelTiles),
+                                       1, 8),
+                            stats);
     }
 
     Builder builder(func.getContext());

@@ -430,8 +430,18 @@ elif ((alps_p5m)); then
 elif ((alps_p5l)); then
   schemes=(alps-hmx-f16-bias-epilogue-formation)
 elif ((alps_vdae_full_e)); then
-  schemes=(alps-c-e-hmx-direct-output alps-vdae-full-e \
-    alps-vdae-full-e-traffic-control)
+  if [[ ${ALPS_VDAE_TREATMENT_ONLY:-0} -eq 1 ]]; then
+    if [[ ${ALPS_VDAE_REGULATED_ONLY:-0} -eq 1 ]]; then
+      schemes=(alps-vdae-full-e-traffic-control)
+    elif [[ ${ALPS_VDAE_UNREGULATED_ONLY:-0} -eq 1 ]]; then
+      schemes=(alps-vdae-full-e)
+    else
+      schemes=(alps-vdae-full-e alps-vdae-full-e-traffic-control)
+    fi
+  else
+    schemes=(alps-c-e-hmx-direct-output alps-vdae-full-e \
+      alps-vdae-full-e-traffic-control)
+  fi
 elif ((alps_p5k)); then
   schemes=(alps-hmx-direct-output-formation)
 elif ((alps_p5j)); then
@@ -983,6 +993,7 @@ run_case() {
     ALPS_ENABLE_EXACT_READINESS="$([[ ${scheme} == alps-elementwise-exact-readiness || ${scheme} == alps-elementwise-exact-overlap || ${scheme} == alps-elementwise-vector-dae || ${scheme} == alps-elementwise-traffic-control || ${scheme} == alps-vdae-full-e || ${scheme} == alps-vdae-full-e-traffic-control ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_EXACT_OVERLAP="$([[ ${scheme} == alps-elementwise-exact-overlap || ${scheme} == alps-elementwise-vector-dae || ${scheme} == alps-elementwise-traffic-control || ${scheme} == alps-vdae-full-e || ${scheme} == alps-vdae-full-e-traffic-control ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_VECTOR_DAE="$([[ ${scheme} == alps-elementwise-vector-dae || ${scheme} == alps-vdae-full-e || ${scheme} == alps-vdae-full-e-traffic-control ]] && echo 1 || echo 0)" \
+    ALPS_VDAE_PANEL_TILES="${ALPS_VDAE_PANEL_TILES:-1}" \
     ALPS_ENABLE_TRAFFIC_CONTROL="$([[ ${scheme} == alps-final || ${scheme} == alps-elementwise-traffic-control || ${scheme} == alps-c-e-hmx-async-drain-traffic-control || ${scheme} == alps-vdae-full-e-traffic-control ]] && echo 1 || echo 0)" \
     ALPS_ENABLE_FP16_HVX_ARITHMETIC="$([[ ${scheme} == alps-fp16-hvx-arithmetic ]] && echo 1 || echo 0)" \
     HEXAGON_MLIR_DUMP_DIR="${case_dir}/artifacts" \

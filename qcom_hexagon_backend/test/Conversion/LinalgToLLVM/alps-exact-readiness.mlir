@@ -31,10 +31,12 @@ func.func @exact_weight_pipeline(
   %zero = arith.constant 0 : i32
   %cols = arith.constant 64 : i32
   %no_stage = arith.constant -1 : i32
+  %one = arith.constant 1 : i32
   %scheduled = alps.exact_weight_kick
-      %context, %version, %src, %dst, %tile, %zero, %cols, %zero, %no_stage
+      %context, %version, %src, %dst, %tile, %zero, %cols, %zero, %no_stage,
+      %one
       : index, index, memref<64x64xf16>, memref<?xi8, 1>,
-        i32, i32, i32, i32, i32 -> i1
+        i32, i32, i32, i32, i32, i32 -> i1
   %consumed = alps.exact_weight_consume
       %context, %version, %tile, %zero : index, index, i32, i32 -> i1
   %released = alps.exact_weight_release

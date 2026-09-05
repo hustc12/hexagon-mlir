@@ -258,6 +258,9 @@ def make_layered_hvx_options(args: argparse.Namespace) -> dict:
         or os.environ.get("ALPS_ENABLE_VECTOR_DAE", "0") == "1"
     )
     options["alpsLookahead"] = int(args.alps_lookahead)
+    options["alpsVdaePanelTiles"] = max(
+        1, min(8, int(os.environ.get("ALPS_VDAE_PANEL_TILES", "1")))
+    )
     if options["enableAlpsDualThreadDae"] and not options["enableAlpsExactOverlap"]:
         raise ValueError("vectorized DAE requires an exact-overlap residual supply")
     options["enableAlpsDmaToVtcm"] = False
@@ -308,6 +311,7 @@ def make_layered_hvx_options(args: argparse.Namespace) -> dict:
         f" alps_p3b_overlap={int(options['enableAlpsExactOverlap'])}"
         f" alps_p4a_traffic={int(options['enableAlpsTrafficControl'])}"
         f" alps_vector_dae={int(options['enableAlpsDualThreadDae'])}"
+        f" alps_vdae_panel_tiles={options['alpsVdaePanelTiles']}"
         f" alps_fp16_hvx={int(options['enableAlpsFP16HVXArithmetic'])}"
     )
     return options

@@ -194,15 +194,17 @@ def Alps_ExactWeightKickOp : Alps_Op<"exact_weight_kick",
   let arguments = (ins Index:$context, Index:$value_version,
                        AnyMemRef:$src, AnyMemRef:$dest,
                        I32:$tile_row, I32:$tile_col, I32:$source_cols,
-                       I32:$weight_offset, I32:$stage_offset);
+                       I32:$weight_offset, I32:$stage_offset,
+                       I32:$panel_tiles);
   let results = (outs I1:$scheduled);
   let assemblyFormat = [{
     $context `,` $value_version `,` $src `,` $dest `,` $tile_row `,`
-    $tile_col `,` $source_cols `,` $weight_offset `,` $stage_offset
+    $tile_col `,` $source_cols `,` $weight_offset `,` $stage_offset `,`
+    $panel_tiles
     attr-dict `:` type($context) `,` type($value_version) `,`
     qualified(type($src)) `,` qualified(type($dest)) `,` type($tile_row) `,`
     type($tile_col) `,` type($source_cols) `,` type($weight_offset) `,`
-    type($stage_offset) `->` type($scheduled)
+    type($stage_offset) `,` type($panel_tiles) `->` type($scheduled)
   }];
 }
 

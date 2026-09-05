@@ -55,6 +55,7 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
   DecomposeHexKLMatmul(MLIRContext *ctx, bool enableWeightPrepack,
                        bool enableVtcmLifetimeColoring,
                        bool enableDmaToVtcm, int exactWeightLookahead,
+                       int exactWeightPanelTiles,
                        bool enableDirectOutputFormation,
                        bool enableF16BiasEpilogueFormation,
                        bool enableAsyncDrain, Value sharedVtcm)
@@ -62,6 +63,7 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
         enableVtcmLifetimeColoring(enableVtcmLifetimeColoring),
         enableDmaToVtcm(enableDmaToVtcm),
         exactWeightLookahead(std::clamp(exactWeightLookahead, 1, 7)),
+        exactWeightPanelTiles(std::clamp(exactWeightPanelTiles, 1, 8)),
         enableDirectOutputFormation(enableDirectOutputFormation),
         enableF16BiasEpilogueFormation(enableF16BiasEpilogueFormation),
         enableAsyncDrain(enableAsyncDrain),
@@ -71,6 +73,7 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
   bool enableVtcmLifetimeColoring;
   bool enableDmaToVtcm;
   int exactWeightLookahead;
+  int exactWeightPanelTiles;
   bool enableDirectOutputFormation;
   bool enableF16BiasEpilogueFormation;
   bool enableAsyncDrain;
@@ -331,7 +334,8 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
     //             WH for one column stays in VTCM; RmToWh once per (col,kt).
     Value twoKTiles = rewriter.create<arith::MulIOp>(
         loc, kTiles, rewriter.create<arith::ConstantIndexOp>(loc, 2));
-    const int weightSlotCount = exactWeightLookahead + 1;
+    const int weightPanelSlotCount = exactWeightLookahead + 1;
+    const int weightSlotCount = weightPanelSlotCount * exactWeightPanelTiles;
     Value vtcmTiles;
     if (enableVtcmLifetimeColoring && enableWeightPrepack) {
       // [0,K): AH, [K,2K): persistent WH. One scratch tile at 2K is
@@ -598,10 +602,21 @@ struct DecomposeHexKLMatmul final : public OpRewritePattern<hexkl::MatmulOp> {
                           ValueRange) {
                         Value kt =
                             bbb.create<arith::IndexCastOp>(loc, i32Ty, ktIdx);
-                        Value slotCount = bbb.create<arith::ConstantIntOp>(
-                            loc, i32Ty, weightSlotCount);
-                        Value phase =
-                            bbb.create<arith::RemUIOp>(loc, kt, slotCount);
+                        Value panelTiles = bbb.create<arith::ConstantIntOp>(
+                            loc, i32Ty, exactWeightPanelTiles);
+                        Value panelSlotCount = bbb.create<arith::ConstantIntOp>(
+                            loc, i32Ty, weightPanelSlotCount);
+                        Value panel =
+                            bbb.create<arith::DivUIOp>(loc, kt, panelTiles);
+                        Value panelSlot = bbb.create<arith::RemUIOp>(
+                            loc, panel, panelSlotCount);
+                        Value panelLane =
+                            bbb.create<arith::RemUIOp>(loc, kt, panelTiles);
+                        Value phase = bbb.create<arith::AddIOp>(
+                            loc,
+                            bbb.create<arith::MulIOp>(loc, panelSlot,
+                                                     panelTiles),
+                            panelLane);
                         Value curW = bbb.create<arith::AddIOp>(
                             loc, wOff0,
                             bbb.create<arith::MulIOp>(loc, phase, i32_4096));
@@ -776,7 +791,8 @@ struct VtcmLiveRegion {
 /// 2=HMX consume, 3=accumulator readback, 4=result copy.
 static int64_t computeColoredVtcmTiles(int64_t kTiles, bool weightPrepack,
                                        bool dmaToVtcm,
-                                       int exactWeightLookahead) {
+                                       int exactWeightLookahead,
+                                       int exactWeightPanelTiles) {
   SmallVector<VtcmLiveRegion> regions;
   if (weightPrepack) {
     regions.push_back({kTiles, 0, 5}); // WH retained across all M rows
@@ -786,9 +802,11 @@ static int64_t computeColoredVtcmTiles(int64_t kTiles, bool weightPrepack,
     regions.push_back({kTiles, 0, 5}); // AH retained across all N columns
     regions.push_back({1, 0, 1});      // RM scratch, dead before WH
     regions.push_back(
-        {std::clamp(exactWeightLookahead, 1, 7) + 1, 1, 3}); // WH queue
+        {(std::clamp(exactWeightLookahead, 1, 7) + 1) *
+             std::clamp(exactWeightPanelTiles, 1, 8),
+         1, 3}); // WH panel queue
     if (dmaToVtcm)
-      regions.push_back({1, 1, 2});    // non-aliasing async DMA stage
+      regions.push_back({std::clamp(exactWeightPanelTiles, 1, 8), 1, 2});
   }
   regions.push_back({1, 3, 4}); // accumulator read tile
   regions.push_back({1, 3, 5}); // flat result tile; overlaps accumulator
@@ -827,7 +845,8 @@ static int64_t computeColoredVtcmTiles(int64_t kTiles, bool weightPrepack,
 static std::optional<int64_t>
 estimateVtcmBytes(hexkl::MatmulOp op, bool enableWeightPrepack,
                   bool enableVtcmLifetimeColoring, bool enableDmaToVtcm,
-                  bool enableAsyncDrain, int exactWeightLookahead) {
+                  bool enableAsyncDrain, int exactWeightLookahead,
+                  int exactWeightPanelTiles) {
   auto lhsType = dyn_cast<MemRefType>(op.getLhs().getType());
   if (!lhsType || !lhsType.hasStaticShape() || lhsType.getRank() != 2)
     return std::nullopt;
@@ -838,10 +857,13 @@ estimateVtcmBytes(hexkl::MatmulOp op, bool enableWeightPrepack,
   if (enableVtcmLifetimeColoring)
     return (computeColoredVtcmTiles(kTiles, enableWeightPrepack,
                                     enableDmaToVtcm,
-                                    exactWeightLookahead) +
+                                    exactWeightLookahead,
+                                    exactWeightPanelTiles) +
             (enableAsyncDrain ? 2 : 0)) *
            4096;
-  int64_t weightSlotCount = std::clamp(exactWeightLookahead, 1, 7) + 1;
+  int64_t weightSlotCount =
+      (std::clamp(exactWeightLookahead, 1, 7) + 1) *
+      std::clamp(exactWeightPanelTiles, 1, 8);
   int64_t defBytes = (kTiles * 2 + weightSlotCount + 5) * 4096;
   int64_t prepackBytes = (kTiles * 3 + 5) * 4096;
   return (enableWeightPrepack ? prepackBytes : defBytes) +
@@ -951,6 +973,7 @@ void populateDecomposeHexKLMatmulPatterns(RewritePatternSet &patterns,
                                           bool enableVtcmLifetimeColoring,
                                           bool enableDmaToVtcm,
                                           int exactWeightLookahead,
+                                          int exactWeightPanelTiles,
                                           bool enableDirectOutputFormation,
                                           bool enableF16BiasEpilogueFormation,
                                           bool enableAsyncDrain,
@@ -958,6 +981,7 @@ void populateDecomposeHexKLMatmulPatterns(RewritePatternSet &patterns,
   patterns.add<DecomposeHexKLMatmul>(
       patterns.getContext(), enableWeightPrepack,
       enableVtcmLifetimeColoring, enableDmaToVtcm, exactWeightLookahead,
+      exactWeightPanelTiles,
       enableDirectOutputFormation, enableF16BiasEpilogueFormation,
       enableAsyncDrain, sharedVtcm);
 }
@@ -1030,7 +1054,9 @@ struct DecomposeHexKLMatmulPass
       for (hexkl::MatmulOp op : matmuls) {
         auto bytes = estimateVtcmBytes(
             op, enableWeightPrepack, enableVtcmLifetimeColoring,
-            enableDmaToVtcm, enableAsyncDrain, exactWeightLookahead);
+            enableDmaToVtcm, enableAsyncDrain, exactWeightLookahead,
+            exactWeightPanelTiles);
+        // exact-weight panel staging is included in the same arena estimate.
         if (!bytes) {
           allStatic = false;
           break;
@@ -1064,11 +1090,13 @@ struct DecomposeHexKLMatmulPass
       auto legacy = estimateVtcmBytes(op, enableWeightPrepack,
                                       /*coloring=*/false,
                                       enableDmaToVtcm, enableAsyncDrain,
-                                      exactWeightLookahead);
+                                      exactWeightLookahead,
+                                      exactWeightPanelTiles);
       auto colored = estimateVtcmBytes(op, enableWeightPrepack,
                                        /*coloring=*/true,
                                        enableDmaToVtcm, enableAsyncDrain,
-                                       exactWeightLookahead);
+                                       exactWeightLookahead,
+                                       exactWeightPanelTiles);
       if (!legacy || !colored)
         return;
       legacyPeak = std::max(legacyPeak, *legacy);
@@ -1095,7 +1123,8 @@ struct DecomposeHexKLMatmulPass
 
     populateDecomposeHexKLMatmulPatterns(
         patterns, enableWeightPrepack, enableVtcmLifetimeColoring,
-        enableDmaToVtcm, exactWeightLookahead, enableDirectOutputFormation,
+        enableDmaToVtcm, exactWeightLookahead, exactWeightPanelTiles,
+        enableDirectOutputFormation,
         enableF16BiasEpilogueFormation, enableAsyncDrain, sharedVtcm);
     if (failed(applyPatternsGreedily(func, std::move(patterns)))) {
       return signalPassFailure();

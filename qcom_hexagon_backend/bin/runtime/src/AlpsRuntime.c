@@ -166,6 +166,7 @@ typedef struct {
   int32_t dma_credit_owned;
   int32_t scout_owned;
   int32_t source_is_wh;
+  int32_t panel_tiles;
 } AlpsExactDescriptor;
 
 typedef struct {
@@ -607,6 +608,11 @@ uint64_t __alps_descriptor_release_failures(void) {
 #define ALPS_WH_CACHE_SLOTS 2048
 #define ALPS_WH_CACHE_PROBES 8
 #define ALPS_WH_TILE_BYTES 4096
+#define ALPS_EXACT_MAX_PANEL_TILES 8
+/* BEiT's largest single-layer K-panel x N-tile working set is 288 entries.
+ * Keep one bounded power-of-two cache large enough for that layer without
+ * retaining the complete model's formed weights. */
+#define ALPS_WH_PANEL_CACHE_SLOTS 512
 
 typedef struct {
   uint64_t context;
@@ -622,6 +628,22 @@ typedef struct {
 } AlpsWhCacheEntry;
 
 static AlpsWhCacheEntry alps_wh_cache[ALPS_WH_CACHE_SLOTS];
+typedef struct {
+  uint64_t context;
+  uint32_t generation;
+  uint32_t epoch;
+  const void *source;
+  int32_t tile_row;
+  int32_t tile_col;
+  int32_t source_cols;
+  int32_t site_id;
+  int32_t panel_tiles;
+  volatile int valid;
+  unsigned char data[ALPS_EXACT_MAX_PANEL_TILES * ALPS_WH_TILE_BYTES]
+      __attribute__((aligned(128)));
+} AlpsWhPanelCacheEntry;
+static AlpsWhPanelCacheEntry
+    alps_wh_panel_cache[ALPS_WH_PANEL_CACHE_SLOTS];
 static uint64_t alps_wh_context = 0;
 static uint32_t alps_wh_generation = 0;
 static uint32_t alps_wh_epoch = 1;
@@ -876,6 +898,12 @@ void __alps_wh_cache_invalidate(uint64_t context, uint32_t generation) {
         alps_wh_cache[i].generation == generation)
       __atomic_store_n(&alps_wh_cache[i].valid, 0, __ATOMIC_RELEASE);
   }
+  for (int i = 0; i < ALPS_WH_PANEL_CACHE_SLOTS; ++i) {
+    if (__atomic_load_n(&alps_wh_panel_cache[i].valid, __ATOMIC_ACQUIRE) &&
+        alps_wh_panel_cache[i].context == context &&
+        alps_wh_panel_cache[i].generation == generation)
+      __atomic_store_n(&alps_wh_panel_cache[i].valid, 0, __ATOMIC_RELEASE);
+  }
 }
 
 uint64_t __alps_wh_cache_stats(void) {
@@ -933,6 +961,45 @@ alps_wh_cache_reserve(const void *source, int32_t tile_row, int32_t tile_col,
   entry->source_cols = source_cols;
   entry->site_id = site_id;
   return entry;
+}
+
+static AlpsWhPanelCacheEntry *alps_wh_panel_cache_find(
+    const void *source, int32_t tile_row, int32_t tile_col,
+    int32_t source_cols, int32_t site_id, int32_t panel_tiles,
+    int reserve) {
+  uint64_t context = __atomic_load_n(&alps_wh_context, __ATOMIC_ACQUIRE);
+  uint32_t generation = __atomic_load_n(&alps_wh_generation, __ATOMIC_ACQUIRE);
+  uint32_t epoch = __atomic_load_n(&alps_wh_epoch, __ATOMIC_ACQUIRE);
+  unsigned base = alps_wh_cache_hash(source, tile_row, tile_col, source_cols,
+                                     site_id, context, generation) &
+                  (ALPS_WH_PANEL_CACHE_SLOTS - 1);
+  AlpsWhPanelCacheEntry *victim = &alps_wh_panel_cache[base];
+  for (unsigned i = 0; i < ALPS_WH_CACHE_PROBES; ++i) {
+    AlpsWhPanelCacheEntry *entry =
+        &alps_wh_panel_cache[(base + i) & (ALPS_WH_PANEL_CACHE_SLOTS - 1)];
+    int valid = __atomic_load_n(&entry->valid, __ATOMIC_ACQUIRE);
+    if (valid && entry->context == context &&
+        entry->generation == generation && entry->epoch == epoch &&
+        entry->source == source && entry->tile_row == tile_row &&
+        entry->tile_col == tile_col && entry->source_cols == source_cols &&
+        entry->site_id == site_id && entry->panel_tiles == panel_tiles)
+      return entry;
+    if (!valid || entry->epoch != epoch)
+      victim = entry;
+  }
+  if (!reserve)
+    return NULL;
+  __atomic_store_n(&victim->valid, 0, __ATOMIC_RELEASE);
+  victim->context = context;
+  victim->generation = generation;
+  victim->epoch = epoch;
+  victim->source = source;
+  victim->tile_row = tile_row;
+  victim->tile_col = tile_col;
+  victim->source_cols = source_cols;
+  victim->site_id = site_id;
+  victim->panel_tiles = panel_tiles;
+  return victim;
 }
 
 /* Adaptive controller state (real closed loop; not a no-op).
@@ -1312,7 +1379,9 @@ static void alps_pack_weight_tile_to_stage(const _Float16 *src,
 
 /* P3b descriptor-owned staging.  Unlike alps_stage, a slot is addressed by
  * the exact descriptor and cannot be consumed through a process-global FIFO. */
-static uint16_t alps_exact_stage[ALPS_DESCRIPTOR_SLOTS][ALPS_STAGE_ELEMS];
+static uint16_t
+    alps_exact_stage[ALPS_DESCRIPTOR_SLOTS]
+                    [ALPS_STAGE_ELEMS * ALPS_EXACT_MAX_PANEL_TILES];
 
 static int64_t alps_pack_tile_identity(int32_t tile_row, int32_t tile_col) {
   return (int64_t)(((uint64_t)(uint32_t)tile_row << 32) | (uint32_t)tile_col);
@@ -1360,6 +1429,16 @@ static void alps_exact_sync_weight(const void *src, void *dest,
                                  src_cols, stage);
   hmx_weight_gather(stage, (char *)dest + weight_offset, 2, 32, 32);
 #endif
+}
+
+static void alps_exact_sync_weight_panel(const void *src, void *dest,
+                                         int32_t tile_row, int32_t tile_col,
+                                         int32_t src_cols,
+                                         int32_t weight_offset,
+                                         int32_t panel_tiles) {
+  for (int32_t lane = 0; lane < panel_tiles; ++lane)
+    alps_exact_sync_weight(src, dest, tile_row + lane, tile_col, src_cols,
+                           weight_offset + lane * ALPS_WH_TILE_BYTES);
 }
 
 static void alps_exact_complete_impl(void *descriptor_handle_as_ptr,
@@ -1414,25 +1493,43 @@ static void alps_exact_complete_impl(void *descriptor_handle_as_ptr,
   if (descriptor->source_is_wh) {
     /* Direct DDR-WH -> VTCM-WH DMA already formed the consumer layout. */
   } else if (stage) {
-    hexkl_micro_hmx_rm_to_wh_f16((uint8_t *)descriptor->dest,
-                                 (uint32_t)descriptor->weight_offset, stage, 0,
-                                 0, 32);
+    for (int32_t lane = 0; lane < descriptor->panel_tiles; ++lane)
+      hexkl_micro_hmx_rm_to_wh_f16(
+          (uint8_t *)descriptor->dest,
+          (uint32_t)(descriptor->weight_offset +
+                     lane * ALPS_WH_TILE_BYTES),
+          stage + (size_t)lane * ALPS_STAGE_ELEMS, 0, 0, 32);
   } else {
-    alps_exact_sync_weight(descriptor->src, descriptor->dest,
-                           descriptor->tile_row, descriptor->tile_col,
-                           descriptor->source_cols, descriptor->weight_offset);
+    alps_exact_sync_weight_panel(
+        descriptor->src, descriptor->dest, descriptor->tile_row,
+        descriptor->tile_col, descriptor->source_cols,
+        descriptor->weight_offset, descriptor->panel_tiles);
   }
 #else
   if (!descriptor->source_is_wh && stage)
-    hmx_weight_gather(
-        stage, (char *)descriptor->dest + descriptor->weight_offset, 2, 32, 32);
+    for (int32_t lane = 0; lane < descriptor->panel_tiles; ++lane)
+      hmx_weight_gather(stage + (size_t)lane * ALPS_STAGE_ELEMS,
+                        (char *)descriptor->dest + descriptor->weight_offset +
+                            lane * ALPS_WH_TILE_BYTES,
+                        2, 32, 32);
 #endif
-  if (descriptor->scout_owned && !descriptor->source_is_wh) {
+  if (descriptor->scout_owned && !descriptor->source_is_wh &&
+      descriptor->panel_tiles == 1) {
     AlpsWhCacheEntry *entry = alps_wh_cache_reserve(
         descriptor->src, descriptor->tile_row, descriptor->tile_col,
         descriptor->source_cols, (int32_t)descriptor->value_version);
     memcpy(entry->data, (char *)descriptor->dest + descriptor->weight_offset,
            ALPS_WH_TILE_BYTES);
+    if (entry->epoch == __atomic_load_n(&alps_wh_epoch, __ATOMIC_ACQUIRE))
+      __atomic_store_n(&entry->valid, 1, __ATOMIC_RELEASE);
+  } else if (descriptor->scout_owned && !descriptor->source_is_wh) {
+    AlpsWhPanelCacheEntry *entry = alps_wh_panel_cache_find(
+        descriptor->src, descriptor->tile_row, descriptor->tile_col,
+        descriptor->source_cols, (int32_t)descriptor->value_version,
+        descriptor->panel_tiles, /*reserve=*/1);
+    memcpy(entry->data,
+           (char *)descriptor->dest + descriptor->weight_offset,
+           (size_t)descriptor->panel_tiles * ALPS_WH_TILE_BYTES);
     if (entry->epoch == __atomic_load_n(&alps_wh_epoch, __ATOMIC_ACQUIRE))
       __atomic_store_n(&entry->valid, 1, __ATOMIC_RELEASE);
   }
@@ -1468,42 +1565,55 @@ static int alps_exact_start_transfer(int32_t descriptor_handle) {
   (void)context;
   unsigned flat = (unsigned)descriptor_handle % ALPS_DESCRIPTOR_SLOTS;
   AlpsWhCacheEntry *cached = NULL;
+  AlpsWhPanelCacheEntry *cached_panel = NULL;
   if (descriptor->scout_owned) {
-    cached = alps_wh_cache_lookup(
-        descriptor->src, descriptor->tile_row, descriptor->tile_col,
-        descriptor->source_cols, (int32_t)descriptor->value_version);
-    if (cached)
+    if (descriptor->panel_tiles == 1)
+      cached = alps_wh_cache_lookup(
+          descriptor->src, descriptor->tile_row, descriptor->tile_col,
+          descriptor->source_cols, (int32_t)descriptor->value_version);
+    else
+      cached_panel = alps_wh_panel_cache_find(
+          descriptor->src, descriptor->tile_row, descriptor->tile_col,
+          descriptor->source_cols, (int32_t)descriptor->value_version,
+          descriptor->panel_tiles, /*reserve=*/0);
+    if (cached || cached_panel)
       __atomic_fetch_add(&alps_exact_wh_cache_hits, 1, __ATOMIC_RELAXED);
     else
       __atomic_fetch_add(&alps_exact_wh_cache_misses, 1, __ATOMIC_RELAXED);
   }
-  const _Float16 *row0 = cached
-                            ? (const _Float16 *)cached->data
+  const _Float16 *row0 = (cached || cached_panel)
+                            ? (const _Float16 *)(cached_panel
+                                                     ? cached_panel->data
+                                                     : cached->data)
                             : (const _Float16 *)descriptor->src +
                                   (size_t)descriptor->tile_row * 32 *
                                       (size_t)descriptor->source_cols +
                                   (size_t)descriptor->tile_col * 32;
-  descriptor->source_is_wh = cached != NULL;
+  descriptor->source_is_wh = cached != NULL || cached_panel != NULL;
 #ifdef __hexagon__
   int status = ALPS_DMA_OK;
-  void *stage = cached
+  void *stage = (cached || cached_panel)
                     ? (void *)((char *)descriptor->dest +
                                descriptor->weight_offset)
                     : descriptor->stage_offset >= 0
                           ? (void *)((char *)descriptor->dest +
                                     descriptor->stage_offset)
                           : (void *)alps_exact_stage[flat];
-  int dstAS = cached || descriptor->stage_offset >= 0 ? ALPS_VTCM : ALPS_DDR;
+  int dstAS = (cached || cached_panel) || descriptor->stage_offset >= 0
+                  ? ALPS_VTCM
+                  : ALPS_DDR;
   uint64_t issue_start = __atomic_load_n(&alps_p4a_enabled, __ATOMIC_ACQUIRE)
                              ? alps_read_pcycles()
                              : 0;
-  if (cached) {
+  if (cached || cached_panel) {
     descriptor->dma_token = hexagon_runtime_dma_start(
-        (void *)row0, ALPS_DDR, stage, dstAS, ALPS_WH_TILE_BYTES,
+        (void *)row0, ALPS_DDR, stage, dstAS,
+        (uint32_t)descriptor->panel_tiles * ALPS_WH_TILE_BYTES,
         /*bypassSrc=*/0, /*bypassDst=*/0, &status);
   } else {
     descriptor->dma_token = hexagon_runtime_dma2d_start(
-        (void *)row0, ALPS_DDR, stage, dstAS, /*width=*/64, /*height=*/32,
+        (void *)row0, ALPS_DDR, stage, dstAS, /*width=*/64,
+        /*height=*/32 * descriptor->panel_tiles,
         (uint32_t)descriptor->source_cols * 2u, /*dstStride=*/64,
         /*bypassSrc=*/0, /*bypassDst=*/0, /*isOrdered=*/0,
         /*cacheAllocationPolicy=*/0, &status);
@@ -1514,9 +1624,10 @@ static int alps_exact_start_transfer(int32_t descriptor_handle) {
   if (status != ALPS_DMA_OK) {
     descriptor->dma_credit_owned = 0;
     __atomic_store_n(&alps_exact_dma_credit, 0, __ATOMIC_RELEASE);
-    alps_exact_sync_weight(descriptor->src, descriptor->dest,
-                           descriptor->tile_row, descriptor->tile_col,
-                           descriptor->source_cols, descriptor->weight_offset);
+    alps_exact_sync_weight_panel(
+        descriptor->src, descriptor->dest, descriptor->tile_row,
+        descriptor->tile_col, descriptor->source_cols,
+        descriptor->weight_offset, descriptor->panel_tiles);
     descriptor->dma_token = 0;
     __alps_descriptor_transition(
         descriptor_handle, ALPS_DESC_LOAD_PENDING, ALPS_DESC_LAYOUT_PENDING);
@@ -1528,15 +1639,17 @@ static int alps_exact_start_transfer(int32_t descriptor_handle) {
   /* Token zero is valid; status reports whether the descriptor was issued. */
   descriptor->dma_active = 1;
 #else
-  if (cached)
-    memcpy((char *)descriptor->dest + descriptor->weight_offset, cached->data,
-           ALPS_WH_TILE_BYTES);
+  if (cached || cached_panel)
+    memcpy((char *)descriptor->dest + descriptor->weight_offset,
+           cached_panel ? cached_panel->data : cached->data,
+           (size_t)descriptor->panel_tiles * ALPS_WH_TILE_BYTES);
   else
-    alps_pack_weight_tile_to_stage((const _Float16 *)descriptor->src,
-                                   descriptor->tile_row,
-                                   descriptor->tile_col,
-                                   descriptor->source_cols,
-                                   alps_exact_stage[flat]);
+    for (int32_t lane = 0; lane < descriptor->panel_tiles; ++lane)
+      alps_pack_weight_tile_to_stage(
+          (const _Float16 *)descriptor->src,
+          descriptor->tile_row + lane, descriptor->tile_col,
+          descriptor->source_cols,
+          alps_exact_stage[flat] + (size_t)lane * ALPS_STAGE_ELEMS);
 #endif
   __atomic_thread_fence(__ATOMIC_RELEASE);
   __atomic_fetch_add(&alps_exact_dma_kicks, 1, __ATOMIC_RELAXED);
@@ -1555,9 +1668,11 @@ int32_t __alps_exact_weight_kick(int32_t context_handle,
                                        void *dest, int32_t tile_row,
                                        int32_t tile_col, int32_t src_cols,
                                        int32_t weight_offset,
-                                       int32_t stage_offset) {
+                                       int32_t stage_offset,
+                                       int32_t panel_tiles) {
   if (!src || !dest || tile_row < 0 || tile_col < 0 || src_cols <= 0 ||
-      weight_offset < 0)
+      weight_offset < 0 || panel_tiles <= 0 ||
+      panel_tiles > ALPS_EXACT_MAX_PANEL_TILES)
     return 0;
   int64_t tile = alps_pack_tile_identity(tile_row, tile_col);
   int32_t descriptor_handle =
@@ -1567,8 +1682,8 @@ int32_t __alps_exact_weight_kick(int32_t context_handle,
   AlpsExactDescriptor *descriptor;
   if (descriptor_handle < 0 ||
       !alps_decode_descriptor(descriptor_handle, &context, &descriptor)) {
-    alps_exact_sync_weight(src, dest, tile_row, tile_col, src_cols,
-                           weight_offset);
+    alps_exact_sync_weight_panel(src, dest, tile_row, tile_col, src_cols,
+                                 weight_offset, panel_tiles);
     __atomic_fetch_add(&alps_exact_sync_fallbacks, 1, __ATOMIC_RELAXED);
     return 0;
   }
@@ -1587,10 +1702,11 @@ int32_t __alps_exact_weight_kick(int32_t context_handle,
   descriptor->dma_credit_owned = 0;
   descriptor->scout_owned = 0;
   descriptor->source_is_wh = 0;
+  descriptor->panel_tiles = panel_tiles;
 
   if (!__alps_p4a_request_allowed()) {
-    alps_exact_sync_weight(src, dest, tile_row, tile_col, src_cols,
-                           weight_offset);
+    alps_exact_sync_weight_panel(src, dest, tile_row, tile_col, src_cols,
+                                 weight_offset, panel_tiles);
     __alps_descriptor_transition(
         descriptor_handle, ALPS_DESC_LOAD_PENDING, ALPS_DESC_LAYOUT_PENDING);
     __alps_descriptor_transition(
@@ -1618,8 +1734,8 @@ int32_t __alps_exact_weight_kick(int32_t context_handle,
     /* Preserve the exact descriptor lifecycle even when the one DMA credit is
      * busy.  The fallback produces the demanded WH tile synchronously and
      * publishes READY, so consume/release counters still close exactly. */
-    alps_exact_sync_weight(src, dest, tile_row, tile_col, src_cols,
-                           weight_offset);
+    alps_exact_sync_weight_panel(src, dest, tile_row, tile_col, src_cols,
+                                 weight_offset, panel_tiles);
     __alps_descriptor_transition(
         descriptor_handle, ALPS_DESC_LOAD_PENDING, ALPS_DESC_LAYOUT_PENDING);
     __alps_descriptor_transition(
@@ -1653,7 +1769,8 @@ int32_t __alps_exact_weight_consume(int32_t context_handle,
   if (descriptor->scout_owned && initial_state == ALPS_DESC_READY) {
     __atomic_fetch_add(&alps_exact_ready_before_consume, 1,
                        __ATOMIC_RELAXED);
-    __atomic_fetch_add(&alps_exact_ready_before_consume_bytes, 2048,
+    __atomic_fetch_add(&alps_exact_ready_before_consume_bytes,
+                       (uint64_t)descriptor->panel_tiles * 2048,
                        __ATOMIC_RELAXED);
   }
   int spins = 0;

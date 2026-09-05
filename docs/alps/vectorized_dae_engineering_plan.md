@@ -347,3 +347,116 @@ generated from the preceding matched latency/sysMon summaries; its
 When admitted, the fast completion controller may still throttle and probe
 within that invocation.  When rejected, no residual descriptor machinery is
 emitted.  The policy is contract-driven and contains no model-name condition.
+
+## 10. Theoretical break-even gate and BEiT falsification (2026-09-04)
+
+Selecting a model with more residual bytes is not sufficient to make V-DAE
+profitable.  For a residual stream, the incremental condition is
+
+```text
+native residual critical-path cost
+  > descriptor + queue + DMA setup + token cost
+    + uncovered Access latency + Access/Execute interference
+    + VTCM opportunity cost.
+```
+
+The uncovered term is `max(0, Access service time - independent Execute
+slack)`.  Larger byte volume helps only when it is carried by sufficiently
+coarse requests and the consumer supplies enough independent work.  A scalar-
+dominated model, a residual outside the critical path, or many 2 KiB requests
+cannot pass this inequality merely by increasing total bytes.
+
+BEiT-Base was selected as the strongest existing-corpus test of the opposite
+hypothesis.  Unlike DINO/ViT/DeiT, its topology admission reports a residual
+contract.  Its earlier sysMon run showed 46.69% HVX/HMX-active samples and
+3.54 GB AXI traffic, and its independent asynchronous HMX drain had produced a
+6.46% gain.  Nevertheless, the current exact-weight V-DAE failed the matched
+incremental gate:
+
+| BEiT-Base configuration | Latency (ms) | Relative to formation |
+|---|---:|---:|
+| Full consumer-ready formation | 9,218.58 | 1.00x |
+| Formation + residual V-DAE | 21,270.46 | 0.43x |
+| Formation + V-DAE + fast admission | 13,210.59 | 0.70x |
+
+The unregulated path generated 544,320 2 KiB requests.  Only 13,273 (2.44%)
+were ready before demand; the cache hit rate was 42.00%, and Execute accumulated
+23,712,353,984 wait cycles.  Fast admission suppressed 388,524 requests and
+improved the V-DAE configuration by 1.61x, but synchronous exact-descriptor
+fallback still could not match native formation.  The next invocation should
+therefore reject this contract and use the native path, as demonstrated for
+DINO in Section 9.
+
+Together, DINO and BEiT falsify model selection as a repair for the current
+implementation.  DINO is a favorable cache-reuse case but formation has already
+removed the dominant obligation.  BEiT retains a residual stream, but its
+larger matrices overflow the effective formed-tile working set and make Access
+fall behind even more severely.  No additional complete model should be tried
+with the same 2 KiB schedule.
+
+Before the next model experiment, the Access program must operate on a formed
+panel/supertile rather than one HMX micro-tile: form once, issue one contiguous
+DMA for multiple WH tiles, and publish one bounded token covering that panel.
+The compiler must estimate bytes per descriptor and Access-service/Execute-
+slack ratio, rejecting a site before descriptor lowering when the estimate
+cannot amortize fixed cost.  Queue depth is tuned only after Access throughput
+exceeds consumption throughput.  DINO and BEiT remain the first positive and
+negative structural checks after that redesign; if neither beats its matched
+formation-only control, exact-weight V-DAE should not be claimed as an ALPS
+latency component.
+
+## 11. Panelized Access and the V-DAE break-even result (2026-09-04)
+
+The redesign prescribed above is now implemented without changing the ALPS
+algorithmic boundary.  An Access descriptor covers a panel of four or eight
+consecutive HMX weight tiles.  Scalar/scout code issues one two-dimensional DMA,
+forms the panel into the consumer-ready WH representation, and publishes one
+ready token.  Execute consumes and releases that token at the panel boundary.
+The compiler reserves a bounded `(lookahead + 1) * panel_tiles` VTCM queue and
+rejects loops too short to amortize a panel.  Thus this is a coarser realization
+of the same decoupled Access--Execute contract, not a model-specific compute
+optimization.
+
+The table reports complete-model, one-iteration measurements.  All compared
+V-DAE configurations include the same consumer-driven formation base and pass
+the existing numerical check.
+
+| Model and V-DAE configuration | Latency (ms) | Descriptors | Ready before demand | Execute wait cycles |
+|---|---:|---:|---:|---:|
+| DINOv2, formation only | 3,391.19 | 0 | -- | -- |
+| DINOv2, original 2 KiB descriptor | 4,921.67 | 163,296 | 12.0% | 3,150,000,000 |
+| DINOv2, 8-tile panel | 3,582.52 | 5,184 | 49.42% | 649,159,789 |
+| BEiT, formation only | 9,218.58 | 0 | -- | -- |
+| BEiT, original 2 KiB descriptor | 21,270.46 | 544,320 | 2.44% | 23,712,353,984 |
+| BEiT, 8-tile panel, 256-entry formed-panel cache | 11,681.02 | 36,288 | 34.16% | 8,899,316,669 |
+| BEiT, 8-tile panel, 512-entry formed-panel cache | 9,766.29 | 36,288 | 40.56% | 6,084,215,703 |
+| BEiT, 8-tile panel, 512 entries + runtime admission | 9,377.41 | 36,288 | 47.80% of issued | 1,158,531,899 |
+
+Panelization removes 96.83% of DINO's descriptors and reduces its latency by
+37.38% relative to the original per-tile V-DAE.  It nevertheless remains 5.64%
+slower than formation alone.  BEiT exposes the other limiting factor: its
+largest layer has roughly 288 live formed panels, so the initial 256-entry
+cache thrashed.  A bounded 512-entry cache reduces latency by another 16.39%
+relative to that run and makes the panelized path 2.18x faster than the original
+V-DAE.  Runtime admission then suppresses 30,119 of 36,288 requests and lowers
+latency by a further 3.98%.  The final path is only 1.72% slower than formation,
+but it still does not cross the incremental break-even condition.
+
+This result is useful precisely because it separates mechanism from claim.
+Coarsening Access, retaining consumer-ready panels, and runtime admission all
+work in the predicted direction; correctness and descriptor lifecycle counters
+close.  However, after consumer-driven formation removes the dominant movement,
+the remaining exact-weight stream on both DINO and BEiT lacks enough independent
+Execute slack to repay even the reduced Access cost.  ALPS should therefore
+admit formation and reject this V-DAE contract for these two shapes.  The paper
+must not report exact-weight V-DAE as an independent latency win on this
+evidence.  V-DAE remains the architecture used for residual transfers that pass
+the break-even contract, while the measured rejection is the intended role of
+runtime traffic admission.
+
+The experiment remains on the paper's original path: consumer-ready in-situ
+formation, asynchronous residual supply through a bounded VTCM queue, and
+runtime admission.  It introduces no mixed precision, model-name policy, or
+unrelated arithmetic shortcut.  The 512-entry formed-panel cache is a bounded
+16 MiB DDR structure and must be accounted for explicitly if retained; it is
+not VTCM capacity and is not treated as a free resource.

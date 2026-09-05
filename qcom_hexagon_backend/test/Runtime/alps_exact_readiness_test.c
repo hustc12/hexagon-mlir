@@ -22,7 +22,7 @@ uint64_t __alps_descriptor_release_failures(void);
 int32_t __alps_exact_weight_kick(
     int32_t context, int64_t version, const void *src, void *dest,
     int32_t tile_row, int32_t tile_col, int32_t source_cols,
-    int32_t weight_offset, int32_t stage_offset);
+    int32_t weight_offset, int32_t stage_offset, int32_t panel_tiles);
 int32_t __alps_exact_weight_consume(int32_t context, int64_t version,
                                           int32_t tile_row,
                                           int32_t tile_col);
@@ -92,14 +92,14 @@ int main(void) {
       !__alps_invocation_end(next_context))
     return 5;
 
-  uint16_t weight[64 * 64];
-  unsigned char wh[4096];
-  for (int i = 0; i < 64 * 64; ++i)
+  uint16_t weight[160 * 64];
+  unsigned char wh[4 * 4096];
+  for (int i = 0; i < 160 * 64; ++i)
     weight[i] = (uint16_t)(i + 1);
   int32_t exact_context = __alps_invocation_begin();
   __alps_set_dual_thread_dae(1);
   if (!__alps_exact_weight_kick(exact_context, 19, weight, wh, 1, 0,
-                                      64, 0, -1) ||
+                                      64, 0, -1, 1) ||
       !__alps_exact_weight_consume(exact_context, 19, 1, 0) ||
       !__alps_exact_weight_release(exact_context, 19, 1, 0) ||
       !__alps_invocation_end(exact_context))
@@ -109,11 +109,28 @@ int main(void) {
   // Reusing the same immutable source/version should supply WH directly.
   int32_t warm_context = __alps_invocation_begin();
   if (!__alps_exact_weight_kick(warm_context, 19, weight, wh, 1, 0, 64, 0,
-                                -1) ||
+                                -1, 1) ||
       !__alps_exact_weight_consume(warm_context, 19, 1, 0) ||
       !__alps_exact_weight_release(warm_context, 19, 1, 0) ||
       !__alps_invocation_end(warm_context))
     return 11;
+
+  // One descriptor/token covers the complete four-tile panel, and the second
+  // invocation must reuse that exact consumer-ready panel.
+  int32_t panel_context = __alps_invocation_begin();
+  if (!__alps_exact_weight_kick(panel_context, 23, weight, wh, 1, 0, 64, 0,
+                                -1, 4) ||
+      !__alps_exact_weight_consume(panel_context, 23, 1, 0) ||
+      !__alps_exact_weight_release(panel_context, 23, 1, 0) ||
+      !__alps_invocation_end(panel_context))
+    return 12;
+  int32_t warm_panel_context = __alps_invocation_begin();
+  if (!__alps_exact_weight_kick(warm_panel_context, 23, weight, wh, 1, 0, 64,
+                                0, -1, 4) ||
+      !__alps_exact_weight_consume(warm_panel_context, 23, 1, 0) ||
+      !__alps_exact_weight_release(warm_panel_context, 23, 1, 0) ||
+      !__alps_invocation_end(warm_panel_context))
+    return 13;
 
   uint64_t counts = __alps_descriptor_counts();
   uint64_t release_failures = __alps_descriptor_release_failures();
@@ -131,13 +148,13 @@ int main(void) {
           (unsigned long long)__alps_exact_vdae_ready_bytes(),
           (unsigned long long)__alps_exact_vdae_wait_cycles(),
           (unsigned long long)cache, errors);
-  if ((uint32_t)(counts >> 32) != 3 || (uint32_t)counts != 3 ||
-      (uint32_t)(release_failures >> 32) != 3 ||
+  if ((uint32_t)(counts >> 32) != 5 || (uint32_t)counts != 5 ||
+      (uint32_t)(release_failures >> 32) != 5 ||
       (uint32_t)release_failures < 2 ||
-      (uint32_t)(dma >> 32) != 2 || (uint32_t)dma != 2 ||
-      control != 0 || (uint32_t)(vdae >> 32) != 2 ||
-      (uint32_t)vdae != 2 || __alps_exact_vdae_ready_bytes() != 4096 ||
-      (uint32_t)(cache >> 32) != 1 || (uint32_t)cache != 1 ||
+      (uint32_t)(dma >> 32) != 4 || (uint32_t)dma != 4 ||
+      control != 0 || (uint32_t)(vdae >> 32) != 4 ||
+      (uint32_t)vdae != 4 || __alps_exact_vdae_ready_bytes() != 20480 ||
+      (uint32_t)(cache >> 32) != 2 || (uint32_t)cache != 2 ||
       __alps_exact_vdae_wait_cycles() != 0 || errors == 0)
     return 7;
   puts("ALPS exact-readiness contract: PASS");

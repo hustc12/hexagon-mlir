@@ -1024,6 +1024,8 @@ public:
           enableAlpsDualThreadDae
               ? std::clamp(static_cast<int>(alpsLookahead), 1, 7)
               : 1;
+      decomposeOptions.exactWeightPanelTiles =
+          std::clamp(static_cast<int>(alpsVdaePanelTiles), 1, 8);
       decomposeOptions.enableDirectOutputFormation =
           enableAlpsHmxDirectOutputFormation;
       decomposeOptions.enableF16BiasEpilogueFormation =
@@ -1091,6 +1093,9 @@ public:
         admissionOptions.pageBytes = alpsLedgerPageBytes;
         admissionOptions.vtcmBudgetBytes = alpsLedgerVtcmBudgetBytes;
         if (alpsExactOverlap) {
+          // Admission sees one source tile before PrefetchInsert groups
+          // adjacent tiles into a panel, so retain the per-tile legality
+          // threshold here; the panel amortization gate runs afterwards.
           admissionOptions.minDmaBytes = 2048;
           admissionOptions.enableP3ExactReadiness = true;
         }
@@ -1136,6 +1141,8 @@ public:
           enableAlpsFusedTransformTransfer;
       prefetchOptions.requireAlpsAdmission = alpsMinimalStaticAdmission;
       prefetchOptions.enableAlpsExactOverlap = alpsExactOverlap;
+      prefetchOptions.exactWeightPanelTiles =
+          std::clamp(static_cast<int>(alpsVdaePanelTiles), 1, 8);
       prefetchOptions.kvCachePageTokens = alpsKvCachePageTokens;
       pm.addNestedPass<func::FuncOp>(
           hexagon::createPrefetchInsertPass(prefetchOptions));
