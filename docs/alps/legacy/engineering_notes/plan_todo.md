@@ -283,5 +283,4 @@ Debug write-up: `benchmark_models/QWEN_HEXKL_EXIT13_DEBUG.md`. Full 24L host com
 3. Attention path matters more at longer seq; HexKL-safe batch matmul / fused attn.
 4. HexKL micro (`HEXKL_DIR`): RmToWh/Copy beyond ALPS; vectorization Bad VA.
 
-**Topology status:** main GPT-2=12L (**full 3-way timed**); NaN is numerical not crash. Shared helpers: `benchmark_models/hexkl_utils.py`. Status doc: `benchmark_models/PHASE4_STATUS_AND_ALPS.md`.
-
+**Topology status:** main GPT-2=12L (**full 3-way timed**); NaN is numerical not crash. Shared helpers remain in the benchmark-models tree. Status doc: `../benchmark_models/PHASE4_STATUS_AND_ALPS.md`.

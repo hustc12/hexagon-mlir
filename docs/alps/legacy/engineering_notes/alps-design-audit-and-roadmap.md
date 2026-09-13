@@ -363,7 +363,7 @@ log reports `hexkl_func=0`: the current attention-like guard (`K == M` or
 
 Further performance validation no longer uses GEMM microbenchmarks. The detailed
 Prefetch plus in-situ reshape innovation plan and first Falcon model result are
-recorded in `docs/alps-prefetch-insitu-innovation.md`.
+recorded in `alps-prefetch-insitu-innovation.md`.
 
 The reusable model ablation entry point is:
 

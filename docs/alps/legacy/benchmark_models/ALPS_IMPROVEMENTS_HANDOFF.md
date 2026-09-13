@@ -3,7 +3,7 @@
 > 目的：记录"Alps 可改进之处"四项改进(#1/#2/#3/#4)的**当前实现状态、精确代码位置、
 > 待做项设计、构建绕过方法、设备验证步骤**，供任何人直接接手。
 > 生成时间上下文：device adb `49d1c7b2`，venv `/home/huzq85/2-working/hexagon_npu/mlir-env`。
-> 相关既有文档：`benchmark_models/ALPS_ANALYSIS_AND_ROADMAP.md`、`plan_todo.md`。
+> 相关既有文档：`ALPS_ANALYSIS_AND_ROADMAP.md`、`../engineering_notes/plan_todo.md`。
 
 ---
 

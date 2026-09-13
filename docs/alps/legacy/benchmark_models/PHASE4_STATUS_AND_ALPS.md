@@ -412,8 +412,8 @@ All listed rows: device Pass + Top-1 (2L).
 ## 8. Related living docs
 
 - **Build / install (authoritative):** `docs/user-guide.md`, `scripts/script_release/setup/build_hexagon_mlir.sh`, `scripts/script_release/setup/build_triton.sh`, `scripts/script_release/setup/set_local_env.sh`
-- Living checklist / results table: `plan_todo.md`
-- Alps analysis / roadmap: `benchmark_models/ALPS_ANALYSIS_AND_ROADMAP.md`
-- Alps handoff: `benchmark_models/ALPS_IMPROVEMENTS_HANDOFF.md`
-- Qwen HexKL exit-13 write-up: `benchmark_models/debug_running/QWEN_HEXKL_EXIT13_DEBUG.md`
+- Living checklist / results table: `../engineering_notes/plan_todo.md`
+- Alps analysis / roadmap: `ALPS_ANALYSIS_AND_ROADMAP.md`
+- Alps handoff: `ALPS_IMPROVEMENTS_HANDOFF.md`
+- Qwen HexKL exit-13 write-up: `QWEN_HEXKL_EXIT13_DEBUG.md`
 - Debug runners README: `benchmark_models/debug_running/README.md`

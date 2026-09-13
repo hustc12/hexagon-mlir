@@ -3,9 +3,9 @@
 > 状态快照：2026-08-07，`baseline_5` 分支。
 >
 > 本文不是新的功能清单，而是对 Alps 到目前为止的设计、实现、实验和方向修正做一次因果审计。主要依据是
-> [创新设计文档](docs/alps-prefetch-insitu-innovation.md)、
+> [创新设计文档](alps-prefetch-insitu-innovation.md)、
 > [工程排障记录](Engineering_work.md)、
-> [两个独立预取 baseline 的记录](docs/hexagon-prefetch-baselines-plan.md)、
+> [两个独立预取 baseline 的记录](hexagon-prefetch-baselines-plan.md)、
 > 仓库提交历史，以及仓库根目录中的两份 Hexagon V73 手册。
 
 ## 1. 先给结论：我们不是没有方向，而是曾经使用了不一致的基线
