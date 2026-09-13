@@ -10,5 +10,14 @@ ALPS implementation:
 - `references/`: the V73 architecture manuals used by the design analysis.
 
 Historical plans, intermediate hypotheses, and superseded engineering reports
-are preserved under `../../archive/engineering_notes/` and are intentionally
-excluded from the public reproduction workflow.
+are preserved under `legacy/` and are intentionally excluded from the public
+reproduction workflow. The legacy tree contains material formerly scattered
+under `benchmark_models/` and `archive/`.
+
+The main historical references are:
+
+- `legacy/engineering_notes/alps-prefetch-insitu-innovation.md`;
+- `legacy/engineering_notes/alps-design-audit-and-roadmap.md`;
+- `legacy/engineering_notes/alps_history.md`;
+- `legacy/benchmark_models/ALPS_ANALYSIS_AND_ROADMAP.md`; and
+- `legacy/benchmark_models/ALPS_IMPROVEMENTS_HANDOFF.md`.

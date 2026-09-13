@@ -786,9 +786,9 @@ online/fused compute
 - `qcom_hexagon_backend/lib/Conversion/LinalgToLLVM/FusionPass.cpp`
 - `qcom_hexagon_backend/lib/Conversion/LinalgToLLVM/LinalgToLLVMPass.cpp`
 - `qcom_hexagon_backend/include/hexagon/Dialect/Alps/IR/AlpsOps.td`
-- `../../archive/engineering_notes/engineering_work.md`
-- `../../archive/engineering_notes/alps_history.md`
-- `../../archive/engineering_notes/alps-prefetch-insitu-innovation.md`
+- `legacy/engineering_notes/engineering_work.md`
+- `legacy/engineering_notes/alps_history.md`
+- `legacy/engineering_notes/alps-prefetch-insitu-innovation.md`
 
 ### V73 手册
 

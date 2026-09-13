@@ -190,7 +190,7 @@ Fault PC   : ... _mlir_ciface_GPT2LogitsWrapper+0x14
 
 ## Related results log
 
-See `plan_todo.md` Phase 4 / Results table (HVX vs HexKL vs HexKL+ALPS for Qwen tiny and GPT-2).
+See `../engineering_notes/plan_todo.md` Phase 4 / Results table (HVX vs HexKL vs HexKL+ALPS for Qwen tiny and GPT-2).
 
 ### Fresh 3-way (2026-07-23, `python benchmark_models/debug_running/run_qwen2.5-0.5b_debug.py`, seq=32, tiny debug)
 

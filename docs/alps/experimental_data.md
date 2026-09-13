@@ -33,13 +33,13 @@ project.
 
 Primary sources:
 
-- `../../archive/engineering_notes/plan_todo.md`
-- `benchmark_models/PHASE4_STATUS_AND_ALPS.md`
-- `benchmark_models/debug_running/QWEN_HEXKL_EXIT13_DEBUG.md`
-- `../../archive/engineering_notes/alps-prefetch-insitu-innovation.md`
-- `../../archive/engineering_notes/engineering_work.md`
-- `../../archive/engineering_notes/alps_history.md`
-- `../../archive/engineering_notes/hexagon-prefetch-baselines-plan.md`
+- `legacy/engineering_notes/plan_todo.md`
+- `legacy/benchmark_models/PHASE4_STATUS_AND_ALPS.md`
+- `legacy/benchmark_models/QWEN_HEXKL_EXIT13_DEBUG.md`
+- `legacy/engineering_notes/alps-prefetch-insitu-innovation.md`
+- `legacy/engineering_notes/engineering_work.md`
+- `legacy/engineering_notes/alps_history.md`
+- `legacy/engineering_notes/hexagon-prefetch-baselines-plan.md`
 
 The generic user guides and `benchmark_models/micro_bench/*` documentation
 contain commands, expected performance ranges, or placeholder `Perf: xxxx`
@@ -222,8 +222,8 @@ had vectorization disabled. They must not be mixed with the true-HVX data from
 | GEMM `256^3` FP16 | HexKL + ALPS, idle synchronous fill | 15.731 | Pass; slower. |
 | GEMM `256^3` FP16 | HexKL + ALPS, layout on + async L2 | **13.745** | Pass; about 3% over ~14.2-ms HexKL. |
 
-Source: `../../archive/engineering_notes/plan_todo.md`, results log; duplicated summaries in
-`benchmark_models/PHASE4_STATUS_AND_ALPS.md` and the Qwen exit-13 notes.
+Source: `legacy/engineering_notes/plan_todo.md`, results log; duplicated summaries in
+`legacy/benchmark_models/PHASE4_STATUS_AND_ALPS.md` and the Qwen exit-13 notes.
 
 ### 2026-07-24 — resumed GEMM and GPT-2 variants
 
@@ -236,7 +236,7 @@ Source: `../../archive/engineering_notes/plan_todo.md`, results log; duplicated 
 | GEMM `64x128x256` | ALPS dma2d + WH-on-signal | 4.701 | Pass. |
 | GEMM `64x128x256` | ALPS DMA-to-VTCM stage | 9.420 | Pass; about 2x slower than DDR staging. |
 
-Source: `../../archive/engineering_notes/plan_todo.md`.
+Source: `legacy/engineering_notes/plan_todo.md`.
 
 ### 2026-07-25 — GPT-2 Debug snapshot
 
@@ -252,7 +252,7 @@ for a 2-layer Debug model and should not replace the matched 2026-07-23 rows.
 | ALPS + inter-layer | 322,600 | NA |
 | Attention-HMX | 314,200 | NA |
 
-Source: `benchmark_models/PHASE4_STATUS_AND_ALPS.md`, section 7.7.
+Source: `legacy/benchmark_models/PHASE4_STATUS_AND_ALPS.md`, section 7.7.
 
 ### 2026-07-26 — Falcon Debug cost-model screen
 
@@ -260,7 +260,7 @@ Source: `benchmark_models/PHASE4_STATUS_AND_ALPS.md`, section 7.7.
 |---|---:|---:|---:|---|
 | Falcon Debug, 2L, hidden 64, vocab 4096, seq 128 | 1,693.275 | 1,689.758 | 1,701.922 | All top-1 match; max abs 0.0239. |
 
-Source: `../../archive/engineering_notes/alps-prefetch-insitu-innovation.md`, “First
+Source: `legacy/engineering_notes/alps-prefetch-insitu-innovation.md`, “First
 model result”.
 
 The same date's compiler/runtime validation also recorded:
@@ -274,8 +274,8 @@ The same date's compiler/runtime validation also recorded:
 | GEMM `64x256x512` | Async layout-aware ALPS | 8.442 | Correct; about 3.3% slower than HexKL. |
 | GPT-2 full, seq 128 | original `HVX` row | 127,401.804 | Finite/top-1 qualified; matched HexKL host OOM, so no speedup. |
 
-Source: `../../archive/engineering_notes/alps-design-audit-and-roadmap.md` and the M1
-section of `../../archive/engineering_notes/alps-prefetch-insitu-innovation.md`.
+Source: `legacy/engineering_notes/alps-design-audit-and-roadmap.md` and the M1
+section of `legacy/engineering_notes/alps-prefetch-insitu-innovation.md`.
 
 ### 2026-07-28 — `alps-2x-improvement` Debug matrices
 
@@ -380,7 +380,7 @@ The three LiteRT trials were:
 | XNNPACK CPU | 2 | 1.047 | 0.366 | 0.316 | 0.438 |
 | XNNPACK CPU | 3 | 0.845 | 0.330 | 0.312 | 0.429 |
 
-Source: `../../archive/engineering_notes/alps-prefetch-insitu-innovation.md`, external
+Source: `legacy/engineering_notes/alps-prefetch-insitu-innovation.md`, external
 baseline and LiteRT sections.
 
 ### 2026-07-29 section — first monolithic full-structure screens
@@ -407,7 +407,7 @@ individual subheadings do not provide separate run dates.
 | QNN CPU | 472.936 | FP32, default scheduler; not single-thread controlled. |
 | QNN HTP | **99.520** | FP16, one HVX thread, default profile. |
 
-Source: `../../archive/engineering_notes/alps-prefetch-insitu-innovation.md`, full-model
+Source: `legacy/engineering_notes/alps-prefetch-insitu-innovation.md`, full-model
 screening and Direct-QNN checkpoint.
 
 ### 2026-07-30 — true-vector audit and interleaved percentiles
@@ -440,8 +440,8 @@ screening and Direct-QNN checkpoint.
 | HexKL/HMX | **1.218** | 1.261 | 1.280 |
 | HexKL/HMX + items 1–7 | 1.320 | 2.365 | 2.382 |
 
-Source: `../../archive/engineering_notes/plan_todo.md` and
-`../../archive/engineering_notes/alps-design-audit-and-roadmap.md`.
+Source: `legacy/engineering_notes/plan_todo.md` and
+`legacy/engineering_notes/alps-design-audit-and-roadmap.md`.
 
 ### Date not stated; recorded by the 2026-08-07 history snapshot
 
@@ -459,8 +459,8 @@ Source: `../../archive/engineering_notes/plan_todo.md` and
 | Falcon Debug N1 stationary prototype | HVX 509.019 | N1 661.809 | Correct but 1.300x slower. |
 | Falcon Debug N2 candidate run | HVX reference 509.019 | N2-enabled 491.355 | Zero N2 candidates; difference is noise and not attributable to N2. |
 
-Sources: `../../archive/engineering_notes/alps_history.md` and
-`../../archive/engineering_notes/engineering_work.md`.
+Sources: `legacy/engineering_notes/alps_history.md` and
+`legacy/engineering_notes/engineering_work.md`.
 
 ### 2026-08-06 — full HuBERT and two-prefetch-baseline checkpoint
 
@@ -476,8 +476,8 @@ Sources: `../../archive/engineering_notes/alps_history.md` and
 The two-model Prefetch-Kernel-HX/APT-GET-HX Debug results are in the required
 cross-product matrix in Section 2.
 
-Sources: `../../archive/engineering_notes/engineering_work.md`, sections 15–16, and
-`../../archive/engineering_notes/hexagon-prefetch-baselines-plan.md`.
+Sources: `legacy/engineering_notes/engineering_work.md`, sections 15–16, and
+`legacy/engineering_notes/hexagon-prefetch-baselines-plan.md`.
 
 ### 2026-08-08 and later in the same engineering section — latest upstream v73 corpus
 
@@ -511,7 +511,7 @@ for reproducibility but are superseded by the FP16-model/storage protocol for th
 | GPT-2 full 12L | 29,133.859 | 28,661.474 | 1.016x |
 | SD/CLIP full text encoder | 109,656.923 | 107,141.040 | 1.023x |
 
-Source: `../../archive/engineering_notes/engineering_work.md`, section 17.
+Source: `legacy/engineering_notes/engineering_work.md`, section 17.
 
 ### 2026-08-13 — full-model prefetch baselines and item-7-only convergence
 
@@ -550,7 +550,7 @@ runtime K/V prefetch. The bounded DINO policy reduces issued commands 45.6x
 and issued bytes 45.5x, but improves latency only 1.99% relative to the
 unbounded combination.
 
-Source: `../../archive/engineering_notes/hexagon-prefetch-baselines-plan.md`.
+Source: `legacy/engineering_notes/hexagon-prefetch-baselines-plan.md`.
 
 The default experiment scripts now select **item7-only** and keep items 1–6
 disabled via command-line switches, including explicit disabling of the
